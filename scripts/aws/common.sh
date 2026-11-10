@@ -2,7 +2,10 @@
 # Sourced by operator-run AWS scripts. Never use the caller's default context.
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-export AWS_PROFILE=${AWS_PROFILE:-er-platform}
+# GitHub OIDC supplies short-lived environment credentials, not an SSO profile.
+if [[ "${GITHUB_ACTIONS:-false}" != true ]]; then
+  export AWS_PROFILE=${AWS_PROFILE:-er-platform}
+fi
 export AWS_REGION=us-east-2
 export AWS_DEFAULT_REGION=us-east-2
 NAMESPACE=duckfleet-dev
@@ -20,6 +23,6 @@ assert_cluster() {
   actual=$(kubectl config view --minify --context "$KUBE_CONTEXT" -o jsonpath='{.clusters[0].cluster.server}')
   [[ "$expected" == "$actual" ]] || { echo 'Context is not the er-dev endpoint' >&2; exit 1; }
   [[ $("${KUBE[@]}" get namespace "$NAMESPACE" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/part-of}') == duckfleet ]] || {
-    echo 'Apply the DuckFleet namespace Terraform first' >&2; exit 1;
+    echo 'Apply the shared-platform DuckFleet bootstrap first' >&2; exit 1;
   }
 }

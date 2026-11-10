@@ -1,15 +1,15 @@
 terraform {
   required_version = ">= 1.11, < 2.0"
   required_providers {
-    kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.38" }
-    aws        = { source = "hashicorp/aws", version = "~> 6.0" }
+    aws = { source = "hashicorp/aws", version = "~> 6.0" }
   }
   backend "s3" {
-    bucket       = "er-terraform-state-797781631727"
-    key          = "duckfleet/dev.tfstate"
-    region       = "us-east-2"
-    encrypt      = true
-    use_lockfile = true
+    bucket               = "er-terraform-state-797781631727"
+    key                  = "duckfleet/dev.tfstate"
+    region               = "us-east-2"
+    encrypt              = true
+    use_lockfile         = true
+    workspace_key_prefix = "duckfleet/workspaces"
   }
 }
 
@@ -20,9 +20,6 @@ provider "aws" {
     tags = { Project = "duckfleet", Environment = "dev", ManagedBy = "terraform" }
   }
 }
-
-# Existing ER cluster is a read-only dependency, never imported or managed here.
-data "aws_eks_cluster" "dev" { name = "er-dev" }
 
 locals {
   namespace = "duckfleet-dev"
@@ -84,49 +81,7 @@ resource "aws_ecr_repository" "images" {
   image_scanning_configuration { scan_on_push = true }
   encryption_configuration { encryption_type = "AES256" }
 }
-resource "aws_iam_role" "worker" {
-  name = "duckfleet-dev-worker"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow", Principal = { Service = "pods.eks.amazonaws.com" }
-      Action = ["sts:AssumeRole", "sts:TagSession"]
-      Condition = { StringEquals = {
-        "aws:RequestTag/eks-cluster-arn"            = data.aws_eks_cluster.dev.arn
-        "aws:RequestTag/kubernetes-namespace"       = local.namespace
-        "aws:RequestTag/kubernetes-service-account" = "duckfleet-worker"
-      } }
-    }]
-  })
-}
-resource "aws_iam_role_policy" "lake" {
-  name = "duckfleet-lake-only"
-  role = aws_iam_role.worker.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
-        Resource = ["${aws_s3_bucket.lake.arn}/lake/*"]
-      },
-      {
-        Effect    = "Allow", Action = ["s3:ListBucket"], Resource = [aws_s3_bucket.lake.arn]
-        Condition = { StringLike = { "s3:prefix" = ["lake/*"] } }
-      },
-      { Effect = "Allow", Action = ["s3:GetBucketLocation"], Resource = [aws_s3_bucket.lake.arn] }
-    ]
-  })
-}
-resource "aws_eks_pod_identity_association" "worker" {
-  cluster_name         = data.aws_eks_cluster.dev.name
-  namespace            = local.namespace
-  service_account      = "duckfleet-worker"
-  role_arn             = aws_iam_role.worker.arn
-  disable_session_tags = false
-}
-
 output "namespace" { value = local.namespace }
 output "bucket" { value = aws_s3_bucket.lake.id }
 output "image_repositories" { value = { for name, repo in aws_ecr_repository.images : name => repo.repository_url } }
-output "worker_role_arn" { value = aws_iam_role.worker.arn }
+output "worker_role_arn" { value = "arn:aws:iam::797781631727:role/duckfleet-dev-worker" }

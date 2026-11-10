@@ -13,6 +13,23 @@ for component in worker dbt; do
   dockerfile=docker/server.Dockerfile
   [[ "$component" == worker ]] || dockerfile=docker/dbt.Dockerfile
   image="$registry/duckfleet-dev/$component:$revision"
+  # Immutable tags make reruns safe: reuse the exact committed revision if published.
+  if aws ecr describe-images --repository-name "duckfleet-dev/$component" \
+      --image-ids "imageTag=$revision" --query 'imageDetails[0].imageDigest' --output text \
+      > "artifacts/aws/$component-digest.txt" 2> "artifacts/aws/$component-lookup.err"; then
+    python3 - "$component" <<'PYMETA'
+import json,sys
+from pathlib import Path
+root=Path('artifacts/aws'); kind=sys.argv[1]
+digest=(root/f'{kind}-digest.txt').read_text().strip()
+assert digest.startswith('sha256:') and len(digest)==71
+(root/f'{kind}-image.json').write_text(json.dumps({'containerimage.digest':digest}))
+PYMETA
+    continue
+  fi
+  grep -q ImageNotFoundException "artifacts/aws/$component-lookup.err" || {
+    cat "artifacts/aws/$component-lookup.err" >&2; exit 1;
+  }
   docker buildx build --platform linux/amd64,linux/arm64 -f "$dockerfile" \
     --tag "$image" --push --metadata-file "artifacts/aws/$component-image.json" .
 done
