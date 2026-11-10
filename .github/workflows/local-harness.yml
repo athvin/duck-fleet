@@ -1,0 +1,31 @@
+name: Docker dbt harness
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: local-harness-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Rust checks in Docker
+        run: make check
+      - name: Real dbt integration and restart checks
+        run: make test
+      - name: Save test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: duckfleet-local-harness
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Stop local stack
+        if: always()
+        run: docker compose down -v

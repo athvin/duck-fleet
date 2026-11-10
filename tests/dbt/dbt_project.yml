@@ -1,0 +1,26 @@
+name: duckfleet_harness
+version: '0.1.0'
+config-version: 2
+profile: duckfleet
+model-paths: [models]
+seed-paths: [seeds]
+test-paths: [tests]
+macro-paths: [macros]
+query-comment:
+  comment: '{{ duckfleet_query_comment(node) }}'
+  append: true
+models:
+  duckfleet_harness:
+    +meta:
+      platform:
+        compute: persistent
+        tags:
+          team: harness
+seeds:
+  duckfleet_harness:
+    orders:
+      +column_types:
+        order_id: bigint
+        customer_id: bigint
+        amount: decimal(18,2)
+        updated_at: timestamp
