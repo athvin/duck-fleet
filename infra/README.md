@@ -133,7 +133,8 @@ Workers use the [DuckDB 1.5 AWS credential chain with automatic refresh](https:/
 and the [EKS Pod Identity container endpoint](https://docs.aws.amazon.com/eks/latest/userguide/pod-id-how-it-works.html).
 The identity requires the exact cluster/namespace/service-account tuple and grants
 S3 access only to `lake/` in DuckFleet's bucket. Gateway, database and dbt test pods
-have no AWS role. No static AWS access keys are generated or deployed.
+have no AWS role. The gateway reads query history through its platform database
+connection, independently of worker availability. No static AWS access keys are generated or deployed.
 
 Network policies permit same-namespace SQL/database traffic, DNS, and worker
 HTTPS plus the Pod Identity endpoint; private-network egress and EC2 IMDS are

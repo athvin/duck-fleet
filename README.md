@@ -10,7 +10,7 @@ Requires Docker Engine with Compose v2 (Docker Desktop works). No host Rust,
 Python, dbt, Kubernetes, or AWS credentials are needed. Allow roughly 6 GiB of
 Docker memory and internet access for the initial images, packages, and DuckDB
 extension downloads at image build time. Workers require Linux cgroup v2, as
-provided by the Docker Desktop and Ubuntu CI environments tested here. DuckDB and its three required extensions
+provided by the Docker Desktop and Ubuntu CI environments tested here. DuckDB and its required extensions
 are checksum-pinned in the images; startup needs only the local services.
 
 ```sh
@@ -48,8 +48,10 @@ This deletes the catalog, history, and object-store volumes.
 - A thin `type: duckfleet` dbt adapter sends SQL and bound parameters over HTTP to
   an Axum gateway routing to workers embedding DuckDB 1.5.4. Arrow IPC preserves result types.
 - DuckLake metadata lives in PostgreSQL; data lives in S3-compatible RustFS.
-  A separate PostgreSQL database stores execution history. Only the workers have
-  catalog and object-store credentials.
+  A separate PostgreSQL database stores execution history. Workers attach the
+  catalog and object store; the gateway reads the platform history database in
+  read-only mode. The development PostgreSQL user is shared, so database
+  separation is not a database-credential isolation boundary.
 - dbt seeds, views, tables, `ref`, tests, documentation generation, and
   `delete+insert` incremental updates run remotely. A test-only guard makes a
   client-side `duckdb.connect()` call fail.
@@ -140,7 +142,8 @@ All `/v1` endpoints require `Authorization: Bearer <token>`.
 | POST | `/v1/sessions/{id}/queries` | Execute SQL; returns an Arrow IPC stream and `x-query-id` |
 | DELETE | `/v1/sessions/{id}` | Close connection and roll back any open transaction |
 | POST | `/v1/sessions/{id}/cancel` | Interrupt this session's currently executing statement |
-| GET | `/v1/queries` | Most recent 500 execution records across workers |
+| GET | `/v1/queries` | Filtered history with cursor pagination; defaults to 500 records |
+| GET | `/v1/queries/{query_id}` | One durable record, metrics, and raw DuckDB profile when available |
 | GET | `/v1/workers` | Worker IDs, engine settings, and observed cgroup limits |
 
 A session request can supply `{"compute":{"cpu":2,"memory":"2Gi"},"context":{}}`.
@@ -173,6 +176,65 @@ Responses fail rather than silently truncate beyond 100,000 rows or 16 MiB.
 Each worker has a 1 GiB spill limit and the resource settings listed above.
 These are local resource limits, not billing budgets.
 
+## Query history and profiling
+
+List queries by `model_id`, `invocation_id`, `model_run_id`, `worker_id` (`small`
+or `medium`), and `status`. Filters combine with AND and are bound SQL parameters.
+Supported statuses are `running`, `succeeded`, `failed`, `canceled`, `timed_out`,
+and `interrupted`. All history endpoints require the same bearer authentication
+as execution and remain restricted to the trusted development environment.
+
+```sh
+curl -G -H 'Authorization: Bearer duckfleet-local-development-token' \
+  --data-urlencode 'model_id=model.duckfleet_harness.fct_orders' \
+  --data-urlencode 'worker_id=medium' --data-urlencode 'limit=20' \
+  http://localhost:18080/v1/queries
+```
+
+The response contains `queries` and `next_before`. Pass `before=<next_before>`
+with the same filters to fetch the next page; stop when the cursor is null.
+`limit` must be 1–500. Ordering uses a durable, descending `history_id` sequence,
+not SQL completion order. This is a live history view, not a frozen snapshot:
+new records and status updates may arrive between pages. Pre-existing records
+receive sequence IDs when the additive schema upgrade first runs.
+
+Each record includes SQL, lifecycle timestamps, execution elapsed milliseconds,
+row count, error, requested compute, worker placement, resolved dbt metadata,
+`profile_status`, and compact `metrics`. Fetch `/v1/queries/<query_id>` for the
+full `profile` JSON and operator tree. Raw plans are omitted from list responses.
+Unknown IDs return 404; invalid filters return 400.
+
+Workers enable standard JSON profiling by default. Set `DUCKFLEET_PROFILING=false`
+when starting Compose workers, or `profiling: false` in the Helm values, to disable
+it. The test harness expects profiling enabled. Before each statement the worker
+removes the previous profile output; after execution it caps stored profiles at 1 MiB,
+persists the profile alongside the query's terminal state, and removes the file.
+Statements that emit no profile, disabled profiling, malformed output and oversized
+profiles have explicit statuses (`not_emitted`, `disabled`, `invalid`, `too_large`,
+`io_error`). Older records and in-flight executions use `not_recorded`. A missing
+profile does not change a SQL success into a SQL failure. Profiling remains
+best-effort for trusted SQL; callers can modify DuckDB settings themselves.
+
+`latency` and `cpu_time` are seconds; buffer-memory, temporary-directory, and byte
+counters are bytes. DuckDB CPU/operator times can overlap and must not be summed
+as wall-clock time. Its system peak memory/spill measurements describe the
+engine's scope, not container RSS or an isolated per-model allocation. Byte
+counters are not AWS request/transfer meters. These metrics support diagnosis;
+they are not a billable usage ledger. For multi-statement SQL, DuckDB's file can
+represent only the last profiled statement; the history record covers the whole
+submitted request.
+
+Profiles live in the platform PostgreSQL database for this development release,
+with no automatic retention or S3 archival yet. SQL, profiles, and errors can
+contain sensitive literals. This is a single-tenant operational history API, not
+a customer authorization boundary. A `running` record means the worker accepted
+and began the request; queued operations are not yet durable history records.
+
+The integration gate verifies filtering and pagination, observes/cancels a running
+query without waiting behind it, rejects stale profiles after SQL failure, checks
+history with both workers stopped, and confirms saved profile data survives
+restart. `artifacts/query-profile.json` contains a real profiled dbt model query.
+
 ## Scope and limitations
 
 This is a **trusted, single-tenant development environment** with known local
@@ -188,10 +250,12 @@ Arbitrary DuckDB SQL can access worker files and network resources. Python model
 external materializations, and dbt plugins are unsupported. Unchecked dbt
 materializations or version combinations are not part of the tested contract.
 
-Health reports process availability, not continuous dependency readiness. Query
-history reads the shared ledger through the small worker queue, so it can wait
-behind that worker's running statement;
-cancellation bypasses that queue. The response limit applies to returned data;
+Health reports process availability, not continuous dependency readiness. History
+uses separate, read-only PostgreSQL connections and remains available while
+workers are busy or stopped. Each process admits at most eight concurrent history
+reads, with a three-second connection timeout and PostgreSQL statement timeout;
+excess requests return 429. A database outage returns 503. Cancellation bypasses
+the execution queue. The response limit applies to returned data;
 DuckDB may materialize a result before serialization. Canceling or losing an HTTP
 request is not proof that a write was rolled back. This harness does not yet test
 crash recovery during a commit, backup restoration, or conflicting writes from

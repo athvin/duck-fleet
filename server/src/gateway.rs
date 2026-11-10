@@ -6,7 +6,7 @@ use crate::{
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
@@ -35,6 +35,7 @@ struct Gateway {
     medium: String,
     routes: Arc<Mutex<HashMap<Uuid, Route>>>,
     capacity: Arc<Semaphore>,
+    history: crate::history::Reader,
 }
 impl Gateway {
     fn endpoint(&self, size: Size) -> &str {
@@ -169,13 +170,17 @@ async fn close(State(app): State<Gateway>, Path(id): Path<Uuid>) -> Result<Respo
     }
     response(upstream).await
 }
-async fn history(State(app): State<Gateway>) -> Result<Response, ApiError> {
-    // Both workers write the same PostgreSQL history database.
-    response(
-        app.send(&app.small, Method::GET, "/v1/queries", Bytes::new())
-            .await?,
-    )
-    .await
+async fn history(
+    State(app): State<Gateway>,
+    Query(filter): Query<crate::history::Filter>,
+) -> Result<Json<Value>, ApiError> {
+    app.history.list(filter).await.map(Json)
+}
+async fn query_detail(
+    State(app): State<Gateway>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    app.history.detail(id).await.map(Json)
 }
 async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
     async fn info(app: &Gateway, endpoint: &str) -> Result<Value, ApiError> {
@@ -202,6 +207,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         medium: std::env::var("WORKER_MEDIUM_URL")?,
         routes: Arc::new(Mutex::new(HashMap::new())),
         capacity: Arc::new(Semaphore::new(64)),
+        history: crate::history::Reader::new(std::env::var("PLATFORM_DSN")?),
     };
     let api = Router::new()
         .route("/v1/sessions", post(open))
@@ -209,6 +215,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/sessions/{id}/queries", post(query))
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/queries", get(history))
+        .route("/v1/queries/{id}", get(query_detail))
         .route("/v1/workers", get(workers))
         .route_layer(middleware::from_fn_with_state(app.token.clone(), authorize));
     let router = Router::new()

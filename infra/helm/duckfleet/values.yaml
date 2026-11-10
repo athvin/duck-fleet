@@ -12,3 +12,5 @@ nodeSelector:
 
 # Pause compute after testing; the PostgreSQL PVC and S3 data remain.
 suspended: false
+
+profiling: true
