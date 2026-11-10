@@ -116,8 +116,7 @@ Run after evidence collection to avoid leaving baseline compute running:
 AWS_PROFILE=er-platform KUBE_CONTEXT=er-dev-admin bash scripts/aws/suspend.sh
 ```
 
-This scales gateway, workers, and PostgreSQL to zero; the completed test Job
-expires after 24 hours. S3 versions, images, and the PVC continue to incur storage
+This stops the test Job and scales gateway, workers, and PostgreSQL to zero. S3 versions, images, and the PVC continue to incur storage
 charges. Namespace quotas cap requested resources, **not dollars**; shared node
 capacity and idle time make the actual bill workload-dependent. No AWS spend
 commitments, new cluster, NAT gateway, or public endpoint are introduced.

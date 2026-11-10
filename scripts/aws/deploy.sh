@@ -18,4 +18,4 @@ print(json.dumps({'apiVersion':'v1','kind':'Secret','metadata':{'name':'duckflee
 PY
 fi
 helm upgrade --install duckfleet infra/helm/duckfleet --kube-context "$KUBE_CONTEXT" \
-  --namespace "$NAMESPACE" -f artifacts/aws/values.json --wait --timeout 15m
+  --namespace "$NAMESPACE" -f artifacts/aws/values.json --set suspended=false --wait --timeout 15m
