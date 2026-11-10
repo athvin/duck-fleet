@@ -1,0 +1,2 @@
+CREATE DATABASE lake;
+CREATE DATABASE platform;

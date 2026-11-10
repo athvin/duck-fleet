@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbt-duckfleet"
+version = "0.1.0"
+description = "Experimental dbt adapter for the local DuckFleet HTTP server"
+requires-python = ">=3.12"
+dependencies = ["dbt-core==1.11.11", "dbt-duckdb==1.11.1", "duckdb==1.5.4", "pyarrow==23.0.1"]
+
+[tool.setuptools.packages.find]
+include = ["dbt.adapters.duckfleet*", "dbt.include.duckfleet*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"dbt.include.duckfleet" = ["dbt_project.yml", "macros/*.sql"]

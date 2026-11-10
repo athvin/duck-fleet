@@ -1,0 +1,10 @@
+duckfleet:
+  target: local
+  outputs:
+    local:
+      type: duckfleet
+      endpoint: '{{ env_var("DUCKFLEET_URL", "http://server:8080") }}'
+      token: '{{ env_var("DUCKFLEET_TOKEN") }}'
+      database: lake
+      schema: analytics
+      threads: 2
