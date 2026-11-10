@@ -7,22 +7,22 @@ organization. The intended domain is `duckfleet.com`, pending purchase.
 ## Run locally
 
 Requires Docker Engine with Compose v2 (Docker Desktop works). No host Rust,
-Python, dbt, Kubernetes, or AWS credentials are needed. Allow roughly 4 GiB of
+Python, dbt, Kubernetes, or AWS credentials are needed. Allow roughly 6 GiB of
 Docker memory and internet access for the initial images, packages, and DuckDB
-extension downloads at image build time. DuckDB and its three required extensions
+extension downloads at image build time. Workers require Linux cgroup v2, as
+provided by the Docker Desktop and Ubuntu CI environments tested here. DuckDB and its three required extensions
 are checksum-pinned in the images; startup needs only the local services.
 
 ```sh
 make test
 ```
 
-This builds the images, starts PostgreSQL, RustFS, and the Rust HTTP server, and
-runs a real dbt project through the server. It then restarts the server, verifies
+This builds the images, starts PostgreSQL, RustFS, a Rust gateway, and two Rust workers, and
+runs a real dbt project through the server. It then tests an unavailable worker, restarts the workers and gateway, and verifies
 that results and history survived, and checks that RustFS contains Parquet files.
 Repeated runs reuse the local volumes and rebuild the fixture from scratch.
-Tests leave the services running for inspection. The expected-failure stage
-intentionally prints one dbt model error; the harness requires that error and
-verifies that its pre-hook write rolled back.
+Tests leave the services running for inspection. The failure stages intentionally print dbt errors: one proves pre-hook rollback,
+and another proves that an unsupported size runs no model SQL.
 
 ```sh
 make up     # start the services without running the harness
@@ -46,35 +46,83 @@ This deletes the catalog, history, and object-store volumes.
 ## What the harness proves
 
 - A thin `type: duckfleet` dbt adapter sends SQL and bound parameters over HTTP to
-  an Axum server embedding DuckDB 1.5.4. Arrow IPC preserves result types.
+  an Axum gateway routing to workers embedding DuckDB 1.5.4. Arrow IPC preserves result types.
 - DuckLake metadata lives in PostgreSQL; data lives in S3-compatible RustFS.
-  A separate PostgreSQL database stores execution history. Only the server has
+  A separate PostgreSQL database stores execution history. Only the workers have
   catalog and object-store credentials.
 - dbt seeds, views, tables, `ref`, tests, documentation generation, and
   `delete+insert` incremental updates run remotely. A test-only guard makes a
   client-side `duckdb.connect()` call fail.
 - A dbt connection maps to one server session, preserving temporary tables and
-  transactions through pre-hooks, materialization, and post-hooks. Query comments
-  carry invocation/model IDs and resolved metadata; history groups statements by
-  model run and retains the tags supplied by the example project.
+  transactions through pre-hooks, materialization, and post-hooks. The adapter reads
+  resolved node metadata before opening the connection; comments are disabled in
+  the fixture. History stores model/run IDs, requested resources, tags, and
+  server-observed placement and cgroup limits.
 - The protocol checks authentication, parameter/result fidelity, session isolation,
   rollback, rollback on close, failed SQL recovery, duplicate request rejection,
   response limits, statement timeout, active-query cancellation, and rollback of
   a deliberately failed dbt materialization.
-- Data and query history survive a server-container restart; tiny fixture tables
+- Data and query history survive worker and gateway restarts; tiny fixture tables
   explicitly disable DuckLake data inlining so the test verifies real Parquet
   objects, rather than only catalog rows.
 
-The dbt project runs with two threads, while the first worker executes statements
-serially. This checks session interleaving, not multi-worker write concurrency.
-Test artifacts and the last 500 query records are written under `artifacts/`.
+The dbt project runs with two threads. Each worker executes its own statements
+serially, and dependent models read the preceding worker's committed DuckLake
+results. This is a two-worker integration test, not a stress test of concurrent
+writes to the same tables. Test artifacts and the last 500 query records are
+written under `artifacts/`.
+
+## Request a worker size per model
+
+```sql
+{{ config(meta={
+  'platform': {'compute': 'persistent', 'cpu': 2, 'memory': '2Gi'}
+}) }}
+select * from {{ ref('stg_orders') }}
+```
+
+Defaults can also be set under `models.<project>.+meta.platform` in
+`dbt_project.yml`. The adapter receives dbt's resolved model config before its
+first SQL statement. Both `cpu` and `memory` must be supplied together; omitting
+both selects small. Use `meta.platform.tags` for workload attribution. Other
+platform keys are rejected rather than ignored.
+
+| Requested CPU / memory | Docker worker | DuckDB threads | DuckDB memory limit |
+| --- | --- | --- | --- |
+| 1 / `1Gi` | `worker-small` | 1 | 512 MiB |
+| 2 / `2Gi` | `worker-medium` | 2 | 1 GiB |
+
+Memory in the request is the **container cap**. DuckDB-managed memory is limited to half that cap, leaving room for extensions, networking, and Arrow results. Docker
+CPU quotas are hard limits on CPU time, not dedicated CPU cores.
+
+The gateway selects an exact matching, prestarted Docker worker. It does not
+launch an EC2 instance or create a container on demand. A model's entire lifecycle
+stays on one worker/session; it cannot resize in the middle of a transaction.
+Unsupported sizes return an error, and an unavailable worker never falls back to
+a smaller one.
+
+The harness builds `fct_orders` on medium and `customer_totals` on small, checks
+resource settings inside the materialized results, then rebuilds `fct_orders` on
+small and medium again by changing config. It verifies Docker's actual CPU/memory
+settings, the workers' kernel cgroup limits, and history for hooks through commit.
+Evidence is saved in `artifacts/model-placement.json`, `worker-resources.json`,
+and `docker-worker-limits.jsonl`.
+
+To reproduce the size change manually after `make test`:
+
+```sh
+docker compose run --rm dbt dbt run --select fct_orders --full-refresh \
+  --vars '{"fct_cpu":1,"fct_memory":"1Gi"}'
+docker compose run --rm dbt dbt run --select fct_orders --full-refresh \
+  --vars '{"fct_cpu":2,"fct_memory":"2Gi"}'
+```
 
 ## Layout
 
 ```text
-server/                 Rust Axum API, persistent worker, query history
+server/                 Rust gateway, resource classes, workers, query history
 adapters/dbt-duckfleet/  Python dbt adapter and HTTP/Arrow transport
-compose.yaml            PostgreSQL, RustFS, bucket setup, server, dbt runner
+compose.yaml            PostgreSQL, RustFS, gateway, sized workers, dbt runner
 docker/                 Images and initial PostgreSQL databases
 scripts/                Build and harness helpers
 tests/dbt/              Representative seed, view, table, incremental model, tests
@@ -88,12 +136,15 @@ All `/v1` endpoints require `Authorization: Bearer <token>`.
 | Method | Path | Behavior |
 | --- | --- | --- |
 | GET | `/healthz` | Process health after startup initialization |
-| POST | `/v1/sessions` | Open a connection; returns `session_id` |
+| POST | `/v1/sessions` | Select compute, open a pinned connection; returns `session_id` and placement |
 | POST | `/v1/sessions/{id}/queries` | Execute SQL; returns an Arrow IPC stream and `x-query-id` |
 | DELETE | `/v1/sessions/{id}` | Close connection and roll back any open transaction |
 | POST | `/v1/sessions/{id}/cancel` | Interrupt this session's currently executing statement |
-| GET | `/v1/queries` | Most recent 500 execution records |
+| GET | `/v1/queries` | Most recent 500 execution records across workers |
+| GET | `/v1/workers` | Worker IDs, engine settings, and observed cgroup limits |
 
+A session request can supply `{"compute":{"cpu":2,"memory":"2Gi"},"context":{}}`.
+Compute is fixed when the session opens; query bodies cannot override it.
 A query request has this shape:
 
 ```json
@@ -111,14 +162,16 @@ returns HTTP 409 without executing SQL again; results are not cached or replayed
 An HTTP/transport failure can occur after a write commits. Inspect history and
 application state before retrying; the adapter does not automatically retry SQL.
 Accepted worker executions are recorded before SQL runs and updated on completion.
-At startup, unfinished records become `interrupted` with an unknown-commit warning.
+At worker startup, its own unfinished records become `interrupted` with an
+unknown-commit warning; another worker's running records are left alone.
 
-The queue holds at most 64 operations, with at most 32 sessions. Sessions idle for
+Each worker queue holds at most 64 operations, with at most 32 sessions. The
+gateway allows at most 64 routed sessions. Sessions idle for
 five minutes are closed on the next worker operation. Statement execution has a
 30-second default deadline (1–60 seconds allowed); queue time is additional.
 Responses fail rather than silently truncate beyond 100,000 rows or 16 MiB.
-DuckDB has a 512 MiB memory setting and 1 GiB spill limit inside a 2 GiB / 2 CPU
-container. These are local resource limits, not billing budgets.
+Each worker has a 1 GiB spill limit and the resource settings listed above.
+These are local resource limits, not billing budgets.
 
 ## Scope and limitations
 
@@ -128,19 +181,22 @@ administrator SQL connection; it is not a SQL sandbox. Do not expose it publicly
 or use customer data. Query history includes SQL text and errors. Logical model
 IDs and tags are caller-supplied correlation data, not authenticated billing data.
 
-Only persistent compute and SQL models are implemented. There is no burst routing,
-warm pool, model resource sizing, durable job queue, pricing/budget ledger,
+Only the two persistent Docker compute classes and SQL models are implemented.
+There is no on-demand instance provisioning, warm pool, durable job queue, pricing/budget ledger,
 multi-tenant authorization, production secret management, or automatic write retry.
 Arbitrary DuckDB SQL can access worker files and network resources. Python models,
 external materializations, and dbt plugins are unsupported. Unchecked dbt
 materializations or version combinations are not part of the tested contract.
 
 Health reports process availability, not continuous dependency readiness. Query
-history uses the same worker queue, so it waits behind a running statement;
+history reads the shared ledger through the small worker queue, so it can wait
+behind that worker's running statement;
 cancellation bypasses that queue. The response limit applies to returned data;
 DuckDB may materialize a result before serialization. Canceling or losing an HTTP
 request is not proof that a write was rolled back. This harness does not yet test
-crash recovery during a commit, backup restoration, or concurrent DuckLake writers.
+crash recovery during a commit, backup restoration, or conflicting writes from
+multiple DuckLake workers. A gateway restart loses its in-memory session routes;
+clients must open new sessions and inspect uncertain write outcomes.
 
 ## Design and upstream contracts
 

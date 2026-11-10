@@ -5,15 +5,15 @@ profile: duckfleet
 model-paths: [models]
 seed-paths: [seeds]
 test-paths: [tests]
-macro-paths: [macros]
-query-comment:
-  comment: '{{ duckfleet_query_comment(node) }}'
-  append: true
+# Placement must work even when query comments are disabled.
+query-comment: null
 models:
   duckfleet_harness:
     +meta:
       platform:
         compute: persistent
+        cpu: 1
+        memory: 1Gi
         tags:
           team: harness
 seeds:

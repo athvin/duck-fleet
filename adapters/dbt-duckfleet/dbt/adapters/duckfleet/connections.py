@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import threading
 
 from dbt.adapters.contracts.connection import ConnectionState
 from dbt.adapters.duckdb.connections import DuckDBConnectionManager
@@ -43,6 +44,7 @@ class DuckFleetCredentials(DuckDBCredentials):
 
 class DuckFleetConnectionManager(DuckDBConnectionManager):
     TYPE = "duckfleet"
+    _SESSION = threading.local()
 
     @classmethod
     def open(cls, connection):
@@ -50,12 +52,25 @@ class DuckFleetConnectionManager(DuckDBConnectionManager):
             return connection
         credentials = connection.credentials
         try:
-            connection.handle = RemoteConnection(credentials.endpoint, credentials.token, connection.name)
+            request = getattr(cls._SESSION, "request", {})
+            connection.handle = RemoteConnection(credentials.endpoint, credentials.token, connection.name,
+                compute=request.get("compute"), context=request.get("context"))
+            connection.handle.session_request = request
             connection.state = ConnectionState.OPEN
         except Exception as error:
             connection.state = ConnectionState.FAIL
             raise FailedToConnectError(str(error)) from error
         return connection
+
+    def set_connection_name(self, name=None):
+        connection = self.get_if_exists()
+        if connection and connection.state == ConnectionState.OPEN:
+            request = getattr(self._SESSION, "request", {})
+            if connection.handle.session_request != request:
+                if connection.transaction_open:
+                    raise RuntimeError("cannot change model or compute inside an open transaction")
+                self.close(connection)
+        return super().set_connection_name(name)
 
     def add_query(self, *args, **kwargs):
         connection = self.get_thread_connection()

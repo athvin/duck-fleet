@@ -1,4 +1,4 @@
-use crate::{ApiError, Envelope, Operation, Output, QueryRequest, Reply};
+use crate::{ApiError, Envelope, Operation, Output, QueryRequest, Reply, compute::Size};
 use anyhow::{Context, Result};
 use arrow_ipc::writer::StreamWriter;
 use axum::http::StatusCode;
@@ -42,9 +42,12 @@ pub(crate) fn interrupt(
 struct Session {
     conn: Connection,
     touched: Instant,
+    context: Value,
 }
 pub(crate) struct Worker {
     root: Connection,
+    size: Size,
+    placement: Value,
     ledger: Client,
     sessions: HashMap<Uuid, Session>,
     active: ActiveSlot,
@@ -60,8 +63,39 @@ fn required(name: &str) -> Result<String> {
 
 impl Worker {
     pub(crate) fn new(active: ActiveSlot, runtime: tokio::runtime::Handle) -> Result<Self> {
+        let size = match required("DUCKFLEET_WORKER_SIZE")?.as_str() {
+            "small" => Size::Small,
+            "medium" => Size::Medium,
+            _ => anyhow::bail!("unknown worker size"),
+        };
+        let mut placement = size.placement();
+        let memory_max: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.max")?
+            .trim()
+            .parse()?;
+        let cpu_max = std::fs::read_to_string("/sys/fs/cgroup/cpu.max")?;
+        let limits: Vec<u64> = cpu_max
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<std::result::Result<_, _>>()?;
+        anyhow::ensure!(
+            limits.len() == 2 && limits[1] > 0 && limits[0] == limits[1] * u64::from(size.cpu()),
+            "Docker CPU quota does not match worker size"
+        );
+        anyhow::ensure!(
+            memory_max == size.memory_bytes(),
+            "Docker memory limit does not match worker size"
+        );
+        placement["cgroup_memory_max"] = json!(memory_max);
+        placement["cgroup_cpu_quota"] = json!(limits[0]);
+        placement["cgroup_cpu_period"] = json!(limits[1]);
+        placement["worker_boot_id"] = json!(Uuid::new_v4());
         let root = Connection::open_in_memory()?;
-        root.execute_batch("SET memory_limit='512MB'; SET threads=2; SET max_temp_directory_size='1GB'; SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; LOAD httpfs; LOAD postgres; LOAD ducklake;")?;
+        root.execute_batch(&format!(
+            "SET memory_limit='{}'; SET threads={};",
+            size.engine_memory(),
+            size.cpu()
+        ))?;
+        root.execute_batch(" SET max_temp_directory_size='1GB'; SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; LOAD httpfs; LOAD postgres; LOAD ducklake;")?;
         root.execute_batch(&format!(
             "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');",
             literal(&required("S3_ACCESS_KEY")?), literal(&required("S3_SECRET_KEY")?), literal(&required("S3_ENDPOINT")?)
@@ -73,20 +107,39 @@ impl Worker {
         ))?;
         // Keep real Parquet objects in the harness, even for tiny seed data.
         root.execute_batch("CALL ducklake_set_option('lake', 'data_inlining_row_limit', 0)")?;
+        placement["duckdb_threads"] = json!(root.query_row(
+            "SELECT current_setting('threads')::BIGINT",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?);
+        placement["duckdb_memory_limit"] = json!(root.query_row(
+            "SELECT current_setting('memory_limit')",
+            [],
+            |r| r.get::<_, String>(0)
+        )?);
         let mut ledger = Client::connect(&required("PLATFORM_DSN")?, NoTls)?;
-        ledger.batch_execute(
-            "CREATE TABLE IF NOT EXISTS query_history (
-            query_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, sql TEXT NOT NULL,
-            context TEXT NOT NULL, status TEXT NOT NULL,
-            accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ,
-            elapsed_ms BIGINT, result_rows BIGINT, error TEXT
-        );
-        UPDATE query_history SET status='interrupted', finished_at=now(),
-            error='server restarted; commit outcome may be unknown, do not blindly retry'
-        WHERE status='running';",
+        let mut transaction = ledger.transaction()?;
+        transaction.batch_execute("SELECT pg_advisory_xact_lock(4283121);
+            CREATE TABLE IF NOT EXISTS query_history (
+                query_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, sql TEXT NOT NULL,
+                context TEXT NOT NULL, status TEXT NOT NULL,
+                accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ,
+                elapsed_ms BIGINT, result_rows BIGINT, error TEXT
+            );
+            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS worker_id TEXT NOT NULL DEFAULT 'legacy';
+            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS placement TEXT NOT NULL DEFAULT '{}';")?;
+        // Starting one worker must not terminate records owned by the other worker.
+        transaction.execute(
+            "UPDATE query_history SET status='interrupted', finished_at=now(),
+            error='worker restarted; commit outcome may be unknown, do not blindly retry'
+            WHERE status='running' AND worker_id=$1",
+            &[&size.name()],
         )?;
+        transaction.commit()?;
         Ok(Self {
             root,
+            size,
+            placement,
             ledger,
             sessions: HashMap::new(),
             active,
@@ -106,7 +159,13 @@ impl Worker {
 
     fn handle(&mut self, op: Operation) -> Reply {
         match op {
-            Operation::Open => {
+            Operation::Info => Ok(Output::Json(self.placement.clone())),
+            Operation::Open(mut request) => {
+                if request.validate()? != self.size {
+                    return Err(ApiError::bad("request does not match this worker size"));
+                }
+                request.context["requested_compute"] =
+                    serde_json::to_value(&request.compute).map_err(|_| ApiError::internal())?;
                 if self.sessions.len() >= 32 {
                     return Err(ApiError(
                         StatusCode::TOO_MANY_REQUESTS,
@@ -122,10 +181,11 @@ impl Worker {
                     Session {
                         conn,
                         touched: Instant::now(),
+                        context: request.context,
                     },
                 );
                 Ok(Output::Json(
-                    json!({"session_id":id, "database":"lake", "duckdb_version":"1.5.4"}),
+                    json!({"session_id":id, "database":"lake", "duckdb_version":"1.5.4", "placement":self.placement}),
                 ))
             }
             Operation::Close(id) => {
@@ -137,7 +197,7 @@ impl Worker {
         }
     }
 
-    fn query(&mut self, id: Uuid, req: QueryRequest) -> Reply {
+    fn query(&mut self, id: Uuid, mut req: QueryRequest) -> Reply {
         let session = self
             .sessions
             .get_mut(&id)
@@ -149,10 +209,16 @@ impl Worker {
             .map(parameter)
             .collect::<Result<Vec<_>>>()
             .map_err(|e| ApiError::bad(e.to_string()))?;
+        // Session identity and policy cannot change midway through a materialization.
+        if let (Some(query), Some(session)) =
+            (req.context.as_object_mut(), session.context.as_object())
+        {
+            query.extend(session.clone());
+        }
         let query_id = req.request_id.to_string();
         let inserted = self.ledger.execute(
-            "INSERT INTO query_history (query_id, session_id, sql, context, status) VALUES ($1,$2,$3,$4,'running') ON CONFLICT DO NOTHING",
-            &[&query_id, &id.to_string(), &req.sql, &req.context.to_string()],
+            "INSERT INTO query_history (query_id, session_id, sql, context, status, worker_id, placement) VALUES ($1,$2,$3,$4,'running',$5,$6) ON CONFLICT DO NOTHING",
+            &[&query_id, &id.to_string(), &req.sql, &req.context.to_string(), &self.size.name(), &self.placement.to_string()],
         ).map_err(|_| ApiError::internal())?;
         if inserted == 0 {
             return Err(ApiError(
@@ -202,14 +268,15 @@ impl Worker {
 
     fn history(&mut self) -> Reply {
         let rows = self.ledger.query(
-            "SELECT query_id,session_id,sql,context,status,accepted_at::text,finished_at::text,elapsed_ms,result_rows,error FROM query_history ORDER BY accepted_at DESC LIMIT 500", &[]
+            "SELECT query_id,session_id,sql,context,status,accepted_at::text,finished_at::text,elapsed_ms,result_rows,error,placement FROM query_history ORDER BY accepted_at DESC LIMIT 500", &[]
         ).map_err(|_| ApiError::internal())?;
         let records: Vec<_> = rows.iter().map(|r| json!({
             "query_id":r.get::<_, String>(0), "session_id":r.get::<_, String>(1),
             "sql":r.get::<_, String>(2), "context":serde_json::from_str::<Value>(r.get::<_, &str>(3)).unwrap_or(Value::Null),
             "status":r.get::<_, String>(4), "accepted_at":r.get::<_, String>(5),
             "finished_at":r.get::<_, Option<String>>(6), "elapsed_ms":r.get::<_, Option<i64>>(7),
-            "result_rows":r.get::<_, Option<i64>>(8), "error":r.get::<_, Option<String>>(9)
+            "result_rows":r.get::<_, Option<i64>>(8), "error":r.get::<_, Option<String>>(9),
+            "placement":serde_json::from_str::<Value>(r.get::<_, &str>(10)).unwrap_or(Value::Null)
         })).collect();
         Ok(Output::Json(json!({"queries":records})))
     }

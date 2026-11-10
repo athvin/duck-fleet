@@ -1,5 +1,8 @@
 //! Local, single-tenant DuckFleet SQL service. All DuckDB work stays on one worker thread.
+mod compute;
+mod gateway;
 mod worker;
+use compute::SessionRequest;
 
 use axum::{
     Json, Router,
@@ -29,7 +32,8 @@ struct Envelope {
     reply: oneshot::Sender<Reply>,
 }
 enum Operation {
-    Open,
+    Open(SessionRequest),
+    Info,
     Close(Uuid),
     Query(Uuid, QueryRequest),
     History,
@@ -98,7 +102,7 @@ impl IntoResponse for Output {
 }
 
 async fn authorize(
-    State(app): State<App>,
+    State(token): State<Arc<str>>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
@@ -107,7 +111,7 @@ async fn authorize(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|v| v == app.token.as_ref());
+        .is_some_and(|v| v == token.as_ref());
     if !valid {
         return (
             StatusCode::UNAUTHORIZED,
@@ -127,8 +131,13 @@ async fn dispatch(app: App, op: Operation) -> Reply {
     })?;
     receiver.await.map_err(|_| ApiError::internal())?
 }
-async fn open(State(app): State<App>) -> Reply {
-    dispatch(app, Operation::Open).await
+async fn open(State(app): State<App>, request: Option<Json<SessionRequest>>) -> Reply {
+    let request = request.map(|Json(r)| r).unwrap_or_default();
+    request.validate()?;
+    dispatch(app, Operation::Open(request)).await
+}
+async fn info(State(app): State<App>) -> Reply {
+    dispatch(app, Operation::Info).await
 }
 async fn close(State(app): State<App>, Path(id): Path<Uuid>) -> Reply {
     dispatch(app, Operation::Close(id)).await
@@ -176,6 +185,9 @@ async fn main() -> anyhow::Result<()> {
         token.len() >= 16,
         "DUCKFLEET_TOKEN must have at least 16 characters"
     );
+    if std::env::var("DUCKFLEET_ROLE").as_deref() == Ok("gateway") {
+        return gateway::serve(token).await;
+    }
     let active = Arc::new(Mutex::new(None));
     let (sender, receiver) = mpsc::channel(64);
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -204,7 +216,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/sessions/{id}/queries", post(query))
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/queries", get(history))
-        .route_layer(middleware::from_fn_with_state(app.clone(), authorize));
+        .route("/v1/worker", get(info))
+        .route_layer(middleware::from_fn_with_state(app.token.clone(), authorize));
     let router = Router::new()
         .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
         .merge(api)

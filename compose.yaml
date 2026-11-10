@@ -29,33 +29,64 @@ services:
       dockerfile: docker/s3.Dockerfile
     depends_on: [object-store]
 
-  server:
+  worker-small:
+    image: duckfleet-worker:local
     build:
       context: .
       dockerfile: docker/server.Dockerfile
-    environment:
+    environment: &worker-environment
       DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
+      DUCKFLEET_WORKER_SIZE: small
       CATALOG_DSN: host=postgres port=5432 dbname=lake user=duckfleet password=local-catalog-password
       PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
       S3_ENDPOINT: object-store:9000
       S3_ACCESS_KEY: DUCKFLEETLOCAL
       S3_SECRET_KEY: local-object-store-password
       S3_DATA_PATH: s3://duckfleet/lake/
-    ports:
-      - '127.0.0.1:${DUCKFLEET_PORT:-18080}:8080'
     depends_on:
       postgres:
         condition: service_healthy
       bucket-init:
         condition: service_completed_successfully
-    healthcheck:
+    healthcheck: &worker-health
       test: [CMD, curl, -fsS, http://localhost:8080/healthz]
       interval: 3s
       timeout: 3s
       retries: 40
+    mem_limit: 1g
+    cpus: 1
+    stop_grace_period: 10s
+
+  worker-medium:
+    image: duckfleet-worker:local
+    environment:
+      <<: *worker-environment
+      DUCKFLEET_WORKER_SIZE: medium
+    depends_on:
+      worker-small:
+        condition: service_healthy
+    healthcheck: *worker-health
     mem_limit: 2g
     cpus: 2
     stop_grace_period: 10s
+
+  server:
+    image: duckfleet-worker:local
+    environment:
+      DUCKFLEET_ROLE: gateway
+      DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
+      WORKER_SMALL_URL: http://worker-small:8080
+      WORKER_MEDIUM_URL: http://worker-medium:8080
+    ports:
+      - '127.0.0.1:${DUCKFLEET_PORT:-18080}:8080'
+    depends_on:
+      worker-small:
+        condition: service_healthy
+      worker-medium:
+        condition: service_healthy
+    healthcheck: *worker-health
+    mem_limit: 256m
+    cpus: 0.5
 
   dbt:
     profiles: [test]

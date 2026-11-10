@@ -2,7 +2,6 @@
 import datetime
 import decimal
 import json
-import re
 import urllib.error
 import urllib.request
 import uuid
@@ -48,11 +47,14 @@ class Client:
 
 
 class RemoteConnection:
-    def __init__(self, endpoint, token, name="client"):
+    def __init__(self, endpoint, token, name="client", compute=None, context=None):
         self.client = Client(endpoint, token)
-        info = json.loads(self.client.request("POST", "/v1/sessions"))
+        self.context = dict(context or {}, connection_name=name)
+        info = json.loads(self.client.request("POST", "/v1/sessions", {
+            "compute": compute or {}, "context": self.context,
+        }))
         self.session_id = info["session_id"]
-        self.context = {"connection_name": name}
+        self.placement = info["placement"]
         self.closed = False
 
     @property
@@ -89,17 +91,6 @@ class RemoteCursor:
 
     def execute(self, sql, parameters=None):
         context = dict(self.connection.context)
-        match = re.search(r"/\*\s*(\{.*?\})\s*\*/", sql, flags=re.DOTALL)
-        if match:
-            try:
-                context["dbt"] = json.loads(match.group(1))
-            except ValueError:
-                pass
-        dbt = context.get("dbt", {})
-        if dbt.get("node_id") and dbt.get("invocation_id"):
-            context["model_run_id"] = str(uuid.uuid5(uuid.NAMESPACE_URL, dbt["invocation_id"] + ":" + dbt["node_id"]))
-        if dbt.get("platform", {}).get("compute", "persistent") != "persistent":
-            raise RuntimeError("local DuckFleet supports only persistent compute")
         self.query_id = str(uuid.uuid4())
         result = self.connection.client.request("POST", self.connection.path + "/queries", {
             "request_id": self.query_id, "sql": sql, "parameters": list(parameters or []), "context": context,

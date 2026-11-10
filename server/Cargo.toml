@@ -9,6 +9,7 @@ arrow-ipc = "58.4.1"
 axum = "0.8"
 duckdb = "=1.10504.0"
 postgres = "0.19.14"
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["full"] }

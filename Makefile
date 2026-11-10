@@ -1,6 +1,7 @@
 .PHONY: up test check down
 up:
-	docker compose up --build -d --wait server
+	docker compose build
+	docker compose up -d --wait server
 test:
 	bash scripts/test-local.sh
 check:
