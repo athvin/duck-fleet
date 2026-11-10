@@ -30,3 +30,10 @@ __pycache__/
 *.egg-info/
 .venv/
 logs/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+infra/**/generated-values.json

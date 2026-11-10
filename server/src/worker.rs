@@ -79,11 +79,11 @@ impl Worker {
             .collect::<std::result::Result<_, _>>()?;
         anyhow::ensure!(
             limits.len() == 2 && limits[1] > 0 && limits[0] == limits[1] * u64::from(size.cpu()),
-            "Docker CPU quota does not match worker size"
+            "container CPU quota does not match worker size"
         );
         anyhow::ensure!(
             memory_max == size.memory_bytes(),
-            "Docker memory limit does not match worker size"
+            "container memory limit does not match worker size"
         );
         placement["cgroup_memory_max"] = json!(memory_max);
         placement["cgroup_cpu_quota"] = json!(limits[0]);
@@ -96,10 +96,23 @@ impl Worker {
             size.cpu()
         ))?;
         root.execute_batch(" SET max_temp_directory_size='1GB'; SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; LOAD httpfs; LOAD postgres; LOAD ducklake;")?;
-        root.execute_batch(&format!(
-            "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');",
-            literal(&required("S3_ACCESS_KEY")?), literal(&required("S3_SECRET_KEY")?), literal(&required("S3_ENDPOINT")?)
-        ))?;
+        match std::env::var("S3_AUTH_MODE").as_deref().unwrap_or("local") {
+            "local" => root.execute_batch(&format!(
+                "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');",
+                literal(&required("S3_ACCESS_KEY")?), literal(&required("S3_SECRET_KEY")?), literal(&required("S3_ENDPOINT")?)
+            ))?,
+            "pod_identity" => {
+                // Fail closed without the EKS-injected container credential provider.
+                // IMDS is disabled in the chart; no static keys are deployed.
+                required("AWS_CONTAINER_CREDENTIALS_FULL_URI")?;
+                required("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")?;
+                root.execute_batch(&format!(
+                    "LOAD aws; CREATE SECRET aws_s3 (TYPE S3, PROVIDER credential_chain, REFRESH auto, REGION {}, SCOPE {});",
+                    literal(&required("AWS_REGION")?), literal(&required("S3_DATA_PATH")?)
+                ))?;
+            }
+            _ => anyhow::bail!("unsupported S3_AUTH_MODE"),
+        }
         root.execute_batch(&format!(
             "ATTACH {} AS lake (DATA_PATH {}); USE lake;",
             literal(&format!("ducklake:postgres:{}", required("CATALOG_DSN")?)),

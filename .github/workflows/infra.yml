@@ -1,0 +1,22 @@
+name: Infrastructure checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+      - run: bash scripts/ci/install-infra-tools.sh
+      - run: make check-infra
+# Validation only: no AWS credentials, OIDC permission, or implicit live apply.
+# The ER repository's CI roles do not trust this repository. A separately reviewed
+# CI bootstrap is needed before adopting its merge-to-main apply workflow.

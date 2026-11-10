@@ -1,0 +1,4 @@
+apiVersion: v2
+name: duckfleet
+version: 0.1.0
+description: Private, single-tenant DuckFleet development sizing harness

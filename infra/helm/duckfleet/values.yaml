@@ -1,0 +1,14 @@
+# Generated immutable image digests are supplied by scripts/aws/publish.sh.
+workerImage: ""
+dbtImage: ""
+bucket: duckfleet-dev-797781631727-us-east-2
+region: us-east-2
+secretName: duckfleet-dev
+storageClass: gp3
+# EKS Auto Mode nodes; match the multi-arch images published by the script.
+nodeSelector:
+  eks.amazonaws.com/compute-type: auto
+  kubernetes.io/os: linux
+
+# Pause compute after testing; the PostgreSQL PVC and S3 data remain.
+suspended: false

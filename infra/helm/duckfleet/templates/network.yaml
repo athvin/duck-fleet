@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: duckfleet-isolation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {}}]
+      ports: [{port: 8080}, {port: 5432}]
+  egress:
+    - to: [{podSelector: {}}]
+      ports: [{port: 8080}, {port: 5432}]
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: duckfleet-worker-aws
+spec:
+  podSelector:
+    matchLabels: {app: duckfleet-worker}
+  policyTypes: [Egress]
+  egress:
+    - to: [{ipBlock: {cidr: 169.254.170.23/32}}]
+      ports: [{port: 80}]
+    # S3 gateway endpoint destinations are public S3 addresses; HTTPS only.
+    # IAM scopes S3 data access. This is not a general SQL sandbox.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+      ports: [{port: 443}]

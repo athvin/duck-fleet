@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: duckfleet-harness
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app: duckfleet-harness}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: duckfleet-no-aws
+      nodeSelector: {{ toJson .Values.nodeSelector }}
+      securityContext:
+        {{- include "duckfleet.podSecurity" . | nindent 8 }}
+      # dbt edits fixture seeds during the incremental test. Copy the project
+      # to an emptyDir so its root filesystem can stay read-only/non-root.
+      initContainers:
+        - name: project
+          image: {{ required "dbtImage is required" .Values.dbtImage | quote }}
+          command: [cp, -R, /app/tests/dbt/., /project/]
+          securityContext:
+            {{- include "duckfleet.containerSecurity" . | nindent 12 }}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 256Mi}
+          volumeMounts: [{name: project, mountPath: /project}]
+      containers:
+        - name: dbt
+          image: {{ .Values.dbtImage | quote }}
+          workingDir: /project
+          command: [python, /app/tests/aws_harness.py]
+          securityContext:
+            {{- include "duckfleet.containerSecurity" . | nindent 12 }}
+          resources:
+            requests: {cpu: "1", memory: 1Gi}
+            limits: {cpu: "2", memory: 2Gi}
+          env:
+            - {name: DUCKFLEET_URL, value: "http://server:8080"}
+            - {name: EXPECT_S3_PREFIX, value: {{ printf "s3://%s/lake/" .Values.bucket | quote }}}
+            - {name: HOME, value: /tmp}
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+            - name: DUCKFLEET_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.secretName }}, key: DUCKFLEET_TOKEN}
+          volumeMounts:
+            - {name: project, mountPath: /project}
+            - {name: artifacts, mountPath: /artifacts}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: project
+          emptyDir: {sizeLimit: 256Mi}
+        - name: artifacts
+          emptyDir: {sizeLimit: 1Gi}
+        - name: tmp
+          emptyDir: {sizeLimit: 256Mi}

@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector: {app: duckfleet-postgres}
+  ports: [{port: 5432, targetPort: 5432}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duckfleet-postgres-init
+data:
+  init.sql: |
+    CREATE DATABASE lake;
+    CREATE DATABASE platform;
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: duckfleet-postgres
+spec:
+  serviceName: postgres
+  replicas: {{ ternary 0 1 .Values.suspended }}
+  selector:
+    matchLabels: {app: duckfleet-postgres}
+  template:
+    metadata:
+      labels: {app: duckfleet-postgres}
+    spec:
+      serviceAccountName: duckfleet-no-aws
+      nodeSelector: {{ toJson .Values.nodeSelector }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: postgres:17.6-bookworm
+          args: ["-c", "max_locks_per_transaction=1024"]
+          securityContext:
+            {{- include "duckfleet.containerSecurity" . | nindent 12 }}
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {cpu: "1", memory: 1Gi}
+          env:
+            - {name: POSTGRES_USER, value: duckfleet}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.secretName }}, key: POSTGRES_PASSWORD}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, duckfleet, -d, lake]}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: init
+          configMap: {name: duckfleet-postgres-init}
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.storageClass }}
+        resources:
+          requests: {storage: 10Gi}
