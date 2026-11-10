@@ -1,13 +1,15 @@
 //! Local, single-tenant DuckFleet SQL service. All DuckDB work stays on one worker thread.
 mod compute;
 mod gateway;
+mod history;
+mod profiling;
 mod worker;
 use compute::SessionRequest;
 
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -24,6 +26,7 @@ struct App {
     sender: mpsc::Sender<Envelope>,
     active: Arc<Mutex<Option<worker::Active>>>,
     token: Arc<str>,
+    history: history::Reader,
 }
 
 type Reply = Result<Output, ApiError>;
@@ -36,7 +39,6 @@ enum Operation {
     Info,
     Close(Uuid),
     Query(Uuid, QueryRequest),
-    History,
 }
 enum Output {
     Json(Value),
@@ -142,8 +144,11 @@ async fn info(State(app): State<App>) -> Reply {
 async fn close(State(app): State<App>, Path(id): Path<Uuid>) -> Reply {
     dispatch(app, Operation::Close(id)).await
 }
-async fn history(State(app): State<App>) -> Reply {
-    dispatch(app, Operation::History).await
+async fn history(State(app): State<App>, Query(filter): Query<history::Filter>) -> Reply {
+    app.history.list(filter).await.map(Output::Json)
+}
+async fn query_detail(State(app): State<App>, Path(id): Path<Uuid>) -> Reply {
+    app.history.detail(id).await.map(Output::Json)
 }
 async fn query(
     State(app): State<App>,
@@ -209,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
         sender,
         active,
         token: token.into(),
+        history: history::Reader::new(std::env::var("PLATFORM_DSN")?),
     };
     let api = Router::new()
         .route("/v1/sessions", post(open))
@@ -216,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/sessions/{id}/queries", post(query))
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/queries", get(history))
+        .route("/v1/queries/{id}", get(query_detail))
         .route("/v1/worker", get(info))
         .route_layer(middleware::from_fn_with_state(app.token.clone(), authorize));
     let router = Router::new()

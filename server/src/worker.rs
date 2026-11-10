@@ -41,6 +41,7 @@ pub(crate) fn interrupt(
 
 struct Session {
     conn: Connection,
+    profile: crate::profiling::Profile,
     touched: Instant,
     context: Value,
 }
@@ -52,6 +53,7 @@ pub(crate) struct Worker {
     sessions: HashMap<Uuid, Session>,
     active: ActiveSlot,
     runtime: tokio::runtime::Handle,
+    profiling_enabled: bool,
 }
 
 fn literal(value: &str) -> String {
@@ -140,7 +142,15 @@ impl Worker {
                 elapsed_ms BIGINT, result_rows BIGINT, error TEXT
             );
             ALTER TABLE query_history ADD COLUMN IF NOT EXISTS worker_id TEXT NOT NULL DEFAULT 'legacy';
-            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS placement TEXT NOT NULL DEFAULT '{}';")?;
+            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS placement TEXT NOT NULL DEFAULT '{}';
+            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS history_id BIGSERIAL;
+            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS profile_status TEXT NOT NULL DEFAULT 'not_recorded';
+            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS profile TEXT;
+            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS metrics TEXT NOT NULL DEFAULT '{}';
+            CREATE UNIQUE INDEX IF NOT EXISTS query_history_order ON query_history(history_id DESC);
+            CREATE INDEX IF NOT EXISTS query_history_model ON query_history((context::jsonb #>> '{dbt,node_id}'),history_id DESC);
+            CREATE INDEX IF NOT EXISTS query_history_invocation ON query_history((context::jsonb #>> '{dbt,invocation_id}'),history_id DESC);
+            CREATE INDEX IF NOT EXISTS query_history_model_run ON query_history((context::jsonb ->> 'model_run_id'),history_id DESC);")?;
         // Starting one worker must not terminate records owned by the other worker.
         transaction.execute(
             "UPDATE query_history SET status='interrupted', finished_at=now(),
@@ -157,6 +167,14 @@ impl Worker {
             sessions: HashMap::new(),
             active,
             runtime,
+            profiling_enabled: match std::env::var("DUCKFLEET_PROFILING")
+                .as_deref()
+                .unwrap_or("true")
+            {
+                "true" => true,
+                "false" => false,
+                _ => anyhow::bail!("DUCKFLEET_PROFILING must be true or false"),
+            },
         })
     }
 
@@ -189,10 +207,13 @@ impl Worker {
                 conn.execute_batch("USE lake")
                     .map_err(|_| ApiError::internal())?;
                 let id = Uuid::new_v4();
+                let profile = crate::profiling::Profile::new(id, self.profiling_enabled, &conn)
+                    .map_err(|_| ApiError::internal())?;
                 self.sessions.insert(
                     id,
                     Session {
                         conn,
+                        profile,
                         touched: Instant::now(),
                         context: request.context,
                     },
@@ -206,7 +227,6 @@ impl Worker {
                 Ok(Output::Json(json!({"closed":true})))
             }
             Operation::Query(id, req) => self.query(id, req),
-            Operation::History => self.history(),
         }
     }
 
@@ -239,6 +259,7 @@ impl Worker {
                 "request_id already accepted; inspect history, SQL was not replayed".into(),
             ));
         }
+        let cleared = session.profile.clear();
         let started = Instant::now();
         *self.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(Active {
             query: req.request_id,
@@ -267,31 +288,18 @@ impl Worker {
         } else {
             reason.unwrap_or("failed")
         };
+        let capture = session.profile.capture(cleared);
+        session.profile.clear();
         let error = result.as_ref().err().map(|e| format!("{e:#}"));
         let rows = result.as_ref().ok().map(|(_, rows)| *rows);
         self.ledger.execute(
-            "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=$3, result_rows=$4, error=$5 WHERE query_id=$1",
-            &[&query_id, &status, &elapsed, &rows, &error],
+            "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=$3, result_rows=$4, error=$5, profile_status=$6, profile=$7, metrics=$8 WHERE query_id=$1",
+            &[&query_id, &status, &elapsed, &rows, &error, &capture.status, &capture.profile, &capture.metrics],
         ).map_err(|_| ApiError::internal())?;
         tracing::info!(query_id, session_id = %id, status, elapsed_ms = elapsed, "query finished");
         result
             .map(|(bytes, _)| Output::Arrow(bytes, req.request_id))
             .map_err(|e| ApiError::bad(format!("{e:#}")))
-    }
-
-    fn history(&mut self) -> Reply {
-        let rows = self.ledger.query(
-            "SELECT query_id,session_id,sql,context,status,accepted_at::text,finished_at::text,elapsed_ms,result_rows,error,placement FROM query_history ORDER BY accepted_at DESC LIMIT 500", &[]
-        ).map_err(|_| ApiError::internal())?;
-        let records: Vec<_> = rows.iter().map(|r| json!({
-            "query_id":r.get::<_, String>(0), "session_id":r.get::<_, String>(1),
-            "sql":r.get::<_, String>(2), "context":serde_json::from_str::<Value>(r.get::<_, &str>(3)).unwrap_or(Value::Null),
-            "status":r.get::<_, String>(4), "accepted_at":r.get::<_, String>(5),
-            "finished_at":r.get::<_, Option<String>>(6), "elapsed_ms":r.get::<_, Option<i64>>(7),
-            "result_rows":r.get::<_, Option<i64>>(8), "error":r.get::<_, Option<String>>(9),
-            "placement":serde_json::from_str::<Value>(r.get::<_, &str>(10)).unwrap_or(Value::Null)
-        })).collect();
-        Ok(Output::Json(json!({"queries":records})))
     }
 }
 
@@ -359,6 +367,26 @@ mod tests {
             batch.schema().field(0).data_type(),
             &duckdb::arrow::datatypes::DataType::Decimal128(20, 2)
         );
+        Ok(())
+    }
+    #[test]
+    fn profiles_are_fresh_and_optional() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let profile = crate::profiling::Profile::new(Uuid::new_v4(), true, &conn)?;
+        let cleared = profile.clear();
+        execute(&conn, "SELECT sum(i) FROM range(100) t(i)", vec![])?;
+        let captured = profile.capture(cleared);
+        assert_eq!(captured.status, "captured");
+        let value: Value = serde_json::from_str(captured.profile.as_deref().unwrap())?;
+        assert_eq!(value["query_name"], "SELECT sum(i) FROM range(100) t(i)");
+        let cleared = profile.clear();
+        assert!(execute(&conn, "SELECT * FROM missing_profile_table", vec![]).is_err());
+        let failed = profile.capture(cleared);
+        assert!(failed.profile.is_none());
+        let other = Connection::open_in_memory()?;
+        let disabled = crate::profiling::Profile::new(Uuid::new_v4(), false, &other)?;
+        execute(&other, "SELECT 1", vec![])?;
+        assert_eq!(disabled.capture(disabled.clear()).status, "disabled");
         Ok(())
     }
     #[test]

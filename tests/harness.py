@@ -153,6 +153,10 @@ def protocol_checks(connection):
 
 def main():
     ARTIFACTS.mkdir(exist_ok=True)
+    import observability
+    if "--history-without-workers" in sys.argv:
+        observability.history_without_workers(URL, TOKEN)
+        return
     if "--unavailable-medium" in sys.argv:
         expect_error(503, lambda: RemoteConnection(URL, TOKEN, compute={"cpu":2,"memory":"2Gi"}))
         small = RemoteConnection(URL, TOKEN, compute={"cpu":1,"memory":"1Gi"})
@@ -166,6 +170,9 @@ def main():
     try:
         if "--after-restart" in sys.argv:
             results(connection)
+            profile_query_id = (ARTIFACTS / "profile-query-id.txt").read_text()
+            profile = json.loads(connection.client.request("GET", "/v1/queries/"+profile_query_id))
+            require(profile["profile_status"] == "captured" and profile["profile"], "profile did not survive restart")
             history = json.loads(connection.client.request("GET", "/v1/queries"))["queries"]
             require(any(q["context"].get("model_run_id") for q in history), "model history did not survive restart")
             model_resources(connection, "fct_orders", 2, "1.0 GiB")
@@ -175,6 +182,8 @@ def main():
             return
         resource_checks(connection)
         protocol_checks(connection)
+        profile_query_id = observability.checks(URL, TOKEN)
+        (ARTIFACTS / "profile-query-id.txt").write_text(profile_query_id)
         dbt("debug", "debug")
         dbt("initial", "build", "--full-refresh")
         require(sql(connection, "select sum(amount) from lake.analytics.fct_orders") == [(decimal.Decimal("170.00"),)], "initial models incorrect")
@@ -208,6 +217,7 @@ def main():
         bad_invocation = json.loads((ARTIFACTS / "unsupported-size/target/run_results.json").read_text())["metadata"]["invocation_id"]
         require(not any(q["context"].get("dbt", {}).get("node_id") == "model.duckfleet_harness.unsupported_size" and q["context"]["dbt"]["invocation_id"] == bad_invocation for q in history), "unsupported model ran SQL")
         verify_model_placement(history)
+        observability.save_model_profile(connection.client, history, ARTIFACTS)
         model_queries = [q for q in history if q["context"].get("dbt", {}).get("node_id") == "model.duckfleet_harness.fct_orders"]
         require(model_queries, "no server-side dbt model queries")
         groups = {}

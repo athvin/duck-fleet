@@ -16,6 +16,9 @@ docker compose run --rm dbt
 docker compose stop worker-medium
 docker compose run --rm --no-deps dbt python /app/tests/harness.py --unavailable-medium
 docker compose up -d --wait worker-medium
+docker compose stop worker-small worker-medium
+docker compose run --rm --no-deps dbt python /app/tests/harness.py --history-without-workers
+docker compose up -d --wait worker-small worker-medium
 docker compose restart worker-small worker-medium server
 docker compose up -d --wait server
 docker compose run --rm dbt python /app/tests/harness.py --after-restart
