@@ -18,6 +18,12 @@ FROM build AS check
 RUN rustup component add rustfmt clippy
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/app/server/target cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
 
+FROM python:3.12.12-slim-bookworm AS aws-credentials-check
+RUN pip install --no-cache-dir duckdb==1.5.4
+COPY --from=build /opt/duckdb /opt/duckdb
+COPY tests/aws_credentials.py /app/aws_credentials.py
+RUN python /app/aws_credentials.py
+
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 && rm -rf /var/lib/apt/lists/* && useradd -m -u 10001 duckfleet
 COPY --from=build /usr/local/lib/libduckdb.so /usr/local/lib/libduckdb.so

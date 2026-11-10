@@ -207,3 +207,9 @@ persistent-worker spikes with Docker rather than Kubernetes.
 - [DuckLake connections and PostgreSQL catalogs](https://ducklake.select/docs/stable/duckdb/usage/connecting)
 - [dbt adapter development](https://docs.getdbt.com/guides/adapter-creation)
 - [dbt-duckdb adapter and materializations](https://github.com/duckdb/dbt-duckdb)
+
+## AWS development lane
+
+[Terraform, isolated EKS namespace, and live dbt sizing harness](infra/README.md)
+are available for a reviewed AWS deployment. The infrastructure document records
+what has been validated locally and what still needs a live run.

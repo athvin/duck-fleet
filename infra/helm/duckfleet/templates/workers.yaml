@@ -1,0 +1,58 @@
+{{- range $size, $cpu := dict "small" 1 "medium" 2 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-{{ $size }}
+spec:
+  selector: {app: duckfleet-worker, size: {{ $size }}}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-{{ $size }}
+spec:
+  # No concurrent writers with the same worker identity during upgrades.
+  replicas: {{ ternary 0 1 $.Values.suspended }}
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: duckfleet-worker, size: {{ $size }}}
+  template:
+    metadata:
+      labels: {app: duckfleet-worker, size: {{ $size }}}
+    spec:
+      serviceAccountName: duckfleet-worker
+      nodeSelector: {{ toJson $.Values.nodeSelector }}
+      securityContext:
+        {{- include "duckfleet.podSecurity" . | nindent 8 }}
+      containers:
+        - name: worker
+          image: {{ required "workerImage must be an immutable ECR digest" $.Values.workerImage | quote }}
+          securityContext:
+            {{- include "duckfleet.containerSecurity" . | nindent 12 }}
+          resources:
+            requests: {cpu: {{ $cpu | quote }}, memory: {{ printf "%dGi" $cpu }}, ephemeral-storage: 2Gi}
+            limits: {cpu: {{ $cpu | quote }}, memory: {{ printf "%dGi" $cpu }}, ephemeral-storage: 3Gi}
+          env:
+            - {name: DUCKFLEET_WORKER_SIZE, value: {{ $size }}}
+            - {name: S3_AUTH_MODE, value: pod_identity}
+            - {name: S3_DATA_PATH, value: {{ printf "s3://%s/lake/" $.Values.bucket | quote }}}
+            - {name: AWS_REGION, value: {{ $.Values.region }}}
+            - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+            - name: DUCKFLEET_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ $.Values.secretName }}, key: DUCKFLEET_TOKEN}
+            - name: CATALOG_DSN
+              valueFrom:
+                secretKeyRef: {name: {{ $.Values.secretName }}, key: CATALOG_DSN}
+            - name: PLATFORM_DSN
+              valueFrom:
+                secretKeyRef: {name: {{ $.Values.secretName }}, key: PLATFORM_DSN}
+          {{- include "duckfleet.health" . | nindent 10 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 2Gi}
+{{- end }}

@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["workerImage", "dbtImage"],
+  "properties": {
+    "workerImage": {"type":"string", "pattern":"^797781631727\\.dkr\\.ecr\\.us-east-2\\.amazonaws\\.com/duckfleet-dev/worker@sha256:[a-f0-9]{64}$"},
+    "dbtImage": {"type":"string", "pattern":"^797781631727\\.dkr\\.ecr\\.us-east-2\\.amazonaws\\.com/duckfleet-dev/dbt@sha256:[a-f0-9]{64}$"},
+    "bucket": {"const":"duckfleet-dev-797781631727-us-east-2"},
+    "region": {"const":"us-east-2"},
+    "secretName": {"const":"duckfleet-dev"},
+    "storageClass": {"const":"gp3"}
+  }
+}

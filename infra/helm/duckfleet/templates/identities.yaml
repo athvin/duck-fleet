@@ -1,0 +1,14 @@
+{{- if ne .Release.Namespace "duckfleet-dev" }}
+{{- fail "This development chart is restricted to duckfleet-dev" }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckfleet-worker
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckfleet-no-aws
+automountServiceAccountToken: false
