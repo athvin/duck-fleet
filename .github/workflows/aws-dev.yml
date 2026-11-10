@@ -1,0 +1,77 @@
+name: AWS development harness
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: duckfleet-aws-dev
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    outputs:
+      deployment_started: ${{ steps.start.outputs.deployment_started }}
+    env:
+      AWS_REGION: us-east-2
+      KUBE_CONTEXT: duckfleet-ci-dev
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Require checks on this exact main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/aws/wait-checks.py
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+      - run: bash scripts/ci/install-infra-tools.sh
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::797781631727:role/duckfleet-ci-dev
+          role-duration-seconds: 7200
+          aws-region: us-east-2
+      - run: aws eks update-kubeconfig --name er-dev --alias duckfleet-ci-dev --region us-east-2
+      - run: bash scripts/aws/check-access.sh
+      - run: bash scripts/aws/apply.sh
+      - run: bash scripts/aws/publish.sh
+      - id: start
+        run: echo 'deployment_started=true' >> "$GITHUB_OUTPUT"
+      - run: bash scripts/aws/deploy.sh
+      - run: bash scripts/aws/test.sh
+      - name: Upload verified fixture evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: duckfleet-aws-evidence
+          path: artifacts/aws/evidence.json
+          if-no-files-found: error
+          retention-days: 14
+  suspend:
+    needs: deploy
+    if: always() && needs.deploy.outputs.deployment_started == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      KUBE_CONTEXT: duckfleet-ci-dev
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: bash scripts/ci/install-infra-tools.sh
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::797781631727:role/duckfleet-ci-dev
+          aws-region: us-east-2
+      - run: aws eks update-kubeconfig --name er-dev --alias duckfleet-ci-dev --region us-east-2
+      - run: bash scripts/aws/suspend.sh

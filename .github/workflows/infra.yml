@@ -17,6 +17,4 @@ jobs:
           terraform_wrapper: false
       - run: bash scripts/ci/install-infra-tools.sh
       - run: make check-infra
-# Validation only: no AWS credentials, OIDC permission, or implicit live apply.
-# The ER repository's CI roles do not trust this repository. A separately reviewed
-# CI bootstrap is needed before adopting its merge-to-main apply workflow.
+# Pull requests remain credential-free; AWS mutation runs only after main checks pass.
