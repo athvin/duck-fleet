@@ -2,12 +2,13 @@
 use crate::{
     ApiError, authorize,
     compute::{SessionRequest, Size},
+    failure,
 };
 use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{StatusCode, header},
+    http::header,
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -65,7 +66,7 @@ impl Gateway {
         routes.retain(|_, r| r.touched.elapsed() < Duration::from_secs(300));
         let route = routes
             .get_mut(&id)
-            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown or expired session".into()))?;
+            .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
         route.touched = Instant::now();
         Ok(route.endpoint.clone())
     }
@@ -95,12 +96,11 @@ async fn open(
         .lock()
         .await
         .retain(|_, r| r.touched.elapsed() < Duration::from_secs(300));
-    let permit = app.capacity.clone().try_acquire_owned().map_err(|_| {
-        ApiError(
-            StatusCode::TOO_MANY_REQUESTS,
-            "gateway session limit reached".into(),
-        )
-    })?;
+    let permit = app
+        .capacity
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::new(failure::CAPACITY, "gateway session limit reached"))?;
     let endpoint = app.endpoint(size).to_owned();
     let body = serde_json::to_vec(&request).map_err(|_| ApiError::internal())?;
     let upstream = app
