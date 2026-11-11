@@ -1,7 +1,6 @@
-use crate::{ApiError, Envelope, Operation, Output, QueryRequest, Reply, compute::Size};
+use crate::{ApiError, Envelope, Operation, Output, QueryRequest, Reply, compute::Size, failure};
 use anyhow::{Context, Result};
 use arrow_ipc::writer::StreamWriter;
-use axum::http::StatusCode;
 use duckdb::{Connection, InterruptHandle, params_from_iter, types::Value as SqlValue};
 use postgres::{Client, NoTls};
 use serde_json::{Value, json};
@@ -147,16 +146,24 @@ impl Worker {
             ALTER TABLE query_history ADD COLUMN IF NOT EXISTS profile_status TEXT NOT NULL DEFAULT 'not_recorded';
             ALTER TABLE query_history ADD COLUMN IF NOT EXISTS profile TEXT;
             ALTER TABLE query_history ADD COLUMN IF NOT EXISTS metrics TEXT NOT NULL DEFAULT '{}';
+            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS failure_kind TEXT;
+            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS retry_safe BOOLEAN;
             CREATE UNIQUE INDEX IF NOT EXISTS query_history_order ON query_history(history_id DESC);
+            CREATE INDEX IF NOT EXISTS query_history_failure ON query_history(failure_kind,history_id DESC);
             CREATE INDEX IF NOT EXISTS query_history_model ON query_history((context::jsonb #>> '{dbt,node_id}'),history_id DESC);
             CREATE INDEX IF NOT EXISTS query_history_invocation ON query_history((context::jsonb #>> '{dbt,invocation_id}'),history_id DESC);
             CREATE INDEX IF NOT EXISTS query_history_model_run ON query_history((context::jsonb ->> 'model_run_id'),history_id DESC);")?;
         // Starting one worker must not terminate records owned by the other worker.
         transaction.execute(
             "UPDATE query_history SET status='interrupted', finished_at=now(),
-            error='worker restarted; commit outcome may be unknown, do not blindly retry'
+            error='worker restarted; commit outcome may be unknown, do not blindly retry',
+            failure_kind=$2, retry_safe=$3
             WHERE status='running' AND worker_id=$1",
-            &[&size.name()],
+            &[
+                &size.name(),
+                &failure::INTERRUPTED.kind,
+                &failure::INTERRUPTED.retry_safe,
+            ],
         )?;
         transaction.commit()?;
         Ok(Self {
@@ -198,10 +205,7 @@ impl Worker {
                 request.context["requested_compute"] =
                     serde_json::to_value(&request.compute).map_err(|_| ApiError::internal())?;
                 if self.sessions.len() >= 32 {
-                    return Err(ApiError(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "session limit reached".into(),
-                    ));
+                    return Err(ApiError::new(failure::CAPACITY, "session limit reached"));
                 }
                 let conn = self.root.try_clone().map_err(|_| ApiError::internal())?;
                 conn.execute_batch("USE lake")
@@ -234,7 +238,7 @@ impl Worker {
         let session = self
             .sessions
             .get_mut(&id)
-            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "unknown or expired session".into()))?;
+            .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
         session.touched = Instant::now();
         let parameters = req
             .parameters
@@ -254,9 +258,9 @@ impl Worker {
             &[&query_id, &id.to_string(), &req.sql, &req.context.to_string(), &self.size.name(), &self.placement.to_string()],
         ).map_err(|_| ApiError::internal())?;
         if inserted == 0 {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "request_id already accepted; inspect history, SQL was not replayed".into(),
+            return Err(ApiError::new(
+                failure::DUPLICATE_REQUEST,
+                "request_id already accepted; inspect history, SQL was not replayed",
             ));
         }
         let cleared = session.profile.clear();
@@ -282,24 +286,29 @@ impl Worker {
         deadline.abort();
         session.touched = Instant::now();
         let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-        // A timer racing with a completed statement must not imply the write rolled back.
-        let status = if result.is_ok() {
-            "succeeded"
-        } else {
-            reason.unwrap_or("failed")
-        };
         let capture = session.profile.capture(cleared);
         session.profile.clear();
         let error = result.as_ref().err().map(|e| format!("{e:#}"));
+        // A timer racing with a completed statement must not imply the write rolled
+        // back, so an interruption reason outranks whatever the engine reported.
+        let failure = error
+            .as_deref()
+            .map(|message| failure::classify(message, reason));
+        let status = failure.and_then(|f| f.status).unwrap_or(if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        });
         let rows = result.as_ref().ok().map(|(_, rows)| *rows);
         self.ledger.execute(
-            "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=$3, result_rows=$4, error=$5, profile_status=$6, profile=$7, metrics=$8 WHERE query_id=$1",
-            &[&query_id, &status, &elapsed, &rows, &error, &capture.status, &capture.profile, &capture.metrics],
+            "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=$3, result_rows=$4, error=$5, profile_status=$6, profile=$7, metrics=$8, failure_kind=$9, retry_safe=$10 WHERE query_id=$1",
+            &[&query_id, &status, &elapsed, &rows, &error, &capture.status, &capture.profile, &capture.metrics,
+              &failure.map(|f| f.kind), &failure.map(|f| f.retry_safe)],
         ).map_err(|_| ApiError::internal())?;
         tracing::info!(query_id, session_id = %id, status, elapsed_ms = elapsed, "query finished");
         result
             .map(|(bytes, _)| Output::Arrow(bytes, req.request_id))
-            .map_err(|e| ApiError::bad(format!("{e:#}")))
+            .map_err(|e| ApiError::new(failure.unwrap_or(failure::SQL_ERROR), format!("{e:#}")))
     }
 }
 

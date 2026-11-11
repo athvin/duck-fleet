@@ -67,12 +67,15 @@ This deletes the catalog, history, and object-store volumes.
 - Data and query history survive worker and gateway restarts; tiny fixture tables
   explicitly disable DuckLake data inlining so the test verifies real Parquet
   objects, rather than only catalog rows.
+- Overlapping transactions from two workers against one catalog resolve as
+  documented in [Concurrent writes and retry safety](#concurrent-writes-and-retry-safety):
+  compatible writes both commit, and a losing commit is discarded whole and
+  reported as retry-safe.
 
 The dbt project runs with two threads. Each worker executes its own statements
 serially, and dependent models read the preceding worker's committed DuckLake
-results. This is a two-worker integration test, not a stress test of concurrent
-writes to the same tables. Test artifacts and the last 500 query records are
-written under `artifacts/`.
+results. Test artifacts and the last 500 query records are written under
+`artifacts/`.
 
 ## Request a worker size per model
 
@@ -129,6 +132,7 @@ docker/                 Images and initial PostgreSQL databases
 scripts/                Build and harness helpers
 tests/dbt/              Representative seed, view, table, incremental model, tests
 tests/harness.py         Protocol, dbt, and restart assertions
+tests/concurrency.py     Overlapping DuckLake transactions and retry classification
 ```
 
 ## Local execution API
@@ -160,8 +164,19 @@ A query request has this shape:
 }
 ```
 
+Every error response carries a machine-readable classification alongside its
+message, so a caller can tell a lost commit race from a broken statement without
+parsing engine text. See
+[Concurrent writes and retry safety](#concurrent-writes-and-retry-safety) for the
+full table.
+
+```json
+{"error": "…", "failure_kind": "transaction_conflict", "retry_safe": true}
+```
+
 Request IDs are unique across sessions and retained in PostgreSQL. A repeated ID
-returns HTTP 409 without executing SQL again; results are not cached or replayed.
+returns HTTP 409 with `failure_kind` `duplicate_request` and without executing SQL
+again; results are not cached or replayed.
 An HTTP/transport failure can occur after a write commits. Inspect history and
 application state before retrying; the adapter does not automatically retry SQL.
 Accepted worker executions are recorded before SQL runs and updated on completion.
@@ -169,7 +184,9 @@ At worker startup, its own unfinished records become `interrupted` with an
 unknown-commit warning; another worker's running records are left alone.
 
 Each worker queue holds at most 64 operations, with at most 32 sessions. The
-gateway allows at most 64 routed sessions. Sessions idle for
+gateway allows at most 64 routed sessions. Exceeding either limit returns HTTP 429
+with `failure_kind` `capacity`, which is retry-safe because the request is rejected
+before any SQL runs. Sessions idle for
 five minutes are closed on the next worker operation. Statement execution has a
 30-second default deadline (1–60 seconds allowed); queue time is additional.
 Responses fail rather than silently truncate beyond 100,000 rows or 16 MiB.
@@ -179,9 +196,11 @@ These are local resource limits, not billing budgets.
 ## Query history and profiling
 
 List queries by `model_id`, `invocation_id`, `model_run_id`, `worker_id` (`small`
-or `medium`), and `status`. Filters combine with AND and are bound SQL parameters.
-Supported statuses are `running`, `succeeded`, `failed`, `canceled`, `timed_out`,
-and `interrupted`. All history endpoints require the same bearer authentication
+or `medium`), `status`, and `failure_kind`. Filters combine with AND and are bound
+SQL parameters. Supported statuses are `running`, `succeeded`, `failed`, `conflict`,
+`canceled`, `timed_out`, and `interrupted`. Only failure kinds that can reach a
+history record are accepted as filters; rejection kinds such as `capacity` never
+become records. All history endpoints require the same bearer authentication
 as execution and remain restricted to the trusted development environment.
 
 ```sh
@@ -200,7 +219,10 @@ receive sequence IDs when the additive schema upgrade first runs.
 
 Each record includes SQL, lifecycle timestamps, execution elapsed milliseconds,
 row count, error, requested compute, worker placement, resolved dbt metadata,
-`profile_status`, and compact `metrics`. Fetch `/v1/queries/<query_id>` for the
+`profile_status`, compact `metrics`, and the stored `failure_kind` and
+`retry_safe` classification. Both are null on success and on records written
+before those columns existed, in the same way older records report a
+`not_recorded` profile. Fetch `/v1/queries/<query_id>` for the
 full `profile` JSON and operator tree. Raw plans are omitted from list responses.
 Unknown IDs return 404; invalid filters return 400.
 
@@ -235,6 +257,77 @@ query without waiting behind it, rejects stale profiles after SQL failure, check
 history with both workers stopped, and confirms saved profile data survives
 restart. `artifacts/query-profile.json` contains a real profiled dbt model query.
 
+## Concurrent writes and retry safety
+
+DuckLake detects a write conflict when a transaction **commits**, not while its
+statements run. The first transaction to commit wins, and a losing transaction is
+discarded whole rather than partly applied. Everything in this section was measured
+against DuckDB 1.5.4 with a DuckLake PostgreSQL catalog and is re-verified on every
+run by `tests/concurrency.py`, which interleaves two real worker sessions so the
+conflict window is exact instead of a race. Evidence is saved to
+`artifacts/write-conflicts.json`.
+
+| Overlapping writes | Outcome |
+| --- | --- |
+| Appends to the same table | Both commit; no row lost |
+| Writes to different tables | Both commit |
+| `delete`+`insert` on one table | Second commit conflicts |
+| `update` vs `update` | Second commit conflicts |
+| `insert` vs `delete` | Second commit conflicts, in either commit order |
+| `ALTER` or `CREATE` on the same object | Second commit conflicts |
+
+Conflict granularity is the **data file**, not the row: two writers that rewrite
+disjoint rows of one table still conflict. A dbt DAG that runs two `delete+insert`
+models against the same table concurrently will therefore lose one of them. Order
+those models or give them separate tables; do not rely on row ranges keeping them
+apart. A write becomes visible to the other worker as soon as it commits, including
+to a transaction that starts after it, so a dependent model does not read a stale
+snapshot. A transaction that started earlier keeps the snapshot it opened with.
+
+A losing commit returns HTTP 409, `failure_kind` `transaction_conflict`, and
+`retry_safe` true. Because the engine has already discarded the transaction, the
+recovery is to replay the whole transaction from `BEGIN`. Do **not** send `ROLLBACK`
+first: no transaction is active and the statement fails. The session itself stays
+usable.
+
+Neither the server nor the adapter replays SQL on its own. A dbt model that loses a
+commit fails, and rerunning it (for example `dbt retry`) replays its transaction;
+a single statement cannot be retried in isolation because the materialization spans
+several statements.
+
+Two sessions on one worker share a DuckDB instance, but behave the same way: even
+two updates to the same row both succeed as statements and conflict only at commit.
+
+`retry_safe` is true only where the platform can prove the request left nothing
+behind. An interruption always outranks the engine's message, because a commit
+stopped by a deadline may still have committed.
+
+| `failure_kind` | HTTP | `retry_safe` | Meaning |
+| --- | --- | --- | --- |
+| `transaction_conflict` | 409 | yes | Lost a commit race; the transaction was discarded whole |
+| `capacity` | 429 | yes | A queue or session limit rejected the request before any SQL ran |
+| `sql_error` | 400 | no | The engine refused or failed the SQL; earlier statements in a multi-statement request may have applied |
+| `timeout` | 400 | no | A deadline interrupted the statement; an interrupted commit may still have committed |
+| `canceled` | 400 | no | A caller interrupted the statement; same unknown outcome |
+| `invalid_request` | 400 | no | Rejected before execution; correct the request rather than resend it |
+| `unknown_session` | 404 | no | The session expired or was closed; open a new one |
+| `not_found` | 404 | no | No such history record |
+| `duplicate_request` | 409 | no | This `request_id` was already accepted; inspect its history record |
+| `unavailable` | 503 | no | A worker or the history database was unreachable mid-request |
+| `interrupted` | — | no | Recorded at worker startup for its own unfinished records; never an HTTP response |
+
+Find conflicts in history with the `status` or `failure_kind` filter:
+
+```sh
+curl -G -H 'Authorization: Bearer duckfleet-local-development-token' \
+  --data-urlencode 'failure_kind=transaction_conflict' \
+  http://localhost:18080/v1/queries
+```
+
+What this does not yet cover: conflict rates under genuine parallel load, automatic
+or coordinated retry, locking or reservations that would prevent a conflict, and
+cleanup of the data files a losing transaction already wrote to object storage.
+
 ## Scope and limitations
 
 This is a **trusted, single-tenant development environment** with known local
@@ -257,9 +350,10 @@ reads, with a three-second connection timeout and PostgreSQL statement timeout;
 excess requests return 429. A database outage returns 503. Cancellation bypasses
 the execution queue. The response limit applies to returned data;
 DuckDB may materialize a result before serialization. Canceling or losing an HTTP
-request is not proof that a write was rolled back. This harness does not yet test
-crash recovery during a commit, backup restoration, or conflicting writes from
-multiple DuckLake workers. A gateway restart loses its in-memory session routes;
+request is not proof that a write was rolled back. Conflicting writes from multiple
+DuckLake workers are covered above, but this harness does not yet test crash
+recovery during a commit or backup restoration.
+A gateway restart loses its in-memory session routes;
 clients must open new sessions and inspect uncertain write outcomes.
 
 ## Design and upstream contracts

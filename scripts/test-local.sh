@@ -13,6 +13,9 @@ test "$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}
 test "$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$medium_id")" = '2000000000 2147483648'
 docker inspect --format '{"container":{{json .Name}},"nano_cpus":{{.HostConfig.NanoCpus}},"memory_bytes":{{.HostConfig.Memory}}}' "$small_id" "$medium_id" > artifacts/docker-worker-limits.jsonl
 docker compose run --rm dbt
+# Overlapping DuckLake transactions need both workers healthy, so this runs before
+# any worker is stopped below.
+docker compose run --rm dbt python /app/tests/harness.py --concurrency
 docker compose stop worker-medium
 docker compose run --rm --no-deps dbt python /app/tests/harness.py --unavailable-medium
 docker compose up -d --wait worker-medium
