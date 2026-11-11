@@ -55,6 +55,33 @@ pub(crate) const CANCELED: Failure = Failure {
     http: StatusCode::BAD_REQUEST,
 };
 
+/// The prepaid balance cannot cover even a one-second execution. No SQL ran, so
+/// sending the same request again once the balance is topped up is legitimate.
+pub(crate) const BUDGET_EXHAUSTED: Failure = Failure {
+    status: Some("refused"),
+    kind: "budget_exhausted",
+    retry_safe: true,
+    http: StatusCode::PAYMENT_REQUIRED,
+};
+
+/// The per-job cost cap is too low to buy a single second at this compute size.
+/// Resending is pointless: raise the cap or ask for a smaller class.
+pub(crate) const BUDGET_JOB_COST: Failure = Failure {
+    status: Some("refused"),
+    kind: "budget_job_cost",
+    retry_safe: false,
+    http: StatusCode::BAD_REQUEST,
+};
+
+/// The statement was stopped because it reached the cost its budget allowed. Like
+/// any interruption, a commit caught by it may still have committed.
+pub(crate) const BUDGET_EXCEEDED: Failure = Failure {
+    status: Some("budget_exceeded"),
+    kind: "budget_exceeded",
+    retry_safe: false,
+    http: StatusCode::BAD_REQUEST,
+};
+
 /// A worker restarted while this request was running. The record is reconciled at
 /// startup rather than returned over HTTP, and whether it committed is unknown.
 pub(crate) const INTERRUPTED: Failure = Failure {
@@ -133,6 +160,7 @@ pub(crate) fn classify(error: &str, reason: Option<&str>) -> Failure {
     match reason {
         Some("timed_out") => TIMEOUT,
         Some("canceled") => CANCELED,
+        Some("budget_exceeded") => BUDGET_EXCEEDED,
         _ if error.contains(CONFLICT_MARKER) => CONFLICT,
         _ => SQL_ERROR,
     }
@@ -146,6 +174,9 @@ pub(crate) fn by_kind(kind: &str) -> Option<Failure> {
         CONFLICT,
         TIMEOUT,
         CANCELED,
+        BUDGET_EXHAUSTED,
+        BUDGET_JOB_COST,
+        BUDGET_EXCEEDED,
         INTERRUPTED,
         UNAUTHORIZED,
         INVALID_REQUEST,
@@ -160,11 +191,13 @@ pub(crate) fn by_kind(kind: &str) -> Option<Failure> {
 }
 
 /// Terminal states a history record may hold, for filter validation.
-pub(crate) const STATUSES: [&str; 7] = [
+pub(crate) const STATUSES: [&str; 9] = [
     "running",
     "succeeded",
     "failed",
     "conflict",
+    "refused",
+    "budget_exceeded",
     "canceled",
     "timed_out",
     "interrupted",
@@ -227,6 +260,9 @@ mod tests {
             CONFLICT,
             TIMEOUT,
             CANCELED,
+            BUDGET_EXHAUSTED,
+            BUDGET_JOB_COST,
+            BUDGET_EXCEEDED,
             INTERRUPTED,
             UNAUTHORIZED,
             INVALID_REQUEST,
@@ -240,12 +276,24 @@ mod tests {
         .filter(|f| f.retry_safe)
         .map(|f| f.kind)
         .collect();
-        assert_eq!(safe, ["transaction_conflict", "capacity"]);
+        assert_eq!(
+            safe,
+            ["transaction_conflict", "budget_exhausted", "capacity"]
+        );
     }
 
     #[test]
     fn stored_kinds_round_trip_and_statuses_are_known() {
-        for failure in [CONFLICT, SQL_ERROR, TIMEOUT, CANCELED, INTERRUPTED] {
+        for failure in [
+            CONFLICT,
+            SQL_ERROR,
+            TIMEOUT,
+            CANCELED,
+            INTERRUPTED,
+            BUDGET_EXHAUSTED,
+            BUDGET_JOB_COST,
+            BUDGET_EXCEEDED,
+        ] {
             assert_eq!(by_kind(failure.kind), Some(failure));
             assert!(STATUSES.contains(&failure.status.unwrap()));
         }

@@ -37,6 +37,7 @@ struct Gateway {
     routes: Arc<Mutex<HashMap<Uuid, Route>>>,
     capacity: Arc<Semaphore>,
     history: crate::history::Reader,
+    usage: crate::usage::Reader,
 }
 impl Gateway {
     fn endpoint(&self, size: Size) -> &str {
@@ -182,6 +183,21 @@ async fn query_detail(
 ) -> Result<Json<Value>, ApiError> {
     app.history.detail(id).await.map(Json)
 }
+async fn usage_events(
+    State(app): State<Gateway>,
+    Query(filter): Query<crate::usage::Filter>,
+) -> Result<Json<Value>, ApiError> {
+    app.usage.events(filter).await.map(Json)
+}
+async fn budget(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
+    app.usage.budget().await.map(Json)
+}
+async fn set_budget(
+    State(app): State<Gateway>,
+    Json(update): Json<crate::usage::BudgetUpdate>,
+) -> Result<Json<Value>, ApiError> {
+    app.usage.set_budget(update).await.map(Json)
+}
 async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
     async fn info(app: &Gateway, endpoint: &str) -> Result<Value, ApiError> {
         app.send(endpoint, Method::GET, "/v1/worker", Bytes::new())
@@ -208,6 +224,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         routes: Arc::new(Mutex::new(HashMap::new())),
         capacity: Arc::new(Semaphore::new(64)),
         history: crate::history::Reader::new(std::env::var("PLATFORM_DSN")?),
+        usage: crate::usage::Reader::new(std::env::var("PLATFORM_DSN")?),
     };
     let api = Router::new()
         .route("/v1/sessions", post(open))
@@ -216,6 +233,8 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/queries", get(history))
         .route("/v1/queries/{id}", get(query_detail))
+        .route("/v1/usage", get(usage_events))
+        .route("/v1/budget", get(budget).put(set_budget))
         .route("/v1/workers", get(workers))
         .route_layer(middleware::from_fn_with_state(app.token.clone(), authorize));
     let router = Router::new()

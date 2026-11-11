@@ -16,6 +16,12 @@ docker compose run --rm dbt
 # Overlapping DuckLake transactions need both workers healthy, so this runs before
 # any worker is stopped below.
 docker compose run --rm dbt python /app/tests/harness.py --concurrency
+docker compose run --rm dbt python /app/tests/harness.py --metering
+# The usage ledger must reject edits in the database, not merely in application code.
+for statement in 'UPDATE usage_events SET amount_micro_usd = 0' 'DELETE FROM usage_events'; do
+  { docker compose exec -T postgres psql -U duckfleet -d platform -c "$statement" 2>&1 || true; } \
+    | grep -q 'append-only'
+done
 docker compose stop worker-medium
 docker compose run --rm --no-deps dbt python /app/tests/harness.py --unavailable-medium
 docker compose up -d --wait worker-medium
