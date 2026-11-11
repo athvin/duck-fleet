@@ -161,6 +161,10 @@ def main():
         import concurrency
         concurrency.checks(URL, TOKEN, ARTIFACTS)
         return
+    if "--metering" in sys.argv:
+        import metering
+        metering.checks(URL, TOKEN, ARTIFACTS)
+        return
     if "--unavailable-medium" in sys.argv:
         expect_error(503, lambda: RemoteConnection(URL, TOKEN, compute={"cpu":2,"memory":"2Gi"}))
         small = RemoteConnection(URL, TOKEN, compute={"cpu":1,"memory":"1Gi"})

@@ -3,7 +3,10 @@ mod compute;
 mod failure;
 mod gateway;
 mod history;
+mod metering;
+mod pricing;
 mod profiling;
+mod usage;
 mod worker;
 use compute::SessionRequest;
 
@@ -28,6 +31,7 @@ struct App {
     active: Arc<Mutex<Option<worker::Active>>>,
     token: Arc<str>,
     history: history::Reader,
+    usage: usage::Reader,
 }
 
 type Reply = Result<Output, ApiError>;
@@ -65,7 +69,7 @@ fn default_timeout() -> u64 {
     30
 }
 
-struct ApiError(failure::Failure, String);
+struct ApiError(pub(crate) failure::Failure, pub(crate) String);
 impl ApiError {
     fn new(failure: failure::Failure, message: impl Into<String>) -> Self {
         Self(failure, message.into())
@@ -181,6 +185,15 @@ async fn query(
     }
     dispatch(app, Operation::Query(id, req)).await
 }
+async fn usage_events(State(app): State<App>, Query(filter): Query<usage::Filter>) -> Reply {
+    app.usage.events(filter).await.map(Output::Json)
+}
+async fn budget(State(app): State<App>) -> Reply {
+    app.usage.budget().await.map(Output::Json)
+}
+async fn set_budget(State(app): State<App>, Json(update): Json<usage::BudgetUpdate>) -> Reply {
+    app.usage.set_budget(update).await.map(Output::Json)
+}
 async fn cancel(State(app): State<App>, Path(id): Path<Uuid>, _: HeaderMap) -> Json<Value> {
     let canceled = worker::interrupt(&app.active, Some(id), None, "canceled");
     Json(json!({"interrupted_active_query": canceled}))
@@ -223,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
         active,
         token: token.into(),
         history: history::Reader::new(std::env::var("PLATFORM_DSN")?),
+        usage: usage::Reader::new(std::env::var("PLATFORM_DSN")?),
     };
     let api = Router::new()
         .route("/v1/sessions", post(open))
@@ -231,6 +245,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/queries", get(history))
         .route("/v1/queries/{id}", get(query_detail))
+        .route("/v1/usage", get(usage_events))
+        .route("/v1/budget", get(budget).put(set_budget))
         .route("/v1/worker", get(info))
         .route_layer(middleware::from_fn_with_state(app.token.clone(), authorize));
     let router = Router::new()

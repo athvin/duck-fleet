@@ -71,6 +71,9 @@ This deletes the catalog, history, and object-store volumes.
   documented in [Concurrent writes and retry safety](#concurrent-writes-and-retry-safety):
   compatible writes both commit, and a losing commit is discarded whole and
   reported as retry-safe.
+- No execution escapes the usage ledger, and budgets are enforced before and during
+  execution; see [Metering and budgets](#metering-and-budgets). PostgreSQL itself
+  rejects edits to recorded usage.
 
 The dbt project runs with two threads. Each worker executes its own statements
 serially, and dependent models read the preceding worker's committed DuckLake
@@ -133,6 +136,7 @@ scripts/                Build and harness helpers
 tests/dbt/              Representative seed, view, table, incremental model, tests
 tests/harness.py         Protocol, dbt, and restart assertions
 tests/concurrency.py     Overlapping DuckLake transactions and retry classification
+tests/metering.py        Usage ledger, pricing, and budget enforcement
 ```
 
 ## Local execution API
@@ -149,6 +153,9 @@ All `/v1` endpoints require `Authorization: Bearer <token>`.
 | GET | `/v1/queries` | Filtered history with cursor pagination; defaults to 500 records |
 | GET | `/v1/queries/{query_id}` | One durable record, metrics, and raw DuckDB profile when available |
 | GET | `/v1/workers` | Worker IDs, engine settings, and observed cgroup limits |
+| GET | `/v1/usage` | Append-only usage events with cursor pagination |
+| GET | `/v1/budget` | Prepaid balance, held reservations, spend, caps, rate card |
+| PUT | `/v1/budget` | Set the prepaid balance and per-job cost cap |
 
 A session request can supply `{"compute":{"cpu":2,"memory":"2Gi"},"context":{}}`.
 Compute is fixed when the session opens; query bodies cannot override it.
@@ -198,7 +205,7 @@ These are local resource limits, not billing budgets.
 List queries by `model_id`, `invocation_id`, `model_run_id`, `worker_id` (`small`
 or `medium`), `status`, and `failure_kind`. Filters combine with AND and are bound
 SQL parameters. Supported statuses are `running`, `succeeded`, `failed`, `conflict`,
-`canceled`, `timed_out`, and `interrupted`. Only failure kinds that can reach a
+`refused`, `budget_exceeded`, `canceled`, `timed_out`, and `interrupted`. Only failure kinds that can reach a
 history record are accepted as filters; rejection kinds such as `capacity` never
 become records. All history endpoints require the same bearer authentication
 as execution and remain restricted to the trusted development environment.
@@ -305,9 +312,12 @@ stopped by a deadline may still have committed.
 | `failure_kind` | HTTP | `retry_safe` | Meaning |
 | --- | --- | --- | --- |
 | `transaction_conflict` | 409 | yes | Lost a commit race; the transaction was discarded whole |
+| `budget_exhausted` | 402 | yes | The prepaid balance cannot buy a second; nothing ran and nothing was metered |
 | `capacity` | 429 | yes | A queue or session limit rejected the request before any SQL ran |
 | `sql_error` | 400 | no | The engine refused or failed the SQL; earlier statements in a multi-statement request may have applied |
 | `timeout` | 400 | no | A deadline interrupted the statement; an interrupted commit may still have committed |
+| `budget_exceeded` | 400 | no | Stopped on reaching its per-job cost cap; same unknown-commit caveat |
+| `budget_job_cost` | 400 | no | The per-job cap cannot buy a second at this size; raise the cap or ask for less |
 | `canceled` | 400 | no | A caller interrupted the statement; same unknown outcome |
 | `invalid_request` | 400 | no | Rejected before execution; correct the request rather than resend it |
 | `unknown_session` | 404 | no | The session expired or was closed; open a new one |
@@ -328,6 +338,91 @@ What this does not yet cover: conflict rates under genuine parallel load, automa
 or coordinated retry, locking or reservations that would prevent a conflict, and
 cleanup of the data files a losing transaction already wrote to object storage.
 
+## Metering and budgets
+
+Every accepted execution is metered. Admission reserves funds before any SQL runs,
+settlement records exactly one usage event, and the reservation is released at the
+same time — for successes, SQL errors, timeouts, and lost commit races alike.
+`tests/metering.py` gates that on every run and saves `artifacts/metering.json`.
+
+The ledger is deliberately separate from query history. Diagnostics get rewritten
+as a query progresses; a billable record must not. `usage_events` is append-only
+**in the database**: PostgreSQL rejects `UPDATE` and `DELETE` on it, so a correction
+has to be a new row whose `corrects` column points at what it compensates. Each
+event stores the `rate_card_version` it was priced with, so an old event keeps the
+price it was charged at.
+
+Money is integer micro-USD throughout; a ledger must not accumulate floating-point
+error. Charges round **up** and affordable time rounds **down**, so a budget is
+never overrun by rounding.
+
+```sh
+curl -H 'Authorization: Bearer duckfleet-local-development-token' \
+  http://localhost:18080/v1/budget
+```
+
+```json
+{
+  "prepaid_micro_usd": 10000000, "spent_micro_usd": 109, "held_micro_usd": 0,
+  "available_micro_usd": 9999891, "max_job_micro_usd": 1000000,
+  "usage_events": 20, "held_reservations": 0,
+  "rate_card_version": "local-dev-1", "compute_micro_usd_per_unit_hour": 100000
+}
+```
+
+A compute class bills on a normalized unit of `max(vCPU, GiB RAM / 4)`, so `small`
+is one unit and `medium` is two. `DUCKFLEET_PREPAID_MICRO_USD` (default $10) and
+`DUCKFLEET_MAX_JOB_MICRO_USD` (default $1) seed the budget the first time it is
+created; a restart never refills a balance that has been spent. `PUT /v1/budget`
+sets either limit afterwards, absolutely rather than as a delta. A full `make test`
+run meters only a few thousand micro-USD, but a long-lived local stack does spend
+its seeded balance eventually; raise it with `PUT /v1/budget`, or start over with
+`docker compose down -v`.
+
+**The price is a placeholder.** $0.10 per unit-hour exists to make the metering path
+exercisable. Nothing here is reconciled against a real AWS bill, so this is the
+third of the blueprint's three numbers (billable usage) without the first two
+(physical cost and attributed cost).
+
+Budgets are enforced two ways:
+
+- **Before execution.** If the remaining balance cannot buy even one second,
+  admission refuses with HTTP 402 and `failure_kind` `budget_exhausted`. No SQL
+  runs, the record is `refused`, and nothing is metered — so the same request is
+  safe to send again once funded. If the per-job cap is what cannot buy a second,
+  the refusal is `budget_job_cost` instead: resending will not help.
+- **During execution.** A per-job cost cap is just a shorter deadline, enforced by
+  the same timer as `timeout_seconds`. Whichever binds first decides how the stop
+  is reported: `budget_exceeded` or `timeout`. Both consume real compute, so both
+  are metered, and neither is retry-safe because an interrupted commit may still
+  have committed.
+
+Two workers cannot both spend the last of the balance: admission locks the budget
+row, so reservations serialize across workers.
+
+If settlement itself fails, the reservation stays held and the execution stays
+`running`; the next worker start settles it from the elapsed time history recorded
+and marks the event `source: recovery`. That keeps "no unmetered execution" true
+across a crash, at the cost of a delay. Sessions themselves are free — only
+statement execution meters.
+
+```sh
+curl -G -H 'Authorization: Bearer duckfleet-local-development-token' \
+  --data-urlencode 'execution_id=<query_id>' http://localhost:18080/v1/usage
+```
+
+Usage listing pages on a descending `ledger_id` exactly like query history, filters
+by `execution_id` and `source`, and caps `limit` at 500.
+
+What this does not yet cover: the ledger meters compute only — no storage, S3
+requests, catalog, or network meters. The per-job cap is therefore enforceable as a
+deadline, because elapsed time is the only thing that costs anything; adding a
+request or byte meter would break that equivalence and need separate enforcement.
+There is no tenant dimension, because the harness bills one tenant. Nothing issues a
+compensating event yet; `corrects` and the append-only trigger establish how a
+correction must work, not a feature that performs one. Spend is not reconciled
+against an AWS bill, so of the blueprint's three numbers this is only the third.
+
 ## Scope and limitations
 
 This is a **trusted, single-tenant development environment** with known local
@@ -337,8 +432,11 @@ or use customer data. Query history includes SQL text and errors. Logical model
 IDs and tags are caller-supplied correlation data, not authenticated billing data.
 
 Only the two persistent Docker compute classes and SQL models are implemented.
-There is no on-demand instance provisioning, warm pool, durable job queue, pricing/budget ledger,
+There is no on-demand instance provisioning, warm pool, durable job queue,
 multi-tenant authorization, production secret management, or automatic write retry.
+The usage ledger meters compute only, against a placeholder rate card, and nothing
+reconciles it against a real AWS bill; see
+[Metering and budgets](#metering-and-budgets).
 Arbitrary DuckDB SQL can access worker files and network resources. Python models,
 external materializations, and dbt plugins are unsupported. Unchecked dbt
 materializations or version combinations are not part of the tested contract.
