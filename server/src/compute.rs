@@ -61,6 +61,10 @@ impl Size {
     pub fn memory_bytes(self) -> u64 {
         u64::from(self.cpu()) * 1024 * 1024 * 1024
     }
+    /// Normalized billable size of this class, used by metering and pricing.
+    pub fn units(self) -> i64 {
+        crate::pricing::normalized_units(self.cpu(), self.memory_bytes())
+    }
     pub fn engine_memory(self) -> &'static str {
         match self {
             Self::Small => "512MiB",

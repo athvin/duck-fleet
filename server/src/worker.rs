@@ -1,4 +1,6 @@
-use crate::{ApiError, Envelope, Operation, Output, QueryRequest, Reply, compute::Size, failure};
+use crate::{
+    ApiError, Envelope, Operation, Output, QueryRequest, Reply, compute::Size, failure, metering,
+};
 use anyhow::{Context, Result};
 use arrow_ipc::writer::StreamWriter;
 use duckdb::{Connection, InterruptHandle, params_from_iter, types::Value as SqlValue};
@@ -60,6 +62,21 @@ fn literal(value: &str) -> String {
 }
 fn required(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("missing {name}"))
+}
+/// Reads an optional micro-USD setting. A budget of zero would refuse every
+/// execution, so a configured value must be positive rather than merely parseable.
+fn env_micro_usd(name: &str, default: i64) -> Result<i64> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(raw) => {
+            let value: i64 = raw
+                .trim()
+                .parse()
+                .with_context(|| format!("{name} must be a whole number of micro-USD"))?;
+            anyhow::ensure!(value > 0, "{name} must be greater than zero");
+            Ok(value)
+        }
+    }
 }
 
 impl Worker {
@@ -165,7 +182,20 @@ impl Worker {
                 &failure::INTERRUPTED.retry_safe,
             ],
         )?;
+        // The budget starts from configuration only the first time it is created; a
+        // restart must not refill a balance that has already been spent.
+        metering::migrate(
+            &mut transaction,
+            env_micro_usd("DUCKFLEET_PREPAID_MICRO_USD", 10_000_000)?,
+            env_micro_usd("DUCKFLEET_MAX_JOB_MICRO_USD", 1_000_000)?,
+        )?;
+        // Funds this worker was holding when it stopped are settled against whatever
+        // its history row recorded, so nothing stays both unmetered and reserved.
+        let recovered = metering::recover(&mut transaction, size.name())?;
         transaction.commit()?;
+        if recovered > 0 {
+            tracing::warn!(recovered, "settled reservations abandoned by a restart");
+        }
         Ok(Self {
             root,
             size,
@@ -263,6 +293,31 @@ impl Worker {
                 "request_id already accepted; inspect history, SQL was not replayed",
             ));
         }
+        // Reserve funds before any SQL runs. There is no execution path around this:
+        // a refusal closes the record it just accepted instead of leaving it running.
+        let admission = match metering::admit(
+            &mut self.ledger,
+            &query_id,
+            self.size.units(),
+            req.timeout_seconds,
+            self.size.name(),
+        ) {
+            Ok(admission) => admission,
+            Err(refusal) => {
+                let _ = self.ledger.execute(
+                    "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=0,
+                     error=$3, failure_kind=$4, retry_safe=$5 WHERE query_id=$1",
+                    &[
+                        &query_id,
+                        &refusal.0.status.unwrap_or("refused"),
+                        &refusal.1,
+                        &refusal.0.kind,
+                        &refusal.0.retry_safe,
+                    ],
+                );
+                return Err(refusal);
+            }
+        };
         let cleared = session.profile.clear();
         let started = Instant::now();
         *self.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(Active {
@@ -272,9 +327,17 @@ impl Worker {
             reason: None,
         });
         let active = self.active.clone();
+        // One timer enforces both limits, because a cost cap is just a shorter
+        // deadline. Which limit bound it decides how the stop is reported.
+        let (deadline_seconds, request_id) = (admission.deadline_seconds, req.request_id);
+        let deadline_reason = if admission.limited_by_budget {
+            "budget_exceeded"
+        } else {
+            "timed_out"
+        };
         let deadline = self.runtime.spawn(async move {
-            tokio::time::sleep(Duration::from_secs(req.timeout_seconds)).await;
-            interrupt(&active, None, Some(req.request_id), "timed_out");
+            tokio::time::sleep(Duration::from_secs(deadline_seconds)).await;
+            interrupt(&active, None, Some(request_id), deadline_reason);
         });
         let result = execute(&session.conn, &req.sql, parameters);
         let reason = self
@@ -300,6 +363,30 @@ impl Worker {
             "failed"
         });
         let rows = result.as_ref().ok().map(|(_, rows)| *rows);
+        // Meter before the record goes terminal. If this fails the reservation stays
+        // held and the next worker start settles it, so no execution escapes the
+        // ledger; the SQL has already run, so the caller still gets its outcome.
+        match metering::settle(
+            &mut self.ledger,
+            &admission,
+            elapsed,
+            self.size.name(),
+            &req.context.to_string(),
+        ) {
+            Ok(charged) => tracing::debug!(
+                query_id,
+                charged_micro_usd = charged,
+                reserved_micro_usd = admission.reserved_micro_usd,
+                "usage settled"
+            ),
+            Err(error) => {
+                tracing::error!(
+                    query_id,
+                    ?error,
+                    "usage not settled; recovery will settle it"
+                )
+            }
+        }
         self.ledger.execute(
             "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=$3, result_rows=$4, error=$5, profile_status=$6, profile=$7, metrics=$8, failure_kind=$9, retry_safe=$10 WHERE query_id=$1",
             &[&query_id, &status, &elapsed, &rows, &error, &capture.status, &capture.profile, &capture.metrics,
