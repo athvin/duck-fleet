@@ -2,27 +2,34 @@ name: AWS development harness
 on:
   push:
     branches: [main]
+    paths:
+      - 'server/**'
+      - 'adapters/**'
+      - 'docker/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'infra/terraform/**'
+      - 'infra/helm/**'
+      - '.github/workflows/**'
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
   group: duckfleet-aws-dev
   cancel-in-progress: false
+env:
+  AWS_REGION: us-east-2
+  KUBE_CONTEXT: duckfleet-ci-dev
+  TF_IN_AUTOMATION: 'true'
 jobs:
-  deploy:
+  prepare:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 110
+    timeout-minutes: 45
     permissions:
       contents: read
       actions: read
       id-token: write
-    outputs:
-      deployment_started: ${{ steps.start.outputs.deployment_started }}
-    env:
-      AWS_REGION: us-east-2
-      KUBE_CONTEXT: duckfleet-ci-dev
-      TF_IN_AUTOMATION: 'true'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Require checks on this exact main commit
@@ -33,18 +40,57 @@ jobs:
         with:
           terraform_version: 1.11.4
           terraform_wrapper: false
-      - run: bash scripts/ci/install-infra-tools.sh
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
           role-to-assume: arn:aws:iam::797781631727:role/duckfleet-ci-dev
-          role-duration-seconds: 7200
           aws-region: us-east-2
       - run: aws eks update-kubeconfig --name er-dev --alias duckfleet-ci-dev --region us-east-2
       - run: bash scripts/aws/check-access.sh
       - run: bash scripts/aws/apply.sh
-      - run: bash scripts/aws/publish.sh
+  publish:
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::797781631727:role/duckfleet-ci-dev
+          aws-region: us-east-2
+      - run: bash scripts/aws/publish.sh "$IMAGE_ARCH"
+        env:
+          IMAGE_ARCH: ${{ matrix.arch }}
+  deploy:
+    needs: [prepare, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      deployment_started: ${{ steps.start.outputs.deployment_started }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: bash scripts/ci/install-infra-tools.sh
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::797781631727:role/duckfleet-ci-dev
+          aws-region: us-east-2
+      - run: bash scripts/aws/assemble-images.sh
+      - run: aws eks update-kubeconfig --name er-dev --alias duckfleet-ci-dev --region us-east-2
       - id: start
         run: echo 'deployment_started=true' >> "$GITHUB_OUTPUT"
       - run: bash scripts/aws/deploy.sh

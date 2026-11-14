@@ -1,5 +1,8 @@
 """Safety regressions for the live deployment lane; no AWS calls."""
 import importlib.util
+import os
+import tempfile
+import fnmatch
 import subprocess
 import unittest
 from pathlib import Path
@@ -64,9 +67,13 @@ class AwsCiTests(unittest.TestCase):
     def test_workflow_boundary_and_cleanup(self):
         workflow = yaml.safe_load((ROOT/'.github/workflows/aws-dev.yml').read_text())
         self.assertFalse(workflow['concurrency']['cancel-in-progress'])
-        deploy = workflow['jobs']['deploy']
-        self.assertEqual(deploy['if'], "github.ref == 'refs/heads/main'")
-        steps = deploy['steps']
+        prepare = workflow['jobs']['prepare']
+        self.assertEqual(prepare['if'], "github.ref == 'refs/heads/main'")
+        self.assertEqual(workflow['jobs']['publish']['needs'], 'prepare')
+        self.assertEqual(set(workflow['jobs']['deploy']['needs']), {'prepare', 'publish'})
+        self.assertEqual(workflow['jobs']['suspend']['needs'], 'deploy')
+        self.assertEqual({item['arch']: item['runner'] for item in workflow['jobs']['publish']['strategy']['matrix']['include']}, {'amd64': 'ubuntu-24.04', 'arm64': 'ubuntu-24.04-arm'})
+        steps = prepare['steps']
         checks = next(i for i,s in enumerate(steps) if s.get('run') == 'python3 scripts/aws/wait-checks.py')
         credentials = next(i for i,s in enumerate(steps) if s.get('uses','').startswith('aws-actions/'))
         self.assertLess(checks, credentials)
@@ -76,6 +83,11 @@ class AwsCiTests(unittest.TestCase):
             for step in job['steps']:
                 if 'uses' in step:
                     self.assertRegex(step['uses'], r'@[0-9a-f]{40}$')
+        paths = workflow[True]['push']['paths']  # YAML 1.1 parses `on` as True.
+        for path in ['server/src/main.rs', 'scripts/aws/publish.sh', 'docker/server.Dockerfile', 'infra/helm/duckfleet/values.yaml', '.github/workflows/aws-dev.yml']:
+            self.assertTrue(any(fnmatch.fnmatchcase(path, pattern) for pattern in paths), path)
+        for path in ['README.md', 'infra/README.md']:
+            self.assertFalse(any(fnmatch.fnmatchcase(path, pattern) for pattern in paths), path)
         # PR workflow must never receive AWS identity.
         pr = yaml.safe_load((ROOT/'.github/workflows/infra.yml').read_text())
         self.assertNotIn('id-token', pr['permissions'])
@@ -154,6 +166,55 @@ class RolloutWaitTests(unittest.TestCase):
         # Handing the wait to helm is what produced the opaque deadline error.
         self.assertNotIn('--wait', commands)
         self.assertIn('wait-rollout.py', commands)
+
+class ImagePublishingTests(unittest.TestCase):
+    def test_indexes_require_both_platforms(self):
+        values = load('image_values', 'scripts/aws/image_values.py')
+        digest = 'sha256:' + 'a'*64
+        amd = {'platform': {'os': 'linux', 'architecture': 'amd64'}}
+        arm = {'platform': {'os': 'linux', 'architecture': 'arm64'}}
+        attestation = {'platform': {'os': 'unknown', 'architecture': 'unknown'}, 'annotations': {'vnd.docker.reference.type': 'attestation-manifest'}}
+        reference = values.image_reference('worker', digest, {'manifests': [arm, amd, attestation]})
+        self.assertTrue(reference.endswith('/worker@'+digest))
+        for manifests in [[], [amd], [amd, amd], [amd, arm, amd], [amd, {}], [amd, arm, {'platform': {'os': 'windows', 'architecture': 'amd64'}}]]:
+            with self.assertRaises(ValueError):
+                values.image_reference('worker', digest, {'manifests': manifests})
+        with self.assertRaises(ValueError):
+            values.image_reference('worker', 'latest', {'manifests': [amd, arm]})
+
+    def test_registry_errors_never_become_cache_misses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = Path(directory)/'aws'
+            command.write_text("""#!/usr/bin/env python3
+import os,sys
+mode=os.environ['FIXTURE_MODE']
+if mode == 'hit': print('sha256:'+'a'*64)
+elif mode == 'invalid': print('None')
+else:
+    print('ImageNotFoundException' if mode=='missing' else 'AccessDeniedException', file=sys.stderr)
+    sys.exit(254)
+""")
+            command.chmod(0o755)
+            env = dict(os.environ, PATH=directory+os.pathsep+os.environ['PATH'], GITHUB_ACTIONS='true')
+            script = f'source "{ROOT}/scripts/aws/image-common.sh"; image_digest worker revision'
+            for mode, expected in [('hit', 0), ('missing', 1), ('denied', 2), ('invalid', 2)]:
+                result = subprocess.run(['bash', '-c', script], env=dict(env, FIXTURE_MODE=mode), capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                if mode != 'hit': self.assertEqual(result.stdout, '')
+
+    def test_wrong_native_runner_fails_before_aws(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path/'uname').write_text('#!/bin/sh\nprintf "x86_64\n"\n')
+            (path/'aws').write_text('#!/bin/sh\ntouch "$AWS_CALLED"\nexit 99\n')
+            for executable in path.iterdir(): executable.chmod(0o755)
+            marker = path/'aws-called'
+            result = subprocess.run(['bash', str(ROOT/'scripts/aws/publish.sh'), 'arm64'],
+                env=dict(os.environ, PATH=directory+os.pathsep+os.environ['PATH'], AWS_CALLED=str(marker)),
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('must match the runner', result.stderr)
+            self.assertFalse(marker.exists())
 
 if __name__ == '__main__':
     unittest.main()
