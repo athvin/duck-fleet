@@ -1,7 +1,6 @@
 //! Read-only history requests use independent, bounded PostgreSQL connections.
 //! They never enter the DuckDB worker queue or acquire its execution lock.
-use crate::ApiError;
-use axum::http::StatusCode;
+use crate::{ApiError, failure};
 use postgres::{Client, NoTls, Row};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -20,6 +19,7 @@ pub(crate) struct Filter {
     pub limit: i64,
     pub before: Option<i64>,
     pub status: Option<String>,
+    pub failure_kind: Option<String>,
     pub worker_id: Option<String>,
     pub model_id: Option<String>,
     pub invocation_id: Option<String>,
@@ -31,6 +31,7 @@ impl Default for Filter {
             limit: 500,
             before: None,
             status: None,
+            failure_kind: None,
             worker_id: None,
             model_id: None,
             invocation_id: None,
@@ -45,18 +46,19 @@ impl Filter {
                 "limit must be 1–500 and before must be positive",
             ));
         }
-        if self.status.as_deref().is_some_and(|s| {
-            ![
-                "running",
-                "succeeded",
-                "failed",
-                "canceled",
-                "timed_out",
-                "interrupted",
-            ]
-            .contains(&s)
-        }) {
+        if self
+            .status
+            .as_deref()
+            .is_some_and(|s| !failure::STATUSES.contains(&s))
+        {
             return Err(ApiError::bad("unknown query status"));
+        }
+        if self
+            .failure_kind
+            .as_deref()
+            .is_some_and(|s| failure::by_kind(s).is_none_or(|f| f.status.is_none()))
+        {
+            return Err(ApiError::bad("unknown failure kind"));
         }
         if self
             .worker_id
@@ -77,7 +79,7 @@ impl Filter {
     }
 }
 
-const COLUMNS: &str = "query_id,session_id,sql,context,status,accepted_at::text,finished_at::text,elapsed_ms,result_rows,error,placement,history_id,worker_id,profile_status,metrics";
+const COLUMNS: &str = "query_id,session_id,sql,context,status,accepted_at::text,finished_at::text,elapsed_ms,result_rows,error,placement,history_id,worker_id,profile_status,metrics,failure_kind,retry_safe";
 fn record(row: &Row) -> Value {
     fn json_column(row: &Row, column: usize) -> Value {
         serde_json::from_str(row.get::<_, &str>(column)).unwrap_or(Value::Null)
@@ -90,7 +92,10 @@ fn record(row: &Row) -> Value {
         "result_rows":row.get::<_, Option<i64>>(8), "error":row.get::<_, Option<String>>(9),
         "placement":json_column(row,10), "history_id":row.get::<_, i64>(11),
         "worker_id":row.get::<_, String>(12), "profile_status":row.get::<_, String>(13),
-        "metrics":json_column(row,14)
+        "metrics":json_column(row,14),
+        // Null on success, and on records written before this column existed.
+        "failure_kind":row.get::<_, Option<String>>(15),
+        "retry_safe":row.get::<_, Option<bool>>(16)
     })
 }
 impl Reader {
@@ -104,12 +109,11 @@ impl Reader {
     where
         F: FnOnce(&mut Client) -> Result<Value, ApiError> + Send + 'static,
     {
-        let permit = self.capacity.clone().try_acquire_owned().map_err(|_| {
-            ApiError(
-                StatusCode::TOO_MANY_REQUESTS,
-                "history reader capacity reached".into(),
-            )
-        })?;
+        let permit = self
+            .capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::new(failure::CAPACITY, "history reader capacity reached"))?;
         let dsn = self.dsn.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -135,7 +139,8 @@ impl Reader {
                   AND ($4::text IS NULL OR context::jsonb #>> '{{dbt,node_id}}'=$4)
                   AND ($5::text IS NULL OR context::jsonb #>> '{{dbt,invocation_id}}'=$5)
                   AND ($6::text IS NULL OR context::jsonb ->> 'model_run_id'=$6)
-                ORDER BY history_id DESC LIMIT $7"
+                  AND ($7::text IS NULL OR failure_kind=$7)
+                ORDER BY history_id DESC LIMIT $8"
                     ),
                     &[
                         &filter.before,
@@ -144,6 +149,7 @@ impl Reader {
                         &filter.model_id,
                         &filter.invocation_id,
                         &filter.model_run_id,
+                        &filter.failure_kind,
                         &(filter.limit + 1),
                     ],
                 )
@@ -168,10 +174,10 @@ impl Reader {
                     &[&id.to_string()],
                 )
                 .map_err(|_| ApiError::internal())?
-                .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "query not found".into()))?;
+                .ok_or_else(|| ApiError::new(failure::NOT_FOUND, "query not found"))?;
             let mut value = record(&row);
             value["profile"] = row
-                .get::<_, Option<&str>>(15)
+                .get::<_, Option<&str>>(17)
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(Value::Null);
             Ok(value)
@@ -192,6 +198,10 @@ mod tests {
             json!({"status":"made_up"}),
             json!({"worker_id":"huge"}),
             json!({"model_id":""}),
+            json!({"failure_kind":"made_up"}),
+            // Rejection kinds never reach a history record, so they cannot be filtered.
+            json!({"failure_kind":"capacity"}),
+            json!({"failure_kind":"duplicate_request"}),
         ] {
             assert!(
                 serde_json::from_value::<Filter>(input)
@@ -202,5 +212,16 @@ mod tests {
         }
         assert!(Filter::default().validate().is_ok());
         assert!(serde_json::from_value::<Filter>(json!({"unknown":true})).is_err());
+        for input in [
+            json!({"status":"conflict"}),
+            json!({"failure_kind":"transaction_conflict"}),
+        ] {
+            assert!(
+                serde_json::from_value::<Filter>(input)
+                    .unwrap()
+                    .validate()
+                    .is_ok()
+            );
+        }
     }
 }

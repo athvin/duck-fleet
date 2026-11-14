@@ -1,5 +1,6 @@
 //! Local, single-tenant DuckFleet SQL service. All DuckDB work stays on one worker thread.
 mod compute;
+mod failure;
 mod gateway;
 mod history;
 mod profiling;
@@ -10,7 +11,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -64,21 +65,34 @@ fn default_timeout() -> u64 {
     30
 }
 
-struct ApiError(StatusCode, String);
+struct ApiError(failure::Failure, String);
 impl ApiError {
+    fn new(failure: failure::Failure, message: impl Into<String>) -> Self {
+        Self(failure, message.into())
+    }
     fn bad(message: impl Into<String>) -> Self {
-        Self(StatusCode::BAD_REQUEST, message.into())
+        Self(failure::INVALID_REQUEST, message.into())
     }
     fn internal() -> Self {
         Self(
-            StatusCode::SERVICE_UNAVAILABLE,
+            failure::UNAVAILABLE,
             "worker or execution history unavailable; do not automatically retry writes".into(),
         )
     }
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error": self.1}))).into_response()
+        // `retry_safe` is the machine-readable half of the message: true only where
+        // the platform can prove the request left no partial effect behind.
+        (
+            self.0.http,
+            Json(json!({
+                "error": self.1,
+                "failure_kind": self.0.kind,
+                "retry_safe": self.0.retry_safe,
+            })),
+        )
+            .into_response()
     }
 }
 impl IntoResponse for Output {
@@ -115,22 +129,16 @@ async fn authorize(
         .and_then(|v| v.strip_prefix("Bearer "))
         .is_some_and(|v| v == token.as_ref());
     if !valid {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"invalid bearer token"})),
-        )
-            .into_response();
+        return ApiError::new(failure::UNAUTHORIZED, "invalid bearer token").into_response();
     }
     next.run(request).await
 }
 async fn dispatch(app: App, op: Operation) -> Reply {
     let (reply, receiver) = oneshot::channel();
-    app.sender.try_send(Envelope { op, reply }).map_err(|_| {
-        ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "worker queue full or closed".into(),
-        )
-    })?;
+    // A rejected send never reached the engine, so this request may be sent again.
+    app.sender
+        .try_send(Envelope { op, reply })
+        .map_err(|_| ApiError::new(failure::CAPACITY, "worker queue full or closed"))?;
     receiver.await.map_err(|_| ApiError::internal())?
 }
 async fn open(State(app): State<App>, request: Option<Json<SessionRequest>>) -> Reply {

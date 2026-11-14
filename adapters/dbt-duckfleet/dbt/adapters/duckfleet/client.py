@@ -16,9 +16,18 @@ def encode_parameter(value):
 
 
 class RemoteError(RuntimeError):
-    def __init__(self, status, message):
+    """A failure the server classified.
+
+    `retry_safe` repeats the server's judgement and is true only where the platform
+    proved the request left no partial effect. Acting on it is the caller's choice:
+    this transport never replays a statement by itself.
+    """
+
+    def __init__(self, status, message, failure_kind=None, retry_safe=False):
         super().__init__(message)
         self.status = status
+        self.failure_kind = failure_kind
+        self.retry_safe = retry_safe
 
 
 class Client:
@@ -39,11 +48,14 @@ class Client:
                 return response.read()
         except urllib.error.HTTPError as error:
             message = error.read().decode()
+            kind, retry_safe = None, False
             try:
-                message = json.loads(message)["error"]
+                payload = json.loads(message)
+                message = payload["error"]
+                kind, retry_safe = payload.get("failure_kind"), bool(payload.get("retry_safe"))
             except (ValueError, KeyError):
                 pass
-            raise RemoteError(error.code, message) from error
+            raise RemoteError(error.code, message, kind, retry_safe) from error
 
 
 class RemoteConnection:

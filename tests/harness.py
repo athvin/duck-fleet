@@ -157,6 +157,10 @@ def main():
     if "--history-without-workers" in sys.argv:
         observability.history_without_workers(URL, TOKEN)
         return
+    if "--concurrency" in sys.argv:
+        import concurrency
+        concurrency.checks(URL, TOKEN, ARTIFACTS)
+        return
     if "--unavailable-medium" in sys.argv:
         expect_error(503, lambda: RemoteConnection(URL, TOKEN, compute={"cpu":2,"memory":"2Gi"}))
         small = RemoteConnection(URL, TOKEN, compute={"cpu":1,"memory":"1Gi"})
