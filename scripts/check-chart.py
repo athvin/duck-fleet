@@ -17,6 +17,11 @@ for size, cpu in [('small', 1), ('medium', 2)]:
     assert env['S3_AUTH_MODE'] == 'pod_identity'
     assert env['AWS_EC2_METADATA_DISABLED'] == 'true'
     assert 'S3_SECRET_KEY' not in env
+    # A worker reports not-ready while it waits for the catalog. Waiting longer than
+    # the startup probe allows would have the pod replaced mid-wait, which is the
+    # crash loop the wait exists to prevent.
+    probe = container['startupProbe']
+    assert int(env['DUCKFLEET_CATALOG_WAIT_SECONDS']) <= probe['periodSeconds'] * probe['failureThreshold']
 for o in objects:
     assert o['kind'] not in ['Ingress', 'ClusterRole', 'ClusterRoleBinding', 'NodePool']
     if o['kind'] == 'Service':

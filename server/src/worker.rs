@@ -83,6 +83,76 @@ fn env_micro_usd(name: &str, default: i64) -> Result<i64> {
     }
 }
 
+/// How long startup waits for a catalog that is not reachable yet. Bounded so a
+/// catalog that never appears fails the container instead of leaving it not-ready
+/// forever, and configurable because the wait a rollout needs is environment
+/// specific. The default sits inside both the Compose healthcheck window and the
+/// Kubernetes startup probe budget.
+fn catalog_wait() -> Result<Duration> {
+    match std::env::var("DUCKFLEET_CATALOG_WAIT_SECONDS") {
+        Err(_) => Ok(Duration::from_secs(60)),
+        Ok(raw) => Ok(Duration::from_secs(raw.trim().parse().with_context(
+            || "DUCKFLEET_CATALOG_WAIT_SECONDS must be a whole number of seconds",
+        )?)),
+    }
+}
+
+/// Text meaning the connection has not been established yet, so waiting may help.
+///
+/// This is an allowlist and the default is fatal. A rejected password, a missing
+/// role or an absent database is a configuration error that no amount of waiting
+/// repairs, and retrying those would burn the whole budget before reporting the
+/// real problem.
+fn connection_pending(message: &str) -> bool {
+    const PENDING: [&str; 9] = [
+        "could not translate host name",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "connection refused",
+        "could not connect to server",
+        "the database system is starting up",
+        "no route to host",
+        "connection timed out",
+        "timeout expired",
+    ];
+    let message = message.to_ascii_lowercase();
+    PENDING.iter().any(|pending| message.contains(pending))
+}
+
+/// Retries an attempt that cannot succeed until a dependency is listening.
+///
+/// DNS and PostgreSQL can both be unready when a pod starts. Exiting makes the
+/// restart backoff outlive the deploy wait, so the attempt is repeated in place and
+/// the process stays up reporting not-ready instead.
+fn retrying<T>(
+    what: &str,
+    host: &str,
+    budget: Duration,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = Instant::now() + budget;
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        let error = match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if !connection_pending(&format!("{error:#}")) {
+            return Err(error);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(error.context(format!(
+                "{what} at host {host} was still unreachable after {}s",
+                budget.as_secs()
+            )));
+        }
+        tracing::warn!(host, what, "dependency not reachable yet; waiting");
+        std::thread::sleep(backoff.min(remaining));
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
 impl Worker {
     pub(crate) fn new(active: ActiveSlot, runtime: tokio::runtime::Handle) -> Result<Self> {
         let size = match required("DUCKFLEET_WORKER_SIZE")?.as_str() {
@@ -139,13 +209,18 @@ impl Worker {
             }
             _ => anyhow::bail!("unsupported S3_AUTH_MODE"),
         }
-        startup.run(
-            "attaching the DuckLake catalog",
-            &format!(
-                "ATTACH {} AS lake (DATA_PATH {}); USE lake;",
-                literal(&format!("ducklake:postgres:{}", required("CATALOG_DSN")?)),
-                literal(&required("S3_DATA_PATH")?)
-            ),
+        let wait = catalog_wait()?;
+        let catalog_dsn = required("CATALOG_DSN")?;
+        let attach = format!(
+            "ATTACH {} AS lake (DATA_PATH {}); USE lake;",
+            literal(&format!("ducklake:postgres:{catalog_dsn}")),
+            literal(&required("S3_DATA_PATH")?)
+        );
+        retrying(
+            "DuckLake catalog",
+            &crate::secrets::dsn_host(&catalog_dsn),
+            wait,
+            || startup.run("attaching the DuckLake catalog", &attach),
         )?;
         // Keep real Parquet objects in the harness, even for tiny seed data.
         startup.run(
@@ -163,9 +238,17 @@ impl Worker {
             [],
             |r| r.get::<_, String>(0)
         )?);
-        let mut ledger = redactor.guard(
-            "connecting to the platform database",
-            Client::connect(&required("PLATFORM_DSN")?, NoTls),
+        let platform_dsn = required("PLATFORM_DSN")?;
+        let mut ledger = retrying(
+            "platform database",
+            &crate::secrets::dsn_host(&platform_dsn),
+            wait,
+            || {
+                redactor.guard(
+                    "connecting to the platform database",
+                    Client::connect(&platform_dsn, NoTls),
+                )
+            },
         )?;
         let mut transaction = ledger.transaction()?;
         transaction.batch_execute("SELECT pg_advisory_xact_lock(4283121);
@@ -473,6 +556,76 @@ fn execute(conn: &Connection, sql: &str, parameters: Vec<SqlValue>) -> Result<(V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_unestablished_connections_are_waited_out() {
+        for pending in [
+            "could not translate host name \"postgres\" to address: Temporary failure in name resolution",
+            "Name or service not known",
+            "could not connect to server: Connection refused",
+            "FATAL: the database system is starting up",
+            "connection timed out",
+        ] {
+            assert!(connection_pending(pending), "should wait: {pending}");
+        }
+        // Waiting cannot repair configuration, so these must fail immediately.
+        for fatal in [
+            "FATAL: password authentication failed for user \"duckfleet\"",
+            "FATAL: role \"duckfleet\" does not exist",
+            "FATAL: database \"lake\" does not exist",
+            "permission denied for schema public",
+            "no pg_hba.conf entry for host",
+            "IO Error: Failed to attach DuckLake MetaData",
+        ] {
+            assert!(!connection_pending(fatal), "should not wait: {fatal}");
+        }
+    }
+
+    #[test]
+    fn retrying_returns_as_soon_as_the_dependency_answers() -> Result<()> {
+        let mut attempts = 0;
+        let value = retrying("catalog", "postgres", Duration::from_secs(5), || {
+            attempts += 1;
+            if attempts < 3 {
+                anyhow::bail!("could not connect to server: Connection refused");
+            }
+            Ok(attempts)
+        })?;
+        assert_eq!((value, attempts), (3, 3));
+        Ok(())
+    }
+
+    #[test]
+    fn a_fatal_failure_is_never_retried() {
+        let mut attempts = 0;
+        let error = retrying(
+            "catalog",
+            "postgres",
+            Duration::from_secs(30),
+            || -> Result<()> {
+                attempts += 1;
+                anyhow::bail!("FATAL: password authentication failed for user \"duckfleet\"")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1, "a rejected credential must not be waited out");
+        assert!(format!("{error:#}").contains("password authentication failed"));
+    }
+
+    #[test]
+    fn an_expired_budget_names_the_host_it_waited_for() {
+        let error = retrying(
+            "DuckLake catalog",
+            "catalog.internal",
+            Duration::from_millis(0),
+            || -> Result<()> { anyhow::bail!("could not translate host name") },
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("catalog.internal"), "{rendered}");
+        assert!(rendered.contains("still unreachable"), "{rendered}");
+    }
+
     #[test]
     fn parameters_and_arrow_preserve_nulls_and_decimal_precision() -> Result<()> {
         let conn = Connection::open_in_memory()?;

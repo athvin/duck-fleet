@@ -14,3 +14,8 @@ nodeSelector:
 suspended: false
 
 profiling: true
+
+# A worker reports not-ready while it waits for the catalog, so this must stay inside
+# the startup probe budget (failureThreshold 120 at 5s). The probe, not this value,
+# is what finally replaces a pod whose catalog never appears.
+catalogWaitSeconds: 120

@@ -16,12 +16,14 @@ docker inspect --format '{"container":{{json .Name}},"nano_cpus":{{.HostConfig.N
 # as it exits, so an unscrubbed ATTACH writes the catalog password to the container
 # log on every boot failure. Force the failure and read the log back.
 if docker compose run --rm --no-deps -T \
+  -e DUCKFLEET_CATALOG_WAIT_SECONDS=0 \
   -e CATALOG_DSN='host=catalog-does-not-resolve port=5432 dbname=lake user=duckfleet password=local-catalog-password' \
   worker-small > artifacts/worker-boot-failure.log 2>&1; then
   echo 'worker booted despite an unresolvable catalog host' >&2
   exit 1
 fi
 grep -q 'attaching the DuckLake catalog' artifacts/worker-boot-failure.log
+grep -q 'still unreachable' artifacts/worker-boot-failure.log
 grep -q 'catalog-does-not-resolve' artifacts/worker-boot-failure.log
 ! grep -q 'local-catalog-password' artifacts/worker-boot-failure.log
 docker compose run --rm dbt
@@ -44,3 +46,23 @@ docker compose restart worker-small worker-medium server
 docker compose up -d --wait server
 docker compose run --rm dbt python /app/tests/harness.py --after-restart
 docker compose run --rm bucket-init --verify
+
+# A pod can start before DNS and PostgreSQL are ready. The worker has to wait rather
+# than exit: a restart backoff outlives the deploy wait, which is what turned this
+# race into a failed release rather than a slow one.
+docker compose stop worker-small postgres
+docker compose up -d --no-deps worker-small
+waiting_id=$(docker compose ps -q worker-small)
+# Serving but not ready, and specifically not restarting while it waits.
+test "$(docker compose exec -T worker-small curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/healthz)" = 503
+test "$(docker inspect -f '{{.State.Health.Status}}' "$waiting_id")" != healthy
+test "$(docker inspect -f '{{.RestartCount}}' "$waiting_id")" = 0
+docker compose up -d --wait postgres
+docker compose up -d --wait --no-deps worker-small
+# The same container became ready on its own: neither restarted nor replaced.
+test "$(docker compose ps -q worker-small)" = "$waiting_id"
+test "$(docker inspect -f '{{.RestartCount}}' "$waiting_id")" = 0
+test "$(docker compose exec -T worker-small curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/healthz)" = 200
+docker inspect -f '{"container":{{json .Name}},"restarts":{{.RestartCount}},"health":{{json .State.Health.Status}}}' "$waiting_id" > artifacts/worker-late-catalog.jsonl
+docker compose up -d --wait server
+echo 'PASS: worker waited for a late catalog and became ready without restarting'

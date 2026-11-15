@@ -28,6 +28,11 @@
     },
     "profiling": {
       "type": "boolean"
+    },
+    "catalogWaitSeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 600
     }
   }
 }
