@@ -12,6 +12,18 @@ test -n "$small_id" && test -n "$medium_id" && test "$small_id" != "$medium_id"
 test "$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$small_id")" = '1000000000 1073741824'
 test "$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$medium_id")" = '2000000000 2147483648'
 docker inspect --format '{"container":{{json .Name}},"nano_cpus":{{.HostConfig.NanoCpus}},"memory_bytes":{{.HostConfig.Memory}}}' "$small_id" "$medium_id" > artifacts/docker-worker-limits.jsonl
+# DuckDB quotes the failing statement in its error and the process prints that error
+# as it exits, so an unscrubbed ATTACH writes the catalog password to the container
+# log on every boot failure. Force the failure and read the log back.
+if docker compose run --rm --no-deps -T \
+  -e CATALOG_DSN='host=catalog-does-not-resolve port=5432 dbname=lake user=duckfleet password=local-catalog-password' \
+  worker-small > artifacts/worker-boot-failure.log 2>&1; then
+  echo 'worker booted despite an unresolvable catalog host' >&2
+  exit 1
+fi
+grep -q 'attaching the DuckLake catalog' artifacts/worker-boot-failure.log
+grep -q 'catalog-does-not-resolve' artifacts/worker-boot-failure.log
+! grep -q 'local-catalog-password' artifacts/worker-boot-failure.log
 docker compose run --rm dbt
 # Overlapping DuckLake transactions need both workers healthy, so this runs before
 # any worker is stopped below.

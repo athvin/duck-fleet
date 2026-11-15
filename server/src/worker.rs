@@ -1,5 +1,8 @@
 use crate::{
-    ApiError, Envelope, Operation, Output, QueryRequest, Reply, compute::Size, failure, metering,
+    ApiError, Envelope, Operation, Output, QueryRequest, Reply,
+    compute::Size,
+    failure, metering,
+    secrets::{Redactor, Startup},
 };
 use anyhow::{Context, Result};
 use arrow_ipc::writer::StreamWriter;
@@ -55,6 +58,7 @@ pub(crate) struct Worker {
     active: ActiveSlot,
     runtime: tokio::runtime::Handle,
     profiling_enabled: bool,
+    redactor: Redactor,
 }
 
 fn literal(value: &str) -> String {
@@ -107,15 +111,19 @@ impl Worker {
         placement["cgroup_cpu_quota"] = json!(limits[0]);
         placement["cgroup_cpu_period"] = json!(limits[1]);
         placement["worker_boot_id"] = json!(Uuid::new_v4());
-        let root = Connection::open_in_memory()?;
-        root.execute_batch(&format!(
-            "SET memory_limit='{}'; SET threads={};",
-            size.engine_memory(),
-            size.cpu()
-        ))?;
-        root.execute_batch(" SET max_temp_directory_size='1GB'; SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; LOAD httpfs; LOAD postgres; LOAD ducklake;")?;
+        let redactor = Redactor::from_env();
+        let startup = Startup::new(Connection::open_in_memory()?, redactor.clone());
+        startup.run(
+            "applying engine limits",
+            &format!(
+                "SET memory_limit='{}'; SET threads={};",
+                size.engine_memory(),
+                size.cpu()
+            ),
+        )?;
+        startup.run("loading extensions", " SET max_temp_directory_size='1GB'; SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; LOAD httpfs; LOAD postgres; LOAD ducklake;")?;
         match std::env::var("S3_AUTH_MODE").as_deref().unwrap_or("local") {
-            "local" => root.execute_batch(&format!(
+            "local" => startup.run("creating the object store secret", &format!(
                 "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');",
                 literal(&required("S3_ACCESS_KEY")?), literal(&required("S3_SECRET_KEY")?), literal(&required("S3_ENDPOINT")?)
             ))?,
@@ -124,20 +132,27 @@ impl Worker {
                 // IMDS is disabled in the chart; no static keys are deployed.
                 required("AWS_CONTAINER_CREDENTIALS_FULL_URI")?;
                 required("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")?;
-                root.execute_batch(&format!(
+                startup.run("creating the pod identity object store secret", &format!(
                     "LOAD aws; CREATE SECRET aws_s3 (TYPE S3, PROVIDER credential_chain, REFRESH auto, REGION {}, SCOPE {});",
                     literal(&required("AWS_REGION")?), literal(&required("S3_DATA_PATH")?)
                 ))?;
             }
             _ => anyhow::bail!("unsupported S3_AUTH_MODE"),
         }
-        root.execute_batch(&format!(
-            "ATTACH {} AS lake (DATA_PATH {}); USE lake;",
-            literal(&format!("ducklake:postgres:{}", required("CATALOG_DSN")?)),
-            literal(&required("S3_DATA_PATH")?)
-        ))?;
+        startup.run(
+            "attaching the DuckLake catalog",
+            &format!(
+                "ATTACH {} AS lake (DATA_PATH {}); USE lake;",
+                literal(&format!("ducklake:postgres:{}", required("CATALOG_DSN")?)),
+                literal(&required("S3_DATA_PATH")?)
+            ),
+        )?;
         // Keep real Parquet objects in the harness, even for tiny seed data.
-        root.execute_batch("CALL ducklake_set_option('lake', 'data_inlining_row_limit', 0)")?;
+        startup.run(
+            "disabling data inlining",
+            "CALL ducklake_set_option('lake', 'data_inlining_row_limit', 0)",
+        )?;
+        let root = startup.into_connection();
         placement["duckdb_threads"] = json!(root.query_row(
             "SELECT current_setting('threads')::BIGINT",
             [],
@@ -148,7 +163,10 @@ impl Worker {
             [],
             |r| r.get::<_, String>(0)
         )?);
-        let mut ledger = Client::connect(&required("PLATFORM_DSN")?, NoTls)?;
+        let mut ledger = redactor.guard(
+            "connecting to the platform database",
+            Client::connect(&required("PLATFORM_DSN")?, NoTls),
+        )?;
         let mut transaction = ledger.transaction()?;
         transaction.batch_execute("SELECT pg_advisory_xact_lock(4283121);
             CREATE TABLE IF NOT EXISTS query_history (
@@ -212,6 +230,7 @@ impl Worker {
                 "false" => false,
                 _ => anyhow::bail!("DUCKFLEET_PROFILING must be true or false"),
             },
+            redactor,
         })
     }
 
@@ -351,7 +370,12 @@ impl Worker {
         let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
         let capture = session.profile.capture(cleared);
         session.profile.clear();
-        let error = result.as_ref().err().map(|e| format!("{e:#}"));
+        // A DuckLake error can quote the catalog connection string long after startup,
+        // and this text reaches both the history row and the caller.
+        let error = result
+            .as_ref()
+            .err()
+            .map(|e| self.redactor.scrub(&format!("{e:#}")));
         // A timer racing with a completed statement must not imply the write rolled
         // back, so an interruption reason outranks whatever the engine reported.
         let failure = error
@@ -395,7 +419,13 @@ impl Worker {
         tracing::info!(query_id, session_id = %id, status, elapsed_ms = elapsed, "query finished");
         result
             .map(|(bytes, _)| Output::Arrow(bytes, req.request_id))
-            .map_err(|e| ApiError::new(failure.unwrap_or(failure::SQL_ERROR), format!("{e:#}")))
+            // Reuses the scrubbed text, so the caller and history never disagree.
+            .map_err(|_| {
+                ApiError::new(
+                    failure.unwrap_or(failure::SQL_ERROR),
+                    error.unwrap_or_else(|| "query failed".into()),
+                )
+            })
     }
 }
 
