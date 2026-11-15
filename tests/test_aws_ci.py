@@ -6,9 +6,27 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('plan_guard', ROOT/'scripts/aws/plan_guard.py')
-guard = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(guard)
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, ROOT/path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+guard = load('plan_guard', 'scripts/aws/plan_guard.py')
+rollout = load('wait_rollout', 'scripts/aws/wait-rollout.py')
+
+def pod(name, uid, unschedulable=None):
+    conditions = []
+    if unschedulable is not None:
+        conditions.append({'type': 'PodScheduled', 'status': 'False',
+                           'reason': 'Unschedulable', 'message': unschedulable})
+    else:
+        conditions.append({'type': 'PodScheduled', 'status': 'True'})
+    return {'metadata': {'name': name, 'uid': uid}, 'status': {'conditions': conditions}}
+
+def deployment(name, desired, ready):
+    return {'metadata': {'name': name}, 'spec': {'replicas': desired},
+            'status': {'readyReplicas': ready}}
 
 class AwsCiTests(unittest.TestCase):
     def plan(self, actions, address='aws_s3_bucket.lake'):
@@ -61,6 +79,81 @@ class AwsCiTests(unittest.TestCase):
         # PR workflow must never receive AWS identity.
         pr = yaml.safe_load((ROOT/'.github/workflows/infra.yml').read_text())
         self.assertNotIn('id-token', pr['permissions'])
+
+class RolloutWaitTests(unittest.TestCase):
+    GRACE = 90
+
+    def evaluate(self, deployments, pods, first_seen, now):
+        return rollout.evaluate(deployments, pods, first_seen, now, self.GRACE)
+
+    def test_ready_only_when_every_deployment_has_its_replicas(self):
+        ready = [deployment('worker-small', 1, 1), deployment('server', 1, 1)]
+        state, _ = self.evaluate(ready, [pod('worker-small-1', 'a')], {}, 0)
+        self.assertEqual(state, 'ready')
+        state, message = self.evaluate(
+            [deployment('worker-small', 1, 0), *ready], [pod('worker-small-1', 'a')], {}, 0)
+        self.assertEqual(state, 'waiting')
+        self.assertIn('worker-small 0/1 ready', message)
+
+    def test_a_suspended_deployment_counts_as_ready(self):
+        suspended = {'metadata': {'name': 'worker-medium'}, 'spec': {'replicas': 0}, 'status': {}}
+        state, _ = self.evaluate([suspended], [], {}, 0)
+        self.assertEqual(state, 'ready')
+
+    def test_node_provisioning_is_waited_out_not_failed(self):
+        # EKS Auto Mode creates nodes on demand, so a briefly unschedulable pod is
+        # normal. Failing on first sight would break every cold-node deploy.
+        pods = [pod('worker-medium-1', 'm', '0/3 nodes are available: insufficient cpu')]
+        first_seen = {}
+        state, _ = self.evaluate([deployment('worker-medium', 1, 0)], pods, first_seen, 0)
+        self.assertEqual(state, 'waiting')
+        state, _ = self.evaluate(
+            [deployment('worker-medium', 1, 0)], pods, first_seen, self.GRACE - 1)
+        self.assertEqual(state, 'waiting')
+
+    def test_a_pod_held_unschedulable_fails_with_the_scheduler_message(self):
+        reason = '0/3 nodes are available: 3 Insufficient cpu'
+        pods = [pod('worker-medium-1', 'm', reason)]
+        first_seen = {}
+        self.evaluate([deployment('worker-medium', 1, 0)], pods, first_seen, 0)
+        state, message = self.evaluate(
+            [deployment('worker-medium', 1, 0)], pods, first_seen, self.GRACE)
+        self.assertEqual(state, 'failed')
+        self.assertIn(reason, message)
+        self.assertIn('worker-medium-1', message)
+
+    def test_the_grace_window_restarts_when_a_pod_gets_scheduled(self):
+        first_seen = {}
+        self.evaluate([deployment('worker-medium', 1, 0)],
+                      [pod('worker-medium-1', 'm', 'insufficient cpu')], first_seen, 0)
+        self.assertIn('m', first_seen)
+        # Scheduled at last: the earlier wait must not count toward the next one.
+        self.evaluate([deployment('worker-medium', 1, 1)],
+                      [pod('worker-medium-1', 'm')], first_seen, 10)
+        self.assertNotIn('m', first_seen)
+        state, _ = self.evaluate([deployment('worker-medium', 1, 0)],
+                                 [pod('worker-medium-1', 'm', 'insufficient cpu')],
+                                 first_seen, 11)
+        self.assertEqual(state, 'waiting')
+
+    def test_other_scheduling_conditions_are_not_treated_as_unschedulable(self):
+        for condition in [
+            {'type': 'PodScheduled', 'status': 'True'},
+            {'type': 'Ready', 'status': 'False', 'reason': 'Unschedulable'},
+            {'type': 'PodScheduled', 'status': 'False', 'reason': 'SchedulingGated'},
+        ]:
+            observed = {'metadata': {'name': 'p', 'uid': 'u'},
+                        'status': {'conditions': [condition]}}
+            self.assertIsNone(rollout.unschedulable_reason(observed), str(condition))
+
+    def test_deploy_waits_separately_from_helm(self):
+        deploy = (ROOT/'scripts/aws/deploy.sh').read_text()
+        # Comments discuss the flag by name, so only executable lines are checked.
+        commands = '\n'.join(line for line in deploy.splitlines()
+                             if not line.lstrip().startswith('#'))
+        # Handing the wait to helm is what produced the opaque deadline error.
+        self.assertNotIn('--wait', commands)
+        self.assertIn('wait-rollout.py', commands)
 
 if __name__ == '__main__':
     unittest.main()
