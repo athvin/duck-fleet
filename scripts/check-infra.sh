@@ -19,6 +19,17 @@ PY
 helm lint infra/helm/duckfleet --namespace duckfleet-dev -f "$values"
 helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" > "$rendered"
 python3 scripts/check-chart.py "$rendered"
+# A CPU request may sit below its limit so a class fits constrained capacity, but a
+# request above the limit would schedule a worker onto a node that cannot honour the
+# limit its cgroup assertion depends on. Prove that is rejected, not merely rendered.
+overcommitted="$validation_dir/overcommitted.yaml"
+if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+     --set-json 'workerCpuRequests={"medium":4}' > "$overcommitted" 2>/dev/null \
+   && python3 scripts/check-chart.py "$overcommitted" > /dev/null 2>&1; then
+  echo 'A worker CPU request above its limit must fail the chart check' >&2
+  exit 1
+fi
+echo 'PASS: a CPU request above its limit is rejected'
 for script in scripts/aws/*.sh; do bash -n "$script"; done
 
 python3 -m unittest discover -s tests -p test_aws_ci.py
