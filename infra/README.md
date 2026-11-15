@@ -60,15 +60,17 @@ namespaces. Kubernetes application credentials remain privileged within the
 trusted DuckFleet development namespace; this is not customer SQL isolation.
 
 After the bootstrap has applied, merging this repo's CI change enables
-`AWS development harness`. Each main push (or a manual dispatch on main) does:
+`AWS development harness`. Each main push affecting deployment inputs (or a manual dispatch on main) does:
 
 1. Wait for both Docker and infrastructure checks on this exact SHA; refuse a
    superseded main revision.
 2. Obtain short-lived OIDC credentials and verify effective namespace permissions.
 3. Plan and apply only DuckFleet storage/image resources. Reject incomplete plans,
    deletes, replacements, imports, moves and resources outside the explicit list.
-4. Publish both CPU architectures under immutable commit tags and deploy by digest.
-   A rerun reuses an existing immutable commit tag. Secrets are generated once via
+4. Build on native x86 and ARM runners in parallel, publish immutable architecture
+   tags, and assemble a commit index only after both builds succeed. Validate both
+   platforms before deploying by digest. A rerun reuses immutable tags; a registry
+   permission error fails instead of masquerading as a cache miss. Secrets are generated once via
    stdin; redeployment preserves the database password.
 5. Run the live dbt sizing harness and upload only verified fixture evidence.
 6. Run a separate cleanup job even after a deployment/test failure, scale the
@@ -79,7 +81,8 @@ After the bootstrap has applied, merging this repo's CI change enables
 gh workflow run aws-dev.yml --repo athvin/duck-fleet --ref main
 ```
 
-Workflow runs serialize, without canceling an in-flight deployment. PR validation
+Workflow runs serialize, without canceling an in-flight deployment. Documentation-only
+pushes do not start AWS runs; the credential-free required checks still run. PR validation
 receives no AWS credentials. Terraform plan/state and raw Kubernetes/secret output
 are never uploaded. The runner uses an explicit `duckfleet-ci-dev` context; local
 operator scripts default to `er-dev-admin` and never use the workstation default
