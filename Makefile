@@ -11,5 +11,10 @@ check:
 .PHONY: check-infra
 check-infra:
 	bash scripts/check-infra.sh
+
+# Needs kind, kubectl and helm. Creates and destroys its own cluster; no AWS access.
+.PHONY: test-k8s
+test-k8s:
+	bash scripts/test-k8s.sh
 down:
 	docker compose down

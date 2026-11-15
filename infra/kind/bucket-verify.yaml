@@ -1,0 +1,22 @@
+# Confirms real Parquet objects reached the local lake, the same check the Compose
+# harness ends with. Runs after the dbt harness, so it is applied separately.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bucket-verify
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: duckfleet-bucket-verify}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: verify
+          image: duckfleet-s3:local
+          imagePullPolicy: Never
+          args: ['--verify']
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}

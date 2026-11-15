@@ -1,0 +1,11 @@
+# Carries /artifacts between harness runs. The restart assertions read a query id
+# the first run recorded, and the chart's emptyDir is scoped to a single pod.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: duckfleet-harness-artifacts
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: standard
+  resources:
+    requests: {storage: 1Gi}

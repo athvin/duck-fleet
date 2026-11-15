@@ -29,3 +29,23 @@ jobs:
       - name: Stop local stack
         if: always()
         run: docker compose down -v
+
+  # Runs beside the Compose harness rather than after it: this proves scheduling,
+  # probes and real cgroup limits, which Compose cannot express at all.
+  kubernetes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: bash scripts/ci/install-infra-tools.sh
+      - run: bash scripts/ci/install-kind.sh
+      - name: Kubernetes release and in-cluster dbt harness
+        run: make test-k8s
+      - name: Save cluster evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: duckfleet-kind-harness
+          path: artifacts/kind/
+          if-no-files-found: ignore
+          retention-days: 7
