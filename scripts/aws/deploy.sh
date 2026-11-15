@@ -17,5 +17,9 @@ dsn=f'host=postgres port=5432 user=duckfleet password={password}'
 print(json.dumps({'apiVersion':'v1','kind':'Secret','metadata':{'name':'duckfleet-dev','namespace':'duckfleet-dev'},'type':'Opaque','stringData':{'POSTGRES_PASSWORD':password,'DUCKFLEET_TOKEN':secrets.token_hex(32),'CATALOG_DSN':dsn+' dbname=lake','PLATFORM_DSN':dsn+' dbname=platform'}}))
 PY
 fi
+# Helm applies the release; convergence is waited for separately. `helm --wait` only
+# ever reports "context deadline exceeded", which says nothing about which pod failed
+# or why, and spends the whole timeout before saying even that.
 helm upgrade --install duckfleet infra/helm/duckfleet --kube-context "$KUBE_CONTEXT" \
-  --namespace "$NAMESPACE" -f artifacts/aws/values.json --set suspended=false --wait --timeout 15m
+  --namespace "$NAMESPACE" -f artifacts/aws/values.json --set suspended=false --timeout 5m
+python3 scripts/aws/wait-rollout.py --namespace "$NAMESPACE" --context "$KUBE_CONTEXT"
