@@ -1,0 +1,60 @@
+# A local stand-in for S3, which the chart deliberately does not own: on AWS the
+# bucket is Terraform-managed and reached with Pod Identity. Nothing here duplicates
+# anything the chart renders, so it cannot drift away from the release under test.
+apiVersion: v1
+kind: Service
+metadata:
+  name: object-store
+spec:
+  selector: {app: duckfleet-object-store}
+  ports: [{port: 9000, targetPort: 9000}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: object-store
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: duckfleet-object-store}
+  template:
+    metadata:
+      labels: {app: duckfleet-object-store}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: rustfs
+          image: rustfs/rustfs:1.0.4
+          env:
+            - {name: RUSTFS_ACCESS_KEY, value: DUCKFLEETLOCAL}
+            - {name: RUSTFS_SECRET_KEY, value: local-object-store-password}
+            - {name: RUSTFS_CONSOLE_ENABLE, value: 'false'}
+          ports: [{containerPort: 9000}]
+          resources:
+            requests: {cpu: 50m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          volumeMounts: [{name: data, mountPath: /data}]
+      volumes:
+        - name: data
+          emptyDir: {sizeLimit: 4Gi}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bucket-init
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels: {app: duckfleet-bucket-init}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: init
+          image: duckfleet-s3:local
+          imagePullPolicy: Never
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
