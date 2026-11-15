@@ -15,14 +15,17 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -33,6 +36,10 @@ struct App {
     token: Arc<str>,
     history: history::Reader,
     usage: usage::Reader,
+    /// Set once the worker has attached its catalog. The HTTP server is bound before
+    /// that happens so a slow catalog shows as not-ready rather than refusing
+    /// connections, which a probe cannot tell apart from a crashed process.
+    ready: Arc<AtomicBool>,
 }
 
 type Reply = Result<Output, ApiError>;
@@ -138,7 +145,27 @@ async fn authorize(
     }
     next.run(request).await
 }
+async fn health(State(app): State<App>) -> Response {
+    if app.ready.load(Ordering::Acquire) {
+        Json(json!({"status": "ok"})).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "starting"})),
+        )
+            .into_response()
+    }
+}
 async fn dispatch(app: App, op: Operation) -> Reply {
+    // The worker does not read its queue until the catalog is attached, so a request
+    // accepted now would wait for a reply that cannot arrive. The queue has spare
+    // capacity, so `try_send` below would accept it rather than reject it.
+    if !app.ready.load(Ordering::Acquire) {
+        return Err(ApiError::new(
+            failure::STARTING,
+            "worker is still attaching its catalog; no statement was executed",
+        ));
+    }
     let (reply, receiver) = oneshot::channel();
     // A rejected send never reached the engine, so this request may be sent again.
     app.sender
@@ -217,27 +244,35 @@ async fn main() -> anyhow::Result<()> {
     }
     let active = Arc::new(Mutex::new(None));
     let (sender, receiver) = mpsc::channel(64);
-    let (ready_tx, ready_rx) = oneshot::channel();
+    let (failed_tx, failed_rx) = oneshot::channel();
+    let ready = Arc::new(AtomicBool::new(false));
     let worker_active = active.clone();
+    let worker_ready = ready.clone();
+    // Startup waits for the catalog on a bounded budget, so reaching the error arm
+    // means waiting will not help. Hand the failure back to `main` so the exit code
+    // and the message still reflect it.
+    let startup_failure = Arc::new(Mutex::new(None));
+    let failure_slot = startup_failure.clone();
     let runtime = tokio::runtime::Handle::current();
     std::thread::Builder::new()
         .name("duckfleet-worker".into())
         .spawn(move || match worker::Worker::new(worker_active, runtime) {
             Ok(mut worker) => {
-                let _ = ready_tx.send(Ok(()));
+                worker_ready.store(true, Ordering::Release);
                 worker.run(receiver);
             }
             Err(error) => {
-                let _ = ready_tx.send(Err(error));
+                *failure_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                let _ = failed_tx.send(());
             }
         })?;
-    ready_rx.await??;
     let app = App {
         sender,
         active,
         token: token.into(),
         history: history::Reader::new(std::env::var("PLATFORM_DSN")?),
         usage: usage::Reader::new(std::env::var("PLATFORM_DSN")?),
+        ready,
     };
     let api = Router::new()
         .route("/v1/sessions", post(open))
@@ -251,16 +286,28 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/worker", get(info))
         .route_layer(middleware::from_fn_with_state(app.token.clone(), authorize));
     let router = Router::new()
-        .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
+        .route("/healthz", get(health))
         .merge(api)
         .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    tracing::info!(port = 8080, "DuckFleet local server ready");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
+    tracing::info!(
+        port = 8080,
+        "DuckFleet local server listening; worker starting"
+    );
+    tokio::select! {
+        served = axum::serve(listener, router).with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+        }) => served?,
+        // Also reached if the worker thread dies after becoming ready, which drops the
+        // sender. Serving on without an engine is worse than exiting and being replaced.
+        _ = failed_rx => {
+            return Err(startup_failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_else(|| anyhow::anyhow!("worker thread stopped unexpectedly")));
+        }
+    }
     Ok(())
 }

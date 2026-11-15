@@ -68,6 +68,20 @@ impl Redactor {
     }
 }
 
+/// Names the host a connection string points at. A hostname is not a credential, and
+/// an unreachable-catalog failure is not actionable without it.
+pub(crate) fn dsn_host(dsn: &str) -> String {
+    dsn_field(dsn, "host").unwrap_or_else(|| "unknown".into())
+}
+
+fn dsn_field(dsn: &str, wanted: &str) -> Option<String> {
+    dsn.split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .find(|(key, _)| key.eq_ignore_ascii_case(wanted))
+        .map(|(_, value)| value.trim_matches('\'').to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 /// Extracts `password` field values from a libpq keyword/value connection string.
 fn dsn_passwords(dsn: &str) -> Vec<String> {
     dsn.split_whitespace()
@@ -135,6 +149,14 @@ mod tests {
     fn a_shorter_secret_cannot_leave_part_of_a_longer_one() {
         let scrubbed = Redactor::new(["abc".to_owned(), "abcdef".to_owned()]).scrub("value=abcdef");
         assert_eq!(scrubbed, format!("value={MASK}"));
+    }
+
+    #[test]
+    fn names_the_host_without_exposing_the_rest() {
+        assert_eq!(dsn_host(DSN), "postgres");
+        assert_eq!(dsn_host("host='quoted-host' port=5432"), "quoted-host");
+        assert_eq!(dsn_host("port=5432 dbname=lake"), "unknown");
+        assert_eq!(dsn_host("host= port=5432"), "unknown");
     }
 
     #[test]

@@ -140,6 +140,16 @@ pub(crate) const CAPACITY: Failure = Failure {
     http: StatusCode::TOO_MANY_REQUESTS,
 };
 
+/// The worker has not attached its catalog yet, so the request never reached the
+/// engine. Unlike `UNAVAILABLE` there is no partial effect to reason about: nothing
+/// ran, which makes resending safe once the worker reports ready.
+pub(crate) const STARTING: Failure = Failure {
+    status: None,
+    kind: "starting",
+    retry_safe: true,
+    http: StatusCode::SERVICE_UNAVAILABLE,
+};
+
 /// A dependency failed or a worker disappeared mid-request. Whether the work
 /// committed is unknown, which is exactly when an automatic replay is unsafe.
 pub(crate) const UNAVAILABLE: Failure = Failure {
