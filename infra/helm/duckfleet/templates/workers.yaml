@@ -32,7 +32,11 @@ spec:
           securityContext:
             {{- include "duckfleet.containerSecurity" . | nindent 12 }}
           resources:
-            requests: {cpu: {{ $cpu | quote }}, memory: {{ printf "%dGi" $cpu }}, ephemeral-storage: 2Gi}
+            # The cgroup quota the worker asserts comes from the CPU *limit*, so the
+            # limit is always the exact class size. The request may sit lower to fit
+            # constrained capacity; memory stays requests == limits because memory is
+            # not compressible.
+            requests: {cpu: {{ dig $size $cpu ($.Values.workerCpuRequests | default dict) | quote }}, memory: {{ printf "%dGi" $cpu }}, ephemeral-storage: 2Gi}
             limits: {cpu: {{ $cpu | quote }}, memory: {{ printf "%dGi" $cpu }}, ephemeral-storage: 3Gi}
           env:
             - {name: DUCKFLEET_WORKER_SIZE, value: {{ $size }}}

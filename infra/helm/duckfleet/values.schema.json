@@ -33,6 +33,18 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 600
+    },
+    "workerCpuRequests": {
+      "type": "object",
+      "propertyNames": {
+        "enum": ["small", "medium"]
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {"type": "integer", "minimum": 1},
+          {"type": "string", "pattern": "^[0-9]+m$"}
+        ]
+      }
     }
   }
 }

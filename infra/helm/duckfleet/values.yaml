@@ -19,3 +19,22 @@ profiling: true
 # the startup probe budget (failureThreshold 120 at 5s). The probe, not this value,
 # is what finally replaces a pod whose catalog never appears.
 catalogWaitSeconds: 120
+
+# worker-medium cannot be placed at all today, and not because the cluster is merely
+# busy: the `app` NodePool it selects is capped to m6i/m6a large, which is 2 vCPU with
+# about 1780m allocatable, while the pod's 2-CPU request claims 2050m once daemonset
+# overhead is counted. Karpenter answers "no instance type has enough resources", so
+# it cannot even provision a node (entity-resolution-engine#1086).
+#
+# The cgroup quota the worker asserts comes from the CPU *limit*, so lowering only the
+# request brings the claim to about 1050m. That is satisfiable by a fresh m6i.large,
+# which is how worker-small gets placed, while the pod still receives a true 2-CPU
+# cgroup and the full 2Gi of memory.
+#
+# Two costs, both accepted deliberately for a development lane. The pod becomes
+# Burstable rather than Guaranteed, the shape the gateway already uses. And its 2-CPU
+# limit now exceeds what one m6i.large can actually deliver, so DuckDB's two threads
+# can be throttled: correct, but not a basis for performance measurement. #18 needs
+# real capacity, and #12 is what removes this entry.
+workerCpuRequests:
+  medium: 1
