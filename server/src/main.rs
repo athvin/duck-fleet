@@ -6,6 +6,7 @@ mod history;
 mod metering;
 mod pricing;
 mod profiling;
+mod secrets;
 mod usage;
 mod worker;
 use compute::SessionRequest;
