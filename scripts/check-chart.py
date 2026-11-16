@@ -3,9 +3,7 @@ import ipaddress
 import sys
 import yaml
 
-def cores(quantity):
-    """Kubernetes CPU quantity in cores; 'm' is the only suffix Kubernetes allows."""
-    return float(quantity[:-1]) / 1000 if quantity.endswith('m') else float(quantity)
+from worker_resources import assert_worker_resources
 
 objects = list(yaml.safe_load_all(open(sys.argv[1])))
 by_name = {(o['kind'], o['metadata']['name']): o for o in objects}
@@ -15,16 +13,9 @@ for size, cpu in [('small', 1), ('medium', 2)]:
     pod = worker['spec']['template']['spec']
     assert pod['serviceAccountName'] == 'duckfleet-worker'
     container = pod['containers'][0]
-    # The worker derives its DuckDB thread count and memory limit from the cgroup,
-    # which reflects the *limits*. Those must be exactly the class size or the worker
-    # refuses to start.
-    assert container['resources']['limits']['cpu'] == str(cpu)
-    for key in ['requests', 'limits']:
-        assert container['resources'][key]['memory'] == f'{cpu}Gi'
-    # A CPU request below the limit is allowed so a class can fit constrained
-    # capacity, but never above it and never zero: that would let a worker be
-    # scheduled onto a node that cannot give it the CPU its limit promises.
-    assert 0 < cores(container['resources']['requests']['cpu']) <= cpu
+    # The same rule the deploy verification applies to live pods, so the rendered
+    # release and what actually runs cannot disagree about what is legal.
+    assert_worker_resources(container['resources'], cpu, f'rendered worker-{size}')
     env = {e['name']:e.get('value') for e in container['env']}
     assert env['S3_AUTH_MODE'] == 'pod_identity'
     assert env['AWS_EC2_METADATA_DISABLED'] == 'true'

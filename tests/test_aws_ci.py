@@ -21,6 +21,7 @@ def load(name, path):
 guard = load('plan_guard', 'scripts/aws/plan_guard.py')
 rollout = load('wait_rollout', 'scripts/aws/wait-rollout.py')
 dns = load('check_dns_egress', 'scripts/aws/check-dns-egress.py')
+resources = load('worker_resources', 'scripts/worker_resources.py')
 
 def pod(name, uid, unschedulable=None):
     conditions = []
@@ -219,6 +220,56 @@ else:
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('must match the runner', result.stderr)
             self.assertFalse(marker.exists())
+
+class WorkerResourceRuleTests(unittest.TestCase):
+    """One rule, shared by the chart check and the live-pod verification.
+
+    These were separate copies. #22 relaxed `requests == limits` so a class could be
+    scheduled on capped capacity and only the chart copy was updated; the live-pod
+    copy stayed broken and unnoticed because no deploy had reached it.
+    """
+
+    def spec(self, cpu, request=None, memory=None):
+        return {'requests': {'cpu': request or str(cpu), 'memory': memory or f'{cpu}Gi'},
+                'limits': {'cpu': str(cpu), 'memory': memory or f'{cpu}Gi'}}
+
+    def test_a_request_below_its_limit_is_allowed(self):
+        # Exactly what worker-medium deploys as, and why it can be scheduled at all.
+        resources.assert_worker_resources(self.spec(2, request='1'), 2, 'test')
+        resources.assert_worker_resources(self.spec(2, request='500m'), 2, 'test')
+        resources.assert_worker_resources(self.spec(1), 1, 'test')
+
+    def test_a_request_above_its_limit_is_rejected(self):
+        for request in ['3', '2500m']:
+            with self.assertRaises(AssertionError):
+                resources.assert_worker_resources(self.spec(2, request=request), 2, 'test')
+
+    def test_a_zero_request_is_rejected(self):
+        with self.assertRaises(AssertionError):
+            resources.assert_worker_resources(self.spec(2, request='0'), 2, 'test')
+
+    def test_the_cpu_limit_must_be_exactly_the_class_size(self):
+        # The cgroup quota the worker asserts is derived from the limit.
+        wrong = self.spec(2)
+        wrong['limits']['cpu'] = '4'
+        with self.assertRaises(AssertionError):
+            resources.assert_worker_resources(wrong, 2, 'test')
+
+    def test_memory_must_match_on_both_because_it_is_not_compressible(self):
+        for kind in ['requests', 'limits']:
+            wrong = self.spec(2)
+            wrong[kind]['memory'] = '1Gi'
+            with self.assertRaises(AssertionError):
+                resources.assert_worker_resources(wrong, 2, 'test')
+
+    def test_both_callers_use_the_shared_rule(self):
+        # Built in pieces so this does not match its own source.
+        call = 'assert_worker' + '_resources('
+        for script in ['scripts/check-chart.py', 'scripts/aws/verify.py']:
+            source = (ROOT/script).read_text()
+            self.assertIn(call, source, f'{script} must use the shared rule')
+            self.assertNotIn("for kind in ['requests', 'limits']:\n        assert "
+                             "container['resources'][kind]['cpu']", source)
 
 class DnsEgressTests(unittest.TestCase):
     """The policy must permit whatever address pods actually resolve against.
