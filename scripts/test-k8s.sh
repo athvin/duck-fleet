@@ -12,6 +12,9 @@ NS=duckfleet-dev
 CONTEXT="kind-$CLUSTER"
 KUBE=(kubectl --context "$CONTEXT" -n "$NS")
 REGISTRY=797781631727.dkr.ecr.us-east-2.amazonaws.com/duckfleet-dev
+# Pinned like every other dependency here; a floating CNI would change what
+# enforcement means between runs.
+CALICO_VERSION=${CALICO_VERSION:-v3.30.4}
 work=$(mktemp -d)
 mkdir -p artifacts/kind
 
@@ -34,7 +37,18 @@ cleanup() {
 trap cleanup EXIT
 
 kind delete cluster --name "$CLUSTER" > /dev/null 2>&1 || true
-kind create cluster --name "$CLUSTER" --wait 120s
+# No --wait: with the default CNI disabled the nodes stay NotReady until one is
+# installed, so readiness is waited for after Calico below.
+kind create cluster --name "$CLUSTER" --config infra/kind/cluster.yaml
+# An enforcing CNI, pinned. kind's default ignores NetworkPolicy entirely, which made
+# the local suite reassuring rather than silent about isolation and let #30 reach six
+# consecutive AWS deploys. The added setup time is reported because this runs on every
+# pull request.
+cni_started=$SECONDS
+kubectl --context "$CONTEXT" apply -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
+kubectl --context "$CONTEXT" -n kube-system rollout status daemonset/calico-node --timeout=300s
+kubectl --context "$CONTEXT" wait --for=condition=Ready nodes --all --timeout=300s
+printf 'enforcing CNI (calico %s) ready in %ss\n' "$CALICO_VERSION" "$((SECONDS - cni_started))"
 
 # Built locally and loaded into the node; localize.py rewrites the chart's ECR
 # digests to these tags with imagePullPolicy Never, so nothing is ever pulled.
@@ -75,9 +89,20 @@ render() {
 # deploy if that ever becomes possible — so this cluster, which we own outright, is
 # where the feature is actually exercised. The API server is reachable at the default
 # service address in kind.
+# The API server's endpoint, read from the cluster rather than assumed. Egress policy
+# is matched after kube-proxy rewrites the destination, so permitting the Service's
+# ClusterIP on 443 matches nothing: on kind the traffic arrives at the node's address
+# on 6443. Assuming otherwise is what denied the gateway on the first run with an
+# enforcing CNI, and would have denied it on EKS too.
+api_address=$(kubectl --context "$CONTEXT" -n default get endpoints kubernetes \
+  -o jsonpath='{.subsets[0].addresses[0].ip}')
+api_port=$(kubectl --context "$CONTEXT" -n default get endpoints kubernetes \
+  -o jsonpath='{.subsets[0].ports[0].port}')
+printf 'API server endpoint: %s:%s\n' "$api_address" "$api_port"
 render --no-hooks \
   --set isolatedCompute.enabled=true \
-  --set 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32' \
+  --set "isolatedCompute.apiServerCidrs[0]=$api_address/32" \
+  --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
   | python3 scripts/kind/localize.py \
   --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod \
@@ -93,6 +118,14 @@ done
 
 python3 scripts/kind/assert_limits.py --context "$CONTEXT" --namespace "$NS" \
   | tee artifacts/kind/worker-limits.jsonl
+
+# Isolation, actually enforced. Runs before the dbt harness because a cluster that
+# cannot resolve DNS or reach PostgreSQL would fail there in a way that looks like an
+# application problem — and because every pod above reaching ready is itself the proof
+# that the permitted paths work.
+python3 scripts/kind/check_networkpolicy.py --context "$CONTEXT" --namespace "$NS" \
+  --image duckfleet-worker:local --release "$work/release.yaml" \
+  --evidence artifacts/kind/networkpolicy.json
 
 # Runs the chart's own Job spec, re-pointed at the shared harness. The AWS harness it
 # normally runs additionally asserts the real development bucket, which cannot be

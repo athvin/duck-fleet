@@ -1,0 +1,17 @@
+# A local cluster whose CNI actually enforces NetworkPolicy.
+#
+# kind's default CNI ignores NetworkPolicy entirely: the objects apply, look correct,
+# and nothing is enforced. That is the worst shape for a test gap, and #30 is what it
+# cost — the chart permitted DNS egress only to pods that do not exist on EKS Auto
+# Mode, six consecutive deploys failed on it, and the local harness passed happily
+# throughout because the policy was inert. The harness was not silent about isolation,
+# it was reassuring about it.
+#
+# With the default CNI disabled, nodes stay NotReady until one is installed, so the
+# harness creates this cluster without waiting and waits after installing Calico.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+  # Left at kind's default. Calico reads the kubeadm pod CIDR, so there is nothing to
+  # keep in step here; pinning it in both places would only create a way to disagree.

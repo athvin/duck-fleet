@@ -12,6 +12,9 @@ with `compute_unavailable` and no statement runs. See #39.
 {{- if not .Values.isolatedCompute.apiServerCidrs }}
 {{- fail "isolatedCompute.enabled requires apiServerCidrs: the gateway cannot reach the Kubernetes API, and leaving it unset would open egress rather than fail" }}
 {{- end }}
+{{- if not .Values.isolatedCompute.apiServerPorts }}
+{{- fail "isolatedCompute.enabled requires apiServerPorts: the API server's endpoint port is not always 443, and an empty list would render a rule matching every port" }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -54,13 +57,24 @@ spec:
     matchLabels: {app: duckfleet-gateway}
   policyTypes: [Egress]
   egress:
-    # Only the gateway, only the API server, only HTTPS. The blanket isolation policy
-    # denies this otherwise, which would present as a timeout rather than a denial.
+    # Only the gateway, and only the API server. The blanket isolation policy denies
+    # this otherwise, which presents as a timeout rather than a denial.
+    #
+    # These must describe the API server's *endpoints*, not its Service address. Egress
+    # policy is evaluated after kube-proxy has rewritten the destination, so traffic a
+    # pod sends to the ClusterIP on 443 is matched against the endpoint address and
+    # port — on kind, 6443 at the node's address. A rule written against the ClusterIP
+    # matches nothing and denies the gateway, which is why the port is configured here
+    # rather than fixed at 443, and why a preflight asserts the configured values
+    # actually cover the cluster's endpoints.
     - to:
         {{- range .Values.isolatedCompute.apiServerCidrs }}
         - ipBlock: {cidr: {{ . | quote }}}
         {{- end }}
-      ports: [{port: 443}]
+      ports:
+        {{- range .Values.isolatedCompute.apiServerPorts }}
+        - {port: {{ . }}}
+        {{- end }}
 ---
 apiVersion: v1
 kind: ConfigMap

@@ -226,6 +226,32 @@ class RolloutWaitTests(unittest.TestCase):
         # And it must check the account before touching anything.
         self.assertLess(bootstrap.index('get-caller-identity'), bootstrap.index('create-bucket'))
 
+    def test_api_egress_must_cover_the_endpoint_not_the_service(self):
+        """The rule shipped in #9 matched neither half of the real destination.
+
+        Egress policy is evaluated after kube-proxy rewrites the destination, so
+        traffic a pod sends to the API server's ClusterIP on 443 arrives at an
+        endpoint address on that endpoint's port. The first local run with an
+        enforcing CNI denied the gateway because the rule named the ClusterIP.
+        """
+        egress = load('check_api_egress', 'scripts/aws/check-api-egress.py')
+        # kind: the node's address on 6443, which the ClusterIP rule misses entirely.
+        endpoint = [('172.20.0.4', 6443)]
+        self.assertEqual(
+            egress.uncovered(endpoint, ['10.96.0.1/32'], [443]), ['172.20.0.4:6443'],
+            'a rule naming the Service address must be reported as covering nothing')
+        self.assertEqual(egress.uncovered(endpoint, ['172.20.0.0/16'], [6443]), [])
+        # Right address, wrong port is still denied, and has to be reported as such.
+        self.assertEqual(egress.uncovered(endpoint, ['172.20.0.0/16'], [443]),
+                         ['172.20.0.4:6443'])
+        # EKS: endpoints are ENIs in the VPC, on 443.
+        self.assertEqual(egress.uncovered([('10.42.3.17', 443)], ['10.42.0.0/16'], [443]), [])
+        self.assertEqual(egress.uncovered([('10.42.3.17', 443)], ['172.20.0.1/32'], [443]),
+                         ['10.42.3.17:443'])
+        # Every endpoint must be covered, not just one of them.
+        pair = [('10.42.3.17', 443), ('10.42.9.4', 443)]
+        self.assertEqual(egress.uncovered(pair, ['10.42.3.0/24'], [443]), ['10.42.9.4:443'])
+
     def test_the_cluster_is_not_applied_by_ci(self):
         """Adding a cluster must not widen what an automated apply can create.
 
