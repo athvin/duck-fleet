@@ -3,10 +3,11 @@ terraform {
   required_providers {
     aws = { source = "hashicorp/aws", version = "~> 6.0" }
   }
+  # Partial configuration: the bucket, key and region come from
+  # scripts/aws/target.env by way of -backend-config, so the state location is named
+  # in the same one place as the rest of the deploy target. Terraform backends cannot
+  # read variables, which is why this is supplied at init rather than declared here.
   backend "s3" {
-    bucket               = "er-terraform-state-797781631727"
-    key                  = "duckfleet/dev.tfstate"
-    region               = "us-east-2"
     encrypt              = true
     use_lockfile         = true
     workspace_key_prefix = "duckfleet/workspaces"

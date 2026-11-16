@@ -10,7 +10,10 @@ assert_account
 export TF_WORKSPACE=default
 plan=$(mktemp)
 trap 'rm -f "$plan"' EXIT
-terraform -chdir=infra/terraform/dev init -input=false
+terraform -chdir=infra/terraform/dev init -input=false \
+  -backend-config="bucket=$DUCKFLEET_STATE_BUCKET" \
+  -backend-config="key=$DUCKFLEET_STATE_KEY" \
+  -backend-config="region=$DUCKFLEET_REGION"
 terraform -chdir=infra/terraform/dev plan -input=false -lock-timeout=5m -out="$plan"
 terraform -chdir=infra/terraform/dev show -json "$plan" | python3 scripts/aws/plan_guard.py
 terraform -chdir=infra/terraform/dev apply -input=false -lock-timeout=5m "$plan"

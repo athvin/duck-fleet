@@ -5,6 +5,7 @@ import os
 import tempfile
 import fnmatch
 import subprocess
+import re
 import unittest
 from pathlib import Path
 import yaml
@@ -173,20 +174,18 @@ class RolloutWaitTests(unittest.TestCase):
         self.assertIn('wait-rollout.py', commands)
 
     def test_the_deploy_target_is_named_in_one_place(self):
-        """The entity-resolution cluster may be referred to only where it is configured.
+        """Entity-resolution resources may be named only where the target is configured.
 
-        It is still where this deploys, but it used to be named in a script, a
-        workflow three times, a deploy step and a runbook — so moving the target meant
-        finding all of them, and missing one would have deployed somewhere unintended.
+        They are still what this deploys to, but the cluster used to be named in a
+        script, a workflow three times, a deploy step and a runbook, so moving the
+        target meant finding all of them and missing one would have deployed somewhere
+        unintended. The state bucket was a second, quieter instance of the same thing.
         """
-        allowed = {
-            # The one place the target is configured.
-            "scripts/aws/target.env",
-            # The Terraform state bucket, which is still an entity-resolution bucket.
-            # Moving it needs a new bucket and a state migration, which require AWS
-            # write access; tracked on #12 rather than hidden by this gate.
-            "infra/terraform/dev/main.tf",
-        }
+        # Every entity-resolution resource this repository points at, not just the
+        # cluster: an earlier version of this test matched only "er-dev" while listing
+        # main.tf as an exception for naming the state bucket, which "er-dev" never
+        # matched. The exception was inert and the comment was wrong.
+        borrowed = ["er-dev", "er-platform", "er-prod", "er-terraform-state"]
         searched = [path
                     for pattern in ["scripts/**/*", ".github/workflows/*",
                                     "infra/terraform/**/*.tf", "infra/helm/**/*"]
@@ -194,11 +193,38 @@ class RolloutWaitTests(unittest.TestCase):
         # A gate over an empty set would pass while proving nothing.
         self.assertGreater(len(searched), 20, "nothing was searched")
         offenders = sorted(
-            str(path.relative_to(ROOT)) for path in searched
-            if str(path.relative_to(ROOT)) not in allowed
-            and "er-dev" in path.read_text(errors="ignore")
+            f"{path.relative_to(ROOT)}: {name}"
+            for path in searched for name in borrowed
+            if path.relative_to(ROOT).as_posix() != "scripts/aws/target.env"
+            and name in path.read_text(errors="ignore")
         )
         self.assertEqual(offenders, [], "name the target in scripts/aws/target.env instead")
+
+    def test_terraform_state_location_comes_from_the_target(self):
+        """The backend must not pin a bucket the target configuration also names.
+
+        Two declarations plus a test keeping them equal is the shape that produced
+        the duplicated resource rule behind #34; one declaration has nothing to drift.
+        """
+        backend = (ROOT/'infra/terraform/dev/main.tf').read_text()
+        backend = backend[backend.index('backend "s3"'):]
+        backend = backend[:backend.index('}')]
+        # Matched as assignments rather than substrings: `workspace_key_prefix`
+        # legitimately stays here and contains "key".
+        pinned = re.findall(r"^\s*(bucket|key|region)\s*=", backend, re.M)
+        self.assertEqual(pinned, [],
+                         "these belong in target.env, supplied via -backend-config")
+        apply = (ROOT/'scripts/aws/apply.sh').read_text()
+        for supplied in ["bucket=$DUCKFLEET_STATE_BUCKET", "key=$DUCKFLEET_STATE_KEY",
+                         "region=$DUCKFLEET_REGION"]:
+            self.assertIn(supplied, apply)
+
+    def test_the_state_bootstrap_refuses_a_bucket_we_do_not_own(self):
+        """A mistyped override must not apply a bucket policy to someone else's bucket."""
+        bootstrap = (ROOT/'scripts/aws/bootstrap-state.sh').read_text()
+        self.assertIn('== duckfleet-*', bootstrap)
+        # And it must check the account before touching anything.
+        self.assertLess(bootstrap.index('get-caller-identity'), bootstrap.index('create-bucket'))
 
     def test_verification_counts_only_persistent_workers(self):
         verify = (ROOT/'scripts/aws/verify.py').read_text()

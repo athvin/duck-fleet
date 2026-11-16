@@ -27,7 +27,7 @@ access and a decision about recurring cost.
 
 | Boundary | DuckFleet resource |
 | --- | --- |
-| Terraform state | `s3://er-terraform-state-797781631727/duckfleet/dev.tfstate` with S3 locking |
+| Terraform state | the bucket and key named in `scripts/aws/target.env`, with S3 locking |
 | Kubernetes | `duckfleet-dev`, restricted Pod Security, resource quota |
 | Object storage | `duckfleet-dev-797781631727-us-east-2`, private, TLS, encryption, versioning |
 | Worker IAM | `duckfleet-dev-worker`, one Pod Identity association for `duckfleet-dev/duckfleet-worker` |
@@ -41,6 +41,35 @@ whole model lifecycles to these workers. They may share an EC2 node. This does
 **not** test dynamic EC2 instance creation, dedicated nodes, or 32 CPU workers.
 PostgreSQL is separate from ER's Aurora databases for this disposable experiment.
 This is not a production database/backup/HA design.
+
+## Move Terraform state to a bucket DuckFleet owns
+
+State currently lives under a key inside an entity-resolution bucket. The location is
+configuration now (`DUCKFLEET_STATE_BUCKET`, `DUCKFLEET_STATE_KEY`), and the Terraform
+backend takes it through `-backend-config` rather than pinning it, so the bucket is
+named in the same one place as the rest of the target.
+
+Terraform cannot create the bucket that holds its own state, so this is the one piece
+of infrastructure outside Terraform. It holds state and nothing else.
+
+```sh
+# 1. Create it. Idempotent, and refuses any bucket not named duckfleet-*.
+DUCKFLEET_STATE_BUCKET=duckfleet-terraform-state-797781631727 \
+  bash scripts/aws/bootstrap-state.sh
+
+# 2. Copy the state across. Prompts, leaves the old copy untouched, and verifies the
+#    resource count matches before reporting success.
+DUCKFLEET_STATE_BUCKET=duckfleet-terraform-state-797781631727 \
+  bash scripts/aws/migrate-state.sh
+
+# 3. Change the default in scripts/aws/target.env and open a pull request.
+```
+
+The order matters and is why nothing ends up half-moved: CI reads the same
+`target.env`, so until step 3 merges, CI keeps initialising against the old bucket
+while the new one sits ready. If step 2 is skipped, step 3's first apply would
+initialise an empty state and plan to create resources that already exist — which the
+plan guard rejects, but the clearer protection is simply not to reorder these.
 
 ## Checks without AWS
 
