@@ -172,6 +172,34 @@ class RolloutWaitTests(unittest.TestCase):
         self.assertNotIn('--wait', commands)
         self.assertIn('wait-rollout.py', commands)
 
+    def test_the_deploy_target_is_named_in_one_place(self):
+        """The entity-resolution cluster may be referred to only where it is configured.
+
+        It is still where this deploys, but it used to be named in a script, a
+        workflow three times, a deploy step and a runbook — so moving the target meant
+        finding all of them, and missing one would have deployed somewhere unintended.
+        """
+        allowed = {
+            # The one place the target is configured.
+            "scripts/aws/target.env",
+            # The Terraform state bucket, which is still an entity-resolution bucket.
+            # Moving it needs a new bucket and a state migration, which require AWS
+            # write access; tracked on #12 rather than hidden by this gate.
+            "infra/terraform/dev/main.tf",
+        }
+        searched = [path
+                    for pattern in ["scripts/**/*", ".github/workflows/*",
+                                    "infra/terraform/**/*.tf", "infra/helm/**/*"]
+                    for path in ROOT.glob(pattern) if path.is_file()]
+        # A gate over an empty set would pass while proving nothing.
+        self.assertGreater(len(searched), 20, "nothing was searched")
+        offenders = sorted(
+            str(path.relative_to(ROOT)) for path in searched
+            if str(path.relative_to(ROOT)) not in allowed
+            and "er-dev" in path.read_text(errors="ignore")
+        )
+        self.assertEqual(offenders, [], "name the target in scripts/aws/target.env instead")
+
     def test_verification_counts_only_persistent_workers(self):
         verify = (ROOT/'scripts/aws/verify.py').read_text()
         # A session pod carries `app: duckfleet-worker` so the worker NetworkPolicy
