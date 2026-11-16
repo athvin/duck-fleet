@@ -1,6 +1,10 @@
 """Cross-check API/model evidence against independently observed Kubernetes pods."""
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from worker_resources import assert_worker_resources  # noqa: E402
 
 root = Path('artifacts/aws')
 records = [line.removeprefix('DUCKFLEET_AWS_EVIDENCE=') for line in (root/'harness.log').read_text().splitlines() if line.startswith('DUCKFLEET_AWS_EVIDENCE=')]
@@ -23,9 +27,9 @@ for pod in workers:
     assert pod['status']['phase'] == 'Running'
     assert pod['spec']['serviceAccountName'] == 'duckfleet-worker'
     container = next(c for c in pod['spec']['containers'] if c['name'] == 'worker')
-    for kind in ['requests', 'limits']:
-        assert container['resources'][kind]['cpu'] == str(cpu)
-        assert container['resources'][kind]['memory'] == f'{cpu}Gi'
+    # The same rule the chart check applies to the rendered release, so what is legal
+    # on a live pod cannot drift from what is legal in the chart.
+    assert_worker_resources(container['resources'], cpu, f'pod {pod["metadata"]["name"]}')
     observed = next(w for w in evidence['workers'] if w['worker_id'] == size)
     assert observed['cgroup_memory_max'] == cpu * 1024**3
     assert observed['cgroup_cpu_quota'] == cpu * observed['cgroup_cpu_period']
