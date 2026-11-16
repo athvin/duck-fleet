@@ -60,12 +60,20 @@ impl Filter {
         {
             return Err(ApiError::bad("unknown failure kind"));
         }
-        if self
-            .worker_id
-            .as_deref()
-            .is_some_and(|s| !["small", "medium"].contains(&s))
-        {
-            return Err(ApiError::bad("unknown worker"));
+        // A format check, not an allowlist: worker identities are deployment
+        // configuration now, so naming one that does not exist is an empty page
+        // rather than a bad request. Shape is still bounded, since this reaches a
+        // query parameter.
+        if self.worker_id.as_deref().is_some_and(|id| {
+            id.is_empty()
+                || id.len() > 63
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        }) {
+            return Err(ApiError::bad(
+                "worker_id must be 1-63 characters of letters, digits, dashes or underscores",
+            ));
         }
         if [&self.model_id, &self.invocation_id, &self.model_run_id]
             .iter()
@@ -196,7 +204,10 @@ mod tests {
             json!({"limit":501}),
             json!({"before":0}),
             json!({"status":"made_up"}),
-            json!({"worker_id":"huge"}),
+            // Shape, not membership: a worker that does not exist is an empty page.
+            json!({"worker_id":""}),
+            json!({"worker_id":"has spaces"}),
+            json!({"worker_id":"a'b"}),
             json!({"model_id":""}),
             json!({"failure_kind":"made_up"}),
             // Rejection kinds never reach a history record, so they cannot be filtered.

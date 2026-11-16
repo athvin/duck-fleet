@@ -16,6 +16,15 @@ for size, cpu in [('small', 1), ('medium', 2)]:
     # The same rule the deploy verification applies to live pods, so the rendered
     # release and what actually runs cannot disagree about what is legal.
     assert_worker_resources(container['resources'], cpu, f'rendered worker-{size}')
+    # The worker checks its cgroup against this declaration and refuses to start on a
+    # mismatch, so the declaration must match the limits the chart actually renders.
+    # Checked here too, because a drift between them would fail at deploy time rather
+    # than at render time.
+    declared = {e['name']: e.get('value') for e in container['env']}
+    assert declared['DUCKFLEET_WORKER_CPU'] == str(cpu), declared['DUCKFLEET_WORKER_CPU']
+    assert declared['DUCKFLEET_WORKER_MEMORY'] == f'{cpu}Gi', declared['DUCKFLEET_WORKER_MEMORY']
+    assert declared['DUCKFLEET_WORKER_CPU'] == container['resources']['limits']['cpu']
+    assert declared['DUCKFLEET_WORKER_MEMORY'] == container['resources']['limits']['memory']
     env = {e['name']:e.get('value') for e in container['env']}
     assert env['S3_AUTH_MODE'] == 'pod_identity'
     assert env['AWS_EC2_METADATA_DISABLED'] == 'true'

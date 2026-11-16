@@ -1,7 +1,7 @@
 //! Pins each session to one configured worker. It never retries or reroutes SQL.
 use crate::{
     ApiError, authorize,
-    compute::{SessionRequest, Size},
+    compute::{Resources, SessionRequest},
     failure,
 };
 use axum::{
@@ -38,8 +38,8 @@ struct WorkerInfo {
     memory_bytes: u64,
 }
 impl WorkerInfo {
-    fn serves(&self, size: Size) -> bool {
-        self.cpu == size.cpu() && self.memory_bytes == size.memory_bytes()
+    fn serves(&self, wanted: Resources) -> bool {
+        self.cpu == wanted.cpu && self.memory_bytes == wanted.memory_bytes
     }
 }
 
@@ -123,7 +123,7 @@ impl Gateway {
     /// the catalog wait removed. A miss refreshes once, so a worker that was still
     /// starting when the table was built is not reported as a class that does not
     /// exist.
-    async fn endpoint_for(&self, size: Size) -> Result<String, ApiError> {
+    async fn endpoint_for(&self, wanted: Resources) -> Result<String, ApiError> {
         const FRESH: Duration = Duration::from_secs(30);
         let cached = {
             let fleet = self.fleet.lock().await;
@@ -132,13 +132,13 @@ impl Gateway {
                 .filter(|f| f.discovered.elapsed() < FRESH && f.unreachable.is_empty())
         };
         if let Some(fleet) = cached
-            && let Some(worker) = fleet.workers.iter().find(|w| w.serves(size))
+            && let Some(worker) = fleet.workers.iter().find(|w| w.serves(wanted))
         {
             return Ok(worker.endpoint.clone());
         }
         let fleet = self.discover().await;
         *self.fleet.lock().await = Some(fleet.clone());
-        if let Some(worker) = fleet.workers.iter().find(|w| w.serves(size)) {
+        if let Some(worker) = fleet.workers.iter().find(|w| w.serves(wanted)) {
             return Ok(worker.endpoint.clone());
         }
         // Never falls back to a different size. Which failure it is matters: a
@@ -147,19 +147,23 @@ impl Gateway {
             ApiError::new(
                 failure::UNAVAILABLE,
                 format!(
-                    "no worker provides cpu={}, memory={}Gi; this deployment runs {:?}",
-                    size.cpu(),
-                    size.cpu(),
-                    fleet.workers.iter().map(|w| w.cpu).collect::<Vec<_>>()
+                    "no worker provides cpu={}, memory={}; this deployment runs {:?}",
+                    wanted.cpu,
+                    wanted.memory(),
+                    fleet
+                        .workers
+                        .iter()
+                        .map(|w| format!("cpu={} memory_bytes={}", w.cpu, w.memory_bytes))
+                        .collect::<Vec<_>>()
                 ),
             )
         } else {
             ApiError::new(
                 failure::UNAVAILABLE,
                 format!(
-                    "a worker serving cpu={}, memory={}Gi is not reachable; no statement ran",
-                    size.cpu(),
-                    size.cpu()
+                    "a worker serving cpu={}, memory={} is not reachable; no statement ran",
+                    wanted.cpu,
+                    wanted.memory()
                 ),
             )
         })
@@ -210,8 +214,7 @@ async fn open(
 ) -> Result<Response, ApiError> {
     let mut request = request.map(|Json(r)| r).unwrap_or_default();
     let placement = request.validate()?;
-    let size = placement.size;
-    request.compute = size.request();
+    request.compute = placement.resources.request();
     app.routes
         .lock()
         .await
@@ -221,7 +224,7 @@ async fn open(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::new(failure::CAPACITY, "gateway session limit reached"))?;
-    let endpoint = app.endpoint_for(size).await?;
+    let endpoint = app.endpoint_for(placement.resources).await?;
     let body = serde_json::to_vec(&request).map_err(|_| ApiError::internal())?;
     let upstream = app
         .send(&endpoint, Method::POST, "/v1/sessions", body.into())

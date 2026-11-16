@@ -22,6 +22,17 @@ if docker compose run --rm --no-deps -T \
   echo 'worker booted despite an unresolvable catalog host' >&2
   exit 1
 fi
+# Configuration that disagrees with the container must stop the worker. Serving a
+# size nobody configured would look like a correct placement in history and bill as
+# the size the caller asked for, so it is refused rather than reported.
+if docker compose run --rm --no-deps -T -e DUCKFLEET_WORKER_CPU=4 \
+  worker-small > artifacts/worker-misconfigured.log 2>&1; then
+  echo 'worker started with container limits that do not match its configuration' >&2
+  exit 1
+fi
+grep -q 'do not match the configured' artifacts/worker-misconfigured.log
+grep -q 'cpu: 1' artifacts/worker-misconfigured.log
+grep -q 'cpu: 4' artifacts/worker-misconfigured.log
 grep -q 'attaching the DuckLake catalog' artifacts/worker-boot-failure.log
 grep -q 'still unreachable' artifacts/worker-boot-failure.log
 grep -q 'catalog-does-not-resolve' artifacts/worker-boot-failure.log
