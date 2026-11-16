@@ -1,6 +1,6 @@
 use crate::{
     ApiError, Envelope, Operation, Output, QueryRequest, Reply,
-    compute::Size,
+    compute::{Mode, Placement, Size},
     failure, metering,
     secrets::{Redactor, Startup},
 };
@@ -48,6 +48,10 @@ struct Session {
     profile: crate::profiling::Profile,
     touched: Instant,
     context: Value,
+    /// What the caller asked for, resolved once when the session opened. Billing
+    /// reads this rather than the worker's own class, so a future placement that
+    /// exceeds the request cannot quietly start charging for the provision.
+    placement: Placement,
 }
 pub(crate) struct Worker {
     root: Connection,
@@ -163,7 +167,13 @@ impl Worker {
             "medium" => Size::Medium,
             _ => anyhow::bail!("unknown worker size"),
         };
-        let mut placement = size.placement();
+        // A worker only ever serves the persistent tier; an isolated request is
+        // refused by the contract before it reaches one.
+        let mut placement = Placement {
+            mode: Mode::Persistent,
+            size,
+        }
+        .describe();
         let memory_max: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.max")?
             .trim()
             .parse()?;
@@ -334,7 +344,10 @@ impl Worker {
         match op {
             Operation::Info => Ok(Output::Json(self.placement.clone())),
             Operation::Open(mut request) => {
-                if request.validate()? != self.size {
+                // The gateway already routed by mode and size; this is the worker
+                // refusing to serve a placement that is not its own.
+                let placement = request.validate()?;
+                if placement.size != self.size {
                     return Err(ApiError::bad("request does not match this worker size"));
                 }
                 request.context["requested_compute"] =
@@ -355,6 +368,7 @@ impl Worker {
                         profile,
                         touched: Instant::now(),
                         context: request.context,
+                        placement,
                     },
                 );
                 Ok(Output::Json(
@@ -375,6 +389,9 @@ impl Worker {
             .get_mut(&id)
             .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
         session.touched = Instant::now();
+        // Read before the ledger is borrowed: billing follows the session's resolved
+        // request, not the class of whatever worker served it.
+        let billable_units = session.placement.units();
         let parameters = req
             .parameters
             .iter()
@@ -403,7 +420,7 @@ impl Worker {
         let admission = match metering::admit(
             &mut self.ledger,
             &query_id,
-            self.size.units(),
+            billable_units,
             req.timeout_seconds,
             self.size.name(),
         ) {
