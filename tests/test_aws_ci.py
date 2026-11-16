@@ -1,5 +1,6 @@
 """Safety regressions for the live deployment lane; no AWS calls."""
 import importlib.util
+import ipaddress
 import os
 import tempfile
 import fnmatch
@@ -9,6 +10,8 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+IMAGE = ('797781631727.dkr.ecr.us-east-2.amazonaws.com/duckfleet-dev/{kind}@sha256:'
+         + 'a'*64)
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, ROOT/path)
     module = importlib.util.module_from_spec(spec)
@@ -17,6 +20,7 @@ def load(name, path):
 
 guard = load('plan_guard', 'scripts/aws/plan_guard.py')
 rollout = load('wait_rollout', 'scripts/aws/wait-rollout.py')
+dns = load('check_dns_egress', 'scripts/aws/check-dns-egress.py')
 
 def pod(name, uid, unschedulable=None):
     conditions = []
@@ -215,6 +219,65 @@ else:
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('must match the runner', result.stderr)
             self.assertFalse(marker.exists())
+
+class DnsEgressTests(unittest.TestCase):
+    """The policy must permit whatever address pods actually resolve against.
+
+    A selector-only rule matched nothing on EKS Auto Mode and denied DNS outright,
+    which presented as an unreachable catalog across six deploys.
+    """
+
+    def test_resolver_is_the_tenth_address_of_the_service_cidr(self):
+        for cidr, expected in [('172.20.0.0/16', '172.20.0.10'),
+                               ('10.100.0.0/16', '10.100.0.10')]:
+            network = ipaddress.ip_network(cidr)
+            self.assertEqual(str(dns.resolver_address(network)), expected)
+
+    def test_the_shipped_ranges_cover_the_dev_cluster_resolver(self):
+        ranges = dns.configured_ranges(ROOT/'infra/helm/duckfleet/values.yaml')
+        resolver = dns.resolver_address(ipaddress.ip_network('172.20.0.0/16'))
+        self.assertTrue(dns.covering_ranges(resolver, ranges),
+                        f'{resolver} not covered by {[str(e) for e in ranges]}')
+
+    def test_ranges_that_miss_the_resolver_are_detected(self):
+        # The exact mistake that cost six deploys: a rule that cannot reach DNS.
+        resolver = dns.resolver_address(ipaddress.ip_network('172.20.0.0/16'))
+        near_miss = [ipaddress.ip_network('10.0.0.0/16'),
+                     ipaddress.ip_network('172.21.0.0/16')]
+        self.assertEqual(dns.covering_ranges(resolver, near_miss), [])
+
+    def test_every_configured_range_stays_private(self):
+        # Port 53 to a public range would let a SQL engine resolve externally.
+        for entry in dns.configured_ranges(ROOT/'infra/helm/duckfleet/values.yaml'):
+            self.assertTrue(entry.is_private, entry)
+
+    def test_missing_configuration_is_rejected_not_defaulted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            empty = Path(directory)/'values.yaml'
+            empty.write_text('profiling: true\n')
+            with self.assertRaises(SystemExit):
+                dns.configured_ranges(empty)
+
+    def test_the_policy_permits_dns_by_address_and_only_on_port_53(self):
+        rendered = subprocess.run(
+            ['helm', 'template', 'duckfleet', str(ROOT/'infra/helm/duckfleet'),
+             '--namespace', 'duckfleet-dev',
+             '--set', f'workerImage={IMAGE.format(kind="worker")}',
+             '--set', f'dbtImage={IMAGE.format(kind="dbt")}'],
+            check=True, capture_output=True, text=True).stdout
+        isolation = next(doc['spec'] for doc in yaml.safe_load_all(rendered)
+                         if doc and doc['kind'] == 'NetworkPolicy'
+                         and doc['metadata']['name'] == 'duckfleet-isolation')
+        dns_rules = [rule for rule in isolation['egress']
+                     if any(p.get('port') == 53 for p in rule.get('ports', []))]
+        self.assertTrue(dns_rules)
+        blocks = [peer['ipBlock']['cidr'] for rule in dns_rules
+                  for peer in rule['to'] if 'ipBlock' in peer]
+        self.assertTrue(blocks, 'a selector alone matches nothing on EKS Auto Mode')
+        for rule in dns_rules:
+            self.assertEqual({p['port'] for p in rule['ports']}, {53}, rule)
+        for cidr in blocks:
+            self.assertTrue(ipaddress.ip_network(cidr).is_private, cidr)
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,4 +1,5 @@
 """Validate the rendered, deployable resource boundary. Requires PyYAML."""
+import ipaddress
 import sys
 import yaml
 
@@ -44,5 +45,25 @@ for o in objects:
             assert not c['securityContext']['allowPrivilegeEscalation']
             assert c['securityContext']['capabilities']['drop'] == ['ALL']
             assert c['resources']['requests'] and c['resources']['limits']
-assert by_name['NetworkPolicy', 'duckfleet-isolation']['spec']['policyTypes'] == ['Ingress', 'Egress']
-print('PASS: chart resource sizes, identity, isolation, and private services')
+isolation = by_name['NetworkPolicy', 'duckfleet-isolation']['spec']
+assert isolation['policyTypes'] == ['Ingress', 'Egress']
+
+# Cluster DNS is permitted by selector and by address, because neither form works on
+# every topology. Both must stay port 53 only, and neither may reach a public range:
+# port 53 to anywhere would let a SQL engine resolve against an external server.
+dns_rules = [rule for rule in isolation['egress']
+             if any(port.get('port') == 53 for port in rule.get('ports', []))]
+assert dns_rules, 'no DNS egress rule; workers cannot resolve the catalog'
+for rule in dns_rules:
+    assert {port['port'] for port in rule['ports']} == {53}, rule
+    for peer in rule['to']:
+        cidr = peer.get('ipBlock', {}).get('cidr')
+        if cidr is None:
+            continue
+        network = ipaddress.ip_network(cidr)
+        assert network.is_private, f'DNS egress must stay private, got {cidr}'
+        assert network.prefixlen >= 8, f'DNS egress range too broad: {cidr}'
+assert any('ipBlock' in peer for rule in dns_rules for peer in rule['to']), (
+    'DNS must also be reachable by address; a selector matches nothing on EKS Auto Mode'
+)
+print('PASS: chart resource sizes, identity, isolation, private services, and scoped DNS')
