@@ -37,6 +37,20 @@ grep -q 'attaching the DuckLake catalog' artifacts/worker-boot-failure.log
 grep -q 'still unreachable' artifacts/worker-boot-failure.log
 grep -q 'catalog-does-not-resolve' artifacts/worker-boot-failure.log
 ! grep -q 'local-catalog-password' artifacts/worker-boot-failure.log
+# A worker reached directly must refuse isolation as well. A worker *is* the shared
+# compute the guarantee excludes, and workers are addressable in their own right, so
+# refusing only at the gateway would leave the promise resting on nobody calling one.
+# The persistent request alongside it proves the 501 is a refusal and not a worker
+# that rejects everything.
+session() { # session <worker> <json>
+  docker compose exec -T "$1" sh -c 'curl -sS -o /dev/null -w "%{http_code}" \
+    -X POST http://localhost:8080/v1/sessions \
+    -H "Authorization: Bearer $DUCKFLEET_TOKEN" -H "Content-Type: application/json" \
+    -d '"'$2'"
+}
+test "$(session worker-small '{"compute":{"compute":"isolated","cpu":1,"memory":"1Gi"}}')" = 501
+test "$(session worker-small '{"compute":{"compute":"persistent","cpu":1,"memory":"1Gi"}}')" = 200
+echo 'PASS: a worker addressed directly refuses isolation it cannot provide'
 docker compose run --rm dbt
 # Overlapping DuckLake transactions need both workers healthy, so this runs before
 # any worker is stopped below.

@@ -19,7 +19,9 @@ spec:
     metadata:
       labels: {app: duckfleet-gateway}
     spec:
-      serviceAccountName: duckfleet-no-aws
+      # Identity follows capability: a gateway that creates pods needs a token, and
+      # one that cannot must not have one.
+      serviceAccountName: {{ ternary "duckfleet-gateway" "duckfleet-no-aws" .Values.isolatedCompute.enabled }}
       nodeSelector: {{ toJson .Values.nodeSelector }}
       securityContext:
         {{- include "duckfleet.podSecurity" . | nindent 8 }}
@@ -44,4 +46,23 @@ spec:
             - name: DUCKFLEET_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.secretName }}, key: DUCKFLEET_TOKEN}
+            {{- if .Values.isolatedCompute.enabled }}
+            - {name: DUCKFLEET_ISOLATED_POD, value: /etc/duckfleet/pod.json}
+            - {name: DUCKFLEET_ISOLATED_READY_SECONDS, value: {{ .Values.isolatedCompute.readySeconds | quote }}}
+            # Session pods are owned by this pod, so losing the gateway has the
+            # garbage collector remove them rather than leaving them billing.
+            - name: DUCKFLEET_POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+            - name: DUCKFLEET_POD_UID
+              valueFrom:
+                fieldRef: {fieldPath: metadata.uid}
+            {{- end }}
           {{- include "duckfleet.health" . | nindent 10 }}
+          {{- if .Values.isolatedCompute.enabled }}
+          volumeMounts:
+            - {name: isolated-pod, mountPath: /etc/duckfleet, readOnly: true}
+      volumes:
+        - name: isolated-pod
+          configMap: {name: duckfleet-isolated-pod}
+          {{- end }}

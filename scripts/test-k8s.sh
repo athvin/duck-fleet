@@ -70,8 +70,17 @@ render() {
 # Hooks are rendered separately so the harness Job runs after the release is ready.
 # Each render declares the rewrites it must contain, so a chart change that moves one
 # of them fails here instead of leaving the local run testing a different shape.
-render --no-hooks | python3 scripts/kind/localize.py \
-  --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port \
+# Isolated compute is enabled here and nowhere else. The gateway needs RBAC to create
+# pods, the AWS deploy identity cannot grant it any, and check-access.sh fails the
+# deploy if that ever becomes possible — so this cluster, which we own outright, is
+# where the feature is actually exercised. The API server is reachable at the default
+# service address in kind.
+render --no-hooks \
+  --set isolatedCompute.enabled=true \
+  --set 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32' \
+  --set isolatedCompute.readySeconds=180 \
+  | python3 scripts/kind/localize.py \
+  --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod \
   > "$work/release.yaml"
 "${KUBE[@]}" apply -f "$work/release.yaml"
 
@@ -105,6 +114,70 @@ harness() { # harness <job-name> <command> [timeout]
 harness duckfleet-harness 'python /app/tests/harness.py'
 grep -q 'PASS: protocol checks and dbt lifecycle' artifacts/kind/duckfleet-harness.log
 grep -q 'PASS: model config selected small and medium workers' artifacts/kind/duckfleet-harness.log
+
+# On-demand compute. The harness asserts what the API reports; these assert the
+# cluster facts it cannot see, which is the half that matters for a leak.
+isolated_pods() { "${KUBE[@]}" get pods -l duckfleet-compute=isolated -o name; }
+# Waited for rather than asserted: the run above opens and closes an isolated session
+# of its own, so its pod may still be terminating. Starting from empty is what makes
+# the assertions below about *these* pods.
+await_no_isolated_pods() {
+  for _ in $(seq 1 30); do
+    [[ -z "$(isolated_pods)" ]] && return 0
+    sleep 2
+  done
+  echo "session pods outlived their sessions: $(isolated_pods)" >&2
+  return 1
+}
+await_no_isolated_pods
+harness duckfleet-isolated 'python /app/tests/harness.py --isolated' 600
+grep -q 'PASS: an isolated session ran on its own pod' artifacts/kind/duckfleet-isolated.log
+grep -q 'PASS: an unplaceable isolated request was refused' artifacts/kind/duckfleet-isolated.log
+# Closed sessions leave no pods. Checked after the run rather than during it, because
+# "the pod existed" is proven by the session having answered at all.
+for _ in $(seq 1 30); do
+  [[ -z "$(isolated_pods)" ]] && break
+  sleep 2
+done
+test -z "$(isolated_pods)" || {
+  echo "session pods outlived their sessions: $(isolated_pods)" >&2; exit 1; }
+echo 'PASS: closing an isolated session removed its pod'
+
+# The layer that does not depend on the gateway behaving well: abandon a session, then
+# destroy the gateway. The owner reference must have the pod collected regardless, and
+# the replacement gateway must settle what the pod was holding.
+harness duckfleet-leak 'python /app/tests/harness.py --leak-isolated' 600
+leaked=$("${KUBE[@]}" get pods -l duckfleet-compute=isolated -o jsonpath='{.items[0].metadata.name}')
+test -n "$leaked"
+echo "abandoned session pod: $leaked"
+held() {
+  "${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
+    "SELECT count(*) FROM reservations WHERE state='held' AND worker_id LIKE 'duckfleet-session-%'" \
+    | tr -d '[:space:]'
+}
+# Without this the settlement check below would pass on a ledger that never held
+# anything: a reservation is taken per statement, so an idle abandoned session owes
+# nothing and would prove nothing.
+test "$(held)" -ge 1 || { echo 'the abandoned session held no funds to settle' >&2; exit 1; }
+echo "funds held by the abandoned pod: $(held)"
+"${KUBE[@]}" delete pod -l app=duckfleet-gateway --wait=true
+for _ in $(seq 1 60); do
+  "${KUBE[@]}" get "pod/$leaked" > /dev/null 2>&1 || break
+  sleep 2
+done
+"${KUBE[@]}" get "pod/$leaked" > /dev/null 2>&1 && {
+  echo "an abandoned session pod survived the gateway that owned it" >&2; exit 1; }
+echo 'PASS: an abandoned session pod was collected with the gateway that owned it'
+"${KUBE[@]}" rollout status deployment/server --timeout=420s
+# Nothing may still be held against a pod that no longer exists: an isolated identity
+# never returns to recover its own funds, so the replacement gateway has to.
+for _ in $(seq 1 30); do
+  [[ "$(held)" == 0 ]] && break
+  sleep 2
+done
+held > artifacts/kind/held-isolated.txt
+grep -qx 0 artifacts/kind/held-isolated.txt
+echo 'PASS: a new gateway settled the reservations the abandoned pod was holding'
 
 "${KUBE[@]}" apply -f infra/kind/bucket-verify.yaml
 python3 scripts/kind/await_job.py --context "$CONTEXT" --namespace "$NS" \

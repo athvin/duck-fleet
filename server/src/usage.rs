@@ -187,6 +187,46 @@ impl Reader {
         })
         .await
     }
+
+    /// Session-pod identities still holding funds, for the gateway to settle.
+    ///
+    /// Read from the ledger rather than from the cluster on purpose: a pod the
+    /// garbage collector already removed leaves no trace in Kubernetes but still
+    /// holds money here, and that is the direction of disagreement that costs.
+    pub async fn held_isolated(&self, prefix: &'static str) -> Result<Vec<String>, ApiError> {
+        let held = self
+            .run(false, move |client| {
+                let workers =
+                    metering::held_matching(client, prefix).map_err(|_| ApiError::internal())?;
+                Ok(json!(workers))
+            })
+            .await?;
+        Ok(held
+            .as_array()
+            .map(|workers| {
+                workers
+                    .iter()
+                    .filter_map(|worker| worker.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Settles a session pod's abandoned reservations. Safe to call for a pod that
+    /// settled its own, because recovery only touches rows still held; that is what
+    /// lets every teardown path call it without first working out which one it is.
+    pub async fn settle_isolated(&self, worker: String) -> Result<u64, ApiError> {
+        let settled = self
+            .run(true, move |client| {
+                let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
+                let settled = metering::recover(&mut transaction, &worker)
+                    .map_err(|_| ApiError::internal())?;
+                transaction.commit().map_err(|_| ApiError::internal())?;
+                Ok(json!(settled))
+            })
+            .await?;
+        Ok(settled.as_u64().unwrap_or(0))
+    }
 }
 
 #[cfg(test)]

@@ -3,6 +3,8 @@ mod compute;
 mod failure;
 mod gateway;
 mod history;
+mod isolated;
+mod kube;
 mod metering;
 mod pricing;
 mod profiling;
@@ -238,6 +240,14 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // Process-wide and before any HTTP client is built. reqwest is compiled without a
+    // default crypto provider so the Kubernetes CA can be the only trusted root, and
+    // in that configuration *every* client panics on build until one is installed —
+    // including the gateway's plain HTTP client to the workers, which uses no TLS at
+    // all. Installing it next to the one caller that needs TLS crashed on boot.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
     let token = std::env::var("DUCKFLEET_TOKEN")?;
     anyhow::ensure!(
         token.len() >= 16,

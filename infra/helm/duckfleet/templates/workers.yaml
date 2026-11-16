@@ -41,26 +41,7 @@ spec:
             requests: {cpu: {{ dig $size $cpu ($.Values.workerCpuRequests | default dict) | quote }}, memory: {{ printf "%dGi" $cpu }}, ephemeral-storage: 2Gi}
             limits: {cpu: {{ $cpu | quote }}, memory: {{ printf "%dGi" $cpu }}, ephemeral-storage: 3Gi}
           env:
-            - {name: DUCKFLEET_WORKER_ID, value: {{ $size }}}
-            # Declared from the same values as the limits above. The worker
-            # refuses to start if the container it got disagrees.
-            - {name: DUCKFLEET_WORKER_CPU, value: {{ $cpu | quote }}}
-            - {name: DUCKFLEET_WORKER_MEMORY, value: {{ printf "%dGi" $cpu | quote }}}
-            - {name: S3_AUTH_MODE, value: pod_identity}
-            - {name: DUCKFLEET_PROFILING, value: {{ $.Values.profiling | quote }}}
-            - {name: DUCKFLEET_CATALOG_WAIT_SECONDS, value: {{ $.Values.catalogWaitSeconds | quote }}}
-            - {name: S3_DATA_PATH, value: {{ printf "s3://%s/lake/" $.Values.bucket | quote }}}
-            - {name: AWS_REGION, value: {{ $.Values.region }}}
-            - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
-            - name: DUCKFLEET_TOKEN
-              valueFrom:
-                secretKeyRef: {name: {{ $.Values.secretName }}, key: DUCKFLEET_TOKEN}
-            - name: CATALOG_DSN
-              valueFrom:
-                secretKeyRef: {name: {{ $.Values.secretName }}, key: CATALOG_DSN}
-            - name: PLATFORM_DSN
-              valueFrom:
-                secretKeyRef: {name: {{ $.Values.secretName }}, key: PLATFORM_DSN}
+            {{- include "duckfleet.workerEnv" (dict "root" $ "id" $size "cpu" $cpu "memory" (printf "%dGi" $cpu)) | nindent 12 }}
           {{- include "duckfleet.health" . | nindent 10 }}
           volumeMounts:
             - {name: tmp, mountPath: /tmp}

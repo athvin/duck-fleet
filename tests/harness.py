@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -125,16 +126,28 @@ def verify_model_placement(history):
 def routing_contract_checks(connection):
     """The compute contract over the wire, with no dbt involved.
 
-    Isolated compute is a recognised mode this deployment cannot run yet, so asking
-    for it must be refused explicitly rather than quietly served by a shared worker.
+    Whether isolated compute can run is a property of the deployment, so this asserts
+    against what the gateway reports about itself rather than assuming either answer.
+    Most deployments cannot create pods, and there asking for isolation must be
+    refused explicitly rather than quietly served by a shared worker.
     """
     client = connection.client
-    refused = expect_error(501, lambda: client.request(
-        "POST", "/v1/sessions",
-        {"compute": {"compute": "isolated", "cpu": 1, "memory": "1Gi"}}))
-    require(refused.failure_kind == "compute_unavailable", str(refused))
-    # Nothing ran, so the caller may send it again once the mode is supported.
-    require(refused.retry_safe is True, str(refused))
+    available = json.loads(client.request("GET", "/v1/workers"))["isolated_compute"]
+    isolated = {"compute": "isolated", "cpu": 1, "memory": "1Gi"}
+    if available:
+        # Covered in depth by --isolated against a real cluster; here it only has to
+        # be reachable, so that "available" is not a claim nothing checks.
+        opened = json.loads(client.request("POST", "/v1/sessions", {"compute": isolated}))
+        try:
+            require(opened["placement"]["compute"] == "isolated", str(opened["placement"]))
+        finally:
+            client.request("DELETE", "/v1/sessions/" + opened["session_id"])
+    else:
+        refused = expect_error(501, lambda: client.request(
+            "POST", "/v1/sessions", {"compute": isolated}))
+        require(refused.failure_kind == "compute_unavailable", str(refused))
+        # Nothing ran, so the caller may send it again somewhere that supports it.
+        require(refused.retry_safe is True, str(refused))
     # An unrecognised mode is a different problem: fix the request, not the platform.
     # It must stay a *classified* 400 rather than becoming an extractor rejection,
     # which would be the one failure here carrying no failure_kind to act on.
@@ -203,6 +216,129 @@ def protocol_checks(connection):
     require(any(q["status"] == "canceled" for q in history), "missing cancellation history")
 
 
+def isolated_session(compute):
+    """Opens an isolated session over the adapter, as a caller would.
+
+    Through `RemoteConnection` rather than raw HTTP so results come back decoded:
+    the worker answers in Arrow IPC, where a scalar is binary and asserting on the
+    bytes proves nothing about the value.
+
+    The pod name arrives as the placement's `worker_id`, which is the pod's own name,
+    because reservation recovery keys on worker identity.
+    """
+    connection = RemoteConnection(URL, TOKEN, compute=compute)
+    placement = connection.placement
+    require(placement["compute"] == "isolated", str(placement))
+    require(placement["worker_id"].startswith("duckfleet-session-"), str(placement))
+    return connection, placement
+
+
+def isolated_checks():
+    """On-demand compute, against a real cluster.
+
+    Everything here is observable through the API. Whether the pod is actually gone
+    afterwards is a cluster fact, so test-k8s.sh asserts that with kubectl; what this
+    proves is that the platform reports the placement honestly and refuses what it
+    cannot place.
+    """
+    # A size no persistent worker in this release runs, so it cannot be satisfied by
+    # a shared worker even by accident.
+    compute = {"compute": "isolated", "cpu": 1, "memory": "768Mi"}
+    connection, placement = isolated_session(compute)
+    pod = placement["worker_id"]
+    (ARTIFACTS / "isolated-pod.txt").write_text(pod)
+    try:
+        # The cgroup the pod actually got, not what was asked for. These come from the
+        # pod reading its own limits, so they are the kubelet's answer rather than the
+        # chart's intention.
+        require(placement["cpu"] == 1, str(placement))
+        require(placement["memory_bytes"] == 768 * 1024 * 1024, str(placement))
+        require(placement["cgroup_memory_max"] == 768 * 1024 * 1024, str(placement))
+        require(placement["cgroup_cpu_quota"] // placement["cgroup_cpu_period"] == 1,
+                str(placement))
+        # The engine is sized from the pod's own limits, as on a persistent worker.
+        require(sql(connection, "select 21 * 2") == [(42,)], "isolated session did not answer")
+        require(sql(connection, "select current_setting('threads')::integer") == [(1,)],
+                "isolated engine was not sized from its pod")
+        # No sharing: an identical second request gets a pod of its own rather than
+        # joining this one. Asking for isolation twice must not quietly produce one
+        # pod serving two callers, which is what a shared worker would do.
+        other, other_placement = isolated_session(compute)
+        try:
+            require(other_placement["worker_id"] != pod, f"two isolated sessions shared {pod}")
+            require(sql(other, "select 1") == [(1,)], "second isolated session did not answer")
+        finally:
+            other.close()
+    finally:
+        connection.close()
+
+    # History records an isolated placement the same way it records a shared one, so
+    # a bill can be traced to the pod that earned it.
+    history = json.loads(Client(URL, TOKEN).request("GET", "/v1/queries?worker_id=" + pod))
+    rows = history["queries"]
+    require(rows, f"no history rows for {pod}")
+    for row in rows:
+        require(row["placement"]["compute"] == "isolated", str(row["placement"]))
+        require(row["placement"]["worker_id"] == pod, str(row["placement"]))
+    print(f"PASS: an isolated session ran on its own pod {pod} and reported its real cgroup")
+
+    # A size no node can hold must be refused with the scheduler's reason, and must
+    # never be quietly served by a persistent worker.
+    refused = expect_error(503, lambda: Client(URL, TOKEN).request(
+        "POST", "/v1/sessions",
+        {"compute": {"compute": "isolated", "cpu": 64, "memory": "512Gi"}}))
+    require("not downgraded" in str(refused), str(refused))
+    # The scheduler's own words, so the shortfall is actionable rather than guessed.
+    require("Insufficient" in str(refused), str(refused))
+    # Its own kind, not the generic one an internal failure shares: nothing ran, and
+    # unlike a deployment that cannot isolate at all, capacity may differ later.
+    require(refused.failure_kind == "not_placeable", str(refused))
+    require(refused.retry_safe is True, str(refused))
+    print("PASS: an unplaceable isolated request was refused, not downgraded")
+
+    # Metered under the pod's own identity, which is what makes an isolated bill
+    # attributable: the pod is gone, so this row is the only remaining record of it.
+    metered = json.loads(Client(URL, TOKEN).request("GET", "/v1/usage"))["events"]
+    mine = [event for event in metered if event["worker_id"] == pod]
+    require(mine, f"the isolated session was not metered under {pod}")
+    require(all(event["amount_micro_usd"] >= 0 for event in mine), str(mine))
+    print(f"PASS: the isolated session was metered under its own pod ({len(mine)} events)")
+
+
+def leak_isolated():
+    """Abandons an isolated session mid-statement, with funds still reserved.
+
+    Leaves the pod running and never closes it, so the caller can destroy the gateway
+    and assert the pod is collected and the ledger settled anyway.
+
+    The statement matters. A reservation is taken per statement and released when it
+    reaches a terminal status, so abandoning an idle session holds nothing and would
+    make the settlement assertion pass without proving anything. Money is only at
+    risk while a statement is still running, because an isolated pod never restarts
+    to recover its own reservation the way a persistent worker does.
+    """
+    connection, placement = isolated_session(
+        {"compute": "isolated", "cpu": 1, "memory": "768Mi"})
+    (ARTIFACTS / "leaked-pod.txt").write_text(placement["worker_id"])
+
+    def long_statement():
+        try:
+            connection.client.request("POST", connection.path + "/queries", {
+                "request_id": str(uuid.uuid4()),
+                "sql": "select sum(a.range * b.range) from range(200000) a, range(200000) b",
+                "timeout_seconds": 60,
+            })
+        except Exception:
+            # Expected: this process exits while the statement is still running, and
+            # the pod running it is about to be destroyed underneath it.
+            pass
+
+    threading.Thread(target=long_statement, daemon=True).start()
+    # Long enough for the worker to have admitted the statement and taken its hold.
+    time.sleep(8)
+    print(f"left a statement running on {placement['worker_id']}")
+
+
 def main():
     ARTIFACTS.mkdir(exist_ok=True)
     import observability
@@ -216,6 +352,12 @@ def main():
     if "--metering" in sys.argv:
         import metering
         metering.checks(URL, TOKEN, ARTIFACTS)
+        return
+    if "--isolated" in sys.argv:
+        isolated_checks()
+        return
+    if "--leak-isolated" in sys.argv:
+        leak_isolated()
         return
     if "--unavailable-medium" in sys.argv:
         expect_error(503, lambda: RemoteConnection(URL, TOKEN, compute={"cpu":2,"memory":"2Gi"}))

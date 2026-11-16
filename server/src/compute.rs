@@ -173,10 +173,9 @@ impl ComputeRequest {
     /// Resolves a request to a placement, or refuses it.
     ///
     /// Only the request itself is judged here. Whether any worker provides these
-    /// resources is the router's question, and answering it here would turn a
-    /// temporarily absent worker into a malformed request. There is no fallback
-    /// between modes — a request for isolation is never served by shared compute,
-    /// because quietly doing so would void the guarantee the caller asked for.
+    /// resources — or whether this deployment can create a pod at all — is the
+    /// router's question, and answering it here would turn a temporarily absent
+    /// worker into a malformed request.
     pub fn resolve(&self) -> Result<Placement, ApiError> {
         let mode = self.mode()?;
         let resources = match (self.cpu, self.memory.as_deref()) {
@@ -190,15 +189,20 @@ impl ComputeRequest {
                 ));
             }
         };
-        if mode == Mode::Isolated {
-            return Err(ApiError::new(
-                crate::failure::COMPUTE_UNAVAILABLE,
-                "isolated compute is not available in this deployment; no statement ran \
-                 and the request was not downgraded to shared compute",
-            ));
-        }
         Ok(Placement { mode, resources })
     }
+}
+
+/// Refused because this deployment cannot run isolated compute, which most cannot:
+/// the gateway needs RBAC to create pods and the deploy asserts it cannot grant
+/// itself any. Defined here, beside the contract, so the one sentence that promises
+/// no downgrade cannot drift from the mode it describes.
+pub(crate) fn unavailable() -> ApiError {
+    ApiError::new(
+        crate::failure::COMPUTE_UNAVAILABLE,
+        "isolated compute is not available in this deployment; no statement ran \
+         and the request was not downgraded to shared compute",
+    )
 }
 
 impl Placement {
@@ -207,6 +211,18 @@ impl Placement {
     /// for the provision would bill each one for the whole worker.
     pub fn units(self) -> i64 {
         self.resources.units()
+    }
+    /// The resolved request, so the worker is told the mode as well as the size.
+    ///
+    /// Sending only the size would have an isolated session recorded as persistent
+    /// in history, because a pod cannot tell from a request alone whether it was
+    /// created for one caller or is shared with thirty others.
+    pub fn request(self) -> ComputeRequest {
+        ComputeRequest {
+            compute: self.mode.name().into(),
+            cpu: Some(self.resources.cpu),
+            memory: Some(self.resources.memory()),
+        }
     }
     /// `worker_id` is the worker's own identity, passed in rather than derived from
     /// its size: reservation recovery keys on it, so it must stay stable even if the
@@ -367,6 +383,27 @@ mod tests {
         );
     }
 
+    /// The mode survives being forwarded to the worker. Sending only the size would
+    /// have an isolated session recorded as persistent, because a pod cannot tell
+    /// from a request whether it is dedicated or shared with thirty others.
+    #[test]
+    fn a_placement_forwards_its_mode_as_well_as_its_size() {
+        for mode in [Mode::Persistent, Mode::Isolated] {
+            let placement = Placement {
+                mode,
+                resources: Resources {
+                    cpu: 4,
+                    memory_bytes: 6 * GIB,
+                },
+            };
+            let forwarded = placement.request();
+            assert_eq!(forwarded.compute, mode.name());
+            let resolved = forwarded.resolve().unwrap();
+            assert_eq!(resolved.mode, mode);
+            assert_eq!(resolved.resources, placement.resources);
+        }
+    }
+
     #[test]
     fn a_resolved_size_round_trips_through_its_own_request() {
         for resources in [
@@ -384,14 +421,30 @@ mod tests {
         }
     }
 
-    /// Isolation is a guarantee, so a request for it is refused rather than served
-    /// by shared compute. The code is distinguishable from a malformed request: one
-    /// means ask differently, the other means ask later.
+    /// A request for isolation is well formed. Whether this deployment can place it
+    /// is the router's question, exactly as it is for a size no worker provides.
     #[test]
-    fn isolated_is_refused_and_never_downgraded() {
-        let error = request(json!({"compute":"isolated","cpu":1,"memory":"1Gi"}))
+    fn isolated_resolves_to_a_placement_the_router_then_judges() {
+        let placement = request(json!({"compute":"isolated","cpu":4,"memory":"8Gi"}))
             .resolve()
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(placement.mode, Mode::Isolated);
+        assert_eq!(
+            placement.resources,
+            Resources {
+                cpu: 4,
+                memory_bytes: 8 * GIB
+            }
+        );
+    }
+
+    /// Isolation is a guarantee, so where it cannot be provided the request is
+    /// refused rather than served by shared compute. The code is distinguishable
+    /// from a malformed request: one means ask differently, the other means ask
+    /// elsewhere.
+    #[test]
+    fn unavailable_isolation_is_refused_and_never_downgraded() {
+        let error = unavailable();
         assert_eq!(error.0, crate::failure::COMPUTE_UNAVAILABLE);
         assert!(error.0.retry_safe);
         assert!(error.1.contains("not downgraded"), "{}", error.1);
