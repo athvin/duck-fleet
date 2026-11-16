@@ -5,7 +5,7 @@ import time
 import uuid
 from urllib.parse import urlencode
 
-from dbt.adapters.duckfleet.client import Client, RemoteConnection, RemoteError
+from duckfleet import Client, RemoteConnection, RemoteError
 
 
 def require(condition, message):

@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 
-from dbt.adapters.duckfleet.client import Client, RemoteConnection, RemoteError
+from duckfleet import Client, RemoteConnection, RemoteError
 
 URL = os.environ["DUCKFLEET_URL"]
 TOKEN = os.environ["DUCKFLEET_TOKEN"]

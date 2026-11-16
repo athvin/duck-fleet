@@ -3,6 +3,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /
 WORKDIR /app
 COPY adapters/dbt-duckfleet/requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir -r /app/requirements.lock
+# The adapter depends on the standalone client rather than carrying its own copy of
+# the wire protocol, so it is installed first.
+COPY clients/duckfleet-python /app/client
+RUN pip install --no-cache-dir --no-deps /app/client
 COPY adapters/dbt-duckfleet /app/adapter
 RUN pip install --no-cache-dir --no-deps /app/adapter && pip check
 COPY tests /app/tests

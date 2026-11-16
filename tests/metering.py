@@ -8,7 +8,7 @@ import json
 import math
 import uuid
 
-from dbt.adapters.duckfleet.client import Client, RemoteConnection, RemoteError
+from duckfleet import Client, RemoteConnection, RemoteError
 
 SMALL = {"cpu": 1, "memory": "1Gi"}
 MEDIUM = {"cpu": 2, "memory": "2Gi"}

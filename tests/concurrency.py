@@ -10,7 +10,7 @@ PostgreSQL catalog. This file is the executable record of that behavior.
 import json
 import uuid
 
-from dbt.adapters.duckfleet.client import RemoteConnection, RemoteError
+from duckfleet import RemoteConnection, RemoteError
 
 SMALL = {"cpu": 1, "memory": "1Gi"}
 MEDIUM = {"cpu": 2, "memory": "2Gi"}

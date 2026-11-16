@@ -108,6 +108,23 @@ services:
       server:
         condition: service_healthy
 
+  # The same server, reached by a client that has no dbt installed. A separate image
+  # rather than another command on `dbt`, because the absence of dbt is the thing
+  # being demonstrated and it cannot be demonstrated from an image that has it.
+  api:
+    profiles: [test]
+    build:
+      context: .
+      dockerfile: docker/cli.Dockerfile
+    environment:
+      DUCKFLEET_URL: http://server:8080
+      DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
+    volumes:
+      - ./artifacts:/artifacts
+    depends_on:
+      server:
+        condition: service_healthy
+
 volumes:
   postgres-data:
   object-data:
