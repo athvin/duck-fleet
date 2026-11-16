@@ -42,6 +42,48 @@ whole model lifecycles to these workers. They may share an EC2 node. This does
 PostgreSQL is separate from ER's Aurora databases for this disposable experiment.
 This is not a production database/backup/HA design.
 
+## Create the cluster DuckFleet owns
+
+`infra/terraform/cluster` defines an EKS Auto Mode cluster, its VPC, the IAM roles
+Auto Mode requires, the worker identity and Pod Identity association, and a CI access
+entry scoped to the `duckfleet-dev` namespace.
+
+**It is applied by an operator, never by CI.** The cluster needs `iam:CreateRole`,
+`eks:CreateCluster` and `ec2:CreateVpc`; CI applies on every main push and its plan
+guard allows only the lake bucket and the two image repositories. Putting the cluster
+there would trade a permanent widening of an automated apply for a one-time creation.
+It has its own state key for the same reason. A test asserts both, so this cannot drift.
+
+Standing cost is the control plane at $0.10/hour, about **$73/month**, plus an
+instance-dependent EKS Auto Mode fee on top of EC2 while nodes exist — and the lane
+suspends compute after each run, so that is minutes per run rather than continuous.
+There is deliberately **no NAT Gateway**: at roughly $32/month per availability zone it
+would cost more than the cluster it serves. The subnets are public with an Internet
+Gateway, which is free, and an S3 gateway endpoint keeps DuckLake traffic off the
+internet at no charge. AWS recommends private subnets; this is a disposable
+development lane with no inbound exposure, so the trade is deliberate. A production
+target should take private subnets and pay for the NAT.
+
+```sh
+source scripts/aws/target.env
+terraform -chdir=infra/terraform/cluster init \
+  -backend-config="bucket=$DUCKFLEET_STATE_BUCKET" \
+  -backend-config="key=$DUCKFLEET_CLUSTER_STATE_KEY" \
+  -backend-config="region=$DUCKFLEET_REGION"
+terraform -chdir=infra/terraform/cluster plan     # read this before applying
+terraform -chdir=infra/terraform/cluster apply    # about 15 minutes
+terraform -chdir=infra/terraform/cluster output -raw target_env
+```
+
+The last command prints the three values to put in `scripts/aws/target.env`. Changing
+them there is what moves the lane onto the new cluster, and it is a separate reviewed
+pull request — with `DUCKFLEET_REQUIRE_BOOTSTRAP=false`, because the namespace label
+that check waits for is applied by a bootstrap that only exists on the shared cluster.
+
+Expect the first apply to need iteration. The module is `validate`-clean and passes
+mocked-provider tests, which catches schema and scope errors but cannot establish that
+the cluster converges. Keep the plan output if it fails.
+
 ## Move Terraform state to a bucket DuckFleet owns
 
 State currently lives under a key inside an entity-resolution bucket. The location is

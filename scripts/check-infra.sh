@@ -12,6 +12,12 @@ rendered="$validation_dir/rendered.yaml"
 "$TF" -chdir=infra/terraform/dev init -backend=false -input=false
 "$TF" -chdir=infra/terraform/dev validate
 "$TF" -chdir=infra/terraform/dev test
+# The operator-applied cluster module. Validated and mock-tested here even though CI
+# never applies it, so a broken cluster definition fails on a pull request rather than
+# in front of whoever is running the apply.
+"$TF" -chdir=infra/terraform/cluster init -backend=false -input=false
+"$TF" -chdir=infra/terraform/cluster validate
+"$TF" -chdir=infra/terraform/cluster test
 python3 - <<'PY' > "$values"
 import json
 print(json.dumps({kind+'Image':'797781631727.dkr.ecr.us-east-2.amazonaws.com/duckfleet-dev/'+kind+'@sha256:'+'a'*64 for kind in ['worker','dbt']}))
