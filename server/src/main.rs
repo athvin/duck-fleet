@@ -77,6 +77,10 @@ fn default_timeout() -> u64 {
     30
 }
 
+/// Debug exposes nothing the client is not already sent: the message is the same
+/// string `IntoResponse` returns, and it is scrubbed of credentials before it gets
+/// here. It exists so assertions can report which failure was produced.
+#[derive(Debug)]
 struct ApiError(pub(crate) failure::Failure, pub(crate) String);
 impl ApiError {
     fn new(failure: failure::Failure, message: impl Into<String>) -> Self {

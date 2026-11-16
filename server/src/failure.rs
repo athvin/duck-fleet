@@ -140,6 +140,19 @@ pub(crate) const CAPACITY: Failure = Failure {
     http: StatusCode::TOO_MANY_REQUESTS,
 };
 
+/// A recognised compute mode that this deployment cannot run yet. Distinct from
+/// `INVALID_REQUEST` on purpose: the request is well formed and will become valid
+/// once the mode is implemented, so a client can tell "ask differently" apart from
+/// "ask later". Never downgraded to another mode, because silently running a model
+/// on shared compute when isolation was requested would break the guarantee the
+/// caller asked for.
+pub(crate) const COMPUTE_UNAVAILABLE: Failure = Failure {
+    status: None,
+    kind: "compute_unavailable",
+    retry_safe: true,
+    http: StatusCode::NOT_IMPLEMENTED,
+};
+
 /// The worker has not attached its catalog yet, so the request never reached the
 /// engine. Unlike `UNAVAILABLE` there is no partial effect to reason about: nothing
 /// ran, which makes resending safe once the worker reports ready.

@@ -91,7 +91,8 @@ async fn open(
     request: Option<Json<SessionRequest>>,
 ) -> Result<Response, ApiError> {
     let mut request = request.map(|Json(r)| r).unwrap_or_default();
-    let size = request.validate()?;
+    let placement = request.validate()?;
+    let size = placement.size;
     request.compute = size.request();
     app.routes
         .lock()

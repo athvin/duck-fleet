@@ -23,12 +23,13 @@ def require(condition, message):
 
 
 def expect_error(status, action):
+    """Returns the classified error, so a caller can assert on how it was classified."""
     try:
         action()
     except RemoteError as error:
         require(error.status == status, f"expected HTTP {status}, got {error.status}: {error}")
-    else:
-        raise AssertionError(f"expected HTTP {status}")
+        return error
+    raise AssertionError(f"expected HTTP {status}")
 
 
 def sql(connection, statement, parameters=None):
@@ -103,8 +104,41 @@ def verify_model_placement(history):
     print("PASS: model config selected small and medium workers; hooks and commits stayed pinned")
 
 
+def routing_contract_checks(connection):
+    """The compute contract over the wire, with no dbt involved.
+
+    Isolated compute is a recognised mode this deployment cannot run yet, so asking
+    for it must be refused explicitly rather than quietly served by a shared worker.
+    """
+    client = connection.client
+    refused = expect_error(501, lambda: client.request(
+        "POST", "/v1/sessions",
+        {"compute": {"compute": "isolated", "cpu": 1, "memory": "1Gi"}}))
+    require(refused.failure_kind == "compute_unavailable", str(refused))
+    # Nothing ran, so the caller may send it again once the mode is supported.
+    require(refused.retry_safe is True, str(refused))
+    # An unrecognised mode is a different problem: fix the request, not the platform.
+    # It must stay a *classified* 400 rather than becoming an extractor rejection,
+    # which would be the one failure here carrying no failure_kind to act on.
+    unknown = expect_error(400, lambda: client.request(
+        "POST", "/v1/sessions", {"compute": {"compute": "burst"}}))
+    require(unknown.failure_kind == "invalid_request", str(unknown))
+    require("persistent or isolated" in str(unknown), str(unknown))
+    # The resolved mode is reported back, so a caller can see where it landed.
+    opened = json.loads(client.request("POST", "/v1/sessions",
+                                       {"compute": {"cpu": 2, "memory": "2Gi"}}))
+    try:
+        placement = opened["placement"]
+        require(placement["compute"] == "persistent", str(placement))
+        require(placement["worker_id"] == "medium", str(placement))
+    finally:
+        client.request("DELETE", "/v1/sessions/" + opened["session_id"])
+    print("PASS: compute routing contract names its mode and refuses what it cannot run")
+
+
 def protocol_checks(connection):
     client = connection.client
+    routing_contract_checks(connection)
     expect_error(401, lambda: Client(URL, "wrong-token").request("POST", "/v1/sessions"))
     expect_error(404, lambda: client.request("POST", f"/v1/sessions/{uuid.uuid4()}/queries", {"request_id":str(uuid.uuid4()), "sql":"select 1"}))
     expect_error(400, lambda: sql(connection, "select missing_column"))
