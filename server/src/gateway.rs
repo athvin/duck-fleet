@@ -28,23 +28,141 @@ struct Route {
     touched: Instant,
     _permit: OwnedSemaphorePermit,
 }
+/// What a worker reports about itself. The worker reads its CPU and memory from its
+/// own cgroup, so this is what the container actually got rather than what a label
+/// claims it should have.
+#[derive(Clone, Debug)]
+struct WorkerInfo {
+    endpoint: String,
+    cpu: u16,
+    memory_bytes: u64,
+}
+impl WorkerInfo {
+    fn serves(&self, size: Size) -> bool {
+        self.cpu == size.cpu() && self.memory_bytes == size.memory_bytes()
+    }
+}
+
+/// A discovery result, cached between requests.
+///
+/// `unreachable` is kept because "no worker serves this" and "the worker that does
+/// is not answering" are different failures: the first is a deployment that lacks a
+/// class, the second is one that is degraded. Collapsing them would report a missing
+/// class every time a pod restarted.
+#[derive(Clone, Debug)]
+struct Fleet {
+    workers: Vec<WorkerInfo>,
+    unreachable: Vec<String>,
+    discovered: Instant,
+}
+
 #[derive(Clone)]
 struct Gateway {
     client: Client,
     token: Arc<str>,
-    small: String,
-    medium: String,
+    /// Worker endpoints, not classes. The gateway asks each one what it is, because
+    /// it cannot list pods: both service accounts set
+    /// `automountServiceAccountToken: false` and the deploy asserts DuckFleet cannot
+    /// grant itself RBAC, so the workers are the only available authority.
+    endpoints: Arc<Vec<String>>,
+    fleet: Arc<Mutex<Option<Fleet>>>,
     routes: Arc<Mutex<HashMap<Uuid, Route>>>,
     capacity: Arc<Semaphore>,
     history: crate::history::Reader,
     usage: crate::usage::Reader,
 }
 impl Gateway {
-    fn endpoint(&self, size: Size) -> &str {
-        match size {
-            Size::Small => &self.small,
-            Size::Medium => &self.medium,
+    async fn worker_info(&self, endpoint: &str) -> Result<WorkerInfo, ApiError> {
+        // Short relative to the statement timeout: discovery must not inherit the
+        // deadline of the query it is about to route.
+        let reported: Value = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.send(endpoint, Method::GET, "/v1/worker", Bytes::new()),
+        )
+        .await
+        .map_err(|_| ApiError::internal())??
+        .error_for_status()
+        .map_err(|_| ApiError::internal())?
+        .json()
+        .await
+        .map_err(|_| ApiError::internal())?;
+        let cpu = reported["cpu"].as_u64().ok_or_else(ApiError::internal)?;
+        let memory_bytes = reported["memory_bytes"]
+            .as_u64()
+            .ok_or_else(ApiError::internal)?;
+        Ok(WorkerInfo {
+            endpoint: endpoint.to_owned(),
+            cpu: u16::try_from(cpu).map_err(|_| ApiError::internal())?,
+            memory_bytes,
+        })
+    }
+
+    async fn discover(&self) -> Fleet {
+        let mut workers = Vec::new();
+        let mut unreachable = Vec::new();
+        for endpoint in self.endpoints.iter() {
+            match self.worker_info(endpoint).await {
+                Ok(info) => workers.push(info),
+                Err(_) => unreachable.push(endpoint.clone()),
+            }
         }
+        if !unreachable.is_empty() {
+            tracing::warn!(?unreachable, "some workers did not report their resources");
+        }
+        Fleet {
+            workers,
+            unreachable,
+            discovered: Instant::now(),
+        }
+    }
+
+    /// Routes by requested resources, not by a configured class name.
+    ///
+    /// Discovery is lazy and cached rather than done at startup: requiring a worker
+    /// to answer before the gateway can serve would reintroduce the startup coupling
+    /// the catalog wait removed. A miss refreshes once, so a worker that was still
+    /// starting when the table was built is not reported as a class that does not
+    /// exist.
+    async fn endpoint_for(&self, size: Size) -> Result<String, ApiError> {
+        const FRESH: Duration = Duration::from_secs(30);
+        let cached = {
+            let fleet = self.fleet.lock().await;
+            fleet
+                .clone()
+                .filter(|f| f.discovered.elapsed() < FRESH && f.unreachable.is_empty())
+        };
+        if let Some(fleet) = cached
+            && let Some(worker) = fleet.workers.iter().find(|w| w.serves(size))
+        {
+            return Ok(worker.endpoint.clone());
+        }
+        let fleet = self.discover().await;
+        *self.fleet.lock().await = Some(fleet.clone());
+        if let Some(worker) = fleet.workers.iter().find(|w| w.serves(size)) {
+            return Ok(worker.endpoint.clone());
+        }
+        // Never falls back to a different size. Which failure it is matters: a
+        // degraded fleet is worth retrying, a missing class is not.
+        Err(if fleet.unreachable.is_empty() {
+            ApiError::new(
+                failure::UNAVAILABLE,
+                format!(
+                    "no worker provides cpu={}, memory={}Gi; this deployment runs {:?}",
+                    size.cpu(),
+                    size.cpu(),
+                    fleet.workers.iter().map(|w| w.cpu).collect::<Vec<_>>()
+                ),
+            )
+        } else {
+            ApiError::new(
+                failure::UNAVAILABLE,
+                format!(
+                    "a worker serving cpu={}, memory={}Gi is not reachable; no statement ran",
+                    size.cpu(),
+                    size.cpu()
+                ),
+            )
+        })
     }
     async fn send(
         &self,
@@ -103,7 +221,7 @@ async fn open(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::new(failure::CAPACITY, "gateway session limit reached"))?;
-    let endpoint = app.endpoint(size).to_owned();
+    let endpoint = app.endpoint_for(size).await?;
     let body = serde_json::to_vec(&request).map_err(|_| ApiError::internal())?;
     let upstream = app
         .send(&endpoint, Method::POST, "/v1/sessions", body.into())
@@ -209,8 +327,30 @@ async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
             .await
             .map_err(|_| ApiError::internal())
     }
-    let (small, medium) = tokio::try_join!(info(&app, &app.small), info(&app, &app.medium))?;
-    Ok(Json(json!({"workers":[small,medium]})))
+    // Every configured worker must answer: this endpoint reports the fleet, and a
+    // silently short list would read as a deployment that is smaller than it is.
+    let mut reported = Vec::with_capacity(app.endpoints.len());
+    for endpoint in app.endpoints.iter() {
+        reported.push(info(&app, endpoint).await?);
+    }
+    Ok(Json(json!({"workers": reported})))
+}
+
+/// Worker endpoints, listed rather than named by class, so a deployment can run any
+/// set of sizes without the gateway being taught about them.
+fn worker_endpoints() -> anyhow::Result<Vec<String>> {
+    let configured = std::env::var("DUCKFLEET_WORKER_URLS")?;
+    let endpoints: Vec<String> = configured
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    anyhow::ensure!(
+        !endpoints.is_empty(),
+        "DUCKFLEET_WORKER_URLS must list at least one worker endpoint"
+    );
+    Ok(endpoints)
 }
 
 pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
@@ -220,8 +360,8 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             .retry(reqwest::retry::never())
             .build()?,
         token: token.into(),
-        small: std::env::var("WORKER_SMALL_URL")?,
-        medium: std::env::var("WORKER_MEDIUM_URL")?,
+        endpoints: Arc::new(worker_endpoints()?),
+        fleet: Arc::new(Mutex::new(None)),
         routes: Arc::new(Mutex::new(HashMap::new())),
         capacity: Arc::new(Semaphore::new(64)),
         history: crate::history::Reader::new(std::env::var("PLATFORM_DSN")?),

@@ -36,8 +36,11 @@ spec:
             - name: PLATFORM_DSN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.secretName }}, key: PLATFORM_DSN}
-            - {name: WORKER_SMALL_URL, value: "http://worker-small:8080"}
-            - {name: WORKER_MEDIUM_URL, value: "http://worker-medium:8080"}
+            # Endpoints, not classes. The gateway asks each worker what resources it
+            # has, because it cannot list pods: the service account mounts no token
+            # and the deploy asserts DuckFleet cannot grant itself RBAC.
+            - name: DUCKFLEET_WORKER_URLS
+              value: {{ include "duckfleet.workerUrls" . | quote }}
             - name: DUCKFLEET_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.secretName }}, key: DUCKFLEET_TOKEN}

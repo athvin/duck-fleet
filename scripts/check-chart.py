@@ -36,6 +36,21 @@ for o in objects:
             assert not c['securityContext']['allowPrivilegeEscalation']
             assert c['securityContext']['capabilities']['drop'] == ['ALL']
             assert c['resources']['requests'] and c['resources']['limits']
+# The gateway routes to endpoints it was given, so every one must name a Service the
+# release actually renders. A URL pointing at nothing would look like a missing
+# worker class at request time rather than a packaging mistake at render time.
+gateway = next(c for c in by_name['Deployment', 'server']['spec']['template']['spec']['containers']
+               if c['name'] == 'gateway')
+worker_urls = {e['name']: e.get('value') for e in gateway['env']}['DUCKFLEET_WORKER_URLS']
+services = {name for kind, name in by_name if kind == 'Service'}
+assert worker_urls, 'the gateway must be given worker endpoints'
+for url in worker_urls.split(','):
+    host = url.removeprefix('http://').split(':')[0]
+    assert host in services, f'gateway points at {host}, which this release does not render'
+    assert ('Deployment', host) in by_name, f'no Deployment backs {host}'
+assert len(worker_urls.split(',')) == len([n for k, n in by_name
+                                           if k == 'Deployment' and n.startswith('worker-')])
+
 isolation = by_name['NetworkPolicy', 'duckfleet-isolation']['spec']
 assert isolation['policyTypes'] == ['Ingress', 'Egress']
 
