@@ -115,12 +115,25 @@ limits on CPU time, not dedicated CPU cores.
 
 A request no worker provides is refused with `503`, naming the sizes the
 deployment does run. It is never served by a different size, and an unreachable
-worker is reported separately from a size that was never provisioned. The
-gateway selects an exact matching, prestarted worker; it does not
-launch an EC2 instance or create a container on demand. A model's entire lifecycle
-stays on one worker/session; it cannot resize in the middle of a transaction.
-Unsupported sizes return an error, and an unavailable worker never falls back to
-a smaller one.
+worker is reported separately from a size that was never provisioned. A model's
+entire lifecycle stays on one worker/session; it cannot resize in the middle of a
+transaction. Unsupported sizes return an error, and an unavailable worker never
+falls back to a smaller one.
+
+A request carries a mode as well as a size. `persistent` selects an exact
+matching, prestarted worker, shared with other sessions of the same size.
+`isolated` creates a pod for that session alone, with requests equal to limits,
+and removes it afterwards; nothing else is admitted to that pod, before or after.
+An unplaceable isolated request is refused with the scheduler's own reason and is
+never downgraded to a shared worker.
+
+Isolated compute is **off by default**, and where it is off the mode is refused
+with `501 compute_unavailable` rather than quietly served. It needs the gateway to
+hold a namespaced Role over pods, and the development deploy identity is not
+permitted to create Roles — `scripts/aws/check-access.sh` asserts it cannot and
+fails the deploy if that ever changes. So `make test-k8s` is where the feature
+actually runs, against a cluster that is ours to grant; `duck-fleet#39` tracks the
+grant that would turn it on in the shared development namespace.
 
 The harness builds `fct_orders` on medium and `customer_totals` on small, checks
 resource settings inside the materialized results, then rebuilds `fct_orders` on
@@ -165,7 +178,7 @@ All `/v1` endpoints require `Authorization: Bearer <token>`.
 | POST | `/v1/sessions/{id}/cancel` | Interrupt this session's currently executing statement |
 | GET | `/v1/queries` | Filtered history with cursor pagination; defaults to 500 records |
 | GET | `/v1/queries/{query_id}` | One durable record, metrics, and raw DuckDB profile when available |
-| GET | `/v1/workers` | Worker IDs, engine settings, and observed cgroup limits |
+| GET | `/v1/workers` | Worker IDs, engine settings, observed cgroup limits, and whether isolated compute is available |
 | GET | `/v1/usage` | Append-only usage events with cursor pagination |
 | GET | `/v1/budget` | Prepaid balance, held reservations, spend, caps, rate card |
 | PUT | `/v1/budget` | Set the prepaid balance and per-job cost cap |

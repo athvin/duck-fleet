@@ -60,6 +60,13 @@ pub(crate) struct Worker {
     worker_id: String,
     resources: Resources,
     placement: Value,
+    /// True when this process is a pod created for a single isolated session, which
+    /// bounds what it will admit below.
+    dedicated: bool,
+    /// Sessions admitted over this process's lifetime, not the count currently open.
+    /// A dedicated pod is spent once it has served one, so reusing a pod whose
+    /// session has closed would quietly turn it back into shared compute.
+    served: u64,
     ledger: Client,
     sessions: HashMap<Uuid, Session>,
     active: ActiveSlot,
@@ -236,13 +243,18 @@ impl Worker {
             observed.resources
         );
         let resources = declared;
-        // A worker only ever serves the persistent tier; an isolated request is
-        // refused by the contract before it reaches one.
-        let mut placement = Placement {
-            mode: Mode::Persistent,
-            resources,
-        }
-        .describe(&worker_id);
+        // Whether this process is a pod created for one session, declared by the
+        // chart rather than inferred from the request. A caller must not be able to
+        // relabel where their statement ran, in either direction: claiming isolation
+        // on a shared worker would void the guarantee, and claiming shared compute on
+        // a dedicated pod would misreport what was billed.
+        let dedicated = std::env::var("DUCKFLEET_ISOLATED").as_deref() == Ok("true");
+        let mode = if dedicated {
+            Mode::Isolated
+        } else {
+            Mode::Persistent
+        };
+        let mut placement = Placement { mode, resources }.describe(&worker_id);
         placement["cgroup_memory_max"] = json!(observed.resources.memory_bytes);
         placement["cgroup_cpu_quota"] = json!(observed.cpu_quota);
         placement["cgroup_cpu_period"] = json!(observed.cpu_period);
@@ -368,6 +380,8 @@ impl Worker {
             worker_id,
             resources,
             placement,
+            dedicated,
+            served: 0,
             ledger,
             sessions: HashMap::new(),
             active,
@@ -408,6 +422,28 @@ impl Worker {
                 }
                 request.context["requested_compute"] =
                     serde_json::to_value(&request.compute).map_err(|_| ApiError::internal())?;
+                // Refused here as well as at the gateway, because a worker is
+                // reachable in its own right: this process is the shared compute the
+                // isolation guarantee excludes, so it must never serve the request.
+                if placement.mode == Mode::Isolated && !self.dedicated {
+                    return Err(crate::compute::unavailable());
+                }
+                if self.dedicated && placement.mode != Mode::Isolated {
+                    return Err(ApiError::bad(
+                        "this pod was created for one isolated session and does not serve \
+                         shared compute",
+                    ));
+                }
+                // One session for the pod's lifetime. This is what makes the
+                // isolation real rather than intended: no second session can be
+                // admitted alongside, or after, the one it was created for.
+                if self.dedicated && self.served > 0 {
+                    return Err(ApiError::new(
+                        failure::CAPACITY,
+                        "this pod has already served its session; isolated compute is one \
+                         session per pod",
+                    ));
+                }
                 if self.sessions.len() >= 32 {
                     return Err(ApiError::new(failure::CAPACITY, "session limit reached"));
                 }
@@ -427,6 +463,7 @@ impl Worker {
                         placement,
                     },
                 );
+                self.served += 1;
                 Ok(Output::Json(
                     json!({"session_id":id, "database":"lake", "duckdb_version":"1.5.4", "placement":self.placement}),
                 ))

@@ -12,6 +12,7 @@ testing a different shape than it claims to.
 """
 
 import argparse
+import json
 import sys
 
 import yaml
@@ -107,6 +108,15 @@ class Localizer:
                 # noise in a throwaway cluster.
                 claim["spec"]["resources"]["requests"]["storage"] = "2Gi"
                 self.mark("storage-class")
+        if kind == "ConfigMap" and "pod.json" in doc.get("data", {}):
+            # The isolated pod template is a JSON string inside a ConfigMap, so none
+            # of the rewrites above reach it. Left alone, the gateway would create a
+            # pod that tries to pull from ECR and never becomes ready — and the
+            # failure would look like a scheduling problem rather than a packaging one.
+            template = json.loads(doc["data"]["pod.json"])
+            self.pod(template["spec"])
+            doc["data"]["pod.json"] = json.dumps(template)
+            self.mark("isolated-pod")
         if kind == "NetworkPolicy":
             # The release reaches S3 over the internet on AWS. Locally the object
             # store is another pod in this namespace, so same-namespace traffic needs

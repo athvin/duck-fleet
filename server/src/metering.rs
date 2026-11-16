@@ -154,6 +154,24 @@ pub(crate) fn recover(transaction: &mut Transaction, worker_id: &str) -> Result<
     Ok(orphans.len() as u64)
 }
 
+/// Worker identities that still hold funds and whose names begin with `prefix`.
+///
+/// For a session pod the identity is the pod's own name, so these are the holds that
+/// no restart will ever settle: a persistent worker recovers its own when it comes
+/// back, but a pod that has been deleted never comes back. The gateway is the only
+/// process left that knows they existed.
+pub(crate) fn held_matching(client: &mut Client, prefix: &str) -> Result<Vec<String>> {
+    Ok(client
+        .query(
+            "SELECT DISTINCT worker_id FROM reservations
+             WHERE state = 'held' AND worker_id LIKE $1 || '%'",
+            &[&prefix],
+        )?
+        .iter()
+        .map(|row| row.get(0))
+        .collect())
+}
+
 /// Reserves funds for one execution. The budget row is locked for the duration, so
 /// concurrent admissions on different workers cannot both pass on the same balance.
 pub(crate) fn admit(

@@ -171,6 +171,20 @@ pub(crate) const UNAVAILABLE: Failure = Failure {
     retry_safe: false,
     http: StatusCode::SERVICE_UNAVAILABLE,
 };
+/// A well-formed isolated request that nothing could hold: no node fits it, or the
+/// pod never became ready.
+///
+/// Separate from `UNAVAILABLE` because that is also what an internal failure returns,
+/// where a statement may already have run, so it has to stay conservative about
+/// retries. Here the failure happened before any session existed, so the request
+/// provably left nothing behind — and unlike `COMPUTE_UNAVAILABLE`, which means this
+/// deployment cannot isolate at all, capacity may well be different later.
+pub(crate) const NOT_PLACEABLE: Failure = Failure {
+    status: None,
+    kind: "not_placeable",
+    retry_safe: true,
+    http: StatusCode::SERVICE_UNAVAILABLE,
+};
 
 /// DuckDB's marker for a transaction that lost a commit race. DuckLake repeats it
 /// in the catalog commit error, and the same text covers conflicting inserts,

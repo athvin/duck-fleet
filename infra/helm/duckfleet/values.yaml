@@ -51,3 +51,25 @@ workerCpuRequests:
 dnsEgressCidrs:
   - 172.20.0.0/16
   - 10.0.0.0/16
+
+# On-demand compute: a pod per session, sized to the request.
+#
+# Off here, and not as a rollout gate. The gateway would need a Role to create pods,
+# and the deploy identity cannot create Roles — check-access.sh asserts it cannot and
+# fails the deploy if that ever changes. Enabling this in a namespace DuckFleet does
+# not own would therefore break the release, so the local Kubernetes harness is where
+# it runs. #39 tracks the grant; #12 removes the need for it.
+#
+# Where this is false, `compute: isolated` returns compute_unavailable, no statement
+# runs, and the request is never downgraded to a shared worker.
+isolatedCompute:
+  enabled: false
+  # Hard ceiling on a session pod's life, enforced by the kubelet rather than by the
+  # gateway, so a pod cannot outlive the gateway that forgot it. Well above the 60s
+  # statement timeout: this bounds leaks, it does not time out queries.
+  maxSessionSeconds: 1800
+  # How long to wait for a pod to become ready before giving up and deleting it.
+  readySeconds: 120
+  # Where the Kubernetes API server may be reached. Required when enabled: defaulting
+  # it would mean opening egress to reach an address nobody declared.
+  apiServerCidrs: []

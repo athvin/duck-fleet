@@ -172,6 +172,28 @@ class RolloutWaitTests(unittest.TestCase):
         self.assertNotIn('--wait', commands)
         self.assertIn('wait-rollout.py', commands)
 
+    def test_verification_counts_only_persistent_workers(self):
+        verify = (ROOT/'scripts/aws/verify.py').read_text()
+        # A session pod carries `app: duckfleet-worker` so the worker NetworkPolicy
+        # grants it S3 egress, which means selecting on that label alone would count
+        # a transient isolated pod as part of the persistent tier and then fail
+        # looking for a `size` it does not have.
+        self.assertIn("'duckfleet-compute' not in", verify)
+
+    def test_a_release_needing_rbac_it_cannot_create_fails_before_helm(self):
+        deploy = (ROOT/'scripts/aws/deploy.sh').read_text()
+        commands = '\n'.join(line for line in deploy.splitlines()
+                             if not line.lstrip().startswith('#'))
+        # Enabling isolated compute against an identity that cannot create Roles has
+        # to be refused before anything is applied, and has to say why rather than
+        # surfacing as a forbidden object partway through a release.
+        self.assertIn('can-i create roles.rbac.authorization.k8s.io', commands)
+        self.assertIn('duck-fleet#39', deploy)
+        gate = commands.index('can-i create roles')
+        self.assertLess(gate, commands.index('helm upgrade'),
+                        'the RBAC gate must run before the release is applied')
+
+
 class ImagePublishingTests(unittest.TestCase):
     def test_indexes_require_both_platforms(self):
         values = load('image_values', 'scripts/aws/image_values.py')

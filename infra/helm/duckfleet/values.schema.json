@@ -42,6 +42,22 @@
         "pattern": "^[0-9]{1,3}(\\.[0-9]{1,3}){3}/([0-9]|[12][0-9]|3[0-2])$"
       }
     },
+    "isolatedCompute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "maxSessionSeconds": {"type": "integer", "minimum": 60, "maximum": 7200},
+        "readySeconds": {"type": "integer", "minimum": 5, "maximum": 600},
+        "apiServerCidrs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9]{1,3}(\\.[0-9]{1,3}){3}/([0-9]|[12][0-9]|3[0-2])$"
+          }
+        }
+      }
+    },
     "workerCpuRequests": {
       "type": "object",
       "propertyNames": {

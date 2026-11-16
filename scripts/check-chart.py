@@ -1,5 +1,6 @@
 """Validate the rendered, deployable resource boundary. Requires PyYAML."""
 import ipaddress
+import json
 import sys
 import yaml
 
@@ -29,6 +30,9 @@ for size, cpu in [('small', 1), ('medium', 2)]:
     assert env['S3_AUTH_MODE'] == 'pod_identity'
     assert env['AWS_EC2_METADATA_DISABLED'] == 'true'
     assert 'S3_SECRET_KEY' not in env
+    # A persistent worker is shared compute, so it must not claim to be a dedicated
+    # pod: that claim is what lets a worker admit an isolated session at all.
+    assert 'DUCKFLEET_ISOLATED' not in env
     # A worker reports not-ready while it waits for the catalog. Waiting longer than
     # the startup probe allows would have the pod replaced mid-wait, which is the
     # crash loop the wait exists to prevent.
@@ -81,4 +85,105 @@ for rule in dns_rules:
 assert any('ipBlock' in peer for rule in dns_rules for peer in rule['to']), (
     'DNS must also be reachable by address; a selector matches nothing on EKS Auto Mode'
 )
+
+# On-demand compute is the one capability that needs the gateway to hold a Kubernetes
+# token, so the whole of it renders together or not at all. A release with the token
+# but not the Role, or the Role but not the egress rule, would fail somewhere less
+# obvious than here.
+ISOLATED = [('ServiceAccount', 'duckfleet-gateway'),
+            ('Role', 'duckfleet-isolated-pods'),
+            ('RoleBinding', 'duckfleet-isolated-pods'),
+            ('NetworkPolicy', 'duckfleet-gateway-kubernetes'),
+            ('ConfigMap', 'duckfleet-isolated-pod')]
+present = [key for key in ISOLATED if key in by_name]
+assert not present or len(present) == len(ISOLATED), (
+    f'isolated compute is half-rendered: {present}')
+
+gateway_pod = by_name['Deployment', 'server']['spec']['template']['spec']
+if not present:
+    # The default, and what every deploy into a namespace DuckFleet does not own must
+    # keep producing: no token, so no ability to create pods, so `compute: isolated`
+    # is refused rather than served from a shared worker.
+    assert gateway_pod['serviceAccountName'] == 'duckfleet-no-aws'
+    assert not gateway_pod.get('volumes'), gateway_pod.get('volumes')
+    for account in ['duckfleet-worker', 'duckfleet-no-aws']:
+        assert by_name['ServiceAccount', account]['automountServiceAccountToken'] is False
+else:
+    assert gateway_pod['serviceAccountName'] == 'duckfleet-gateway'
+    assert by_name['ServiceAccount', 'duckfleet-gateway']['automountServiceAccountToken'] is True
+    # Only the gateway. A worker runs user SQL, so a token there would let a query
+    # reach the API server.
+    for account in ['duckfleet-worker', 'duckfleet-no-aws']:
+        assert by_name['ServiceAccount', account]['automountServiceAccountToken'] is False
+
+    # Pods in this namespace and nothing else. `secrets` would hand the gateway the
+    # catalog password it deliberately never reads; roles would let it widen itself.
+    rules = by_name['Role', 'duckfleet-isolated-pods']['rules']
+    assert len(rules) == 1, rules
+    assert rules[0]['apiGroups'] == [''] and rules[0]['resources'] == ['pods'], rules
+    assert sorted(rules[0]['verbs']) == ['create', 'delete', 'get', 'list', 'watch'], rules
+    binding = by_name['RoleBinding', 'duckfleet-isolated-pods']
+    assert binding['roleRef'] == {'apiGroup': 'rbac.authorization.k8s.io', 'kind': 'Role',
+                                  'name': 'duckfleet-isolated-pods'}, binding['roleRef']
+    assert [s['name'] for s in binding['subjects']] == ['duckfleet-gateway']
+
+    # Reaching the API server is a new egress edge. It stays the gateway's alone, on
+    # HTTPS, to declared private addresses: a SQL engine that could reach port 443
+    # anywhere is a data path out.
+    api = by_name['NetworkPolicy', 'duckfleet-gateway-kubernetes']['spec']
+    assert api['podSelector']['matchLabels'] == {'app': 'duckfleet-gateway'}
+    assert api['policyTypes'] == ['Egress']
+    for rule in api['egress']:
+        assert {port['port'] for port in rule['ports']} == {443}, rule
+        for peer in rule['to']:
+            network = ipaddress.ip_network(peer['ipBlock']['cidr'])
+            assert network.is_private, f'API egress must stay private, got {network}'
+            assert network.prefixlen >= 8, f'API egress range too broad: {network}'
+
+    # The pod the gateway creates. Checked against the persistent worker rather than
+    # against a copy of its values, so the two cannot drift: an isolated pod is the
+    # same image under the same security rules, differing only in how it is sized and
+    # how long it lives.
+    template = json.loads(by_name['ConfigMap', 'duckfleet-isolated-pod']['data']['pod.json'])
+    persistent = by_name['Deployment', 'worker-small']['spec']['template']['spec']
+    isolated, container = template['spec'], template['spec']['containers'][0]
+    assert isolated['securityContext'] == persistent['securityContext']
+    assert container['securityContext'] == persistent['containers'][0]['securityContext']
+    assert container['image'] == persistent['containers'][0]['image']
+    assert isolated['nodeSelector'] == persistent['nodeSelector']
+    assert isolated['serviceAccountName'] == 'duckfleet-worker'
+    # Both labels are load-bearing. `app` is what the worker NetworkPolicy selects,
+    # so without it a session pod gets no S3 egress; the other is what a startup
+    # sweep selects on, so without it an abandoned pod is invisible.
+    assert template['metadata']['labels']['app'] == 'duckfleet-worker'
+    assert template['metadata']['labels']['duckfleet-compute'] == 'isolated'
+    # A session pod runs user SQL and must not inherit the gateway's new powers.
+    assert isolated['automountServiceAccountToken'] is False
+    # Never restarted and never immortal: a restart would reattach the catalog under
+    # an identity whose session the gateway has forgotten, and the deadline is the
+    # backstop that bounds a leak if every other layer fails.
+    assert isolated['restartPolicy'] == 'Never'
+    assert isolated['activeDeadlineSeconds'] >= 60
+    # Requests equal limits for what the caller asked for: a dedicated pod has no
+    # neighbour to borrow headroom from. The placeholder sizes here are replaced per
+    # session, so only their equality is meaningful.
+    for quantity in ['cpu', 'memory']:
+        assert container['resources']['requests'][quantity] == \
+               container['resources']['limits'][quantity], quantity
+    # The gateway rewrites these three per session and refuses to start a pod without
+    # them, so the template has to keep carrying them.
+    declared = {e['name']: e.get('value') for e in container['env']}
+    for variable in ['DUCKFLEET_WORKER_ID', 'DUCKFLEET_WORKER_CPU', 'DUCKFLEET_WORKER_MEMORY']:
+        assert variable in declared, variable
+    # Without this the pod would admit shared sessions and report an isolated
+    # placement as persistent in history.
+    assert declared['DUCKFLEET_ISOLATED'] == 'true', declared.get('DUCKFLEET_ISOLATED')
+    # Rendered from the shared helper, so a session pod reaches the same catalog and
+    # bucket as a persistent worker rather than a separately maintained guess.
+    assert declared['S3_AUTH_MODE'] == 'pod_identity'
+    assert declared['AWS_EC2_METADATA_DISABLED'] == 'true'
+    assert 'S3_SECRET_KEY' not in declared
+    secrets = {e['name'] for e in container['env'] if 'valueFrom' in e}
+    assert {'CATALOG_DSN', 'PLATFORM_DSN', 'DUCKFLEET_TOKEN'} <= secrets, secrets
+
 print('PASS: chart resource sizes, identity, isolation, private services, and scoped DNS')

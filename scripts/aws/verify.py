@@ -13,8 +13,16 @@ if len(records) != 1:
 evidence = json.loads(records[0])
 pods = json.loads((root/'pods.json').read_text())['items']
 after = json.loads((root/'pods-after.json').read_text())['items']
-workers = [p for p in pods if p['metadata'].get('labels', {}).get('app') == 'duckfleet-worker' and not p['metadata'].get('deletionTimestamp')]
-assert len(workers) == 2, 'Expected exactly two worker pods'
+# The persistent tier only. A session pod carries `app: duckfleet-worker` too, by
+# design — that label is what grants it S3 egress — so selecting on it alone would
+# count a transient isolated pod as a worker and then fail looking for its `size`.
+# Isolated compute is off wherever this runs today; this keeps that from becoming a
+# trap for whoever enables it (#39).
+workers = [p for p in pods
+           if p['metadata'].get('labels', {}).get('app') == 'duckfleet-worker'
+           and 'duckfleet-compute' not in p['metadata'].get('labels', {})
+           and not p['metadata'].get('deletionTimestamp')]
+assert len(workers) == 2, 'Expected exactly two persistent worker pods'
 assert {p['metadata']['labels']['size'] for p in workers} == {'small', 'medium'}
 assert {w['worker_id'] for w in evidence['workers']} == {'small', 'medium'}
 for pod in workers:
