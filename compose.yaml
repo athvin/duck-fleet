@@ -77,8 +77,8 @@ services:
       DUCKFLEET_ROLE: gateway
       PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
       DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
-      WORKER_SMALL_URL: http://worker-small:8080
-      WORKER_MEDIUM_URL: http://worker-medium:8080
+      # Endpoints, not classes: the gateway asks each worker what resources it has.
+      DUCKFLEET_WORKER_URLS: http://worker-small:8080,http://worker-medium:8080
     ports:
       - '127.0.0.1:${DUCKFLEET_PORT:-18080}:8080'
     depends_on:

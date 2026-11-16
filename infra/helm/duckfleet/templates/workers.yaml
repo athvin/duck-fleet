@@ -1,4 +1,6 @@
-{{- range $size, $cpu := dict "small" 1 "medium" 2 }}
+{{- range $size, $declared := include "duckfleet.workerClasses" . | fromYaml }}
+{{- /* fromYaml routes through JSON, so a class size arrives as a float. */}}
+{{- $cpu := int $declared }}
 ---
 apiVersion: v1
 kind: Service
