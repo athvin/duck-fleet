@@ -51,6 +51,9 @@ session() { # session <worker> <json>
 test "$(session worker-small '{"compute":{"compute":"isolated","cpu":1,"memory":"1Gi"}}')" = 501
 test "$(session worker-small '{"compute":{"compute":"persistent","cpu":1,"memory":"1Gi"}}')" = 200
 echo 'PASS: a worker addressed directly refuses isolation it cannot provide'
+# dbt must be an option, not a dependency. This runs the whole workflow from an image
+# where dbt is not installed, and asserts that before doing anything else.
+docker compose run --rm api
 docker compose run --rm dbt
 # Overlapping DuckLake transactions need both workers healthy, so this runs before
 # any worker is stopped below.

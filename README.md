@@ -155,15 +155,67 @@ docker compose run --rm dbt dbt run --select fct_orders --full-refresh \
 
 ```text
 server/                 Rust gateway, resource classes, workers, query history
-adapters/dbt-duckfleet/  Python dbt adapter and HTTP/Arrow transport
-compose.yaml            PostgreSQL, RustFS, gateway, sized workers, dbt runner
+clients/duckfleet-python/  HTTP/Arrow client and CLI; no dbt dependency
+adapters/dbt-duckfleet/  Python dbt adapter, which depends on that client
+compose.yaml            PostgreSQL, RustFS, gateway, sized workers, dbt and API runners
 docker/                 Images and initial PostgreSQL databases
 scripts/                Build and harness helpers
 tests/dbt/              Representative seed, view, table, incremental model, tests
 tests/harness.py         Protocol, dbt, and restart assertions
+tests/api_workflow.py    The same warehouse workflow with dbt absent
 tests/concurrency.py     Overlapping DuckLake transactions and retry classification
 tests/metering.py        Usage ledger, pricing, and budget enforcement
 ```
+
+## Use it without dbt
+
+dbt is an option, not a dependency. Everything the platform does is reachable from
+the HTTP API, and the client that speaks it is its own package:
+
+```sh
+pip install ./clients/duckfleet-python
+export DUCKFLEET_URL=http://localhost:18080
+export DUCKFLEET_TOKEN=duckfleet-local-development-token
+
+duckfleet sql 'create or replace table analytics.events (id integer, region varchar)' \
+              "insert into analytics.events values (1, 'eu')"
+duckfleet sql 'select region, count(*) from analytics.events group by region'
+duckfleet sql 'select * from analytics.events where region = ?' --param eu --format json
+```
+
+`duckfleet` depends on `pyarrow` and the standard library. It does **not** depend on
+dbt-core, and the dbt adapter depends on *it*, so both speak one wire protocol rather
+than two that can drift apart.
+
+Statements given to one `sql` invocation share a session, which is what pins a load
+and the query that checks it to the same worker. Compute is selectable per invocation,
+the same choice a dbt model expresses through `meta.platform`:
+
+```sh
+duckfleet sql 'select current_setting("threads")' --cpu 2 --memory 2Gi --placement
+duckfleet sql 'select 1' --isolated --cpu 4 --memory 8Gi   # a pod of its own
+```
+
+`duckfleet history`, `query <id>`, `usage`, `budget` and `workers` cover inspection.
+A refusal exits non-zero and prints the server's own classification and `retry_safe`,
+so a shell script can tell "ask differently" from "ask later" without parsing prose.
+
+From Python, the same surface is a DB-API-shaped client:
+
+```python
+from duckfleet import RemoteConnection
+
+connection = RemoteConnection(URL, TOKEN, compute={"cpu": 2, "memory": "2Gi"})
+rows = connection.cursor().execute("select * from analytics.events where region = ?",
+                                   ["eu"]).fetchall()
+connection.close()   # rolls back anything uncommitted
+```
+
+`tests/api_workflow.py` runs this whole path — create, load with bound parameters,
+query, read history and usage, then the same workflow through the CLI — in
+`docker/cli.Dockerfile`, an image where dbt is **not installed**. Its first assertion
+is that `import dbt` fails, because running it anywhere dbt happened to be present
+would show that the API works rather than that it works without dbt.
 
 ## Local execution API
 

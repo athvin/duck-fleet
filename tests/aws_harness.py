@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 import harness
-from dbt.adapters.duckfleet.client import RemoteConnection
+from duckfleet import RemoteConnection
 
 harness.main()
 prefix = os.environ['EXPECT_S3_PREFIX']

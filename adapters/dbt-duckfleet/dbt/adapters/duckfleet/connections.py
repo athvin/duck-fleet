@@ -4,7 +4,7 @@ import threading
 from dbt.adapters.contracts.connection import ConnectionState
 from dbt.adapters.duckdb.connections import DuckDBConnectionManager
 from dbt.adapters.duckdb.credentials import DuckDBCredentials
-from dbt.adapters.duckfleet.client import RemoteConnection
+from duckfleet import RemoteConnection
 from dbt.adapters.exceptions import FailedToConnectError
 
 

@@ -1,4 +1,10 @@
-"""Small DB-API-style transport. No local DuckDB connection or SQL retry path."""
+"""Small DB-API-style transport. No local DuckDB connection or SQL retry path.
+
+The whole client surface for DuckFleet, and deliberately its own package rather than
+part of the dbt adapter. It depends on `pyarrow` and the standard library, so using
+the platform does not mean installing dbt-core. The dbt adapter imports this, so
+there is one definition of the wire protocol rather than two that can drift.
+"""
 import datetime
 import decimal
 import json

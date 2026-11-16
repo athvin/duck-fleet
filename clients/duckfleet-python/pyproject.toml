@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duckfleet"
+version = "0.1.0"
+description = "Client and CLI for the DuckFleet HTTP API"
+requires-python = ">=3.12"
+# pyarrow only, because results arrive as Arrow IPC. Notably absent: dbt-core, which
+# the adapter needs and a caller of this does not.
+dependencies = ["pyarrow==23.0.1"]
+
+[project.scripts]
+duckfleet = "duckfleet.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["duckfleet*"]
