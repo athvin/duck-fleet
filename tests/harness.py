@@ -61,8 +61,26 @@ def resource_checks(connection):
         require(worker["memory_bytes"] == worker["cgroup_memory_max"] == cpu * 1024**3, str(worker))
     (ARTIFACTS / "worker-resources.json").write_text(json.dumps(workers, indent=2))
     require(len({w["worker_boot_id"] for w in workers}) == 2, "workers share one process")
-    for compute in [{"cpu":32,"memory":"128Gi"}, {"cpu":2}, {"cpu":1,"memory":"2Gi"}, {"compute":"burst"}]:
-        expect_error(400, lambda: connection.client.request("POST", "/v1/sessions", {"compute":compute}))
+    # A malformed request is the caller's to fix, so it stays a classified 400.
+    for compute in [{"cpu":2}, {"memory":"2Gi"}, {"cpu":0,"memory":"1Gi"},
+                    {"cpu":1,"memory":"1GB"}, {"compute":"burst"}]:
+        refused = expect_error(400, lambda: connection.client.request(
+            "POST", "/v1/sessions", {"compute":compute}))
+        require(refused.failure_kind == "invalid_request", f"{compute}: {refused}")
+    # A size nothing runs is a different thing: the request is well formed and this
+    # deployment simply has no worker for it. It must say so, and must never be
+    # served by a worker of another size.
+    absent = expect_error(503, lambda: connection.client.request(
+        "POST", "/v1/sessions", {"compute":{"cpu":32,"memory":"128Gi"}}))
+    require("no worker provides cpu=32, memory=128Gi" in str(absent), str(absent))
+    # A size this deployment does run resolves even though nothing was taught it:
+    # 1Gi at 1 CPU is the default pair expressed the long way.
+    exact = RemoteConnection(URL, TOKEN, compute={"cpu":1,"memory":"1024Mi"})
+    try:
+        require(exact.placement["worker_id"] == "small", str(exact.placement))
+        require(exact.placement["memory_bytes"] == 1024**3, str(exact.placement))
+    finally:
+        exact.close()
     medium = RemoteConnection(URL, TOKEN, compute={"cpu":2,"memory":"2Gi"})
     try:
         require(medium.placement["worker_id"] == "medium", "medium request silently fell back")

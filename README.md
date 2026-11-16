@@ -92,18 +92,31 @@ select * from {{ ref('stg_orders') }}
 Defaults can also be set under `models.<project>.+meta.platform` in
 `dbt_project.yml`. The adapter receives dbt's resolved model config before its
 first SQL statement. Both `cpu` and `memory` must be supplied together; omitting
-both selects small. Use `meta.platform.tags` for workload attribution. Other
-platform keys are rejected rather than ignored.
+both requests 1 CPU and `1Gi`. Use `meta.platform.tags` for workload
+attribution. Other platform keys are rejected rather than ignored.
 
-| Requested CPU / memory | Docker worker | DuckDB threads | DuckDB memory limit |
+Any CPU and memory pair may be requested. There is no fixed menu of sizes: a
+worker reports the resources it actually has, read from its own cgroup, and the
+gateway routes a request to a worker providing exactly that. Running a new size
+is running a worker with those limits and listing its endpoint in
+`DUCKFLEET_WORKER_URLS`, not teaching the platform a new name.
+
+The local harness runs two workers, so these resolve out of the box:
+
+| Requested CPU / memory | Worker | DuckDB threads | DuckDB memory limit |
 | --- | --- | --- | --- |
-| 1 / `1Gi` | `worker-small` | 1 | 512 MiB |
-| 2 / `2Gi` | `worker-medium` | 2 | 1 GiB |
+| 1 / `1Gi` | `small` | 1 | 512 MiB |
+| 2 / `2Gi` | `medium` | 2 | 1 GiB |
 
-Memory in the request is the **container cap**. DuckDB-managed memory is limited to half that cap, leaving room for extensions, networking, and Arrow results. Docker
-CPU quotas are hard limits on CPU time, not dedicated CPU cores.
+Memory in the request is the **container cap**, given as a binary quantity such
+as `2Gi` or `512Mi`. DuckDB-managed memory is limited to half that cap, leaving
+room for extensions, networking, and Arrow results. Docker CPU quotas are hard
+limits on CPU time, not dedicated CPU cores.
 
-The gateway selects an exact matching, prestarted Docker worker. It does not
+A request no worker provides is refused with `503`, naming the sizes the
+deployment does run. It is never served by a different size, and an unreachable
+worker is reported separately from a size that was never provisioned. The
+gateway selects an exact matching, prestarted worker; it does not
 launch an EC2 instance or create a container on demand. A model's entire lifecycle
 stays on one worker/session; it cannot resize in the middle of a transaction.
 Unsupported sizes return an error, and an unavailable worker never falls back to

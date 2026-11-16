@@ -1,6 +1,6 @@
 use crate::{
     ApiError, Envelope, Operation, Output, QueryRequest, Reply,
-    compute::{Mode, Placement, Size},
+    compute::{Mode, Placement, Resources},
     failure, metering,
     secrets::{Redactor, Startup},
 };
@@ -55,7 +55,10 @@ struct Session {
 }
 pub(crate) struct Worker {
     root: Connection,
-    size: Size,
+    /// Stable identity used by history and reservation recovery. Separate from
+    /// `resources`, which the worker reads from its cgroup.
+    worker_id: String,
+    resources: Resources,
     placement: Value,
     ledger: Client,
     sessions: HashMap<Uuid, Session>,
@@ -160,39 +163,89 @@ fn retrying<T>(
     }
 }
 
+/// What the cgroup says this container got, with the raw values kept for evidence.
+struct Observed {
+    resources: Resources,
+    cpu_quota: u64,
+    cpu_period: u64,
+}
+
+/// The resources this container actually has, read from its cgroup.
+///
+/// The CPU quota is the *limit*, not the request: a request may sit lower so the pod
+/// fits constrained capacity, and the engine is sized from what it can actually use.
+fn observed_resources() -> Result<Observed> {
+    let memory_bytes: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.max")?
+        .trim()
+        .parse()
+        .context("cgroup memory.max is not a byte count")?;
+    let cpu_max = std::fs::read_to_string("/sys/fs/cgroup/cpu.max")?;
+    let quota: Vec<u64> = cpu_max
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<std::result::Result<_, _>>()
+        .context("cgroup cpu.max is not a quota and period")?;
+    anyhow::ensure!(
+        quota.len() == 2 && quota[1] > 0,
+        "cgroup cpu.max is not a quota-and-period pair"
+    );
+    anyhow::ensure!(
+        quota[0].is_multiple_of(quota[1]),
+        "cgroup CPU quota {} is not a whole number of CPUs at period {}",
+        quota[0],
+        quota[1]
+    );
+    Ok(Observed {
+        resources: Resources {
+            cpu: u16::try_from(quota[0] / quota[1])?,
+            memory_bytes,
+        },
+        cpu_quota: quota[0],
+        cpu_period: quota[1],
+    })
+}
+
 impl Worker {
     pub(crate) fn new(active: ActiveSlot, runtime: tokio::runtime::Handle) -> Result<Self> {
-        let size = match required("DUCKFLEET_WORKER_SIZE")?.as_str() {
-            "small" => Size::Small,
-            "medium" => Size::Medium,
-            _ => anyhow::bail!("unknown worker size"),
-        };
+        // Identity, not size. Reservation recovery keys on this, so it has to stay
+        // stable even if the worker is later given different resources.
+        let worker_id = required("DUCKFLEET_WORKER_ID")?;
+        anyhow::ensure!(
+            !worker_id.is_empty() && worker_id.len() <= 63,
+            "DUCKFLEET_WORKER_ID must be between 1 and 63 characters"
+        );
+        // What this worker is configured to be. Any pair is allowed, so this is not a
+        // menu of classes, but it is declared rather than inferred so the container
+        // can be checked against it below.
+        let declared = Resources::parse(
+            &required("DUCKFLEET_WORKER_CPU")?,
+            &required("DUCKFLEET_WORKER_MEMORY")?,
+        )
+        .map_err(|reason| anyhow::anyhow!("DUCKFLEET_WORKER_CPU/MEMORY: {reason}"))?;
+        // What the container actually got. These must agree: the chart renders the
+        // declaration from the same values as the container's limits, so a mismatch
+        // means something between the chart and the kubelet changed them — a
+        // LimitRange, an admission webhook, a hand-edited manifest. Serving a size
+        // nobody asked this worker to serve would then look like a correct placement
+        // in history and bill as the size that was requested, so it refuses to start.
+        let observed = observed_resources()?;
+        anyhow::ensure!(
+            observed.resources == declared,
+            "container limits {:?} do not match the configured {declared:?}; \
+             refusing to serve resources this worker was not configured for",
+            observed.resources
+        );
+        let resources = declared;
         // A worker only ever serves the persistent tier; an isolated request is
         // refused by the contract before it reaches one.
         let mut placement = Placement {
             mode: Mode::Persistent,
-            size,
+            resources,
         }
-        .describe();
-        let memory_max: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.max")?
-            .trim()
-            .parse()?;
-        let cpu_max = std::fs::read_to_string("/sys/fs/cgroup/cpu.max")?;
-        let limits: Vec<u64> = cpu_max
-            .split_whitespace()
-            .map(str::parse)
-            .collect::<std::result::Result<_, _>>()?;
-        anyhow::ensure!(
-            limits.len() == 2 && limits[1] > 0 && limits[0] == limits[1] * u64::from(size.cpu()),
-            "container CPU quota does not match worker size"
-        );
-        anyhow::ensure!(
-            memory_max == size.memory_bytes(),
-            "container memory limit does not match worker size"
-        );
-        placement["cgroup_memory_max"] = json!(memory_max);
-        placement["cgroup_cpu_quota"] = json!(limits[0]);
-        placement["cgroup_cpu_period"] = json!(limits[1]);
+        .describe(&worker_id);
+        placement["cgroup_memory_max"] = json!(observed.resources.memory_bytes);
+        placement["cgroup_cpu_quota"] = json!(observed.cpu_quota);
+        placement["cgroup_cpu_period"] = json!(observed.cpu_period);
         placement["worker_boot_id"] = json!(Uuid::new_v4());
         let redactor = Redactor::from_env();
         let startup = Startup::new(Connection::open_in_memory()?, redactor.clone());
@@ -200,8 +253,8 @@ impl Worker {
             "applying engine limits",
             &format!(
                 "SET memory_limit='{}'; SET threads={};",
-                size.engine_memory(),
-                size.cpu()
+                resources.engine_memory(),
+                resources.cpu
             ),
         )?;
         startup.run("loading extensions", " SET max_temp_directory_size='1GB'; SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; LOAD httpfs; LOAD postgres; LOAD ducklake;")?;
@@ -291,7 +344,7 @@ impl Worker {
             failure_kind=$2, retry_safe=$3
             WHERE status='running' AND worker_id=$1",
             &[
-                &size.name(),
+                &worker_id,
                 &failure::INTERRUPTED.kind,
                 &failure::INTERRUPTED.retry_safe,
             ],
@@ -305,14 +358,15 @@ impl Worker {
         )?;
         // Funds this worker was holding when it stopped are settled against whatever
         // its history row recorded, so nothing stays both unmetered and reserved.
-        let recovered = metering::recover(&mut transaction, size.name())?;
+        let recovered = metering::recover(&mut transaction, &worker_id)?;
         transaction.commit()?;
         if recovered > 0 {
             tracing::warn!(recovered, "settled reservations abandoned by a restart");
         }
         Ok(Self {
             root,
-            size,
+            worker_id,
+            resources,
             placement,
             ledger,
             sessions: HashMap::new(),
@@ -347,8 +401,10 @@ impl Worker {
                 // The gateway already routed by mode and size; this is the worker
                 // refusing to serve a placement that is not its own.
                 let placement = request.validate()?;
-                if placement.size != self.size {
-                    return Err(ApiError::bad("request does not match this worker size"));
+                if placement.resources != self.resources {
+                    return Err(ApiError::bad(
+                        "request does not match this worker's resources",
+                    ));
                 }
                 request.context["requested_compute"] =
                     serde_json::to_value(&request.compute).map_err(|_| ApiError::internal())?;
@@ -407,7 +463,7 @@ impl Worker {
         let query_id = req.request_id.to_string();
         let inserted = self.ledger.execute(
             "INSERT INTO query_history (query_id, session_id, sql, context, status, worker_id, placement) VALUES ($1,$2,$3,$4,'running',$5,$6) ON CONFLICT DO NOTHING",
-            &[&query_id, &id.to_string(), &req.sql, &req.context.to_string(), &self.size.name(), &self.placement.to_string()],
+            &[&query_id, &id.to_string(), &req.sql, &req.context.to_string(), &self.worker_id, &self.placement.to_string()],
         ).map_err(|_| ApiError::internal())?;
         if inserted == 0 {
             return Err(ApiError::new(
@@ -422,7 +478,7 @@ impl Worker {
             &query_id,
             billable_units,
             req.timeout_seconds,
-            self.size.name(),
+            &self.worker_id,
         ) {
             Ok(admission) => admission,
             Err(refusal) => {
@@ -497,7 +553,7 @@ impl Worker {
             &mut self.ledger,
             &admission,
             elapsed,
-            self.size.name(),
+            &self.worker_id,
             &req.context.to_string(),
         ) {
             Ok(charged) => tracing::debug!(
