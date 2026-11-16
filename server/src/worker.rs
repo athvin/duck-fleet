@@ -67,7 +67,7 @@ pub(crate) struct Worker {
     /// A dedicated pod is spent once it has served one, so reusing a pod whose
     /// session has closed would quietly turn it back into shared compute.
     served: u64,
-    ledger: Client,
+    ledger: Ledger,
     sessions: HashMap<Uuid, Session>,
     active: ActiveSlot,
     runtime: tokio::runtime::Handle,
@@ -170,6 +170,106 @@ fn retrying<T>(
     }
 }
 
+/// The worker's connection to the execution history, and what to do when it dies.
+///
+/// A type of its own rather than a field and some methods on `Worker`: a ledger write
+/// happens while a session is borrowed, so anything taking `&mut Worker` cannot be
+/// called there. Keeping the reconnect logic with the connection it reconnects also
+/// puts the readiness flag next to the only thing that clears it.
+struct Ledger {
+    client: Client,
+    /// Kept so a dead connection can be replaced in place. A worker holds one for its
+    /// whole life, and PostgreSQL restarting does not tell it.
+    dsn: String,
+    /// The flag `/healthz` reports. It was set once at startup and never reconsidered,
+    /// so a worker that could execute nothing still answered 200 and kept receiving
+    /// traffic that could only fail.
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    redactor: Redactor,
+}
+
+impl Ledger {
+    /// Runs a statement, replacing the connection and retrying once if it fails.
+    ///
+    /// `Client::is_closed` reports only a close this client has already observed, so
+    /// PostgreSQL restarting is invisible until a statement is attempted: the first
+    /// one afterwards always fails. Checking beforehand is therefore not enough, and
+    /// the first version of this fix did exactly that — the worker dutifully reported
+    /// itself unserviceable in a situation where reconnecting would have worked. The
+    /// retry is what makes that statement succeed rather than merely fail honestly.
+    ///
+    /// Retried once, not repeatedly: a second failure on a fresh connection is not a
+    /// stale socket, and reporting not-ready is the better answer for that.
+    fn execute(
+        &mut self,
+        step: &str,
+        sql: &str,
+        params: &[&(dyn postgres::types::ToSql + Sync)],
+    ) -> Result<u64, ApiError> {
+        match self.client.execute(sql, params) {
+            Ok(rows) => return Ok(rows),
+            Err(error) => tracing::warn!(
+                step,
+                cause = self.redactor.scrub(&causes(&error)),
+                "a ledger statement failed; replacing the connection"
+            ),
+        }
+        match self.redactor.guard(
+            "reconnecting to the platform database",
+            Client::connect(&self.dsn, NoTls),
+        ) {
+            Ok(client) => {
+                self.client = client;
+                // An earlier failure may have taken this worker out of service; a
+                // working connection is what makes it serviceable again.
+                self.ready.store(true, std::sync::atomic::Ordering::Release);
+                tracing::info!(step, "ledger connection replaced");
+                match self.client.execute(sql, params) {
+                    Ok(rows) => Ok(rows),
+                    Err(again) => Err(self.unserviceable(step, &causes(&again))),
+                }
+            }
+            Err(error) => Err(self.unserviceable(step, &format!("{error:#}"))),
+        }
+    }
+
+    /// Takes this worker out of service and says why.
+    ///
+    /// Clearing readiness is what the chart's liveness probe already watches, so the
+    /// container is restarted and comes back through the ordinary startup path,
+    /// catalog wait included. Serving on without a ledger is worse than being
+    /// replaced, as #21 established.
+    ///
+    /// The cause is logged rather than discarded. These errors were mapped with
+    /// `map_err(|_| ApiError::internal())`, which left the logs silent and the message
+    /// naming neither the ledger nor the reason.
+    fn unserviceable(&self, step: &str, cause: &str) -> ApiError {
+        self.ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        tracing::error!(
+            cause = self.redactor.scrub(cause),
+            step,
+            "execution history unreachable; reporting not-ready so this worker is replaced"
+        );
+        ApiError::internal()
+    }
+}
+
+/// Flattens an error and its causes into one line.
+///
+/// `postgres::Error` displays as "db error" and keeps the server's message in its
+/// source, so logging the error alone says nothing about what went wrong.
+fn causes(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut line = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        line.push_str(": ");
+        line.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    line
+}
+
 /// What the cgroup says this container got, with the raw values kept for evidence.
 struct Observed {
     resources: Resources,
@@ -213,7 +313,11 @@ fn observed_resources() -> Result<Observed> {
 }
 
 impl Worker {
-    pub(crate) fn new(active: ActiveSlot, runtime: tokio::runtime::Handle) -> Result<Self> {
+    pub(crate) fn new(
+        active: ActiveSlot,
+        runtime: tokio::runtime::Handle,
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Self> {
         // Identity, not size. Reservation recovery keys on this, so it has to stay
         // stable even if the worker is later given different resources.
         let worker_id = required("DUCKFLEET_WORKER_ID")?;
@@ -382,7 +486,12 @@ impl Worker {
             placement,
             dedicated,
             served: 0,
-            ledger,
+            ledger: Ledger {
+                client: ledger,
+                dsn: platform_dsn,
+                ready,
+                redactor: redactor.clone(),
+            },
             sessions: HashMap::new(),
             active,
             runtime,
@@ -499,9 +608,10 @@ impl Worker {
         }
         let query_id = req.request_id.to_string();
         let inserted = self.ledger.execute(
+            "recording an accepted execution",
             "INSERT INTO query_history (query_id, session_id, sql, context, status, worker_id, placement) VALUES ($1,$2,$3,$4,'running',$5,$6) ON CONFLICT DO NOTHING",
             &[&query_id, &id.to_string(), &req.sql, &req.context.to_string(), &self.worker_id, &self.placement.to_string()],
-        ).map_err(|_| ApiError::internal())?;
+        )?;
         if inserted == 0 {
             return Err(ApiError::new(
                 failure::DUPLICATE_REQUEST,
@@ -511,7 +621,7 @@ impl Worker {
         // Reserve funds before any SQL runs. There is no execution path around this:
         // a refusal closes the record it just accepted instead of leaving it running.
         let admission = match metering::admit(
-            &mut self.ledger,
+            &mut self.ledger.client,
             &query_id,
             billable_units,
             req.timeout_seconds,
@@ -520,6 +630,7 @@ impl Worker {
             Ok(admission) => admission,
             Err(refusal) => {
                 let _ = self.ledger.execute(
+                    "closing a refused execution",
                     "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=0,
                      error=$3, failure_kind=$4, retry_safe=$5 WHERE query_id=$1",
                     &[
@@ -587,7 +698,7 @@ impl Worker {
         // held and the next worker start settles it, so no execution escapes the
         // ledger; the SQL has already run, so the caller still gets its outcome.
         match metering::settle(
-            &mut self.ledger,
+            &mut self.ledger.client,
             &admission,
             elapsed,
             &self.worker_id,
@@ -608,10 +719,11 @@ impl Worker {
             }
         }
         self.ledger.execute(
+            "recording a finished execution",
             "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=$3, result_rows=$4, error=$5, profile_status=$6, profile=$7, metrics=$8, failure_kind=$9, retry_safe=$10 WHERE query_id=$1",
             &[&query_id, &status, &elapsed, &rows, &error, &capture.status, &capture.profile, &capture.metrics,
               &failure.map(|f| f.kind), &failure.map(|f| f.retry_safe)],
-        ).map_err(|_| ApiError::internal())?;
+        )?;
         tracing::info!(query_id, session_id = %id, status, elapsed_ms = elapsed, "query finished");
         result
             .map(|(bytes, _)| Output::Arrow(bytes, req.request_id))

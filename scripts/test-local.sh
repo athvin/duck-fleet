@@ -94,3 +94,39 @@ test "$(docker compose exec -T worker-small curl -sS -o /dev/null -w '%{http_cod
 docker inspect -f '{"container":{{json .Name}},"restarts":{{.RestartCount}},"health":{{json .State.Health.Status}}}' "$waiting_id" > artifacts/worker-late-catalog.jsonl
 docker compose up -d --wait server
 echo 'PASS: worker waited for a late catalog and became ready without restarting'
+
+# A worker holds one PostgreSQL connection for its whole life, and the server
+# restarting does not tell it. Every statement afterwards failed with a generic 503
+# while /healthz still answered 200, so the container kept taking traffic it could not
+# serve and nothing replaced it. Restart PostgreSQL underneath a running worker and
+# require it to recover on its own.
+docker compose restart postgres
+docker compose up -d --wait postgres
+running_id=$(docker compose ps -q worker-small)
+# The first statement is the one that discovers the dead connection. It must succeed,
+# not merely be reported honestly: reconnecting in place is what keeps open sessions.
+docker compose run --rm --no-deps dbt python - <<'PY'
+import os, uuid
+from duckfleet import Client, RemoteConnection
+url, token = os.environ["DUCKFLEET_URL"], os.environ["DUCKFLEET_TOKEN"]
+connection = RemoteConnection(url, token, compute={"cpu": 1, "memory": "1Gi"})
+try:
+    rows = connection.cursor().execute("select 1 as after_restart").fetchall()
+    assert rows == [(1,)], rows
+finally:
+    connection.close()
+# History is the ledger, so a row proves the reconnect reached PostgreSQL rather than
+# the engine answering from memory while the write was silently dropped.
+history = Client(url, token).request("GET", "/v1/queries?limit=5")
+assert b"after_restart" in history, history[:200]
+PY
+# The same container, never restarted: it replaced its own connection rather than
+# being replaced by the probe.
+test "$(docker compose ps -q worker-small)" = "$running_id"
+test "$(docker inspect -f '{{.RestartCount}}' "$running_id")" = 0
+test "$(docker compose exec -T worker-small curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/healthz)" = 200
+docker compose logs worker-small --since 2m > artifacts/worker-ledger-reconnect.log 2>&1
+grep -q 'ledger connection' artifacts/worker-ledger-reconnect.log
+# The cause reaches the log, and the credential in the DSN does not (#20).
+! grep -q 'local-catalog-password' artifacts/worker-ledger-reconnect.log
+echo 'PASS: a worker replaced its own ledger connection after PostgreSQL restarted'
