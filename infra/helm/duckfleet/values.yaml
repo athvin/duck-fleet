@@ -38,3 +38,16 @@ catalogWaitSeconds: 120
 # real capacity, and #12 is what removes this entry.
 workerCpuRequests:
   medium: 1
+
+# Where cluster DNS may be reached, by address, because it cannot be selected by pod
+# on every topology. Deliberately the service and VPC ranges rather than 0.0.0.0/0:
+# opening port 53 generally is the usual shortcut, and it would permit resolution
+# against an external server, which is a data path out of a SQL engine.
+#
+# The resolver is the .10 of the service CIDR; the VPC range covers a node-local
+# listener. A preflight asserts the cluster's own service CIDR is covered here, so
+# narrowing this or pointing the deploy at a differently addressed cluster fails
+# before the release is applied.
+dnsEgressCidrs:
+  - 172.20.0.0/16
+  - 10.0.0.0/16

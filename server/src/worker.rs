@@ -137,7 +137,8 @@ fn retrying<T>(
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        if !connection_pending(&format!("{error:#}")) {
+        let cause = format!("{error:#}");
+        if !connection_pending(&cause) {
             return Err(error);
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -147,7 +148,9 @@ fn retrying<T>(
                 budget.as_secs()
             )));
         }
-        tracing::warn!(host, what, "dependency not reachable yet; waiting");
+        // The cause is already scrubbed of credentials, and without it a denied DNS
+        // query is indistinguishable from an unreachable database in the logs.
+        tracing::warn!(host, what, cause, "dependency not reachable yet; waiting");
         std::thread::sleep(backoff.min(remaining));
         backoff = (backoff * 2).min(Duration::from_secs(5));
     }

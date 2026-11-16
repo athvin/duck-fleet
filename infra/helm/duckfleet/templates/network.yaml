@@ -11,11 +11,22 @@ spec:
   egress:
     - to: [{podSelector: {}}]
       ports: [{port: 8080}, {port: 5432}]
+    # Cluster DNS is permitted both by selector and by address, because no single
+    # form works on every topology. A cluster with CoreDNS pods in kube-system is
+    # matched by the selector below. EKS Auto Mode runs DNS as a managed component
+    # with no pods and no Service visible there, so the selector matches nothing and
+    # resolution is denied outright: that is what left every worker unable to reach
+    # the catalog. Both rules stay scoped to port 53.
     - to:
         - namespaceSelector:
             matchLabels: {kubernetes.io/metadata.name: kube-system}
           podSelector:
             matchLabels: {k8s-app: kube-dns}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    - to:
+        {{- range .Values.dnsEgressCidrs }}
+        - ipBlock: {cidr: {{ . | quote }}}
+        {{- end }}
       ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
 ---
 apiVersion: networking.k8s.io/v1
