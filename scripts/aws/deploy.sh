@@ -7,7 +7,7 @@ assert_cluster
 [[ -f artifacts/aws/values.json ]] || { echo 'Publish images first' >&2; exit 1; }
 # A policy that cannot reach the cluster's resolver presents as an unreachable
 # catalog, which cost six deploys to diagnose. Fail here instead.
-python3 scripts/aws/check-dns-egress.py er-dev "$AWS_REGION"
+python3 scripts/aws/check-dns-egress.py "$DUCKFLEET_CLUSTER" "$AWS_REGION"
 # Require the existing EKS Auto Mode storage class, never change ER cluster objects.
 [[ $("${KUBE[@]}" get storageclass gp3 -o jsonpath='{.provisioner}') == ebs.csi.eks.amazonaws.com ]] || {
   echo 'Expected Auto Mode gp3 storage class is unavailable' >&2; exit 1;

@@ -5,11 +5,25 @@ passed on main after the query-history release. Live deployment requires the
 [shared-platform bootstrap](https://github.com/athvin/entity-resolution-engine/issues/1082)
 to merge and apply first. Docker and mock-provider tests are not AWS evidence.
 
-The proposed live target is `duckfleet-dev` on the existing **er-dev** EKS Auto
-Mode cluster in account `797781631727`, region `us-east-2`. This adds an AWS test
-lane alongside Docker Compose. DuckFleet owns its Terraform state, S3 bucket and image repositories;
-the existing cluster, networking, node pools, and `gp3` StorageClass remain owned
-by the ER platform. This shares the AWS account, cluster capacity, and bill.
+The deploy target is configuration, named once in `scripts/aws/target.env` and read
+from there by the operator scripts and by CI, so moving it is a change to that file
+rather than to a script, a workflow and this runbook. A test fails the build if the
+cluster is named anywhere else.
+
+Today it resolves to the namespace `duckfleet-dev` on the shared entity-resolution
+development EKS Auto Mode cluster, in account `797781631727`, region `us-east-2`.
+This adds an AWS test lane alongside Docker Compose. DuckFleet owns its S3 bucket and
+image repositories; the cluster, networking, node pools, and `gp3` StorageClass are
+owned by the ER platform, and so is the **Terraform state bucket** — DuckFleet owns
+only the state *key* within it. The AWS account, cluster capacity, and bill are
+shared.
+
+That sharing is a real constraint rather than a detail. Capacity is not ours to
+grant, and it has already blocked two capabilities: 2-CPU worker scheduling
+(entity-resolution-engine#1086) and the pod-create RBAC that isolated compute needs
+(#39). Each one leaves a deliberately-disabled code path in this repository. #12
+tracks giving DuckFleet a target it owns; the remaining work there needs AWS write
+access and a decision about recurring cost.
 
 | Boundary | DuckFleet resource |
 | --- | --- |
@@ -84,9 +98,10 @@ gh workflow run aws-dev.yml --repo athvin/duck-fleet --ref main
 Workflow runs serialize, without canceling an in-flight deployment. Documentation-only
 pushes do not start AWS runs; the credential-free required checks still run. PR validation
 receives no AWS credentials. Terraform plan/state and raw Kubernetes/secret output
-are never uploaded. The runner uses an explicit `duckfleet-ci-dev` context; local
-operator scripts default to `er-dev-admin` and never use the workstation default
-(which may be **er-prod**). No static AWS credentials are created.
+are never uploaded. The runner uses an explicit `duckfleet-ci-dev` context; local operator scripts
+default to the context named in `scripts/aws/target.env` and never use the
+workstation default, which may point at a production cluster. No static AWS
+credentials are created.
 
 Do not use scripts to bypass a local mutation guard; Terraform applies belong to
 CI. Operators may inspect resources with their authorized profile. Before the
@@ -108,7 +123,10 @@ To inspect the private API, use an explicit-context port forward from an authori
 operator session (the API still requires the generated bearer token):
 
 ```sh
-kubectl --context er-dev-admin -n duckfleet-dev port-forward service/server 18081:8080
+# The context and namespace come from scripts/aws/target.env.
+source scripts/aws/target.env
+kubectl --context "$DUCKFLEET_KUBE_CONTEXT" -n "$DUCKFLEET_NAMESPACE" \
+  port-forward service/server 18081:8080
 ```
 
 ## Stop compute and retain the experiment
@@ -116,7 +134,8 @@ kubectl --context er-dev-admin -n duckfleet-dev port-forward service/server 1808
 Run after evidence collection to avoid leaving baseline compute running:
 
 ```sh
-AWS_PROFILE=er-platform KUBE_CONTEXT=er-dev-admin bash scripts/aws/suspend.sh
+# Defaults come from scripts/aws/target.env; override either to target elsewhere.
+bash scripts/aws/suspend.sh
 ```
 
 This stops the test Job and scales gateway, workers, and PostgreSQL to zero. S3 versions, images, and the PVC continue to incur storage

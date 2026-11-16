@@ -44,7 +44,14 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::797781631727:role/duckfleet-ci-dev
           aws-region: us-east-2
-      - run: aws eks update-kubeconfig --name er-dev --alias duckfleet-ci-dev --region us-east-2
+      # The cluster comes from scripts/aws/target.env, which the deploy scripts also
+      # read, so the workflow and the scripts cannot disagree about where this goes.
+      - name: Resolve the deploy target
+        run: |
+          set -euo pipefail
+          source scripts/aws/target.env
+          echo "DUCKFLEET_CLUSTER=$DUCKFLEET_CLUSTER" >> "$GITHUB_ENV"
+      - run: aws eks update-kubeconfig --name "$DUCKFLEET_CLUSTER" --alias "$KUBE_CONTEXT" --region "$AWS_REGION"
       - run: bash scripts/aws/check-access.sh
       - run: bash scripts/aws/apply.sh
   publish:
@@ -90,7 +97,14 @@ jobs:
           role-to-assume: arn:aws:iam::797781631727:role/duckfleet-ci-dev
           aws-region: us-east-2
       - run: bash scripts/aws/assemble-images.sh
-      - run: aws eks update-kubeconfig --name er-dev --alias duckfleet-ci-dev --region us-east-2
+      # The cluster comes from scripts/aws/target.env, which the deploy scripts also
+      # read, so the workflow and the scripts cannot disagree about where this goes.
+      - name: Resolve the deploy target
+        run: |
+          set -euo pipefail
+          source scripts/aws/target.env
+          echo "DUCKFLEET_CLUSTER=$DUCKFLEET_CLUSTER" >> "$GITHUB_ENV"
+      - run: aws eks update-kubeconfig --name "$DUCKFLEET_CLUSTER" --alias "$KUBE_CONTEXT" --region "$AWS_REGION"
       - id: start
         run: echo 'deployment_started=true' >> "$GITHUB_OUTPUT"
       - run: bash scripts/aws/deploy.sh
@@ -119,5 +133,12 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::797781631727:role/duckfleet-ci-dev
           aws-region: us-east-2
-      - run: aws eks update-kubeconfig --name er-dev --alias duckfleet-ci-dev --region us-east-2
+      # The cluster comes from scripts/aws/target.env, which the deploy scripts also
+      # read, so the workflow and the scripts cannot disagree about where this goes.
+      - name: Resolve the deploy target
+        run: |
+          set -euo pipefail
+          source scripts/aws/target.env
+          echo "DUCKFLEET_CLUSTER=$DUCKFLEET_CLUSTER" >> "$GITHUB_ENV"
+      - run: aws eks update-kubeconfig --name "$DUCKFLEET_CLUSTER" --alias "$KUBE_CONTEXT" --region "$AWS_REGION"
       - run: bash scripts/aws/suspend.sh
