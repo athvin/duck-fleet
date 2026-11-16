@@ -226,6 +226,39 @@ class RolloutWaitTests(unittest.TestCase):
         # And it must check the account before touching anything.
         self.assertLess(bootstrap.index('get-caller-identity'), bootstrap.index('create-bucket'))
 
+    def test_the_cluster_is_not_applied_by_ci(self):
+        """Adding a cluster must not widen what an automated apply can create.
+
+        The cluster needs iam:CreateRole, eks:CreateCluster and ec2:CreateVpc. CI
+        applies on every main push and its guard allows the lake bucket and two image
+        repositories, so putting the cluster in that module would have traded a
+        permanent widening of an automated apply for a one-time creation.
+        """
+        guard = load('plan_guard', 'scripts/aws/plan_guard.py')
+        # The guard CI runs still allows only storage and images.
+        self.assertEqual(
+            {address.split('.')[0] for address in guard.ALLOWED},
+            {'aws_s3_bucket', 'aws_s3_bucket_public_access_block',
+             'aws_s3_bucket_ownership_controls',
+             'aws_s3_bucket_server_side_encryption_configuration',
+             'aws_s3_bucket_versioning', 'aws_s3_bucket_policy',
+             'aws_s3_bucket_lifecycle_configuration', 'aws_ecr_repository'},
+            'the CI plan guard must not have grown to cover cluster resources')
+        # And the cluster lives in a module CI never applies.
+        self.assertTrue((ROOT/'infra/terraform/cluster/main.tf').exists())
+        apply = (ROOT/'scripts/aws/apply.sh').read_text()
+        self.assertNotIn('terraform/cluster', apply)
+        workflow = (ROOT/'.github/workflows/aws-dev.yml').read_text()
+        self.assertNotIn('terraform/cluster', workflow)
+
+    def test_the_cluster_module_keeps_its_own_state(self):
+        """A mistake in an operator-run apply must not touch the state CI writes."""
+        target = (ROOT/'scripts/aws/target.env').read_text()
+        self.assertIn('DUCKFLEET_CLUSTER_STATE_KEY', target)
+        keys = re.findall(r'DUCKFLEET_(?:CLUSTER_)?STATE_KEY=\$\{[^:]+:-([^}]+)\}', target)
+        self.assertEqual(len(keys), 2, keys)
+        self.assertNotEqual(keys[0], keys[1], 'the two modules must not share a state key')
+
     def test_verification_counts_only_persistent_workers(self):
         verify = (ROOT/'scripts/aws/verify.py').read_text()
         # A session pod carries `app: duckfleet-worker` so the worker NetworkPolicy
