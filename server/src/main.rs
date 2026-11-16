@@ -270,16 +270,18 @@ async fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Handle::current();
     std::thread::Builder::new()
         .name("duckfleet-worker".into())
-        .spawn(move || match worker::Worker::new(worker_active, runtime) {
-            Ok(mut worker) => {
-                worker_ready.store(true, Ordering::Release);
-                worker.run(receiver);
-            }
-            Err(error) => {
-                *failure_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
-                let _ = failed_tx.send(());
-            }
-        })?;
+        .spawn(
+            move || match worker::Worker::new(worker_active, runtime, worker_ready.clone()) {
+                Ok(mut worker) => {
+                    worker_ready.store(true, Ordering::Release);
+                    worker.run(receiver);
+                }
+                Err(error) => {
+                    *failure_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                    let _ = failed_tx.send(());
+                }
+            },
+        )?;
     let app = App {
         sender,
         active,
