@@ -44,6 +44,16 @@ profiling: true
 # is what finally replaces a pod whose catalog never appears.
 catalogWaitSeconds: 120
 
+# What one normalized compute unit (max of vCPU and GiB/4) costs per hour, in whole
+# micro-USD, and the version stamped on every event priced with it. Cost attribution
+# in the operator's own numbers: the default is the development placeholder, and the
+# measured economics (#18) are what should replace it. Change both together — each
+# reservation copies the pair at admission, so a change reprices only new work and
+# the append-only ledger keeps the rate every event was actually charged at.
+rateCard:
+  version: local-dev-1
+  computeMicroUsdPerUnitHour: 100000
+
 # The other half of not pinning the DuckFleet node pool, and inseparable from it.
 #
 # The shared pool is capped to m6i/m6a `large` — 2 vCPU, about 1780m allocatable — while

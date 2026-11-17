@@ -4,7 +4,7 @@
 //! never enter the DuckDB worker queue, so the billing view stays answerable while
 //! workers are busy or stopped. Reads run read-only; only the budget limits are
 //! writable, and the usage events themselves are immutable in the database.
-use crate::{ApiError, failure, metering};
+use crate::{ApiError, failure, metering, pricing};
 use postgres::{Client, NoTls, Row};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -15,6 +15,9 @@ use tokio::sync::Semaphore;
 pub(crate) struct Reader {
     dsn: Arc<str>,
     capacity: Arc<Semaphore>,
+    /// The card new work is priced with, reported on the budget position and used
+    /// to settle legacy reservations that predate the stored-rate columns.
+    rate: pricing::RateCard,
 }
 
 #[derive(Clone, Deserialize)]
@@ -102,10 +105,11 @@ fn record(row: &Row) -> Value {
 }
 
 impl Reader {
-    pub fn new(dsn: String) -> Self {
+    pub fn new(dsn: String, rate: pricing::RateCard) -> Self {
         Self {
             dsn: dsn.into(),
             capacity: Arc::new(Semaphore::new(8)),
+            rate,
         }
     }
     async fn run<F>(&self, writable: bool, operation: F) -> Result<Value, ApiError>
@@ -168,11 +172,14 @@ impl Reader {
     }
 
     pub async fn budget(&self) -> Result<Value, ApiError> {
-        self.run(false, metering::summary).await
+        let rate = self.rate.clone();
+        self.run(false, move |client| metering::summary(client, &rate))
+            .await
     }
 
     pub async fn set_budget(&self, update: BudgetUpdate) -> Result<Value, ApiError> {
         update.validate()?;
+        let rate = self.rate.clone();
         self.run(true, move |client| {
             // COALESCE leaves an omitted field at its stored value.
             client
@@ -183,7 +190,7 @@ impl Reader {
                     &[&update.prepaid_micro_usd, &update.max_job_micro_usd],
                 )
                 .map_err(|_| ApiError::internal())?;
-            metering::summary(client)
+            metering::summary(client, &rate)
         })
         .await
     }
@@ -216,10 +223,11 @@ impl Reader {
     /// settled its own, because recovery only touches rows still held; that is what
     /// lets every teardown path call it without first working out which one it is.
     pub async fn settle_isolated(&self, worker: String) -> Result<u64, ApiError> {
+        let rate = self.rate.clone();
         let settled = self
             .run(true, move |client| {
                 let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
-                let settled = metering::recover(&mut transaction, &worker)
+                let settled = metering::recover(&mut transaction, &worker, &rate)
                     .map_err(|_| ApiError::internal())?;
                 transaction.commit().map_err(|_| ApiError::internal())?;
                 Ok(json!(settled))

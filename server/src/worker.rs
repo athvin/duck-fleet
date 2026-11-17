@@ -1,7 +1,7 @@
 use crate::{
     ApiError, Envelope, Operation, Output, QueryRequest, Reply,
     compute::{Mode, Placement, Resources},
-    failure, metering,
+    failure, metering, pricing,
     secrets::{Redactor, Startup},
 };
 use anyhow::{Context, Result};
@@ -67,6 +67,10 @@ pub(crate) struct Worker {
     /// A dedicated pod is spent once it has served one, so reusing a pod whose
     /// session has closed would quietly turn it back into shared compute.
     served: u64,
+    /// The card this worker admits and settles with, resolved once at startup. Each
+    /// reservation copies it, so recovery prices work at the card it was admitted
+    /// under rather than whatever a later process runs with.
+    rate: pricing::RateCard,
     ledger: Ledger,
     sessions: HashMap<Uuid, Session>,
     active: ActiveSlot,
@@ -474,7 +478,8 @@ impl Worker {
         )?;
         // Funds this worker was holding when it stopped are settled against whatever
         // its history row recorded, so nothing stays both unmetered and reserved.
-        let recovered = metering::recover(&mut transaction, &worker_id)?;
+        let rate = pricing::RateCard::from_env()?;
+        let recovered = metering::recover(&mut transaction, &worker_id, &rate)?;
         transaction.commit()?;
         if recovered > 0 {
             tracing::warn!(recovered, "settled reservations abandoned by a restart");
@@ -486,6 +491,7 @@ impl Worker {
             placement,
             dedicated,
             served: 0,
+            rate,
             ledger: Ledger {
                 client: ledger,
                 dsn: platform_dsn,
@@ -626,6 +632,7 @@ impl Worker {
             billable_units,
             req.timeout_seconds,
             &self.worker_id,
+            &self.rate,
         ) {
             Ok(admission) => admission,
             Err(refusal) => {
@@ -703,6 +710,7 @@ impl Worker {
             elapsed,
             &self.worker_id,
             &req.context.to_string(),
+            &self.rate,
         ) {
             Ok(charged) => tracing::debug!(
                 query_id,

@@ -68,6 +68,11 @@ template and the code that patches it from drifting silently.
 - {name: S3_AUTH_MODE, value: pod_identity}
 - {name: DUCKFLEET_PROFILING, value: {{ $.Values.profiling | quote }}}
 - {name: DUCKFLEET_CATALOG_WAIT_SECONDS, value: {{ $.Values.catalogWaitSeconds | quote }}}
+# The rate card rides with every role that prices work: workers admit and settle
+# with it, and each reservation copies it so recovery never reprices old work.
+# check-chart.py asserts the gateway carries the same pair.
+- {name: DUCKFLEET_RATE_CARD_VERSION, value: {{ $.Values.rateCard.version | quote }}}
+- {name: DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR, value: {{ $.Values.rateCard.computeMicroUsdPerUnitHour | quote }}}
 - {name: S3_DATA_PATH, value: {{ printf "s3://%s/lake/" $.Values.bucket | quote }}}
 - {name: AWS_REGION, value: {{ $.Values.region }}}
 - {name: AWS_EC2_METADATA_DISABLED, value: "true"}

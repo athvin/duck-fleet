@@ -40,9 +40,10 @@ pub(crate) fn decide(
     max_job_micro_usd: i64,
     units: i64,
     timeout_seconds: u64,
+    rate: &pricing::RateCard,
 ) -> Result<(u64, i64), failure::Failure> {
     let ceiling = available_micro_usd.min(max_job_micro_usd);
-    let affordable = pricing::affordable_seconds(units, ceiling);
+    let affordable = rate.affordable_seconds(units, ceiling);
     if affordable == 0 {
         // Distinguish "out of money" from "this cap is too low to run anything":
         // one is fixed by topping up, the other by changing the request or cap.
@@ -53,7 +54,7 @@ pub(crate) fn decide(
         });
     }
     let deadline = timeout_seconds.min(affordable);
-    Ok((deadline, pricing::charge_micro_usd(units, deadline * 1000)))
+    Ok((deadline, rate.charge_micro_usd(units, deadline * 1000)))
 }
 
 pub(crate) fn migrate(transaction: &mut Transaction, prepaid: i64, max_job: i64) -> Result<()> {
@@ -103,7 +104,9 @@ pub(crate) fn migrate(transaction: &mut Transaction, prepaid: i64, max_job: i64)
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             settled_at TIMESTAMPTZ
         );
-        CREATE INDEX IF NOT EXISTS reservations_held ON reservations(worker_id) WHERE state = 'held';",
+        CREATE INDEX IF NOT EXISTS reservations_held ON reservations(worker_id) WHERE state = 'held';
+        ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rate_micro_usd_per_unit_hour BIGINT;
+        ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rate_card_version TEXT;",
     )?;
     // Seed once. A restart must not silently refill a spent balance.
     transaction.execute(
@@ -114,14 +117,34 @@ pub(crate) fn migrate(transaction: &mut Transaction, prepaid: i64, max_job: i64)
     Ok(())
 }
 
+/// The price recovery puts on an orphan: the rate stored on the reservation at
+/// admission, so a rate change between admission and recovery cannot reprice work,
+/// with the current card standing in only for rows older than the stored columns.
+/// Charges only what the history row proves ran, and never above the hold.
+fn recovery_amount(
+    stored_rate: Option<i64>,
+    current: &pricing::RateCard,
+    units: i64,
+    elapsed_ms: i64,
+    reserved: i64,
+) -> i64 {
+    let rate = stored_rate.unwrap_or(current.compute_micro_usd_per_unit_hour);
+    pricing::charge_at(rate, units, u64::try_from(elapsed_ms).unwrap_or(0)).min(reserved)
+}
+
 /// Settles reservations this worker abandoned by restarting, so no accepted
 /// execution is left both unmetered and holding funds. The charge uses whatever
 /// elapsed time the history row recorded; an execution that never reached its
 /// terminal update is charged nothing, and the event says it came from recovery.
-pub(crate) fn recover(transaction: &mut Transaction, worker_id: &str) -> Result<u64> {
+pub(crate) fn recover(
+    transaction: &mut Transaction,
+    worker_id: &str,
+    current: &pricing::RateCard,
+) -> Result<u64> {
     let orphans = transaction.query(
         "SELECT r.execution_id, r.reserved_micro_usd, r.resource_units,
-                COALESCE(h.elapsed_ms,0), COALESCE(h.context,'{}')
+                COALESCE(h.elapsed_ms,0), COALESCE(h.context,'{}'),
+                r.rate_micro_usd_per_unit_hour, r.rate_card_version
          FROM reservations r LEFT JOIN query_history h ON h.query_id = r.execution_id
          WHERE r.state = 'held' AND r.worker_id = $1",
         &[&worker_id],
@@ -132,15 +155,16 @@ pub(crate) fn recover(transaction: &mut Transaction, worker_id: &str) -> Result<
         let units: i64 = row.get(2);
         let elapsed_ms: i64 = row.get(3);
         let context: String = row.get(4);
-        // Charge only what the history row proves ran, and never above the hold.
-        let amount =
-            pricing::charge_micro_usd(units, u64::try_from(elapsed_ms).unwrap_or(0)).min(reserved);
+        let stored_rate: Option<i64> = row.get(5);
+        let stored_version: Option<String> = row.get(6);
+        let amount = recovery_amount(stored_rate, current, units, elapsed_ms, reserved);
         record(
             transaction,
             &execution_id,
             units,
             elapsed_ms,
             amount,
+            stored_version.as_deref().unwrap_or(&current.version),
             worker_id,
             &context,
             "recovery",
@@ -180,6 +204,7 @@ pub(crate) fn admit(
     units: i64,
     timeout_seconds: u64,
     worker_id: &str,
+    rate: &pricing::RateCard,
 ) -> Result<Admission, ApiError> {
     let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
     let limits = transaction
@@ -204,21 +229,37 @@ pub(crate) fn admit(
         )
         .map_err(|_| ApiError::internal())?
         .get(0);
-    let (deadline_seconds, reserved_micro_usd) =
-        decide(prepaid - spent - held, max_job, units, timeout_seconds).map_err(|failure| {
-            ApiError::new(
-                failure,
-                format!(
-                    "budget refused this execution: {} micro-USD remain, per-job cap is {max_job}",
-                    prepaid - spent - held
-                ),
-            )
-        })?;
+    let (deadline_seconds, reserved_micro_usd) = decide(
+        prepaid - spent - held,
+        max_job,
+        units,
+        timeout_seconds,
+        rate,
+    )
+    .map_err(|failure| {
+        ApiError::new(
+            failure,
+            format!(
+                "budget refused this execution: {} micro-USD remain, per-job cap is {max_job}",
+                prepaid - spent - held
+            ),
+        )
+    })?;
+    // The rate rides on the reservation so settlement and recovery price this
+    // execution at the card it was admitted under, whatever the card is by then.
     transaction
         .execute(
-            "INSERT INTO reservations (execution_id, reserved_micro_usd, resource_units, state, worker_id)
-             VALUES ($1,$2,$3,'held',$4)",
-            &[&execution_id, &reserved_micro_usd, &units, &worker_id],
+            "INSERT INTO reservations (execution_id, reserved_micro_usd, resource_units, state,
+                worker_id, rate_micro_usd_per_unit_hour, rate_card_version)
+             VALUES ($1,$2,$3,'held',$4,$5,$6)",
+            &[
+                &execution_id,
+                &reserved_micro_usd,
+                &units,
+                &worker_id,
+                &rate.compute_micro_usd_per_unit_hour,
+                &rate.version,
+            ],
         )
         .map_err(|_| ApiError::internal())?;
     transaction.commit().map_err(|_| ApiError::internal())?;
@@ -238,6 +279,7 @@ fn record(
     units: i64,
     elapsed_ms: i64,
     amount_micro_usd: i64,
+    rate_card_version: &str,
     worker_id: &str,
     context: &str,
     source: &str,
@@ -257,7 +299,7 @@ fn record(
             &elapsed_ms,
             &units,
             &amount_micro_usd,
-            &pricing::RATE_CARD_VERSION,
+            &rate_card_version,
             &worker_id,
             &context,
             &source,
@@ -267,15 +309,17 @@ fn record(
 }
 
 /// Writes the usage event and releases the unused part of the reservation. Called
-/// for every terminal execution, whatever its status.
+/// for every terminal execution, whatever its status, by the process that admitted
+/// it — so the process card and the admission's card are the same card.
 pub(crate) fn settle(
     client: &mut Client,
     admission: &Admission,
     elapsed_ms: i64,
     worker_id: &str,
     context: &str,
+    rate: &pricing::RateCard,
 ) -> Result<i64> {
-    let amount = pricing::charge_micro_usd(admission.units, u64::try_from(elapsed_ms).unwrap_or(0));
+    let amount = rate.charge_micro_usd(admission.units, u64::try_from(elapsed_ms).unwrap_or(0));
     let mut transaction = client.transaction()?;
     record(
         &mut transaction,
@@ -283,6 +327,7 @@ pub(crate) fn settle(
         admission.units,
         elapsed_ms,
         amount,
+        &rate.version,
         worker_id,
         context,
         "worker",
@@ -296,8 +341,9 @@ pub(crate) fn settle(
     Ok(amount)
 }
 
-/// Current budget position, for the operator view.
-pub(crate) fn summary(client: &mut Client) -> Result<Value, ApiError> {
+/// Current budget position, for the operator view. The rate reported is the card
+/// this process prices *new* work with; recorded events carry their own.
+pub(crate) fn summary(client: &mut Client, rate: &pricing::RateCard) -> Result<Value, ApiError> {
     let limits = client
         .query_one(
             "SELECT prepaid_micro_usd, max_job_micro_usd FROM budget WHERE budget_id=$1",
@@ -326,8 +372,8 @@ pub(crate) fn summary(client: &mut Client) -> Result<Value, ApiError> {
         "max_job_micro_usd": max_job,
         "usage_events": totals.get::<_, i64>(2),
         "held_reservations": totals.get::<_, i64>(3),
-        "rate_card_version": pricing::RATE_CARD_VERSION,
-        "compute_micro_usd_per_unit_hour": pricing::COMPUTE_MICRO_USD_PER_UNIT_HOUR,
+        "rate_card_version": rate.version,
+        "compute_micro_usd_per_unit_hour": rate.compute_micro_usd_per_unit_hour,
     }))
 }
 
@@ -335,41 +381,44 @@ pub(crate) fn summary(client: &mut Client) -> Result<Value, ApiError> {
 mod tests {
     use super::*;
 
-    const HOUR: i64 = pricing::COMPUTE_MICRO_USD_PER_UNIT_HOUR;
+    fn card() -> pricing::RateCard {
+        pricing::dev()
+    }
+    const HOUR: i64 = 100_000;
 
     #[test]
     fn a_comfortable_budget_grants_the_requested_timeout() {
-        let (deadline, reserved) = decide(HOUR, HOUR, 1, 30).unwrap();
+        let (deadline, reserved) = decide(HOUR, HOUR, 1, 30, &card()).unwrap();
         assert_eq!(deadline, 30);
-        assert_eq!(reserved, pricing::charge_micro_usd(1, 30_000));
+        assert_eq!(reserved, card().charge_micro_usd(1, 30_000));
     }
 
     #[test]
     fn the_per_job_cap_shortens_the_deadline_instead_of_refusing() {
         // Enough balance for an hour, but the cap only pays for 36 seconds.
-        let (deadline, reserved) = decide(HOUR, 1_000, 1, 60).unwrap();
+        let (deadline, reserved) = decide(HOUR, 1_000, 1, 60, &card()).unwrap();
         assert_eq!(deadline, 36);
         assert!(reserved <= 1_000);
     }
 
     #[test]
     fn a_thin_balance_shortens_the_deadline_too() {
-        let (deadline, reserved) = decide(1_000, HOUR, 1, 60).unwrap();
+        let (deadline, reserved) = decide(1_000, HOUR, 1, 60, &card()).unwrap();
         assert_eq!(deadline, 36);
         assert!(reserved <= 1_000);
     }
 
     #[test]
     fn a_larger_class_gets_proportionally_less_time() {
-        let (one, _) = decide(HOUR, 1_000, 1, 600).unwrap();
-        let (two, _) = decide(HOUR, 1_000, 2, 600).unwrap();
+        let (one, _) = decide(HOUR, 1_000, 1, 600, &card()).unwrap();
+        let (two, _) = decide(HOUR, 1_000, 2, 600, &card()).unwrap();
         assert_eq!(one, 2 * two);
     }
 
     #[test]
     fn an_exhausted_balance_is_refused_and_safe_to_retry_later() {
         for available in [0, -5_000, 27] {
-            let refusal = decide(available, HOUR, 1, 30).unwrap_err();
+            let refusal = decide(available, HOUR, 1, 30, &card()).unwrap_err();
             assert_eq!(refusal, failure::BUDGET_EXHAUSTED);
             // Nothing ran, so sending it again once funded is legitimate.
             assert!(refusal.retry_safe);
@@ -378,9 +427,44 @@ mod tests {
 
     #[test]
     fn a_cap_too_small_for_one_second_blames_the_cap() {
-        let refusal = decide(HOUR, 10, 1, 30).unwrap_err();
+        let refusal = decide(HOUR, 10, 1, 30, &card()).unwrap_err();
         assert_eq!(refusal, failure::BUDGET_JOB_COST);
         assert!(!refusal.retry_safe);
+    }
+
+    #[test]
+    fn recovery_prices_an_orphan_at_the_rate_it_was_admitted_under() {
+        // The deployment's rate has since doubled; the orphan keeps its old price.
+        let doubled = pricing::RateCard {
+            version: "dev-2x".into(),
+            compute_micro_usd_per_unit_hour: 2 * HOUR,
+        };
+        let at_old_rate = recovery_amount(Some(HOUR), &doubled, 1, 36_000, HOUR);
+        assert_eq!(at_old_rate, 1_000);
+        // A row from before the stored-rate columns is the only one priced at the
+        // current card — there is nothing older to price it with.
+        assert_eq!(recovery_amount(None, &doubled, 1, 36_000, HOUR), 2_000);
+        // Whatever the rate says, the hold is the ceiling.
+        assert_eq!(
+            recovery_amount(Some(HOUR), &doubled, 1, 3_600_000, 5_000),
+            5_000
+        );
+        // An execution history never saw ran is free, at any rate.
+        assert_eq!(recovery_amount(Some(HOUR), &doubled, 1, 0, HOUR), 0);
+    }
+
+    #[test]
+    fn a_doubled_rate_halves_the_deadline_a_budget_buys() {
+        let doubled = pricing::RateCard {
+            version: "dev-2x".into(),
+            compute_micro_usd_per_unit_hour: 2 * HOUR,
+        };
+        let (at_dev, _) = decide(HOUR, HOUR, 1, 7200, &card()).unwrap();
+        let (at_double, reserved) = decide(HOUR, HOUR, 1, 7200, &doubled).unwrap();
+        assert_eq!(at_dev, 3600);
+        assert_eq!(at_double, 1800);
+        // And the reservation is priced by the same card as the deadline.
+        assert_eq!(reserved, doubled.charge_micro_usd(1, 1800 * 1000));
     }
 
     #[test]
@@ -388,10 +472,12 @@ mod tests {
         for units in [1, 2, 32] {
             for available in [1_000, 50_000, HOUR, 10 * HOUR] {
                 for timeout in [1, 30, 60] {
-                    if let Ok((deadline, reserved)) = decide(available, available, units, timeout) {
+                    if let Ok((deadline, reserved)) =
+                        decide(available, available, units, timeout, &card())
+                    {
                         assert!(deadline <= timeout);
                         assert!(
-                            pricing::charge_micro_usd(units, deadline * 1000) <= reserved,
+                            card().charge_micro_usd(units, deadline * 1000) <= reserved,
                             "under-reserved {units}/{available}/{timeout}"
                         );
                         assert!(reserved <= available);

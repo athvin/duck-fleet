@@ -566,7 +566,10 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         routes: Arc::new(Mutex::new(HashMap::new())),
         capacity: Arc::new(Semaphore::new(64)),
         history: crate::history::Reader::new(std::env::var("PLATFORM_DSN")?),
-        usage: crate::usage::Reader::new(std::env::var("PLATFORM_DSN")?),
+        usage: crate::usage::Reader::new(
+            std::env::var("PLATFORM_DSN")?,
+            crate::pricing::RateCard::from_env()?,
+        ),
         isolation,
         draining: Arc::new(AtomicBool::new(false)),
         inflight: Arc::new(AtomicUsize::new(0)),

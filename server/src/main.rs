@@ -366,7 +366,10 @@ async fn main() -> anyhow::Result<()> {
         active,
         token: token.into(),
         history: history::Reader::new(std::env::var("PLATFORM_DSN")?),
-        usage: usage::Reader::new(std::env::var("PLATFORM_DSN")?),
+        usage: usage::Reader::new(
+            std::env::var("PLATFORM_DSN")?,
+            pricing::RateCard::from_env()?,
+        ),
         ready,
         draining: draining.clone(),
     };
