@@ -4,6 +4,23 @@ capabilities:
   drop: [ALL]
 readOnlyRootFilesystem: true
 {{- end -}}
+{{/*
+Where every pod in this release runs, emitted from one place.
+
+Both halves are load-bearing and only work together: the selector sends DuckFleet pods
+to the node pool DuckFleet owns, and the toleration is what lets them land on it, since
+that pool is tainted so nothing else can. Emitting them separately is how a pod ends up
+with one and not the other — selector without toleration never schedules, toleration
+without selector consumes a neighbour's capacity. scripts/check-chart.py asserts the
+session pod template matches the persistent workers, so a caller asking for isolation
+cannot be placed somewhere the shared tier would not have been.
+*/}}
+{{- define "duckfleet.placement" -}}
+nodeSelector: {{ toJson .Values.nodeSelector }}
+{{- if .Values.tolerations }}
+tolerations: {{ toJson .Values.tolerations }}
+{{- end }}
+{{- end -}}
 {{- define "duckfleet.podSecurity" -}}
 runAsNonRoot: true
 runAsUser: 10001
@@ -90,7 +107,7 @@ spec:
   # runs user SQL and must not inherit the gateway's ability to create pods.
   serviceAccountName: duckfleet-worker
   automountServiceAccountToken: false
-  nodeSelector: {{ toJson .Values.nodeSelector }}
+  {{- include "duckfleet.placement" . | nindent 2 }}
   securityContext:
     {{- include "duckfleet.podSecurity" . | nindent 4 }}
   containers:

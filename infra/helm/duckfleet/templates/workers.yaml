@@ -26,7 +26,7 @@ spec:
     spec:
       {{- include "duckfleet.termination" . | nindent 6 }}
       serviceAccountName: duckfleet-worker
-      nodeSelector: {{ toJson $.Values.nodeSelector }}
+      {{- include "duckfleet.placement" $ | nindent 6 }}
       securityContext:
         {{- include "duckfleet.podSecurity" . | nindent 8 }}
       containers:

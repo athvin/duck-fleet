@@ -15,7 +15,7 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: duckfleet-no-aws
-      nodeSelector: {{ toJson .Values.nodeSelector }}
+      {{- include "duckfleet.placement" . | nindent 6 }}
       securityContext:
         {{- include "duckfleet.podSecurity" . | nindent 8 }}
       # dbt edits fixture seeds during the incremental test. Copy the project

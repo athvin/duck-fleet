@@ -55,6 +55,7 @@ for size, cpu in [('small', 1), ('medium', 2)]:
     # crash loop the wait exists to prevent.
     probe = container['startupProbe']
     assert int(env['DUCKFLEET_CATALOG_WAIT_SECONDS']) <= probe['periodSeconds'] * probe['failureThreshold']
+placements = {}
 for o in objects:
     # The release contains only what the deploy identity may create. Roles,
     # RoleBindings and ResourceQuotas belong to the ownership boundary an operator
@@ -71,10 +72,25 @@ for o in objects:
     if o['kind'] in ['Deployment', 'StatefulSet', 'Job']:
         pod = o['spec']['template']['spec']
         assert pod['securityContext']['runAsNonRoot']
+        placements[o['metadata']['name']] = (
+            json.dumps(pod['nodeSelector'], sort_keys=True),
+            json.dumps(pod.get('tolerations'), sort_keys=True))
         for c in pod['containers']+pod.get('initContainers', []):
             assert not c['securityContext']['allowPrivilegeEscalation']
             assert c['securityContext']['capabilities']['drop'] == ['ALL']
             assert c['resources']['requests'] and c['resources']['limits']
+
+# One placement for the whole release, because DuckFleet runs on capacity it owns and
+# every pod has to reach it. The two halves only work together — the selector names the
+# tainted node pool and the toleration is what gets a pod onto it — so a pod rendered
+# with one and not the other either never schedules or lands on a neighbour's node.
+# Emitted from `duckfleet.placement`; asserted here so splitting that helper back apart
+# fails at render time.
+assert len(set(placements.values())) == 1, (
+    f'pods disagree about where they run: {placements}')
+selector, tolerations = next(iter(placements.values()))
+assert 'karpenter.sh/nodepool' in selector, selector
+assert tolerations != 'null' and 'duckfleet.io/dedicated' in tolerations, tolerations
 # The gateway routes to endpoints it was given, so every one must name a Service the
 # release actually renders. A URL pointing at nothing would look like a missing
 # worker class at request time rather than a packaging mistake at render time.
@@ -171,7 +187,12 @@ else:
     assert isolated['securityContext'] == persistent['securityContext']
     assert container['securityContext'] == persistent['containers'][0]['securityContext']
     assert container['image'] == persistent['containers'][0]['image']
+    # Placement, both halves. A session pod that selected the DuckFleet node pool
+    # without tolerating its taint would never schedule, and one that tolerated it
+    # without selecting it could land on a neighbour's node — so these are compared
+    # against the shared tier rather than against a copy of the values.
     assert isolated['nodeSelector'] == persistent['nodeSelector']
+    assert isolated.get('tolerations') == persistent.get('tolerations')
     assert isolated['serviceAccountName'] == 'duckfleet-worker'
     # Both labels are load-bearing. `app` is what the worker NetworkPolicy selects,
     # so without it a session pod gets no S3 egress; the other is what a startup

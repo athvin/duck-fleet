@@ -34,6 +34,18 @@ def pod(name, uid, unschedulable=None):
         conditions.append({'type': 'PodScheduled', 'status': 'True'})
     return {'metadata': {'name': name, 'uid': uid}, 'status': {'conditions': conditions}}
 
+def chart():
+    """The release with isolated compute on, which is the fullest render."""
+    return subprocess.run(
+        ['helm', 'template', 'duckfleet', str(ROOT/'infra/helm/duckfleet'),
+         '--namespace', 'duckfleet-dev',
+         '--set', f'workerImage={IMAGE.format(kind="worker")}',
+         '--set', f'dbtImage={IMAGE.format(kind="dbt")}',
+         '--set', 'isolatedCompute.enabled=true',
+         '--set', 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32'],
+        check=True, capture_output=True, text=True).stdout
+
+
 def deployment(name, desired, ready):
     return {'metadata': {'name': name}, 'spec': {'replicas': desired},
             'status': {'readyReplicas': ready}}
@@ -386,14 +398,7 @@ class RolloutWaitTests(unittest.TestCase):
         # RBAC at all, and check-chart.py fails if it ever does again. Asserted over
         # the render that turns isolated compute on, which is the one that used to
         # carry it.
-        rendered = subprocess.run(
-            ['helm', 'template', 'duckfleet', str(ROOT/'infra/helm/duckfleet'),
-             '--namespace', 'duckfleet-dev',
-             '--set', f'workerImage={IMAGE.format(kind="worker")}',
-             '--set', f'dbtImage={IMAGE.format(kind="dbt")}',
-             '--set', 'isolatedCompute.enabled=true',
-             '--set', 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32'],
-            check=True, capture_output=True, text=True).stdout
+        rendered = chart()
         kinds = {doc['kind'] for doc in yaml.safe_load_all(rendered) if doc}
         self.assertFalse(kinds & {'Role', 'RoleBinding', 'ClusterRole',
                                   'ClusterRoleBinding', 'ResourceQuota'}, kinds)
@@ -587,6 +592,12 @@ class OwnershipBoundaryTests(unittest.TestCase):
     def render(self, namespace='duckfleet-dev'):
         return load('render_boundary', 'scripts/aws/render_boundary.py').documents(namespace)
 
+    def render_eks(self, namespace='duckfleet-dev', node_class='chosen'):
+        """The boundary including the objects that need a real cloud cluster."""
+        return load('render_boundary', 'scripts/aws/render_boundary.py').documents(
+            namespace, node_class)
+
+
     def test_every_object_names_the_target_namespace(self):
         # The namespace is configuration (scripts/aws/target.env), so the boundary has
         # to follow it. Rendering for a different one must move every object, not just
@@ -640,14 +651,7 @@ class OwnershipBoundaryTests(unittest.TestCase):
         bounded = {key.split('.', 1)[1] for key in quota['spec']['hard']
                    if '.' in key and '/' not in key}
         self.assertTrue(bounded, quota['spec']['hard'])
-        rendered = subprocess.run(
-            ['helm', 'template', 'duckfleet', str(ROOT/'infra/helm/duckfleet'),
-             '--namespace', 'duckfleet-dev',
-             '--set', f'workerImage={IMAGE.format(kind="worker")}',
-             '--set', f'dbtImage={IMAGE.format(kind="dbt")}',
-             '--set', 'isolatedCompute.enabled=true',
-             '--set', 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32'],
-            check=True, capture_output=True, text=True).stdout
+        rendered = chart()
         seen = 0
         for kind, name, container in containers(rendered):
             seen += 1
@@ -658,6 +662,71 @@ class OwnershipBoundaryTests(unittest.TestCase):
                                 f'{sorted(bounded - declared)} in {side}; the quota '
                                 'would reject it')
         self.assertGreater(seen, 4, 'the chart rendered fewer containers than expected')
+
+    def test_the_node_pool_is_only_rendered_for_a_real_cluster(self):
+        # The local Kubernetes harness has no Karpenter, so a NodePool there fails on an
+        # unknown kind rather than being ignored. It is therefore kept out of the
+        # portable boundary that harness applies, and appears only when a NodeClass is
+        # named — which is also the one host-cluster fact this needs.
+        portable = {d['kind'] for d in self.render()}
+        self.assertNotIn('NodePool', portable)
+        self.assertIn('ResourceQuota', portable, portable)
+        with_cloud = self.render_eks()
+        self.assertIn('NodePool', {d['kind'] for d in with_cloud})
+        pool = next(d for d in with_cloud if d['kind'] == 'NodePool')
+        self.assertEqual(pool['spec']['template']['spec']['nodeClassRef']['name'], 'chosen')
+
+    def test_the_node_pool_is_dedicated_and_capped(self):
+        pool = next(d for d in self.render_eks() if d['kind'] == 'NodePool')
+        spec = pool['spec']['template']['spec']
+        # Tainted, so the pool is DuckFleet's in both directions: a neighbour cannot
+        # consume capacity DuckFleet pays for. The chart's toleration must match, which
+        # check-chart.py asserts from the other side.
+        self.assertEqual(
+            [(t['key'], t['value'], t['effect']) for t in spec['taints']],
+            [('duckfleet.io/dedicated', 'true', 'NoSchedule')])
+        wanted = {r['key'].rsplit('/', 1)[-1]: r for r in spec['requirements']}
+        # `xlarge` is the whole point: the shared pool is capped to `large`, which is
+        # 2 vCPU with ~1780m allocatable, so a 2-CPU worker claiming 2050m with
+        # daemonset overhead could not be provisioned at all.
+        self.assertIn('xlarge', wanted['instance-size']['values'])
+        # On demand only. A worker holds a DuckLake write transaction, and spot
+        # reclamation mid-statement is a rollback nobody asked for.
+        self.assertEqual(wanted['capacity-type']['values'], ['on-demand'])
+        # A ceiling, so a runaway cannot provision without bound.
+        self.assertTrue(pool['spec']['limits']['cpu'])
+        # WhenEmpty, not WhenEmptyOrUnderutilized: consolidating a busy node would end
+        # a running query, gracefully or otherwise. An empty node still goes away,
+        # which is what makes `suspended: true` stop costing money.
+        self.assertEqual(pool['spec']['disruption']['consolidationPolicy'], 'WhenEmpty')
+
+    def test_a_cluster_scoped_object_must_be_named_for_duckfleet(self):
+        render = load('render_boundary', 'scripts/aws/render_boundary.py')
+        # Cluster-scoped objects sit outside the namespace that bounds everything else
+        # here, so the only thing keeping the boundary bounded is the name.
+        with self.assertRaises(ValueError) as refused:
+            render.placed([{'kind': 'NodePool', 'metadata': {'name': 'general-purpose'}}],
+                          'duckfleet-dev')
+        self.assertIn('not named for DuckFleet', str(refused.exception))
+
+    def test_workers_request_what_they_are_limited_to(self):
+        # The override that dropped the medium worker's CPU request to 1 so it would fit
+        # the shared pool is gone, now that DuckFleet has a pool that can hold it. It
+        # cost Guaranteed QoS and left a 2-CPU limit no single node could deliver, so
+        # the absence is worth asserting rather than assuming.
+        values = yaml.safe_load((ROOT/'infra/helm/duckfleet/values.yaml').read_text())
+        self.assertNotIn('workerCpuRequests', values)
+        rendered = chart()
+        workers = 0
+        for kind, name, container in containers(rendered):
+            if container['name'] != 'worker':
+                continue
+            workers += 1
+            self.assertEqual(container['resources']['requests']['cpu'],
+                             container['resources']['limits']['cpu'], name)
+            self.assertEqual(container['resources']['requests']['memory'],
+                             container['resources']['limits']['memory'], name)
+        self.assertGreaterEqual(workers, 3, 'expected both persistent workers and the session pod')
 
     def test_the_deploy_asks_the_gateway_rather_than_inspecting_rbac(self):
         deploy = (ROOT/'scripts/aws/deploy.sh').read_text()
