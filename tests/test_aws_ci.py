@@ -189,7 +189,8 @@ class RolloutWaitTests(unittest.TestCase):
         borrowed = ["er-dev", "er-platform", "er-prod", "er-terraform-state"]
         searched = [path
                     for pattern in ["scripts/**/*", ".github/workflows/*",
-                                    "infra/terraform/**/*.tf", "infra/helm/**/*"]
+                                    "infra/terraform/**/*.tf", "infra/helm/**/*",
+                                    "infra/kubernetes/**/*"]
                     for path in ROOT.glob(pattern) if path.is_file()]
         # A gate over an empty set would pass while proving nothing.
         self.assertGreater(len(searched), 20, "nothing was searched")
@@ -378,18 +379,27 @@ class RolloutWaitTests(unittest.TestCase):
         # looking for a `size` it does not have.
         self.assertIn("'duckfleet-compute' not in", verify)
 
-    def test_a_release_needing_rbac_it_cannot_create_fails_before_helm(self):
-        deploy = (ROOT/'scripts/aws/deploy.sh').read_text()
-        commands = '\n'.join(line for line in deploy.splitlines()
-                             if not line.lstrip().startswith('#'))
-        # Enabling isolated compute against an identity that cannot create Roles has
-        # to be refused before anything is applied, and has to say why rather than
-        # surfacing as a forbidden object partway through a release.
-        self.assertIn('can-i create roles.rbac.authorization.k8s.io', commands)
-        self.assertIn('duck-fleet#39', deploy)
-        gate = commands.index('can-i create roles')
-        self.assertLess(gate, commands.index('helm upgrade'),
-                        'the RBAC gate must run before the release is applied')
+    def test_a_release_can_never_carry_rbac_the_deploy_cannot_create(self):
+        # This used to be a deploy-time gate: refuse before applying if the render
+        # contained a Role the identity could not create. The gate is gone because the
+        # condition is now impossible rather than merely caught — the chart renders no
+        # RBAC at all, and check-chart.py fails if it ever does again. Asserted over
+        # the render that turns isolated compute on, which is the one that used to
+        # carry it.
+        rendered = subprocess.run(
+            ['helm', 'template', 'duckfleet', str(ROOT/'infra/helm/duckfleet'),
+             '--namespace', 'duckfleet-dev',
+             '--set', f'workerImage={IMAGE.format(kind="worker")}',
+             '--set', f'dbtImage={IMAGE.format(kind="dbt")}',
+             '--set', 'isolatedCompute.enabled=true',
+             '--set', 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32'],
+            check=True, capture_output=True, text=True).stdout
+        kinds = {doc['kind'] for doc in yaml.safe_load_all(rendered) if doc}
+        self.assertFalse(kinds & {'Role', 'RoleBinding', 'ClusterRole',
+                                  'ClusterRoleBinding', 'ResourceQuota'}, kinds)
+        # And the deploy no longer asks a question it is not permitted to answer.
+        self.assertNotIn('can-i create roles',
+                         (ROOT/'scripts/aws/deploy.sh').read_text())
 
 
 class ImagePublishingTests(unittest.TestCase):
@@ -549,6 +559,130 @@ class DnsEgressTests(unittest.TestCase):
             self.assertEqual({p['port'] for p in rule['ports']}, {53}, rule)
         for cidr in blocks:
             self.assertTrue(ipaddress.ip_network(cidr).is_private, cidr)
+
+def containers(rendered):
+    """Every container the chart would run, including the isolated pod template.
+
+    The session pod is rendered into a ConfigMap rather than as an object, because the
+    gateway creates it at runtime — so walking objects alone would miss the one pod
+    most likely to be refused by a quota.
+    """
+    for document in yaml.safe_load_all(rendered):
+        if not document:
+            continue
+        spec = document.get('spec') or {}
+        pods = []
+        if 'template' in spec:
+            pods.append(spec['template']['spec'])
+        if document['kind'] == 'ConfigMap' and 'pod.json' in (document.get('data') or {}):
+            pods.append(json.loads(document['data']['pod.json'])['spec'])
+        for pod in pods:
+            for container in pod.get('containers', []) + pod.get('initContainers', []):
+                yield document['kind'], document['metadata']['name'], container
+
+
+class OwnershipBoundaryTests(unittest.TestCase):
+    """The objects an operator applies, which the deploy identity cannot create."""
+
+    def render(self, namespace='duckfleet-dev'):
+        return load('render_boundary', 'scripts/aws/render_boundary.py').documents(namespace)
+
+    def test_every_object_names_the_target_namespace(self):
+        # The namespace is configuration (scripts/aws/target.env), so the boundary has
+        # to follow it. Rendering for a different one must move every object, not just
+        # the ones that happened to be written with a placeholder.
+        for document in self.render('duckfleet-elsewhere'):
+            if document['kind'] == 'Namespace':
+                self.assertEqual(document['metadata']['name'], 'duckfleet-elsewhere')
+            else:
+                self.assertEqual(document['metadata']['namespace'], 'duckfleet-elsewhere',
+                                 document['metadata']['name'])
+
+    def test_the_grant_is_pods_in_one_namespace_and_nothing_else(self):
+        role = next(d for d in self.render() if d['kind'] == 'Role')
+        self.assertEqual([rule['resources'] for rule in role['rules']], [['pods']])
+        # The gateway must not be able to widen its own grant, read the catalog
+        # credential, or raise the quota that caps it. Asserted rather than reviewed:
+        # this Role is applied by an identity that could grant all three.
+        granted = {resource for rule in role['rules'] for resource in rule['resources']}
+        self.assertFalse(granted & {'roles', 'rolebindings', 'secrets', 'resourcequotas'})
+        for rule in role['rules']:
+            self.assertNotIn('*', rule['verbs'] + rule['resources'] + rule['apiGroups'])
+
+    def test_a_binding_outside_the_namespace_is_refused(self):
+        render = load('render_boundary', 'scripts/aws/render_boundary.py')
+        escaping = [{'kind': 'RoleBinding', 'metadata': {'name': 'b', 'namespace': 'ours'},
+                     'subjects': [{'kind': 'ServiceAccount', 'name': 'gateway',
+                                   'namespace': 'theirs'}]}]
+        with self.assertRaises(ValueError) as refused:
+            render.placed(escaping, 'ours')
+        self.assertIn('outside ours', str(refused.exception))
+
+    def test_an_object_with_no_namespace_is_refused(self):
+        render = load('render_boundary', 'scripts/aws/render_boundary.py')
+        # Not an error to Kubernetes — it lands wherever the caller's context points —
+        # so this is what stops a boundary applied with the wrong context from
+        # granting pod-create somewhere unintended.
+        with self.assertRaises(ValueError):
+            render.placed([{'kind': 'Role', 'metadata': {'name': 'r'}}], 'ours')
+
+    def test_an_unresolved_placeholder_fails_the_render(self):
+        render = load('render_boundary', 'scripts/aws/render_boundary.py')
+        with self.assertRaises(KeyError):
+            render.render('namespace: ${cluster}\n', 'duckfleet-dev')
+
+    def test_the_quota_bounds_only_what_every_container_declares(self):
+        # A ResourceQuota is conditional: naming a resource makes it mandatory on every
+        # container in the namespace. The gateway and PostgreSQL declare no
+        # ephemeral-storage, so a quota that bounded it would reject them rather than
+        # cap them — and the rejection would arrive as an unschedulable pod on a deploy.
+        quota = next(d for d in self.render() if d['kind'] == 'ResourceQuota')
+        bounded = {key.split('.', 1)[1] for key in quota['spec']['hard']
+                   if '.' in key and '/' not in key}
+        self.assertTrue(bounded, quota['spec']['hard'])
+        rendered = subprocess.run(
+            ['helm', 'template', 'duckfleet', str(ROOT/'infra/helm/duckfleet'),
+             '--namespace', 'duckfleet-dev',
+             '--set', f'workerImage={IMAGE.format(kind="worker")}',
+             '--set', f'dbtImage={IMAGE.format(kind="dbt")}',
+             '--set', 'isolatedCompute.enabled=true',
+             '--set', 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32'],
+            check=True, capture_output=True, text=True).stdout
+        seen = 0
+        for kind, name, container in containers(rendered):
+            seen += 1
+            for side in ['requests', 'limits']:
+                declared = set(container['resources'][side])
+                self.assertTrue(bounded <= declared,
+                                f'{kind}/{name} {container["name"]} declares no '
+                                f'{sorted(bounded - declared)} in {side}; the quota '
+                                'would reject it')
+        self.assertGreater(seen, 4, 'the chart rendered fewer containers than expected')
+
+    def test_the_deploy_asks_the_gateway_rather_than_inspecting_rbac(self):
+        deploy = (ROOT/'scripts/aws/deploy.sh').read_text()
+        # The deploy identity cannot read RBAC — the same scoping that makes the
+        # boundary worth separating — so a deploy that looked for the Role would be
+        # checking something it is not permitted to see. It asks the gateway, which
+        # asked the API server about its own access at startup.
+        self.assertIn('isolated_compute', deploy)
+        self.assertNotIn('can-i create roles', deploy)
+        # Read from inside the pod, so the bearer token never reaches a CI log.
+        self.assertIn('Bearer $DUCKFLEET_TOKEN', deploy)
+
+    def test_the_boundary_is_applied_by_an_operator_and_never_by_ci(self):
+        script = (ROOT/'scripts/aws/apply-boundary.sh').read_text()
+        # Checked before anything is applied, so running this with the deploy profile
+        # fails whole rather than leaving a namespace and quota behind with no grant.
+        self.assertIn('auth can-i create roles', script)
+        self.assertIn('render_boundary.py', script)
+        # The deploy lane must not apply it. A pipeline that established its own
+        # boundary would be granting itself the capability, which is the whole thing
+        # check-access.sh exists to prevent.
+        workflow = (ROOT/'.github/workflows/aws-dev.yml').read_text()
+        self.assertNotIn('apply-boundary', workflow)
+        self.assertIn('check-access.sh', workflow)
+
 
 if __name__ == '__main__':
     unittest.main()

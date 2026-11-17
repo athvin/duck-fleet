@@ -62,6 +62,19 @@ run "ci_access_is_confined_to_one_namespace" {
     condition     = aws_eks_access_policy_association.ci.access_scope[0].namespaces == toset(["duckfleet-dev"])
     error_message = "CI must reach the DuckFleet namespace and no other."
   }
+  # AmazonEKSAdminPolicy maps to the `admin` ClusterRole, which may create Roles and
+  # RoleBindings. scripts/aws/check-access.sh fails the deploy when the identity can,
+  # so admin here would abort the first deploy into a cluster this module had just
+  # built correctly — and it would let the deploy widen its own grant, which is the
+  # reason the ownership boundary is applied separately in the first place.
+  # The whole ARN, not its suffix. EKS access policies live under a different ARN
+  # namespace from IAM policies, and this previously named an `iam::aws:policy/` ARN
+  # that does not resolve — so the association would have failed on the first apply
+  # while reading as correct.
+  assert {
+    condition     = aws_eks_access_policy_association.ci.policy_arn == "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
+    error_message = "CI must hold edit, not admin: anything that can create Roles fails check-access.sh."
+  }
 }
 
 run "worker_identity_reaches_only_the_lake_prefix" {

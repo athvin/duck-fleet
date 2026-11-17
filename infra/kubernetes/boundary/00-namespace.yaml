@@ -1,0 +1,12 @@
+# The namespace DuckFleet owns, and the label the deploy checks for.
+#
+# scripts/aws/common.sh refuses to deploy unless this label is present, so applying
+# this file is what marks the boundary as established. A deploy into a namespace that
+# has not had the boundary applied fails before anything is installed, rather than
+# installing a release whose gateway cannot create the pods it advertises.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: "${namespace}"
+  labels:
+    app.kubernetes.io/part-of: duckfleet

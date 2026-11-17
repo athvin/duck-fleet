@@ -13,10 +13,18 @@ use std::{fs, path::PathBuf, time::Duration};
 /// Where the kubelet projects the pod's service account.
 const ACCOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 
+/// The verbs the gateway performs on pods, checked together at startup. A partial
+/// grant is worse than none: `create` without `delete` leaks a pod, and a bill, per
+/// session.
+const REQUIRED: [&str; 4] = ["create", "get", "list", "delete"];
+
 pub(crate) struct Kube {
     client: Client,
     /// Namespaced collection URL; every call this makes is a pod in one namespace.
     pods: String,
+    /// Where the API server answers questions about this identity's own access.
+    reviews: String,
+    namespace: String,
     account: PathBuf,
 }
 
@@ -59,8 +67,49 @@ impl Kube {
         Ok(Self {
             client,
             pods: format!("https://{host}:{port}/api/v1/namespaces/{namespace}/pods"),
+            reviews: format!(
+                "https://{host}:{port}/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
+            ),
+            namespace: namespace.to_owned(),
             account,
         })
+    }
+
+    /// Fails unless this identity may do everything to pods that session compute
+    /// needs, naming the first verb it may not.
+    ///
+    /// Asked of the API server rather than inferred from configuration, because the
+    /// grant is applied outside the release by an operator holding cluster admin — so
+    /// a chart value records what was intended and only the cluster knows what is
+    /// true. Creating a `SelfSubjectAccessReview` needs no permission of its own: the
+    /// default `system:basic-user` binding lets every authenticated identity ask about
+    /// itself, so this cannot fail for the very reason it is checking.
+    pub async fn assert_pod_grant(&self) -> Result<()> {
+        for verb in REQUIRED {
+            let review = serde_json::json!({
+                "apiVersion": "authorization.k8s.io/v1",
+                "kind": "SelfSubjectAccessReview",
+                "spec": {"resourceAttributes": {
+                    "namespace": self.namespace,
+                    "group": "",
+                    "resource": "pods",
+                    "verb": verb,
+                }},
+            });
+            let (status, body) = self
+                .send(Method::POST, &self.reviews.clone(), Some(&review))
+                .await?;
+            let answered =
+                Self::expect_success(status, body, "asking the API server about our own access")?;
+            if !allowed(&answered) {
+                anyhow::bail!(
+                    "this gateway may not {verb} pods in {}: apply infra/kubernetes/boundary \
+                     with an administrative profile to grant it (#39)",
+                    self.namespace
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Read per call rather than cached. A projected token is rotated in place by the
@@ -106,7 +155,9 @@ impl Kube {
             .and_then(Value::as_str)
             .unwrap_or("no message")
             .to_owned();
-        anyhow::bail!("{what} failed: {status}: {message}")
+        // The status travels with the message rather than only being formatted into
+        // it, so a caller can tell a refusal from a failure without parsing prose.
+        Err(anyhow::Error::new(Refused { status, message }).context(format!("{what} failed")))
     }
 
     pub async fn create_pod(&self, pod: &Value) -> Result<Value> {
@@ -152,6 +203,47 @@ impl Kube {
     }
 }
 
+/// An answer from the API server that was not a success, carrying the status so a
+/// caller can act on what kind of answer it was.
+#[derive(Debug)]
+pub(crate) struct Refused {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Whether the API server declined before the pod existed, rather than failing in a
+/// way that might still have created one.
+///
+/// This is the difference between "nothing was created, retry something smaller" and
+/// "this may have been received" — a namespace quota or an admission webhook answers
+/// `403` having changed nothing, which a timeout or a `500` cannot promise.
+pub(crate) fn declined(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<Refused>()
+        .is_some_and(|refused| refused.status == StatusCode::FORBIDDEN)
+}
+
+/// Whether a review came back allowed.
+///
+/// An absent or unparseable field reads as "no". The question is whether permission
+/// was granted, and an answer this cannot read is not a grant — defaulting the other
+/// way would have a gateway advertise isolated compute because it could not
+/// understand the denial.
+fn allowed(review: &Value) -> bool {
+    review
+        .pointer("/status/allowed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +278,68 @@ mod tests {
         let error = format!("{error:#}");
         assert!(error.contains("pods is forbidden"), "{error}");
         assert!(error.contains("creating a session pod"), "{error}");
+    }
+
+    /// A quota or admission refusal changed nothing, so the caller may retry something
+    /// smaller; anything else may have been received and acted on. Getting this wrong
+    /// either tells a caller a request is hopeless when it is not, or promises nothing
+    /// was created when a pod may be running and billing.
+    #[test]
+    fn a_forbidden_answer_is_a_refusal_and_other_failures_are_not() {
+        let quota = Kube::expect_success(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"message": "exceeded quota: duckfleet, requested: cpu=64"}),
+            "creating a session pod",
+        )
+        .unwrap_err();
+        assert!(declined(&quota));
+        // The server's own words survive being wrapped, because the ceiling that was
+        // hit is the only actionable part of the answer.
+        let error = format!("{quota:#}");
+        assert!(error.contains("exceeded quota"), "{error}");
+        assert!(error.contains("creating a session pod"), "{error}");
+
+        for (status, body) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"message": "etcd"}),
+            ),
+            (
+                StatusCode::CONFLICT,
+                serde_json::json!({"message": "already exists"}),
+            ),
+        ] {
+            let other = Kube::expect_success(status, body, "creating a session pod").unwrap_err();
+            assert!(!declined(&other), "{status} must not read as a refusal");
+        }
+        // A transport failure carries no status at all, and must not be mistaken for
+        // one: a call that timed out may still have created the pod.
+        assert!(!declined(&anyhow::anyhow!("connection reset")));
+    }
+
+    /// The API server answers a denial with `allowed: false` and a reason, not with an
+    /// error, so a review that parses is not the same as a grant.
+    #[test]
+    fn only_an_explicit_allowance_counts_as_a_grant() {
+        assert!(allowed(&serde_json::json!({"status": {"allowed": true}})));
+        assert!(!allowed(&serde_json::json!(
+            {"status": {"allowed": false, "reason": "no RBAC policy matched"}}
+        )));
+    }
+
+    /// A gateway that could not read the answer must not conclude it has the grant:
+    /// it would advertise isolated compute and then fail every session at pod-create
+    /// time, which is the failure this check exists to prevent.
+    #[test]
+    fn an_unreadable_answer_is_not_a_grant() {
+        for unreadable in [
+            serde_json::json!({}),
+            serde_json::json!({"status": {}}),
+            serde_json::json!({"status": {"allowed": "true"}}),
+            Value::Null,
+        ] {
+            assert!(!allowed(&unreadable), "{unreadable}");
+        }
     }
 
     #[test]

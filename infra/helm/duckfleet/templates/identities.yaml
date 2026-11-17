@@ -12,3 +12,19 @@ kind: ServiceAccount
 metadata:
   name: duckfleet-no-aws
 automountServiceAccountToken: false
+---
+# The one identity here that holds a token, and the only one the gateway uses when
+# isolated compute is wired up; otherwise it runs as duckfleet-no-aws above and mounts
+# nothing. Created by the chart because the deploy identity may create
+# ServiceAccounts — what it may not create is the Role that makes this one useful, so
+# that lives in infra/kubernetes/boundary and an operator applies it.
+#
+# Rendered unconditionally so the gateway pod can always start: a ServiceAccount the
+# deployment referenced but nothing created would leave the pod unable to mount its
+# token, which is a stuck pod rather than the clean refusal this is meant to degrade
+# to. Unused, it grants nothing.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckfleet-gateway
+automountServiceAccountToken: true

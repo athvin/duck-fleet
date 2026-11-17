@@ -70,6 +70,41 @@ per-tenant credentials.
 Statements already running finish within the worker's drain window (#16); sessions open
 at that moment end.
 
+## Establish the ownership boundary
+
+Run this once per cluster, before the first deploy. It is what makes a namespace
+DuckFleet's rather than merely one DuckFleet installs into.
+
+```sh
+AWS_PROFILE=<an administrative profile> bash scripts/aws/apply-boundary.sh
+```
+
+It applies `infra/kubernetes/boundary`: the namespace and the label the deploy checks
+for, the Role and RoleBinding that let the gateway create session pods, and the
+ResourceQuota that caps them. Idempotent and additive — nothing in it removes or
+narrows an existing object — and it verifies the grant by reading it back rather than
+trusting that `apply` reported success.
+
+**It needs cluster admin, and the deploy identity deliberately is not.** That split is
+the point. `scripts/aws/check-access.sh` asserts the deploy can create none of a Role,
+a RoleBinding or a ResourceQuota, and fails the deploy if it ever can, so a release
+that carried its own RBAC could not install itself — which is exactly why isolated
+compute shipped disabled everywhere but the kind harness until this existed (#39). The
+script checks for admin up front and refuses, rather than leaving a namespace and a
+quota behind with no grant.
+
+Granting a capability and deploying a release are different acts by different
+identities. Keeping them apart is what lets the automated lane stay unable to widen its
+own permissions, on a cluster DuckFleet owns as much as on one it shares.
+
+Once applied, set `isolatedCompute.enabled=true` and deploy. The gateway asks the API
+server whether it holds the grant and reports the answer as `isolated_compute` on
+`GET /v1/workers`, so the two can be applied in either order and a missing grant is a
+`501 compute_unavailable` refusal rather than a session that fails once a pod could not
+be created. Removing the RoleBinding is therefore a supported way to turn the feature
+off. `make test-k8s` applies this same boundary to its kind cluster, so a boundary that
+stops matching the chart fails on a pull request.
+
 ## Create the cluster DuckFleet owns
 
 `infra/terraform/cluster` defines an EKS Auto Mode cluster, its VPC, the IAM roles

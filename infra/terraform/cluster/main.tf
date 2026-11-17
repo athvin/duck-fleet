@@ -239,11 +239,24 @@ resource "aws_eks_cluster" "main" {
   depends_on = [aws_iam_role_policy_attachment.cluster, aws_iam_role_policy_attachment.node]
 }
 
-# CI gets admin inside one namespace and nothing cluster-wide. This is deliberately
-# more than it has on the shared cluster, where it cannot create Roles at all: on a
-# cluster DuckFleet owns, creating the Role that isolated compute needs is correct
-# rather than a boundary violation (#39). check-access.sh asserts the matching
-# expectation per target rather than one rule for both.
+# CI gets edit inside one namespace and nothing cluster-wide: application objects, and
+# not the RBAC or quotas that bound them. Those belong to the ownership boundary in
+# infra/kubernetes/boundary, which an operator applies — owning the cluster changes who
+# can grant a capability, not whether granting one is the deploy's job.
+#
+# Edit rather than admin on purpose. AmazonEKSAdminPolicy grants
+# `rbac.authorization.k8s.io` roles and rolebindings `create`, and check-access.sh fails
+# the deploy when the identity can — so admin here would abort the first deploy into a
+# cluster this module had just built correctly. AmazonEKSEditPolicy carries no RBAC
+# rules at all, and reads resourcequotas without being able to set them, which is
+# exactly the shape that gate asserts.
+#
+# Known gap, recorded rather than guessed at: AmazonEKSEditPolicy carries no
+# `storage.k8s.io` rules, so `deploy.sh`'s storage class preflight would be forbidden
+# here. It needs a cluster-scoped read grant, which is a boundary object and so belongs
+# in infra/kubernetes/boundary — but writing it blind is how the two defects above got
+# here, so it waits until there is a cluster to read it back from. This module is the
+# documented exit, not the deployed target; see infra/README.md.
 resource "aws_eks_access_entry" "ci" {
   cluster_name  = aws_eks_cluster.main.name
   principal_arn = "arn:aws:iam::${var.account}:role/${var.ci_role}"
@@ -253,7 +266,11 @@ resource "aws_eks_access_entry" "ci" {
 resource "aws_eks_access_policy_association" "ci" {
   cluster_name  = aws_eks_cluster.main.name
   principal_arn = aws_eks_access_entry.ci.principal_arn
-  policy_arn    = "arn:aws:iam::aws:policy/AmazonEKSAdminPolicy"
+  # An EKS access policy, not an IAM policy: these live under `eks::aws:
+  # cluster-access-policy/` and carry Kubernetes permissions rather than IAM ones. The
+  # IAM-shaped ARN this used to carry does not resolve, so the association would have
+  # failed on the first apply.
+  policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
   access_scope {
     type       = "namespace"
     namespaces = [var.namespace]
