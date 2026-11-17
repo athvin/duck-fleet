@@ -36,17 +36,34 @@ if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$v
   exit 1
 fi
 echo 'PASS: a CPU request above its limit is rejected'
-# The node pool DuckFleet owns is tainted, so selecting it without tolerating it
-# renders a release whose every pod is permanently Pending. Prove that is rejected at
-# render time rather than discovered as an unschedulable fleet.
-untolerated="$validation_dir/untolerated.yaml"
-if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
-     --set-json 'tolerations=[]' > "$untolerated" 2>/dev/null \
-   && python3 scripts/check-chart.py "$untolerated" > /dev/null 2>&1; then
-  echo 'Selecting the DuckFleet node pool without tolerating its taint must fail' >&2
-  exit 1
-fi
-echo 'PASS: pinning the DuckFleet node pool without tolerating its taint is rejected'
+# The DuckFleet node pool is tainted, so the selector and the toleration only work
+# together: the pin without the toleration is a fleet that never schedules, and the
+# toleration without the pin lets a pod onto a neighbour's node. Both halves are
+# constructed here rather than taken from the defaults — which currently pin neither,
+# so relying on them would test whichever state happened to be configured and silently
+# stop testing anything when it changed. That is exactly what it did.
+PINNED='nodeSelector={"kubernetes.io/os":"linux","eks.amazonaws.com/compute-type":"auto","karpenter.sh/nodepool":"duckfleet"}'
+TOLERATED='tolerations=[{"key":"duckfleet.io/dedicated","operator":"Equal","value":"true","effect":"NoSchedule"}]'
+UNPINNED='nodeSelector={"kubernetes.io/os":"linux","eks.amazonaws.com/compute-type":"auto"}'
+mismatched="$validation_dir/mismatched.yaml"
+for half in "pinned without a toleration:$PINNED;tolerations=[]" \
+            "tolerated without the pin:$UNPINNED;$TOLERATED"; do
+  description=${half%%:*}
+  settings=${half#*:}
+  if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+       --set-json "${settings%%;*}" --set-json "${settings#*;}" > "$mismatched" 2>/dev/null \
+     && python3 scripts/check-chart.py "$mismatched" > /dev/null 2>&1; then
+    echo "The DuckFleet node pool $description must fail the chart check" >&2
+    exit 1
+  fi
+done
+echo 'PASS: the node pool pin and its toleration are rejected unless they agree'
+# And the paired state renders, so the gate is not simply refusing everything.
+paired="$validation_dir/paired.yaml"
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set-json "$PINNED" --set-json "$TOLERATED" --set-json 'workerCpuRequests=null' > "$paired"
+python3 scripts/check-chart.py "$paired" > /dev/null
+echo 'PASS: pinning the node pool and tolerating its taint together is accepted'
 # Isolated compute is off by default, so the assertions covering it only run against
 # a render that turns it on. Both states are checked: the default must keep producing
 # a gateway with no Kubernetes token at all.

@@ -5,23 +5,34 @@ bucket: duckfleet-dev-797781631727-us-east-2
 region: us-east-2
 secretName: duckfleet-dev
 storageClass: gp3
-# Where pods run. EKS Auto Mode nodes, from the node pool DuckFleet owns — see
-# infra/kubernetes/boundary/eks. Pinning the pool is what stops DuckFleet drawing on a
-# neighbour's capacity and being bounded by sizing decisions made for something else.
+# Where pods run. EKS Auto Mode nodes, on whatever pool the cluster offers.
+#
+# DuckFleet has a node pool of its own in infra/kubernetes/boundary/eks, and pinning it
+# is what stops DuckFleet drawing on a neighbour's capacity and being bounded by sizing
+# decisions made for something else. It is *not* pinned here yet, because that pool is
+# cluster-scoped and so an operator creates it: a release that selected a pool nobody
+# had created would leave every pod permanently Pending.
+#
+# Pinning it is three coupled edits, and `scripts/aws/apply-boundary.sh` has to have run
+# first:
+#
+#   1. add `karpenter.sh/nodepool: duckfleet` below
+#   2. add the matching toleration, because that pool is tainted — scripts/check-chart.py
+#      fails the render if one appears without the other
+#   3. remove `workerCpuRequests` below, which exists only to fit the shared pool
+#
+# duck-fleet#39 tracks the flip, alongside enabling isolated compute; both wait on the
+# same one command.
 nodeSelector:
   eks.amazonaws.com/compute-type: auto
   kubernetes.io/os: linux
-  karpenter.sh/nodepool: duckfleet
 
-# What lets these pods onto that pool, which is tainted so nothing else can land there.
-# Paired with the selector above and emitted together by `duckfleet.placement`: a
-# selector without this never schedules, and this without the selector would let a
+# What would let these pods onto the DuckFleet pool, which is tainted so nothing else
+# can land there. Empty while the selector above does not name that pool: emitted
+# together by `duckfleet.placement`, and asserted to agree, because a selector without
+# the toleration never schedules and a toleration without the selector would let a
 # DuckFleet pod consume a neighbour's node.
-tolerations:
-  - key: duckfleet.io/dedicated
-    operator: Equal
-    value: "true"
-    effect: NoSchedule
+tolerations: []
 
 # Pause compute after testing; the PostgreSQL PVC and S3 data remain.
 suspended: false
@@ -32,6 +43,23 @@ profiling: true
 # the startup probe budget (failureThreshold 120 at 5s). The probe, not this value,
 # is what finally replaces a pod whose catalog never appears.
 catalogWaitSeconds: 120
+
+# The other half of not pinning the DuckFleet node pool, and inseparable from it.
+#
+# The shared pool is capped to m6i/m6a `large` — 2 vCPU, about 1780m allocatable — while
+# a 2-CPU worker pod claims 2050m once daemonset overhead is counted. Karpenter answers
+# "no instance type has enough resources", so it cannot even provision a node. The cgroup
+# quota the worker asserts comes from the CPU *limit*, so lowering only the request brings
+# the claim to about 1050m: satisfiable by a fresh `large`, the same path worker-small
+# takes, while the pod still receives a true 2-CPU cgroup and the full 2Gi.
+#
+# Two costs, accepted deliberately for a development lane until the boundary is applied.
+# The pod is Burstable rather than Guaranteed, the shape the gateway already uses. And its
+# 2-CPU limit exceeds what one `large` can deliver, so DuckDB's two threads can be
+# throttled — correct, but not a basis for performance measurement, which is why #18
+# needs the DuckFleet pool. Remove this entry in the same change that pins it.
+workerCpuRequests:
+  medium: 1
 
 # Where cluster DNS may be reached, by address, because it cannot be selected by pod
 # on every topology. Deliberately the service and VPC ranges rather than 0.0.0.0/0:

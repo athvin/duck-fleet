@@ -733,23 +733,33 @@ class OwnershipBoundaryTests(unittest.TestCase):
                           'duckfleet-dev')
         self.assertIn('not named for DuckFleet', str(refused.exception))
 
-    def test_workers_request_what_they_are_limited_to(self):
-        # The override that dropped the medium worker's CPU request to 1 so it would fit
-        # the shared pool is gone, now that DuckFleet has a pool that can hold it. It
-        # cost Guaranteed QoS and left a 2-CPU limit no single node could deliver, so
-        # the absence is worth asserting rather than assuming.
+    def test_pinning_the_pool_and_the_cpu_workaround_are_one_decision(self):
+        # Three values, one choice. `workerCpuRequests` exists only to fit the shared
+        # pool, whose `large` cap cannot provision a 2-CPU worker at all; the DuckFleet
+        # pool can, which is why pinning it is what retires the override. Keeping both
+        # would waste the pool's capacity on a Burstable pod; keeping neither would
+        # leave the medium worker unprovisionable. Either state is coherent, so this
+        # asserts they move together rather than asserting which one is current.
         values = yaml.safe_load((ROOT/'infra/helm/duckfleet/values.yaml').read_text())
-        self.assertNotIn('workerCpuRequests', values)
-        rendered = chart()
+        pinned = 'karpenter.sh/nodepool' in values['nodeSelector']
+        tolerated = bool(values.get('tolerations'))
+        workaround = 'workerCpuRequests' in values
+        self.assertEqual(pinned, tolerated,
+                         'the DuckFleet pool must be pinned and tolerated together')
+        self.assertEqual(pinned, not workaround,
+                         'pinning the DuckFleet pool retires workerCpuRequests; '
+                         'not pinning it requires the override')
+        # Whichever state, a request may sit below its limit but never above it: the
+        # cgroup the worker asserts against comes from the limit, so a request above it
+        # schedules onto a node that cannot honour what the worker checks for.
         workers = 0
-        for kind, name, container in containers(rendered):
+        for kind, name, container in containers(chart()):
             if container['name'] != 'worker':
                 continue
             workers += 1
-            self.assertEqual(container['resources']['requests']['cpu'],
-                             container['resources']['limits']['cpu'], name)
-            self.assertEqual(container['resources']['requests']['memory'],
-                             container['resources']['limits']['memory'], name)
+            resources.assert_worker_resources(
+                container['resources'],
+                int(str(container['resources']['limits']['cpu']).rstrip('m')), name)
         self.assertGreaterEqual(workers, 3, 'expected both persistent workers and the session pod')
 
     def test_the_deploy_asks_the_gateway_rather_than_inspecting_rbac(self):

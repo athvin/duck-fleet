@@ -358,11 +358,16 @@ def drain_inflight():
     the engine is genuinely busy. Getting that wrong is easy and silent: the first
     version of this used a statement that finished in a second, four seconds before
     the signal, so the assertion passed without the drain ever having waited for
-    anything. The size below is calibrated to run for roughly 25 seconds on a 1-CPU
-    worker — long enough to still be running, inside both the statement timeout and
-    the drain window. `scripts/test-local.sh` additionally requires the worker's log
-    to show the signal arriving *before* this statement finished, so a future speedup
-    makes the test fail rather than quietly stop proving anything.
+    anything.
+
+    What proves the statement was in flight is `scripts/assert_drain_order.py`, which
+    reads the worker's own log and requires the signal to appear *before* the statement
+    completed. That is hardware-independent, which matters because the row count is not:
+    the same statement measured 25.8s on this laptop, 43.2s on a GitHub runner, and 58.0s
+    on a slower one, where it hit its own timeout and the test failed having proved
+    nothing about draining. Sizing a statement by wall-clock across unknown hardware is
+    the mistake; the count below targets the low end of the window on the slowest machine
+    seen, and the ordering assertion is what keeps it honest on the fastest.
     """
     marker = ARTIFACTS / "drain-inflight.started"
     marker.unlink(missing_ok=True)
@@ -374,7 +379,10 @@ def drain_inflight():
         try:
             connection.client.request("POST", connection.path + "/queries", {
                 "request_id": str(uuid.uuid4()),
-                "sql": "select count(*) from range(12000000000) where range % 7 = 3",
+                # About 8s on a laptop and under 30s on the slowest runner measured,
+                # against the 58s timeout below. Lower than it was: at 12e9 a slow
+                # runner reached 58.0s and was interrupted.
+                "sql": "select count(*) from range(4000000000) where range % 7 = 3",
                 # Inside the 75-second drain window, so finishing is the drain's doing
                 # rather than the statement being cut short.
                 "timeout_seconds": 58,
@@ -391,10 +399,14 @@ def drain_inflight():
     thread.join(timeout=120)
     require("elapsed" in outcome,
             f"a statement in flight did not survive the drain: {outcome.get('error')}")
-    # It must still have been running when the signal arrived, or this proves nothing.
-    require(outcome["elapsed"] > 8,
-            f"the statement finished in {outcome['elapsed']:.1f}s, too quickly to have "
-            "spanned the signal; raise the row count")
+    # A sanity floor only — the marker is written four seconds in, so anything shorter
+    # than this did not reach the engine at all. Whether the statement actually spanned
+    # the signal is settled by scripts/assert_drain_order.py from the worker's log, not
+    # by its duration; a stricter floor here would only add a flake on fast hardware in
+    # exchange for a proof that is already made properly elsewhere.
+    require(outcome["elapsed"] > 4,
+            f"the statement finished in {outcome['elapsed']:.1f}s, which is less than "
+            "the delay before the signal, so it cannot have been running")
     print(f"PASS: a statement already in flight finished while its worker drained "
           f"({outcome['elapsed']:.1f}s)")
 
