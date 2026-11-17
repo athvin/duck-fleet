@@ -212,6 +212,66 @@ held > artifacts/kind/held-isolated.txt
 grep -qx 0 artifacts/kind/held-isolated.txt
 echo 'PASS: a new gateway settled the reservations the abandoned pod was holding'
 
+# Eviction mid-statement, which nothing else here exercises: the tests below delete
+# pods *between* runs. The signal is the ledger rather than a file, because the harness
+# Job writes to a volume claim this host cannot read — and because a `running` history
+# row naming its worker is a more direct statement of "the engine is busy with this"
+# than any marker would be.
+running_worker() {
+  "${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
+    "SELECT worker_id FROM query_history WHERE status='running'
+       AND sql LIKE 'insert into api_demo.evicted%' LIMIT 1" 2> /dev/null | tr -d '[:space:]'
+}
+harness duckfleet-evicted 'python /app/tests/harness.py --evicted-midquery' 900 &
+evicted=$!
+victim=""
+for _ in $(seq 1 120); do
+  victim=$(running_worker)
+  [[ -n "$victim" ]] && break
+  sleep 2
+done
+if [[ -z "$victim" ]]; then
+  echo 'no statement ever reached running; nothing to evict' >&2
+  kill "$evicted" 2> /dev/null || true
+  exit 1
+fi
+echo "deleting worker-$victim while it is executing"
+"${KUBE[@]}" delete pod -l "app=duckfleet-worker,size=$victim" --wait=false
+wait "$evicted"
+grep -q 'PASS: a statement whose worker was deleted mid-run' artifacts/kind/duckfleet-evicted.log
+for deployment in worker-small worker-medium; do
+  "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
+done
+
+# And again with no grace period at all, which is the case the ticket actually asks
+# about: eviction *during* an open transaction, with no chance to drain. The run above
+# answered honestly that the statement finished first — that is the drain working, not
+# an interrupted transaction, so it does not establish how an interrupted one is
+# reported.
+harness duckfleet-evicted-hard \
+  'python /app/tests/harness.py --evicted-midquery --expect-classified' 900 &
+evicted_hard=$!
+victim=""
+for _ in $(seq 1 120); do
+  victim=$("${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
+    "SELECT worker_id FROM query_history WHERE status='running'
+       AND sql LIKE 'insert into api_demo.evicted_hard%' LIMIT 1" 2> /dev/null | tr -d '[:space:]')
+  [[ -n "$victim" ]] && break
+  sleep 2
+done
+if [[ -z "$victim" ]]; then
+  echo 'no statement ever reached running for the abrupt eviction' >&2
+  kill "$evicted_hard" 2> /dev/null || true
+  exit 1
+fi
+echo "killing worker-$victim outright while it is executing"
+"${KUBE[@]}" delete pod -l "app=duckfleet-worker,size=$victim" --grace-period=0 --force --wait=false
+wait "$evicted_hard"
+grep -q 'PASS: a statement whose worker was deleted mid-run' artifacts/kind/duckfleet-evicted-hard.log
+for deployment in worker-small worker-medium; do
+  "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
+done
+
 "${KUBE[@]}" apply -f infra/kind/bucket-verify.yaml
 python3 scripts/kind/await_job.py --context "$CONTEXT" --namespace "$NS" \
   --job bucket-verify --timeout 300

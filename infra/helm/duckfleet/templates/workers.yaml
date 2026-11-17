@@ -24,6 +24,7 @@ spec:
     metadata:
       labels: {app: duckfleet-worker, size: {{ $size }}}
     spec:
+      {{- include "duckfleet.termination" . | nindent 6 }}
       serviceAccountName: duckfleet-worker
       nodeSelector: {{ toJson $.Values.nodeSelector }}
       securityContext:

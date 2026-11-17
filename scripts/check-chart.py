@@ -1,10 +1,20 @@
 """Validate the rendered, deployable resource boundary. Requires PyYAML."""
 import ipaddress
 import json
+import re
 import sys
+from pathlib import Path
+
 import yaml
 
 from worker_resources import assert_worker_resources
+
+# Read from the server rather than restated here: this is the number the drain has to
+# outlast, and a copy of it would be one more thing to keep in step.
+MAX_STATEMENT_SECONDS = int(re.search(
+    r'!\(1\.\.=(\d+)\)\.contains\(&req\.timeout_seconds\)',
+    (Path(__file__).resolve().parents[1] / 'server/src/main.rs').read_text(),
+).group(1))
 
 objects = list(yaml.safe_load_all(open(sys.argv[1])))
 by_name = {(o['kind'], o['metadata']['name']): o for o in objects}
@@ -33,6 +43,13 @@ for size, cpu in [('small', 1), ('medium', 2)]:
     # A persistent worker is shared compute, so it must not claim to be a dedicated
     # pod: that claim is what lets a worker admit an isolated session at all.
     assert 'DUCKFLEET_ISOLATED' not in env
+    # A drain has to outlast the longest statement a caller may ask for. The API caps
+    # timeout_seconds at 60; unset, Kubernetes defaults this to 30, so a query in its
+    # second half could never finish however well the drain was written. The two are
+    # coupled, so changing either must fail here rather than quietly truncate drains.
+    assert pod['terminationGracePeriodSeconds'] > MAX_STATEMENT_SECONDS, (
+        f"worker-{size} drains in {pod['terminationGracePeriodSeconds']}s, which is "
+        f"not longer than the {MAX_STATEMENT_SECONDS}s a statement may run")
     # A worker reports not-ready while it waits for the catalog. Waiting longer than
     # the startup probe allows would have the pod replaced mid-wait, which is the
     # crash loop the wait exists to prevent.

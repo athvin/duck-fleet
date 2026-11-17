@@ -339,6 +339,127 @@ def leak_isolated():
     print(f"left a statement running on {placement['worker_id']}")
 
 
+def drain_inflight():
+    """Holds a statement in flight while its worker is asked to terminate.
+
+    The caller signals readiness through a file because the drain has to begin while
+    the engine is genuinely busy. Getting that wrong is easy and silent: the first
+    version of this used a statement that finished in a second, four seconds before
+    the signal, so the assertion passed without the drain ever having waited for
+    anything. The size below is calibrated to run for roughly 25 seconds on a 1-CPU
+    worker — long enough to still be running, inside both the statement timeout and
+    the drain window. `scripts/test-local.sh` additionally requires the worker's log
+    to show the signal arriving *before* this statement finished, so a future speedup
+    makes the test fail rather than quietly stop proving anything.
+    """
+    marker = ARTIFACTS / "drain-inflight.started"
+    marker.unlink(missing_ok=True)
+    connection = RemoteConnection(URL, TOKEN, compute={"cpu": 1, "memory": "1Gi"})
+    outcome = {}
+
+    def long_statement():
+        started = time.monotonic()
+        try:
+            connection.client.request("POST", connection.path + "/queries", {
+                "request_id": str(uuid.uuid4()),
+                "sql": "select count(*) from range(12000000000) where range % 7 = 3",
+                # Inside the 75-second drain window, so finishing is the drain's doing
+                # rather than the statement being cut short.
+                "timeout_seconds": 58,
+            })
+            outcome["elapsed"] = time.monotonic() - started
+        except Exception as error:  # noqa: BLE001 - reported, not handled
+            outcome["error"] = f"{error} after {time.monotonic() - started:.1f}s"
+
+    thread = threading.Thread(target=long_statement)
+    thread.start()
+    # Long enough for the statement to have been admitted and reached the engine.
+    time.sleep(4)
+    marker.write_text(connection.placement["worker_id"])
+    thread.join(timeout=120)
+    require("elapsed" in outcome,
+            f"a statement in flight did not survive the drain: {outcome.get('error')}")
+    # It must still have been running when the signal arrived, or this proves nothing.
+    require(outcome["elapsed"] > 8,
+            f"the statement finished in {outcome['elapsed']:.1f}s, too quickly to have "
+            "spanned the signal; raise the row count")
+    print(f"PASS: a statement already in flight finished while its worker drained "
+          f"({outcome['elapsed']:.1f}s)")
+
+
+def evicted_midquery(expect_classified=False):
+    """Reports how a statement ends when its worker pod is deleted underneath it.
+
+    The ticket asks for eviction during an open transaction to be classified
+    consistently rather than left to chance. This does not prescribe the outcome: it
+    requires the outcome to be *legible* — either the statement completed, or it
+    failed with a classification saying whether it is safe to send again. A hang, or a
+    transport error with no classification, is the failure this rules out.
+
+    Committed state is checked afterwards either way, because a DuckLake commit is
+    atomic: whatever the caller was told, the table must not be half-written.
+    """
+    marker = ARTIFACTS / "evicted-midquery.started"
+    marker.unlink(missing_ok=True)
+    # A table per mode, so a graceful run and an abrupt one cannot read each other's
+    # rows when deciding whether a commit was partial.
+    table = "api_demo.evicted_hard" if expect_classified else "api_demo.evicted"
+    setup = RemoteConnection(URL, TOKEN, compute={"cpu": 1, "memory": "1Gi"})
+    try:
+        sql(setup, "create schema if not exists api_demo")
+        sql(setup, f"create or replace table {table} (n bigint)")
+    finally:
+        setup.close()
+
+    connection = RemoteConnection(URL, TOKEN, compute={"cpu": 1, "memory": "1Gi"})
+    outcome = {}
+
+    def write():
+        try:
+            sql(connection, f"insert into {table} "
+                            "select range from range(200000000) where range % 13 = 5")
+            outcome["committed"] = True
+        except RemoteError as error:
+            outcome["classified"] = {"status": error.status, "kind": error.failure_kind,
+                                     "retry_safe": error.retry_safe, "message": str(error)}
+        except Exception as error:  # noqa: BLE001
+            outcome["unclassified"] = f"{type(error).__name__}: {error}"
+
+    thread = threading.Thread(target=write)
+    thread.start()
+    time.sleep(5)
+    marker.write_text(connection.placement["worker_id"])
+    thread.join(timeout=180)
+    require(not thread.is_alive(), "the statement never returned after its worker was deleted")
+    require("unclassified" not in outcome,
+            f"eviction surfaced without a classification: {outcome.get('unclassified')}")
+    # With no grace period the pod cannot drain, so completing would mean the statement
+    # was never actually interrupted and this mode proved nothing.
+    if expect_classified:
+        require("classified" in outcome,
+                f"the statement completed despite an immediate kill: {outcome}")
+
+    # Either answer is acceptable; an illegible one is not.
+    reader = RemoteConnection(URL, TOKEN, compute={"cpu": 1, "memory": "1Gi"})
+    try:
+        rows = sql(reader, f"select count(*) from {table}")[0][0]
+    finally:
+        reader.close()
+    if outcome.get("committed"):
+        require(rows > 0, f"the statement reported success but the table holds {rows} rows")
+        verdict = "completed before the pod went away"
+    else:
+        # Not committed, so nothing may be visible: a partial write would mean a
+        # DuckLake commit was not atomic after all.
+        require(rows == 0, f"a statement that did not commit left {rows} rows behind")
+        verdict = f"failed as {outcome['classified']['kind']}, retry_safe=" \
+                  f"{outcome['classified']['retry_safe']}"
+    (ARTIFACTS / "evicted-midquery.json").write_text(
+        json.dumps({"outcome": outcome, "rows_after": rows}, indent=2) + "\n")
+    print(f"PASS: a statement whose worker was deleted mid-run {verdict}, "
+          f"and committed state stayed consistent ({rows} rows)")
+
+
 def main():
     ARTIFACTS.mkdir(exist_ok=True)
     import observability
@@ -352,6 +473,12 @@ def main():
     if "--metering" in sys.argv:
         import metering
         metering.checks(URL, TOKEN, ARTIFACTS)
+        return
+    if "--evicted-midquery" in sys.argv:
+        evicted_midquery(expect_classified="--expect-classified" in sys.argv)
+        return
+    if "--drain-inflight" in sys.argv:
+        drain_inflight()
         return
     if "--isolated" in sys.argv:
         isolated_checks()

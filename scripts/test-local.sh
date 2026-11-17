@@ -130,3 +130,51 @@ grep -q 'ledger connection' artifacts/worker-ledger-reconnect.log
 # The cause reaches the log, and the credential in the DSN does not (#20).
 ! grep -q 'local-catalog-password' artifacts/worker-ledger-reconnect.log
 echo 'PASS: a worker replaced its own ledger connection after PostgreSQL restarted'
+# Kubernetes terminates a pod with SIGTERM. The worker previously waited on ctrl_c
+# alone — SIGINT — so the graceful path never ran on a pod deletion and it kept
+# admitting new sessions until it was killed. Drain it with a statement in flight and
+# require three things at once: the statement finishes, new sessions are refused with a
+# classified reason, and the process leaves of its own accord.
+rm -f artifacts/drain-inflight.started
+docker compose run --rm --no-deps -T dbt python /app/tests/harness.py --drain-inflight \
+  > artifacts/drain-inflight.log 2>&1 &
+inflight=$!
+for _ in $(seq 1 60); do
+  [ -s artifacts/drain-inflight.started ] && break
+  sleep 1
+done
+test -s artifacts/drain-inflight.started
+draining_id=$(docker compose ps -q worker-small)
+docker kill -s TERM "$draining_id" > /dev/null
+# Reported at once, so a Service drops this endpoint before the process goes away.
+for _ in $(seq 1 15); do
+  status=$(docker compose exec -T worker-small curl -sS http://localhost:8080/healthz 2>/dev/null || true)
+  case "$status" in *draining*) break ;; esac
+  sleep 1
+done
+case "$status" in
+  *draining*) ;;
+  *) echo "healthz did not report draining: $status" >&2; exit 1 ;;
+esac
+# A new session is refused with a reason a caller can act on, not a closed connection.
+docker compose exec -T worker-small sh -c 'curl -sS \
+  -X POST http://localhost:8080/v1/sessions \
+  -H "Authorization: Bearer $DUCKFLEET_TOKEN" -H "Content-Type: application/json" -d "{}"' \
+  > artifacts/drain-refusal.json
+python3 scripts/assert_draining.py artifacts/drain-refusal.json
+# And the statement that was already running finished.
+wait "$inflight"
+grep -q 'PASS: a statement already in flight finished' artifacts/drain-inflight.log
+# The log must show the signal arriving before that statement finished. Without this
+# the check above passes whenever the statement is simply fast, which is how the first
+# version of this test proved nothing at all.
+docker logs "$draining_id" > artifacts/drain-order.log 2>&1
+python3 scripts/assert_drain_order.py artifacts/drain-order.log
+# The container exited because it was asked to, not because it was killed.
+test "$(docker inspect -f '{{.State.ExitCode}}' "$draining_id")" = 0
+# Force-recreated: the drained container exited cleanly, and starting that same
+# stopped container back up is not what a replacement does.
+docker compose up -d --force-recreate --no-deps --wait worker-small
+docker compose up -d --wait server
+echo 'PASS: a worker drained on SIGTERM, refusing new sessions and finishing the one in flight'
+

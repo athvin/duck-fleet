@@ -42,6 +42,12 @@ struct App {
     /// that happens so a slow catalog shows as not-ready rather than refusing
     /// connections, which a probe cannot tell apart from a crashed process.
     ready: Arc<AtomicBool>,
+    /// Set when a termination signal arrives. Kept apart from `ready` because the two
+    /// answer different questions: `ready` is what a probe reads, and this is what
+    /// decides whether new work is admitted. A draining worker reports not-ready *and*
+    /// refuses new sessions, while a starting one refuses everything and will later
+    /// accept it.
+    draining: Arc<AtomicBool>,
 }
 
 type Reply = Result<Output, ApiError>;
@@ -77,6 +83,37 @@ fn default_context() -> Value {
 }
 fn default_timeout() -> u64 {
     30
+}
+
+/// Resolves when the process is asked to stop.
+///
+/// SIGTERM is what Kubernetes sends; the previous shutdown waited on `ctrl_c` alone,
+/// which is SIGINT, so on a pod deletion the graceful path never ran at all and the
+/// worker kept admitting new sessions until it was killed. SIGINT is still handled
+/// because that is what an operator running this locally sends.
+/// How long a drain may take. Longer than the 60 seconds a statement may run, and
+/// comfortably inside the 90-second `terminationGracePeriodSeconds` the chart sets, so
+/// the process leaves of its own accord rather than being killed partway.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(75);
+/// How long the engine must stay idle before the drain is considered finished.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn terminating() {
+    let mut terminate =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                // Refusing to serve over this would be worse than losing the graceful
+                // path, so it is reported and the process carries on with SIGINT alone.
+                tracing::error!(%error, "cannot listen for SIGTERM; drains will not be graceful");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }
 
 /// Debug exposes nothing the client is not already sent: the message is the same
@@ -152,6 +189,16 @@ async fn authorize(
     next.run(request).await
 }
 async fn health(State(app): State<App>) -> Response {
+    // Draining is reported before readiness, because a draining worker is also ready
+    // and answering "ok" would keep it in the Service's endpoints while it shuts down.
+    // Failing here is what takes it out of rotation.
+    if app.draining.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "draining"})),
+        )
+            .into_response();
+    }
     if app.ready.load(Ordering::Acquire) {
         Json(json!({"status": "ok"})).into_response()
     } else {
@@ -180,6 +227,16 @@ async fn dispatch(app: App, op: Operation) -> Reply {
     receiver.await.map_err(|_| ApiError::internal())?
 }
 async fn open(State(app): State<App>, request: Option<Json<SessionRequest>>) -> Reply {
+    // Only new sessions are refused. Queries on sessions already open continue, which
+    // is the drain: the grace period bounds how long that can take, so a client cannot
+    // hold this worker open indefinitely by continuing to send work.
+    if app.draining.load(Ordering::Acquire) {
+        return Err(ApiError::new(
+            failure::DRAINING,
+            "this worker is shutting down and is not accepting new sessions; \
+             no statement was executed",
+        ));
+    }
     let request = request.map(|Json(r)| r).unwrap_or_default();
     request.validate()?;
     dispatch(app, Operation::Open(request)).await
@@ -261,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
     let (failed_tx, failed_rx) = oneshot::channel();
     let ready = Arc::new(AtomicBool::new(false));
     let worker_active = active.clone();
+    let active_for_drain = active.clone();
     let worker_ready = ready.clone();
     // Startup waits for the catalog on a bounded budget, so reaching the error arm
     // means waiting will not help. Hand the failure back to `main` so the exit code
@@ -282,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
         )?;
+    let draining = Arc::new(AtomicBool::new(false));
     let app = App {
         sender,
         active,
@@ -289,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
         history: history::Reader::new(std::env::var("PLATFORM_DSN")?),
         usage: usage::Reader::new(std::env::var("PLATFORM_DSN")?),
         ready,
+        draining: draining.clone(),
     };
     let api = Router::new()
         .route("/v1/sessions", post(open))
@@ -311,9 +371,41 @@ async fn main() -> anyhow::Result<()> {
         port = 8080,
         "DuckFleet local server listening; worker starting"
     );
+    let drain_active = active_for_drain;
     tokio::select! {
-        served = axum::serve(listener, router).with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        served = axum::serve(listener, router).with_graceful_shutdown(async move {
+            terminating().await;
+            // Marked first, and the server deliberately keeps serving afterwards.
+            //
+            // Handing the signal straight to `with_graceful_shutdown` closes the
+            // listener at once, which makes a drain invisible: a readiness probe gets
+            // a refused connection instead of an answer, and the classified refusal
+            // below can never be returned. The first version of this did exactly that,
+            // and the harness caught `/healthz` being unreachable rather than saying
+            // "draining". So the shutdown waits here while the pod is still answering.
+            draining.store(true, Ordering::Release);
+            tracing::info!(
+                "termination signal received; refusing new sessions and finishing open work"
+            );
+            let deadline = std::time::Instant::now() + DRAIN;
+            // A statement runs serially on the worker, so an empty slot means the
+            // engine is idle. The settle window keeps a session's next statement from
+            // being cut off in the gap between two of them.
+            let mut idle_since = None;
+            while std::time::Instant::now() < deadline {
+                let executing = drain_active
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some();
+                match (executing, idle_since) {
+                    (true, _) => idle_since = None,
+                    (false, None) => idle_since = Some(std::time::Instant::now()),
+                    (false, Some(since)) if since.elapsed() >= SETTLE => break,
+                    (false, Some(_)) => {}
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            tracing::info!("drain complete; shutting down");
         }) => served?,
         // Also reached if the worker thread dies after becoming ready, which drops the
         // sender. Serving on without an engine is worse than exiting and being replaced.
