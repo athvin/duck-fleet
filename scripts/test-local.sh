@@ -64,6 +64,40 @@ for statement in 'UPDATE usage_events SET amount_micro_usd = 0' 'DELETE FROM usa
   { docker compose exec -T postgres psql -U duckfleet -d platform -c "$statement" 2>&1 || true; } \
     | grep -q 'append-only'
 done
+# Retention: ancient history dies at the next sweep, fresh history and the ledger
+# survive it, and the sweep records itself. Rows are aged directly in PostgreSQL —
+# the platform cannot write an old timestamp — and the sweep is triggered by
+# restarting the worker, whose startup prune is the same code the hourly one runs.
+events_before=$(docker compose exec -T postgres psql -U duckfleet -d platform -tAc \
+  'SELECT count(*) FROM usage_events' | tr -d '[:space:]')
+docker compose exec -T postgres psql -U duckfleet -d platform -q <<'SQL'
+INSERT INTO query_history (query_id, session_id, sql, context, status, worker_id, placement, principal, accepted_at)
+VALUES ('retention-ancient-1', 'seed', 'select 1', '{}', 'succeeded', 'small', '{}', 'direct', now() - interval '400 days'),
+       ('retention-ancient-2', 'seed', 'select 2', '{}', 'failed', 'small', '{}', 'direct', now() - interval '400 days');
+SQL
+docker compose restart worker-small
+docker compose up -d --wait worker-small
+remaining=unswept
+for _ in $(seq 1 30); do
+  remaining=$(docker compose exec -T postgres psql -U duckfleet -d platform -tAc \
+    "SELECT count(*) FROM query_history WHERE query_id LIKE 'retention-ancient-%'" | tr -d '[:space:]')
+  [ "$remaining" = 0 ] && break
+  sleep 1
+done
+test "$remaining" = 0
+# Everything inside the window survived, and the sweep left an auditable record.
+fresh=$(docker compose exec -T postgres psql -U duckfleet -d platform -tAc \
+  "SELECT count(*) FROM query_history WHERE accepted_at > now() - interval '1 day'" | tr -d '[:space:]')
+test "$fresh" -gt 0
+docker compose exec -T postgres psql -U duckfleet -d platform -tAc \
+  "SELECT count(*) FROM query_history WHERE principal = 'platform'
+     AND context::jsonb ->> 'operation' = 'history_retention'" | tr -d '[:space:]' | grep -qv '^0$'
+# The ledger is not retention's to touch: exactly as many events as before.
+events_after=$(docker compose exec -T postgres psql -U duckfleet -d platform -tAc \
+  'SELECT count(*) FROM usage_events' | tr -d '[:space:]')
+test "$events_before" = "$events_after"
+docker compose up -d --wait server
+echo 'PASS: retention pruned ancient history, spared fresh rows and the ledger, and recorded the sweep'
 docker compose stop worker-medium
 docker compose run --rm --no-deps dbt python /app/tests/harness.py --unavailable-medium
 docker compose up -d --wait worker-medium

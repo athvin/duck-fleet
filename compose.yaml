@@ -43,6 +43,9 @@ services:
       # Pinned to the defaults so the harness's pricing evidence is deterministic.
       DUCKFLEET_RATE_CARD_VERSION: local-dev-1
       DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR: "100000"
+      # A year, so the retention stage can age rows past it while every row the
+      # harness itself writes stays comfortably inside it.
+      DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
       CATALOG_DSN: host=postgres port=5432 dbname=lake user=duckfleet password=local-catalog-password
       PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
       S3_ENDPOINT: object-store:9000

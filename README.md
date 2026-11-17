@@ -422,10 +422,21 @@ represent only the last profiled statement; the history record covers the whole
 submitted request.
 
 Profiles live in the platform PostgreSQL database for this development release,
-with no automatic retention or S3 archival yet. SQL, profiles, and errors can
-contain sensitive literals. This is a single-tenant operational history API, not
-a customer authorization boundary. A `running` record means the worker accepted
-and began the request; queued operations are not yet durable history records.
+with no S3 archival yet. SQL, profiles, and errors can contain sensitive
+literals. This is a single-tenant operational history API, not a customer
+authorization boundary. A `running` record means the worker accepted and began
+the request; queued operations are not yet durable history records.
+
+History retention is configurable and off by default: `historyRetentionDays: 0`
+keeps everything, because discarding records is an operator's decision, never a
+default's. With a window set, workers sweep expired rows — SQL text and profiles
+with them — at startup and hourly, in bounded batches that never hold the engine
+behind a long delete, and each sweep that removed anything records itself in
+history under the `platform` principal. The usage ledger has **no** retention:
+it is billing evidence, so a pruned query's `usage_events` row remains the proof
+of what ran, when, for how long, at which rate — everything except the SQL
+itself. The harness ages rows past the window and proves the sweep removes them,
+spares everything inside it, and leaves the ledger untouched to the row.
 
 The integration gate verifies filtering and pagination, observes/cancels a running
 query without waiting behind it, rejects stale profiles after SQL failure, checks

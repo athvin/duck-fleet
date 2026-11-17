@@ -73,6 +73,7 @@ template and the code that patches it from drifting silently.
 # check-chart.py asserts the gateway carries the same pair.
 - {name: DUCKFLEET_RATE_CARD_VERSION, value: {{ $.Values.rateCard.version | quote }}}
 - {name: DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR, value: {{ $.Values.rateCard.computeMicroUsdPerUnitHour | quote }}}
+- {name: DUCKFLEET_HISTORY_RETENTION_DAYS, value: {{ $.Values.historyRetentionDays | quote }}}
 - {name: S3_DATA_PATH, value: {{ printf "s3://%s/lake/" $.Values.bucket | quote }}}
 - {name: AWS_REGION, value: {{ $.Values.region }}}
 - {name: AWS_EC2_METADATA_DISABLED, value: "true"}

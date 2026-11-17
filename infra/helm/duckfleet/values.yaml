@@ -54,6 +54,13 @@ rateCard:
   version: local-dev-1
   computeMicroUsdPerUnitHour: 100000
 
+# Days of query history to keep; 0 keeps everything, and is the default — history
+# rows carry SQL text and profiles, so throwing them away is an operator's
+# decision, never a default's. The usage ledger has no retention at all: it is
+# billing evidence, and a pruned query's event remains the proof of what ran and
+# what it cost. Workers sweep at startup and hourly, in bounded batches.
+historyRetentionDays: 0
+
 # Reaching the API from outside the cluster: an Ingress terminating TLS at the
 # controller, plus the NetworkPolicy door that admits the controller's namespace.
 # Off by default and off in the dev lane permanently. Enabling it requires naming
