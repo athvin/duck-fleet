@@ -82,6 +82,60 @@ fn dsn_field(dsn: &str, wanted: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Scrubs inline password values out of arbitrary text: `password=secret`,
+/// `password='secret'`, `password: "secret"` all become `password=[redacted]`.
+///
+/// The `Redactor` masks the platform's own credentials, which it knows. This
+/// handles the ones it cannot know: a caller who writes a connection string into
+/// SQL gets the whole string quoted back by the engine's error, and that text
+/// reaches the response and the durable history row. Whatever the caller's
+/// mistake, a history table must not hold a live credential.
+pub(crate) fn scrub_passwords(text: &str) -> String {
+    let lowered = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut position = 0;
+    while let Some(found) = lowered[position..].find("password") {
+        let key_end = position + found + "password".len();
+        output.push_str(&text[position..key_end]);
+        position = key_end;
+        // A separator, with optional spaces either side; "password" with no value
+        // following is prose, not a credential.
+        let mut cursor = position;
+        while bytes.get(cursor) == Some(&b' ') {
+            cursor += 1;
+        }
+        if !matches!(bytes.get(cursor), Some(b'=' | b':')) {
+            continue;
+        }
+        cursor += 1;
+        while bytes.get(cursor) == Some(&b' ') {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            continue;
+        }
+        let separator_end = cursor;
+        // The value: quoted to its closing quote, bare to the next whitespace or
+        // quote character. The mask swallows the quotes with the value.
+        let value_end = match bytes[cursor] {
+            quote @ (b'\'' | b'"') => text[cursor + 1..]
+                .find(quote as char)
+                .map(|end| cursor + 1 + end + 1)
+                .unwrap_or(text.len()),
+            _ => text[cursor..]
+                .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+                .map(|end| cursor + end)
+                .unwrap_or(text.len()),
+        };
+        output.push_str(&text[position..separator_end]);
+        output.push_str(MASK);
+        position = value_end;
+    }
+    output.push_str(&text[position..]);
+    output
+}
+
 /// Extracts `password` field values from a libpq keyword/value connection string.
 fn dsn_passwords(dsn: &str) -> Vec<String> {
     dsn.split_whitespace()
@@ -114,6 +168,32 @@ impl Startup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_passwords_are_scrubbed_whatever_the_spelling() {
+        for (given, expected) in [
+            (
+                "connect 'host=h password=hunter2 dbname=lake' failed",
+                "connect 'host=h password=[redacted] dbname=lake' failed",
+            ),
+            (
+                "password='quoted secret' trailing",
+                "password=[redacted] trailing",
+            ),
+            (
+                "PASSWORD = \"Quoted\" and password: bare",
+                "PASSWORD = [redacted] and password: [redacted]",
+            ),
+            // An unterminated quote swallows to the end rather than leaking a tail.
+            ("password='no closing quote", "password=[redacted]"),
+            // Prose mentioning a password is not a credential.
+            ("wrong password supplied", "wrong password supplied"),
+            ("the password is required", "the password is required"),
+            ("no secrets here", "no secrets here"),
+        ] {
+            assert_eq!(scrub_passwords(given), expected, "{given}");
+        }
+    }
 
     const DSN: &str = "host=postgres port=5432 dbname=lake user=duckfleet password=s3cr3t-value";
 

@@ -1,5 +1,12 @@
-{{- if ne .Release.Namespace "duckfleet-dev" }}
-{{- fail "This development chart is restricted to duckfleet-dev" }}
+{{- /*
+Deploys only into namespaces DuckFleet plainly owns. Exact duckfleet-dev until
+team namespaces existed; the prefix keeps what the restriction was for — a
+render can never land in a neighbour's namespace on a shared cluster — while
+letting the provisioning script stamp out duckfleet-<team> namespaces.
+check-infra proves a foreign namespace still refuses to render.
+*/ -}}
+{{- if not (hasPrefix "duckfleet-" .Release.Namespace) }}
+{{- fail "This chart deploys only into duckfleet-* namespaces" }}
 {{- end }}
 apiVersion: v1
 kind: ServiceAccount

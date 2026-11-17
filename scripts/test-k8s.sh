@@ -29,6 +29,11 @@ cleanup() {
     "${KUBE[@]}" get events --sort-by=.lastTimestamp > artifacts/kind/events.txt 2>&1 || true
     "${KUBE[@]}" logs -l app=duckfleet-worker --tail=200 --prefix > artifacts/kind/workers.log 2>&1 || true
     "${KUBE[@]}" logs -l app=duckfleet-gateway --tail=200 --prefix > artifacts/kind/gateway.log 2>&1 || true
+    # A restarted container's death is only in its previous instance's log and its
+    # recorded last state; without these a crash reads as a mystery restart.
+    "${KUBE[@]}" logs -l app=duckfleet-worker --tail=200 --prefix --previous > artifacts/kind/workers-previous.log 2>&1 || true
+    "${KUBE[@]}" logs -l app=duckfleet-gateway --tail=200 --prefix --previous > artifacts/kind/gateway-previous.log 2>&1 || true
+    "${KUBE[@]}" get pods -o yaml > artifacts/kind/pods.yaml 2>&1 || true
   fi
   rm -rf "$work"
   [[ "${DUCKFLEET_KEEP_CLUSTER:-false}" == true ]] || kind delete cluster --name "$CLUSTER" > /dev/null 2>&1 || true
@@ -403,6 +408,41 @@ if "${KUBE[@]}" get statefulset duckfleet-postgres > /dev/null 2>&1; then
   exit 1
 fi
 echo 'PASS: the release ran a full workflow against an external PostgreSQL, bundled instance gone'
+
+# A second team namespace from the operator scripts: its own boundary, catalog,
+# credentials, and lake prefix, live beside the first — then the isolation claim
+# earns its negative test, and teardown removes the namespace whole while the
+# first feels nothing.
+TEAM=duckfleet-team-b
+DUCKFLEET_KUBE_CONTEXT="$CONTEXT" \
+DUCKFLEET_PROVISION_TRANSFORM="python3 scripts/kind/localize.py --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port --data-path s3://duckfleet/$TEAM/lake/" \
+  bash scripts/provision-namespace.sh "$TEAM" \
+  --set "workerImage=$REGISTRY/worker@sha256:$digest" \
+  --set "dbtImage=$REGISTRY/dbt@sha256:$digest"
+team=(kubectl --context "$CONTEXT" -n "$TEAM")
+# On AWS, S3 is outside every namespace; in kind the stand-in store is a
+# namespace-local pod, so the new namespace brings its own — which is also the
+# aligned model: a team namespace shares storage infrastructure with nobody.
+"${team[@]}" apply -f infra/kind/object-store.yaml
+"${team[@]}" rollout status deployment/object-store --timeout=240s
+"${team[@]}" wait --for=condition=complete job/bucket-init --timeout=240s
+team_token=$("${team[@]}" get secret duckfleet-dev -o jsonpath='{.data.DUCKFLEET_TOKEN}' | base64 -d)
+dev_password=$("${KUBE[@]}" get secret duckfleet-dev -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)
+"${team[@]}" port-forward svc/server 18081:8080 > /dev/null 2>&1 &
+team_forward=$!
+sleep 3
+python3 scripts/kind/team_namespace_probe.py --port 18081 \
+  --token "$team_token" --dev-password "$dev_password"
+kill "$team_forward" 2> /dev/null || true
+DUCKFLEET_CONFIRM_DEPROVISION=yes DUCKFLEET_KUBE_CONTEXT="$CONTEXT" \
+  bash scripts/deprovision-namespace.sh "$TEAM"
+if kubectl --context "$CONTEXT" get namespace "$TEAM" > /dev/null 2>&1; then
+  echo "namespace $TEAM survived deprovisioning" >&2
+  exit 1
+fi
+"${KUBE[@]}" get deployment server > /dev/null
+echo 'PASS: a second namespace was provisioned, isolated at the network even with the'
+echo '      right password, and removed whole while the first namespace felt nothing'
 
 "${KUBE[@]}" get pods -o wide > artifacts/kind/pods.txt
 echo 'PASS: the release converged on Kubernetes, the dbt harness passed in-cluster,'

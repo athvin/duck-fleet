@@ -142,6 +142,15 @@ if grep -q 'duckfleet-postgres' "$external"; then
 fi
 grep -q '10.20.30.40/32' "$external"
 echo 'PASS: an external catalog renders no bundled PostgreSQL and opens egress to the named address'
+# Team namespaces widened the namespace guard from exactly duckfleet-dev to the
+# duckfleet- prefix. What the guard was for must survive the widening: a render
+# can never land in a neighbour's namespace on a shared cluster.
+if helm template duckfleet infra/helm/duckfleet --namespace someone-elses-namespace -f "$values" > /dev/null 2>&1; then
+  echo 'The chart must refuse to render into a namespace DuckFleet does not own' >&2
+  exit 1
+fi
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-team-b -f "$values" > /dev/null
+echo 'PASS: the chart renders for duckfleet-* namespaces and refuses everything else'
 for script in scripts/*.sh scripts/aws/*.sh scripts/ci/*.sh; do bash -n "$script"; done
 # The local Kubernetes harness renders the real chart, so a chart change that moves
 # something out from under the transform is caught here rather than in a cluster.

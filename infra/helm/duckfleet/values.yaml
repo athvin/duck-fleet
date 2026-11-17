@@ -75,6 +75,13 @@ postgres:
   externalCidrs: []
   port: 5432
 
+# Where this namespace's Parquet lives inside the bucket. The provisioning script
+# sets it to <namespace>/lake so team namespaces never share a prefix; the
+# default keeps the primary deployment exactly where it has always been. On AWS
+# the worker IAM policy should be scoped to the same prefix — that policy is the
+# storage half of namespace isolation, and it lives with whoever owns IAM.
+lakePrefix: lake
+
 # Reaching the API from outside the cluster: an Ingress terminating TLS at the
 # controller, plus the NetworkPolicy door that admits the controller's namespace.
 # Off by default and off in the dev lane permanently. Enabling it requires naming

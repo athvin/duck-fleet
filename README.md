@@ -425,7 +425,9 @@ submitted request.
 
 Profiles live in the platform PostgreSQL database for this development release,
 with no S3 archival yet. SQL, profiles, and errors can contain sensitive
-literals. This is a single-tenant operational history API, not a customer
+literals; inline `password=` values in error text are scrubbed before the error
+reaches the caller or the history row, because the engine quotes a caller's
+connection string back verbatim when it fails. This is a single-tenant operational history API, not a customer
 authorization boundary. A `running` record means the worker accepted and began
 the request; queued operations are not yet durable history records.
 
@@ -639,6 +641,26 @@ Parquet written after the backup survives in the bucket as unreferenced objects;
 they are harmless to correctness and belong to table maintenance (#14) to reap.
 The two databases are dumped sequentially, each internally consistent, so history
 may lead or trail the catalog by the dump gap.
+
+## Team namespaces
+
+The namespace boundary is per team or environment, each running one DuckLake —
+the aligned model. `scripts/provision-namespace.sh <namespace>` stamps out the
+next one: the ownership boundary (operator-applied, as always), a fresh
+credential Secret the re-run never rotates, and the release with
+`lakePrefix=<namespace>/lake` so no two namespaces share a byte of the bucket.
+`scripts/deprovision-namespace.sh` removes a namespace whole — compute,
+catalog, credentials, PostgreSQL volume — behind two spoken confirmations for
+the primary, and prints rather than runs the bucket-prefix deletion.
+
+Isolation is by construction, not discipline: each namespace has its own
+PostgreSQL and passwords, its own bootstrap token and issued credentials, its
+own prefix — and the isolation NetworkPolicy keeps 5432 namespace-local, which
+the Kubernetes harness proves the hard way: from a freshly provisioned
+namespace, the first namespace's catalog is unreachable *even when the caller
+holds its real password*. On AWS, the worker IAM policy scoped to the
+namespace's prefix is the storage half of the same boundary, provisioned with
+whoever owns IAM.
 
 ## Lake maintenance
 
