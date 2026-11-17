@@ -6,6 +6,21 @@
 - **Audience:** Founder/CTO, initial engineers, design partners
 - **Document type:** Decision-oriented product, engineering, and commercial plan
 
+> **Current direction (November 16, 2026).** Three decisions recorded since this
+> document was written, where practice now diverges from the text below:
+>
+> 1. **Single-organization open source first.** DuckFleet is being built as a
+>    standalone, self-hosted warehouse for one organization; the managed
+>    multi-tenant offering described here is a possible later stage, not the
+>    current target. Per-customer tenancy language below should be read that way.
+> 2. **Namespace per team/environment, not per customer or database.** Each
+>    namespace runs one DuckLake holding many logical databases. Provisioned
+>    workers are shared per size within a namespace, not dedicated per customer.
+> 3. **HTTP + Arrow now, Postgres wire protocol later.** The native data plane
+>    stays the authenticated HTTP/Arrow-IPC protocol with the Python client and
+>    dbt adapter; a pgwire front for BI tools and Postgres drivers is planned as
+>    a later compatibility layer, not a rewrite of the transport.
+
 **Executive thesis:** Build a Rust-first, dbt-native managed DuckDB/DuckLake platform that routes individual dbt models to persistent, pooled, or burst compute, while providing the operational layer customers expect from a warehouse: query history, performance profiling, cost attribution, budgets, secure sharing, backups, and automated insights. Sell predictable baseline capacity with metered, budget-controlled elasticity. The competitive wedge is per-model compute policy plus transparent cost accounting, not simply “hosted DuckDB.”
 
 ## 1. Executive decision brief
