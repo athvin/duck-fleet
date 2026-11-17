@@ -42,6 +42,34 @@ whole model lifecycles to these workers. They may share an EC2 node. This does
 PostgreSQL is separate from ER's Aurora databases for this disposable experiment.
 This is not a production database/backup/HA design.
 
+## Rotate the catalog credential
+
+The development password was written to pod logs in plaintext until #20 scrubbed it, so
+the credential in use before that fix should be treated as disclosed. #20 stopped the
+leak; this replaces what leaked.
+
+```sh
+bash scripts/aws/rotate-catalog-credential.sh
+```
+
+One command because the database user and the Secret have to change **together**.
+`deploy.sh` writes that Secret only when it is absent and the PostgreSQL PVC outlives a
+redeploy, so changing either alone leaves the workers holding a password the server no
+longer accepts — which presents as an unreachable catalog rather than as a credential
+problem. The script changes the database first, since the reverse would leave the
+database reachable only with a credential that no longer exists anywhere, then applies
+the Secret, restarts the deployments (a Secret change does not reach a running pod's
+environment), and finally requires the fleet to answer before reporting success.
+
+Only the password changes. The DSNs are edited rather than rebuilt, so host, port,
+database and user survive exactly; `DUCKFLEET_TOKEN` is left alone because it is the
+API bearer token, not a database credential, and rotating it here would log every
+caller out as a side effect of database maintenance. #17 replaces that token with
+per-tenant credentials.
+
+Statements already running finish within the worker's drain window (#16); sessions open
+at that moment end.
+
 ## Create the cluster DuckFleet owns
 
 `infra/terraform/cluster` defines an EKS Auto Mode cluster, its VPC, the IAM roles
