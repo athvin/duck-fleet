@@ -116,6 +116,26 @@ async fn terminating() {
     }
 }
 
+/// Waits until `busy` has answered no for a sustained `SETTLE`, or `DRAIN` has passed.
+///
+/// On a worker, busy means a statement is executing; the settle window keeps a
+/// session's next statement from being cut off in the gap between two of them. On the
+/// gateway, busy means a request is in flight, and the same window covers a client
+/// sending its next request on the session it already holds.
+async fn drain_until_idle(busy: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + DRAIN;
+    let mut idle_since = None;
+    while tokio::time::Instant::now() < deadline {
+        match (busy(), idle_since) {
+            (true, _) => idle_since = None,
+            (false, None) => idle_since = Some(tokio::time::Instant::now()),
+            (false, Some(since)) if since.elapsed() >= SETTLE => break,
+            (false, Some(_)) => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Debug exposes nothing the client is not already sent: the message is the same
 /// string `IntoResponse` returns, and it is scrubbed of credentials before it gets
 /// here. It exists so assertions can report which failure was produced.
@@ -387,24 +407,15 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(
                 "termination signal received; refusing new sessions and finishing open work"
             );
-            let deadline = std::time::Instant::now() + DRAIN;
             // A statement runs serially on the worker, so an empty slot means the
-            // engine is idle. The settle window keeps a session's next statement from
-            // being cut off in the gap between two of them.
-            let mut idle_since = None;
-            while std::time::Instant::now() < deadline {
-                let executing = drain_active
+            // engine is idle.
+            drain_until_idle(move || {
+                drain_active
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .is_some();
-                match (executing, idle_since) {
-                    (true, _) => idle_since = None,
-                    (false, None) => idle_since = Some(std::time::Instant::now()),
-                    (false, Some(since)) if since.elapsed() >= SETTLE => break,
-                    (false, Some(_)) => {}
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
+                    .is_some()
+            })
+            .await;
             tracing::info!("drain complete; shutting down");
         }) => served?,
         // Also reached if the worker thread dies after becoming ready, which drops the
@@ -418,4 +429,47 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_drain_ends_at_the_settle_window_not_the_deadline() {
+        let started = tokio::time::Instant::now();
+        drain_until_idle(|| false).await;
+        let elapsed = started.elapsed();
+        assert!(elapsed >= SETTLE, "settled early: {elapsed:?}");
+        assert!(
+            elapsed < DRAIN,
+            "an idle drain waited for the deadline: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_that_never_goes_idle_leaves_at_the_deadline() {
+        let started = tokio::time::Instant::now();
+        drain_until_idle(|| true).await;
+        assert!(started.elapsed() >= DRAIN, "left before the deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_finishing_mid_drain_still_gets_its_settle_window() {
+        // Busy for the first 50 polls — ten virtual seconds — then idle.
+        let polls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        drain_until_idle(|| polls.fetch_add(1, Ordering::Relaxed) < 50).await;
+        let elapsed = started.elapsed();
+        let busy = std::time::Duration::from_secs(10);
+        assert!(
+            elapsed >= busy + SETTLE,
+            "left before the work settled: {elapsed:?}"
+        );
+        assert!(
+            elapsed < DRAIN,
+            "waited for the deadline after going idle: {elapsed:?}"
+        );
+    }
 }

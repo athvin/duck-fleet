@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::header,
+    http::{StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -18,7 +18,10 @@ use reqwest::{Client, Method};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -78,6 +81,44 @@ struct Gateway {
     /// capability is absent rather than disabled: there is no code path that would
     /// serve an isolated request from a shared worker if it were off.
     isolation: Option<Arc<Isolation>>,
+    /// Set when a termination signal arrives, exactly as the worker does it: the
+    /// probe reads it to leave the Service, and `open` reads it to refuse new
+    /// sessions while requests already in flight run on.
+    draining: Arc<AtomicBool>,
+    /// Requests currently inside a `/v1` handler. What the drain waits on — the
+    /// gateway has no engine slot to watch, so this count is its notion of busy.
+    inflight: Arc<AtomicUsize>,
+}
+
+/// Counts a request in on construction and out on `Drop`.
+///
+/// Decrementing on `Drop` rather than after the handler returns is the difference
+/// between a counter and a leak: a caller that disconnects has its future dropped
+/// mid-await, and a drain waiting on a count that can never reach zero again would
+/// always run to its deadline.
+struct InFlight(Arc<AtomicUsize>);
+impl InFlight {
+    fn enter(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count.clone())
+    }
+}
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The refusal a draining gateway returns for a new session. The harness asserts the
+/// kind, the retry safety, and the phrase — a caller telling "open elsewhere now"
+/// apart from "something is broken" depends on all three, and this is deliberately
+/// the same shape the worker returns while it drains.
+fn draining_refusal() -> ApiError {
+    ApiError::new(
+        failure::DRAINING,
+        "this gateway is shutting down and is not accepting new sessions; \
+         no statement was executed",
+    )
 }
 impl Gateway {
     async fn worker_info(&self, endpoint: &str) -> Result<WorkerInfo, ApiError> {
@@ -268,6 +309,11 @@ async fn open(
     State(app): State<Gateway>,
     request: Option<Json<SessionRequest>>,
 ) -> Result<Response, ApiError> {
+    // Only new sessions are refused. Requests on sessions already open continue,
+    // which is the drain: the grace period bounds how long that can take.
+    if app.draining.load(Ordering::Acquire) {
+        return Err(draining_refusal());
+    }
     let mut request = request.map(|Json(r)| r).unwrap_or_default();
     let placement = request.validate()?;
     // Carries the mode as well as the size, so an isolated session is recorded as
@@ -409,6 +455,40 @@ async fn set_budget(
 ) -> Result<Json<Value>, ApiError> {
     app.usage.set_budget(update).await.map(Json)
 }
+/// Wraps every `/v1` route so the drain can see work in flight.
+///
+/// The completion log line fires only for a request that *spanned* the signal:
+/// one admitted during the drain — the refusal itself, a history read — completing
+/// after it proves nothing about whether live work was waited for, and the harness
+/// reads this line to assert exactly that ordering.
+async fn track_inflight(
+    State((draining, inflight)): State<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let entered_draining = draining.load(Ordering::Acquire);
+    let _guard = InFlight::enter(&inflight);
+    let response = next.run(request).await;
+    if !entered_draining && draining.load(Ordering::Acquire) {
+        tracing::info!("a request in flight when the signal arrived has completed");
+    }
+    response
+}
+
+/// Draining is reported before the ok, for the same reason the worker does it: a
+/// draining gateway is still answering, and "ok" would keep it in the Service's
+/// endpoints while it shuts down. Failing here is what takes it out of rotation.
+async fn health(State(app): State<Gateway>) -> Response {
+    if app.draining.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "draining", "role": "gateway"})),
+        )
+            .into_response();
+    }
+    Json(json!({"status": "ok", "role": "gateway"})).into_response()
+}
+
 async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
     async fn info(app: &Gateway, endpoint: &str) -> Result<Value, ApiError> {
         app.send(endpoint, Method::GET, "/v1/worker", Bytes::new())
@@ -488,6 +568,8 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         history: crate::history::Reader::new(std::env::var("PLATFORM_DSN")?),
         usage: crate::usage::Reader::new(std::env::var("PLATFORM_DSN")?),
         isolation,
+        draining: Arc::new(AtomicBool::new(false)),
+        inflight: Arc::new(AtomicUsize::new(0)),
     };
     // Before serving, so a pod this gateway is about to create can never be mistaken
     // for one a previous gateway abandoned.
@@ -533,16 +615,88 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/usage", get(usage_events))
         .route("/v1/budget", get(budget).put(set_budget))
         .route("/v1/workers", get(workers))
-        .route_layer(middleware::from_fn_with_state(app.token.clone(), authorize));
+        .route_layer(middleware::from_fn_with_state(app.token.clone(), authorize))
+        .route_layer(middleware::from_fn_with_state(
+            (app.draining.clone(), app.inflight.clone()),
+            track_inflight,
+        ));
+    let draining = app.draining.clone();
+    let inflight = app.inflight.clone();
     let router = Router::new()
-        .route(
-            "/healthz",
-            get(|| async { Json(json!({"status":"ok","role":"gateway"})) }),
-        )
+        .route("/healthz", get(health))
         .merge(api)
         .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(app);
     tracing::info!("DuckFleet gateway ready");
-    axum::serve(tokio::net::TcpListener::bind("0.0.0.0:8080").await?, router).await?;
+    axum::serve(tokio::net::TcpListener::bind("0.0.0.0:8080").await?, router)
+        .with_graceful_shutdown(async move {
+            crate::terminating().await;
+            // Marked first, and the server deliberately keeps serving afterwards —
+            // handing the signal straight to `with_graceful_shutdown` closes the
+            // listener at once, which is the trap the worker's drain documented: the
+            // probe would see a refused connection instead of "draining", and the
+            // classified refusal could never be returned.
+            draining.store(true, Ordering::Release);
+            tracing::info!(
+                "termination signal received; refusing new sessions and finishing \
+                 requests in flight"
+            );
+            crate::drain_until_idle(move || inflight.load(Ordering::Acquire) > 0).await;
+            tracing::info!("drain complete; shutting down");
+        })
+        .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The harness greps for each of these three, so the contract lives here too:
+    /// weakening any one of them turns "open a session elsewhere now" into
+    /// "something is wrong with this deployment".
+    #[test]
+    fn a_draining_gateway_refuses_sessions_in_the_worker_s_terms() {
+        let refusal = draining_refusal();
+        assert_eq!(refusal.0.kind, "draining");
+        assert!(refusal.0.retry_safe);
+        assert_eq!(refusal.0.http, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            refusal.1.contains("no statement was executed"),
+            "{}",
+            refusal.1
+        );
+    }
+
+    #[test]
+    fn overlapping_requests_are_counted_in_and_out() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let first = InFlight::enter(&count);
+        let second = InFlight::enter(&count);
+        assert_eq!(count.load(Ordering::Acquire), 2);
+        drop(first);
+        assert_eq!(count.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(count.load(Ordering::Acquire), 0);
+    }
+
+    /// A caller that disconnects has its handler future dropped mid-await. The drain
+    /// polls this count until it reaches zero, so a guard that survived cancellation
+    /// without decrementing would hold every future drain to its full deadline.
+    #[tokio::test]
+    async fn a_cancelled_request_still_leaves_the_count() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let entered = count.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            let _guard = InFlight::enter(&entered);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("the request never started");
+        assert_eq!(count.load(Ordering::Acquire), 1);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(count.load(Ordering::Acquire), 0);
+    }
 }

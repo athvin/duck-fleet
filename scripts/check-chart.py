@@ -100,6 +100,12 @@ tolerated = tolerations != 'null' and 'duckfleet.io/dedicated' in tolerations
 assert pinned == tolerated, (
     f'the DuckFleet node pool is {"pinned" if pinned else "not pinned"} but '
     f'{"tolerated" if tolerated else "not tolerated"}: {selector} / {tolerations}')
+# The gateway drains like a worker: a statement it is proxying runs under the same
+# 60-second cap, so its grace period is coupled to the same number. Unset it defaults
+# to 30, which would SIGKILL the drain partway however well it was written.
+assert by_name['Deployment', 'server']['spec']['template']['spec'][
+    'terminationGracePeriodSeconds'] > MAX_STATEMENT_SECONDS, (
+    'the gateway grace period is not longer than the longest statement it may proxy')
 # The gateway routes to endpoints it was given, so every one must name a Service the
 # release actually renders. A URL pointing at nothing would look like a missing
 # worker class at request time rather than a packaging mistake at render time.

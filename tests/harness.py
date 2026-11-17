@@ -351,8 +351,13 @@ def leak_isolated():
     print(f"left a statement running on {placement['worker_id']}")
 
 
-def drain_inflight():
-    """Holds a statement in flight while its worker is asked to terminate.
+def drain_inflight(marker_name="drain-inflight.started", drained="its worker"):
+    """Holds a statement in flight while its worker — or the gateway — is terminated.
+
+    The same scenario proves both drains: the statement flows through the gateway to a
+    worker, so whichever of the two receives the signal must keep it alive. Which one
+    is terminated is the harness script's choice; this function only has to leave a
+    statement genuinely running when the marker file appears.
 
     The caller signals readiness through a file because the drain has to begin while
     the engine is genuinely busy. Getting that wrong is easy and silent: the first
@@ -369,7 +374,7 @@ def drain_inflight():
     the mistake; the count below targets the low end of the window on the slowest machine
     seen, and the ordering assertion is what keeps it honest on the fastest.
     """
-    marker = ARTIFACTS / "drain-inflight.started"
+    marker = ARTIFACTS / marker_name
     marker.unlink(missing_ok=True)
     connection = RemoteConnection(URL, TOKEN, compute={"cpu": 1, "memory": "1Gi"})
     outcome = {}
@@ -407,7 +412,7 @@ def drain_inflight():
     require(outcome["elapsed"] > 4,
             f"the statement finished in {outcome['elapsed']:.1f}s, which is less than "
             "the delay before the signal, so it cannot have been running")
-    print(f"PASS: a statement already in flight finished while its worker drained "
+    print(f"PASS: a statement already in flight finished while {drained} drained "
           f"({outcome['elapsed']:.1f}s)")
 
 
@@ -503,6 +508,9 @@ def main():
         return
     if "--drain-inflight" in sys.argv:
         drain_inflight()
+        return
+    if "--gateway-drain-inflight" in sys.argv:
+        drain_inflight("gateway-drain-inflight.started", "the gateway")
         return
     if "--isolated" in sys.argv:
         isolated_checks()
