@@ -638,6 +638,22 @@ they are harmless to correctness and belong to table maintenance (#14) to reap.
 The two databases are dumped sequentially, each internally consistent, so history
 may lead or trail the catalog by the dump gap.
 
+## External PostgreSQL
+
+The bundled PostgreSQL is a development fixture — one replica, one PVC, no HA —
+and the catalog it holds is the write-coordination point for the whole lake.
+Running DuckFleet as a real warehouse, set `postgres.bundled: false` and point
+the deploy Secret's `CATALOG_DSN` and `PLATFORM_DSN` at managed PostgreSQL; the
+release renders no bundled instance at all, and the server side never knew where
+the catalog lived beyond the DSNs anyway. A database outside the namespace also
+needs its address in `postgres.externalCidrs`, because the isolation
+NetworkPolicy otherwise permits 5432 only between the namespace's own pods.
+Migrating from bundled to external is a [backup and restore](#backup-and-restore)
+with compute stopped: back up the bundled instance, restore into the external
+one, change the DSNs, disable the bundle. The Kubernetes harness proves the
+path by swapping a running release onto a standalone PostgreSQL and running the
+full dbt-free workflow against it.
+
 ## Scope and limitations
 
 This is a **trusted, single-tenant development environment** with known local

@@ -83,6 +83,21 @@
       }
     },
     "historyRetentionDays": {"type": "integer", "minimum": 0, "maximum": 3650},
+    "postgres": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bundled": {"type": "boolean"},
+        "externalCidrs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9]{1,3}(\\.[0-9]{1,3}){3}/([0-9]|[12][0-9]|3[0-2])$"
+          }
+        },
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+      }
+    },
     "exposure": {
       "type": "object",
       "additionalProperties": false,

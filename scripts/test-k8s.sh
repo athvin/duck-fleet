@@ -342,6 +342,53 @@ done
 harness duckfleet-harness-replaced 'python /app/tests/harness.py --after-restart' 600
 grep -q 'PASS: data and query history survived' artifacts/kind/duckfleet-harness-replaced.log
 
+# The external-catalog path, last because it swaps the catalog out from under the
+# release: the same chart pointed at a PostgreSQL it does not own, which is what
+# running against RDS looks like scaled to kind. The in-namespace stand-in needs
+# no externalCidrs — the isolation policy already permits 5432 between this
+# namespace's pods; the out-of-namespace egress render is proven in check-infra.
+"${KUBE[@]}" apply -f infra/kind/external-postgres.yaml
+"${KUBE[@]}" rollout status deployment/external-postgres --timeout=240s
+password=$("${KUBE[@]}" get secret duckfleet-dev -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)
+python3 - "$password" <<'PY' | "${KUBE[@]}" patch secret duckfleet-dev --type merge --patch-file /dev/stdin
+import json, sys
+dsn = f'host=external-postgres port=5432 user=duckfleet password={sys.argv[1]}'
+print(json.dumps({'stringData': {'CATALOG_DSN': dsn + ' dbname=lake',
+                                 'PLATFORM_DSN': dsn + ' dbname=platform'}}))
+PY
+render --no-hooks \
+  --set postgres.bundled=false \
+  --set isolatedCompute.enabled=true \
+  --set "isolatedCompute.apiServerCidrs[0]=$api_address/32" \
+  --set "isolatedCompute.apiServerPorts[0]=$api_port" \
+  --set isolatedCompute.readySeconds=180 \
+  | python3 scripts/kind/localize.py \
+  --expect image,cpu-request,s3-auth,s3-path,node-selector,object-store-port,isolated-pod \
+  > "$work/release-external.yaml"
+"${KUBE[@]}" apply -f "$work/release-external.yaml"
+# apply does not prune, so the bundled instance is removed by name — exactly what
+# an operator migrating to an external catalog does after restoring into it.
+"${KUBE[@]}" delete statefulset/duckfleet-postgres service/postgres configmap/duckfleet-postgres-init
+for deployment in worker-small worker-medium server; do
+  "${KUBE[@]}" rollout restart "deployment/$deployment"
+done
+for deployment in worker-small worker-medium server; do
+  "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
+done
+# Two probes against the fresh external catalog: overlapping DuckLake writes from
+# both workers — commit races resolved through the catalog under test — and the
+# credential matrix, which exercises the platform database's whole surface.
+harness duckfleet-external 'python /app/tests/harness.py --concurrency' 600
+grep -q 'PASS: .* concurrent-write cases match the documented DuckLake semantics' \
+  artifacts/kind/duckfleet-external.log
+harness duckfleet-external-credentials 'python /app/tests/harness.py --credentials' 600
+grep -q 'PASS: credentials are issued' artifacts/kind/duckfleet-external-credentials.log
+if "${KUBE[@]}" get statefulset duckfleet-postgres > /dev/null 2>&1; then
+  echo 'the bundled PostgreSQL survived postgres.bundled=false' >&2
+  exit 1
+fi
+echo 'PASS: the release ran a full workflow against an external PostgreSQL, bundled instance gone'
+
 "${KUBE[@]}" get pods -o wide > artifacts/kind/pods.txt
 echo 'PASS: the release converged on Kubernetes, the dbt harness passed in-cluster,'
 echo '      and data plus history survived worker and gateway pod replacement'

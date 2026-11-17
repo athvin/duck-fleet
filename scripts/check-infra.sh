@@ -127,6 +127,21 @@ for missing in tlsSecretName controllerNamespace host; do
   fi
 done
 echo 'PASS: exposure without its host, certificate secret, or controller namespace is rejected'
+# The external-catalog render: no bundled PostgreSQL object survives the toggle,
+# and an address the operator named reaches the isolation policy's egress — a
+# catalog the policy blocks presents as workers that never become ready, a long
+# way from the value that caused it.
+external="$validation_dir/external-postgres.yaml"
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set postgres.bundled=false \
+  --set 'postgres.externalCidrs[0]=10.20.30.40/32' > "$external"
+python3 scripts/check-chart.py "$external" > /dev/null
+if grep -q 'duckfleet-postgres' "$external"; then
+  echo 'postgres.bundled=false must render no bundled PostgreSQL' >&2
+  exit 1
+fi
+grep -q '10.20.30.40/32' "$external"
+echo 'PASS: an external catalog renders no bundled PostgreSQL and opens egress to the named address'
 for script in scripts/*.sh scripts/aws/*.sh scripts/ci/*.sh; do bash -n "$script"; done
 # The local Kubernetes harness renders the real chart, so a chart change that moves
 # something out from under the transform is caught here rather than in a cluster.

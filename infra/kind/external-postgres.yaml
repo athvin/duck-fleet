@@ -1,0 +1,73 @@
+# A PostgreSQL the release does not own, standing in for RDS: the external-catalog
+# stage points the deploy Secret's DSNs here, disables the bundled instance, and
+# proves the warehouse runs against a catalog whose lifecycle is the operator's.
+# Disposable by design — emptyDir storage, no retention of anything.
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-postgres
+spec:
+  selector: {app: external-postgres}
+  ports: [{port: 5432, targetPort: 5432}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: external-postgres-init
+data:
+  init.sql: |
+    CREATE DATABASE lake;
+    CREATE DATABASE platform;
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: external-postgres}
+  template:
+    metadata:
+      labels: {app: external-postgres}
+    spec:
+      serviceAccountName: duckfleet-no-aws
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: postgres:17.6-bookworm
+          args: ["-c", "max_locks_per_transaction=1024"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+          env:
+            - {name: POSTGRES_USER, value: duckfleet}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: duckfleet-dev, key: POSTGRES_PASSWORD}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, duckfleet, -d, lake]}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: init
+          configMap: {name: external-postgres-init}
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
