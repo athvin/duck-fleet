@@ -81,6 +81,21 @@
         "version": {"type": "string", "minLength": 1, "maxLength": 64},
         "computeMicroUsdPerUnitHour": {"type": "integer", "minimum": 1}
       }
+    },
+    "exposure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "host": {"type": "string"},
+        "tlsSecretName": {"type": "string"},
+        "ingressClassName": {"type": "string"},
+        "controllerNamespace": {"type": "string"},
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        }
+      }
     }
   }
 }

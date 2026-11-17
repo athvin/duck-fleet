@@ -103,6 +103,30 @@ if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$v
   exit 1
 fi
 echo 'PASS: isolated compute without a declared API server address is rejected'
+# Exposure follows the same shape: off by default — the default render above already
+# proved no Ingress — and when enabled, every fact belongs to the operator. The full
+# configuration must render and satisfy the TLS and NetworkPolicy invariants.
+exposed="$validation_dir/exposed.yaml"
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set exposure.enabled=true \
+  --set exposure.host=duckfleet.example.com \
+  --set exposure.tlsSecretName=duckfleet-tls \
+  --set exposure.controllerNamespace=ingress-nginx > "$exposed"
+python3 scripts/check-chart.py "$exposed" > /dev/null
+echo 'PASS: exposure renders an Ingress that terminates TLS and opens only the controller door'
+# Missing any of the three operator facts must fail the render, not default.
+for missing in tlsSecretName controllerNamespace host; do
+  args=(--set exposure.enabled=true)
+  [ "$missing" != host ] && args+=(--set exposure.host=duckfleet.example.com)
+  [ "$missing" != tlsSecretName ] && args+=(--set exposure.tlsSecretName=duckfleet-tls)
+  [ "$missing" != controllerNamespace ] && args+=(--set exposure.controllerNamespace=ingress-nginx)
+  if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+       "${args[@]}" > /dev/null 2>&1; then
+    echo "Exposure without $missing must fail the render" >&2
+    exit 1
+  fi
+done
+echo 'PASS: exposure without its host, certificate secret, or controller namespace is rejected'
 for script in scripts/*.sh scripts/aws/*.sh scripts/ci/*.sh; do bash -n "$script"; done
 # The local Kubernetes harness renders the real chart, so a chart change that moves
 # something out from under the transform is caught here rather than in a cluster.

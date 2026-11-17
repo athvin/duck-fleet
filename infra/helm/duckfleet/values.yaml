@@ -54,6 +54,23 @@ rateCard:
   version: local-dev-1
   computeMicroUsdPerUnitHour: 100000
 
+# Reaching the API from outside the cluster: an Ingress terminating TLS at the
+# controller, plus the NetworkPolicy door that admits the controller's namespace.
+# Off by default and off in the dev lane permanently. Enabling it requires naming
+# the host, the kubernetes.io/tls Secret an operator created in this namespace,
+# and the namespace the ingress controller runs in — each is a fact about a
+# cluster this chart does not own, and a default would invent it. A bearer token
+# must never cross plain HTTP: the render always carries the TLS block and the
+# nginx-family ssl-redirect annotation; a different controller's operator owns
+# configuring its equivalent via `annotations`.
+exposure:
+  enabled: false
+  host: ""
+  tlsSecretName: ""
+  ingressClassName: ""
+  controllerNamespace: ""
+  annotations: {}
+
 # The other half of not pinning the DuckFleet node pool, and inseparable from it.
 #
 # The shared pool is capped to m6i/m6a `large` — 2 vCPU, about 1780m allocatable — while

@@ -34,7 +34,7 @@ access and a decision about recurring cost.
 | Worker IAM | `duckfleet-dev-worker`, one Pod Identity association for `duckfleet-dev/duckfleet-worker` |
 | Registry | `duckfleet-dev/worker`, `duckfleet-dev/dbt`, immutable tags/digests |
 | Metadata + history | dedicated PostgreSQL StatefulSet, separate `lake` and `platform` databases, 10 GiB encrypted gp3 PVC |
-| API | private ClusterIP; no ingress, public IP, DNS or load balancer |
+| API | private ClusterIP; no ingress, public IP, DNS or load balancer — the chart's opt-in `exposure` values stay off here, and the render checks prove the default produces no Ingress |
 
 The smallest test uses two **prestarted pods**, 1 CPU / 1 GiB and 2 CPU / 2 GiB,
 with DuckDB limits of 1 thread / 512 MiB and 2 threads / 1 GiB. The adapter routes

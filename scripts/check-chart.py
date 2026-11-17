@@ -63,7 +63,7 @@ for o in objects:
     # create any of the three, so a chart that rendered one could not install itself.
     # That is exactly how isolated compute came to be undeployable, so it is asserted
     # here rather than left to be rediscovered.
-    assert o['kind'] not in ['Ingress', 'ClusterRole', 'ClusterRoleBinding', 'NodePool',
+    assert o['kind'] not in ['ClusterRole', 'ClusterRoleBinding', 'NodePool',
                              'Role', 'RoleBinding', 'ResourceQuota'], (
         f"{o['kind']}/{o['metadata']['name']} is a boundary object, not a release "
         'object; move it to infra/kubernetes/boundary')
@@ -140,6 +140,38 @@ rate_version, rate_value = next(iter(cards.values()))
 assert rate_version and rate_value and rate_value.isdigit() and int(rate_value) >= 1, (
     f'the rate card must be a named version and a positive integer rate: '
     f'{rate_version!r} {rate_value!r}')
+# Exposure is opt-in. A default render stays ClusterIP-only with no Ingress at all;
+# an exposed render must terminate TLS on every host it serves, refuse plain HTTP,
+# point only at the gateway, and come with the NetworkPolicy door the controller
+# needs — the isolation policy admits only this namespace's pods, so an Ingress
+# without it would be a front door onto a wall.
+ingresses = [o for o in objects if o['kind'] == 'Ingress']
+exposure_policy = by_name.get(('NetworkPolicy', 'duckfleet-exposure'))
+if not ingresses:
+    assert exposure_policy is None, (
+        'an exposure NetworkPolicy without an Ingress admits traffic nothing serves')
+else:
+    assert len(ingresses) == 1, 'one exposed host, one Ingress'
+    ingress = ingresses[0]
+    assert exposure_policy is not None, (
+        'an Ingress without duckfleet-exposure cannot reach the gateway')
+    tls = ingress['spec'].get('tls') or []
+    tls_hosts = {host for block in tls for host in block.get('hosts', [])}
+    assert all(block.get('secretName') for block in tls), 'TLS without a certificate secret'
+    rule_hosts = {rule['host'] for rule in ingress['spec']['rules']}
+    assert rule_hosts and rule_hosts <= tls_hosts, (
+        f'every exposed host must terminate TLS: {rule_hosts} vs {tls_hosts}')
+    assert ingress['metadata']['annotations'].get(
+        'nginx.ingress.kubernetes.io/ssl-redirect') == 'true', (
+        'the plain-HTTP redirect annotation is the render\'s share of "never over HTTP"')
+    for rule in ingress['spec']['rules']:
+        for path in rule['http']['paths']:
+            service = path['backend']['service']
+            assert service['name'] == 'server' and service['port']['number'] == 8080, (
+                'exposure may point only at the gateway')
+    admitted = exposure_policy['spec']['ingress'][0]['from']
+    assert all('namespaceSelector' in source for source in admitted), (
+        'the exposure door admits namespaces an operator named, never addresses')
 
 isolation = by_name['NetworkPolicy', 'duckfleet-isolation']['spec']
 assert isolation['policyTypes'] == ['Ingress', 'Egress']

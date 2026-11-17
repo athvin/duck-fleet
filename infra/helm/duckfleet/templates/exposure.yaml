@@ -1,0 +1,58 @@
+{{/*
+Reaching the API from outside the cluster, rendered only when asked for. Three
+facts have to be named before anything renders, because each belongs to the
+operator and a default would invent it: the host, the TLS certificate Secret
+(this chart never mints certificates), and the namespace the ingress controller
+runs in — the isolation NetworkPolicy admits only this namespace's pods, so an
+unnamed controller would produce an Ingress that cannot reach the gateway.
+
+TLS comes before credentials: a bearer token must never cross plain HTTP. The
+tls block is unconditional, and the redirect annotation below is the
+nginx-family spelling of "refuse plain HTTP" — an operator running a different
+controller owns configuring its equivalent, and may override the annotation set
+through exposure.annotations.
+*/}}
+{{- if .Values.exposure.enabled -}}
+{{- $host := required "exposure.host is required when exposure is enabled" .Values.exposure.host -}}
+{{- $secret := required "exposure.tlsSecretName is required: the chart never mints certificates" .Values.exposure.tlsSecretName -}}
+{{- $controller := required "exposure.controllerNamespace is required: traffic is admitted from a namespace an operator names, never from everywhere" .Values.exposure.controllerNamespace -}}
+{{- $annotations := merge .Values.exposure.annotations (dict "nginx.ingress.kubernetes.io/ssl-redirect" "true") -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: duckfleet
+  annotations:
+    {{- range $key, $value := $annotations }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  {{- with .Values.exposure.ingressClassName }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  tls:
+    - hosts: [{{ $host | quote }}]
+      secretName: {{ $secret }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: server, port: {number: 8080}}}
+---
+# The isolation policy admits only this namespace's pods, so the controller needs
+# its own narrow door: its namespace, the gateway pod, port 8080, nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: duckfleet-exposure
+spec:
+  podSelector:
+    matchLabels: {app: duckfleet-gateway}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: {{ $controller }}}
+      ports: [{port: 8080}]
+{{- end -}}
