@@ -595,6 +595,140 @@ async fn set_budget(
 ) -> Result<Json<Value>, ApiError> {
     app.usage.set_budget(update).await.map(Json)
 }
+/// Runs one platform-owned statement through the ordinary execution machinery: a
+/// session on a default-size worker, the statement, a close. Deliberately not a
+/// side door — because it is a normal execution, it lands in history under the
+/// real principal, is admitted and settled by the ledger, and a losing commit
+/// race is classified `transaction_conflict`, retry-safe, like anyone else's.
+async fn platform_statement(
+    app: &Gateway,
+    principal: &Principal,
+    operation: &str,
+    sql: String,
+) -> Result<Response, ApiError> {
+    if app.draining.load(Ordering::Acquire) {
+        return Err(draining_refusal());
+    }
+    let endpoint = app.endpoint_for(Resources::default()).await?;
+    let open = app
+        .client
+        .request(Method::POST, format!("{endpoint}/v1/sessions"))
+        .bearer_auth(&app.token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(credentials::PRINCIPAL_HEADER, principal.name())
+        .body(json!({"compute": {}, "context": {"operation": operation}}).to_string())
+        .send()
+        .await
+        .map_err(|_| ApiError::internal())?;
+    if !open.status().is_success() {
+        return response(open).await;
+    }
+    let session = open
+        .json::<Value>()
+        .await
+        .ok()
+        .and_then(|info| info["session_id"].as_str().map(str::to_owned))
+        .ok_or_else(ApiError::internal)?;
+    let result = app
+        .send(
+            &endpoint,
+            Method::POST,
+            &format!("/v1/sessions/{session}/queries"),
+            json!({
+                "request_id": Uuid::new_v4(),
+                "sql": sql,
+                "timeout_seconds": 60,
+                "context": {"operation": operation},
+            })
+            .to_string()
+            .into(),
+        )
+        .await;
+    // Closed on every path: the session was this handler's to clean up, and the
+    // worker rolls back anything a failed statement left open.
+    let _ = app
+        .send(
+            &endpoint,
+            Method::DELETE,
+            &format!("/v1/sessions/{session}"),
+            Bytes::new(),
+        )
+        .await;
+    response(result?).await
+}
+
+/// Snapshots of the lake, as the engine reports them. Readable by any principal:
+/// listing destroys nothing and is how a caller decides what expiry would cost.
+async fn lake_snapshots(
+    State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Response, ApiError> {
+    platform_statement(
+        &app,
+        &principal,
+        "lake_snapshots",
+        "SELECT snapshot_id, snapshot_time, schema_version, changes \
+         FROM ducklake_snapshots('lake') ORDER BY snapshot_id"
+            .to_owned(),
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceRequest {
+    /// Expire snapshots older than this many days; `0` keeps only the current
+    /// state, which is exactly as destructive as it sounds.
+    #[serde(default)]
+    expire_older_than_days: Option<u32>,
+    #[serde(default)]
+    compact: bool,
+    #[serde(default)]
+    cleanup: bool,
+}
+
+/// Lake maintenance, bootstrap-only: expiry forfeits time travel and cleanup
+/// deletes files, which is the operator's call — a named principal keeping the
+/// lake tidy should be handed the statements, not the lever.
+async fn lake_maintenance(
+    State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<MaintenanceRequest>,
+) -> Result<Response, ApiError> {
+    admin_only(&principal)?;
+    if request.expire_older_than_days.is_none() && !request.compact && !request.cleanup {
+        return Err(ApiError::bad(
+            "ask for at least one of expire_older_than_days, compact, or cleanup",
+        ));
+    }
+    if request
+        .expire_older_than_days
+        .is_some_and(|days| days > 3650)
+    {
+        return Err(ApiError::bad("expire_older_than_days must be at most 3650"));
+    }
+    // Built from validated integers and booleans only — nothing caller-supplied
+    // reaches the SQL as text.
+    let mut statements = Vec::new();
+    if let Some(days) = request.expire_older_than_days {
+        statements.push(format!(
+            "CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL '{days} days')"
+        ));
+    }
+    if request.compact {
+        statements.push("CALL ducklake_merge_adjacent_files('lake')".to_owned());
+    }
+    if request.cleanup {
+        statements.push(match request.expire_older_than_days {
+            Some(days) if days > 0 => format!(
+                "CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL '{days} days')"
+            ),
+            _ => "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)".to_owned(),
+        });
+    }
+    platform_statement(&app, &principal, "lake_maintenance", statements.join(";\n")).await
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MintRequest {
@@ -849,6 +983,8 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             "/v1/credentials",
             get(list_credentials).post(mint_credential),
         )
+        .route("/v1/lake/snapshots", get(lake_snapshots))
+        .route("/v1/lake/maintenance", post(lake_maintenance))
         .route(
             "/v1/credentials/{id}",
             axum::routing::delete(revoke_credential),

@@ -272,6 +272,11 @@ test "$(docker inspect -f '{{.State.ExitCode}}' "$gateway_id")" = 0
 docker compose up -d --force-recreate --no-deps --wait server
 echo 'PASS: the gateway drained on SIGTERM, refusing new sessions and finishing the request in flight'
 
+# Maintenance before the restore drill, deliberately: expiry collapses time travel
+# to the current state, and running the backup cycle after it proves the two
+# operations compose. Data itself is untouched either way.
+docker compose run --rm dbt python /app/tests/harness.py --maintenance
+
 # The catalog IS the lake, and a backup that has never been restored is a hope, not
 # a backup. Full drill: dump both databases, commit more work, destroy PostgreSQL's
 # volume outright, restore into the fresh instance, and prove the platform serves
