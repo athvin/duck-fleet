@@ -272,6 +272,12 @@ test "$(docker inspect -f '{{.State.ExitCode}}' "$gateway_id")" = 0
 docker compose up -d --force-recreate --no-deps --wait server
 echo 'PASS: the gateway drained on SIGTERM, refusing new sessions and finishing the request in flight'
 
+# The Phase 1 acceptance bar: 110 generated models through the platform, every
+# statement terminal in history and settled in the ledger, wall time and cost
+# written to artifacts/scale-run.json. Before maintenance, so the sweep that
+# follows gets a genuinely fragmented lake to chew on.
+docker compose run --rm dbt python /app/tests/harness.py --scale
+
 # Maintenance before the restore drill, deliberately: expiry collapses time travel
 # to the current state, and running the backup cycle after it proves the two
 # operations compose. Data itself is untouched either way.

@@ -8,6 +8,10 @@ import harness
 from duckfleet import RemoteConnection
 
 harness.main()
+# The Phase 1 acceptance bar, on the real platform: 110 generated models through
+# EKS, every statement terminal in history and settled in the ledger, wall time
+# and attributed cost written to the evidence artifacts.
+harness.scale_checks()
 prefix = os.environ['EXPECT_S3_PREFIX']
 if not re.fullmatch(r's3://duckfleet-dev-[a-z0-9-]+/lake/', prefix):
     raise ValueError('AWS harness must target the DuckFleet development lake')
