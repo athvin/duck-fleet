@@ -416,6 +416,82 @@ def drain_inflight(marker_name="drain-inflight.started", drained="its worker"):
           f"({outcome['elapsed']:.1f}s)")
 
 
+def maintenance_checks():
+    """Snapshot listing, expiry, compaction, and cleanup as platform operations.
+
+    A dozen single-row inserts fragment a table into a dozen tiny files and as
+    many snapshots; maintenance must measurably shrink both without changing a
+    row of data. The operations run through the ordinary execution machinery, so
+    history, principal attribution, and metering are observed here rather than
+    trusted — and the expiry lever stays in the bootstrap's hands alone.
+    """
+    import pyarrow.ipc
+    admin = Client(URL, TOKEN)
+    connection = RemoteConnection(URL, TOKEN, name="maintenance-fixture")
+    try:
+        sql(connection, "create schema if not exists api_demo")
+        sql(connection, "create or replace table api_demo.fragmented (n bigint)")
+        for value in range(12):
+            sql(connection, f"insert into api_demo.fragmented values ({value})")
+        files_before = sql(connection,
+                           "select file_count from ducklake_table_info('lake') "
+                           "where table_name = 'fragmented'")[0][0]
+        require(files_before >= 12,
+                f"expected a fragmented table, found {files_before} files")
+    finally:
+        connection.close()
+
+    def snapshot_count():
+        listing = admin.request("GET", "/v1/lake/snapshots")
+        return pyarrow.ipc.open_stream(listing).read_all().num_rows
+
+    before = snapshot_count()
+    require(before > 12, f"only {before} snapshots before maintenance")
+
+    # A named principal may look; only the bootstrap may expire.
+    janitor_credential = json.loads(
+        admin.request("POST", "/v1/credentials", {"principal": "janitor"}))
+    janitor = Client(URL, janitor_credential["token"])
+    pyarrow.ipc.open_stream(janitor.request("GET", "/v1/lake/snapshots")).read_all()
+    refused = expect_error(403, lambda: janitor.request(
+        "POST", "/v1/lake/maintenance", {"compact": True}))
+    require(refused.failure_kind == "forbidden", str(refused.failure_kind))
+    admin.request("DELETE", "/v1/credentials/" + janitor_credential["credential_id"])
+    # Asking for nothing is the caller's mistake, said plainly.
+    expect_error(400, lambda: admin.request("POST", "/v1/lake/maintenance", {}))
+
+    admin.request("POST", "/v1/lake/maintenance",
+                  {"expire_older_than_days": 0, "compact": True, "cleanup": True})
+    after = snapshot_count()
+    require(after < before, f"snapshots did not shrink: {before} -> {after}")
+
+    verify = RemoteConnection(URL, TOKEN, name="maintenance-verify")
+    try:
+        files_after = sql(verify,
+                          "select file_count from ducklake_table_info('lake') "
+                          "where table_name = 'fragmented'")[0][0]
+        require(files_after < files_before,
+                f"compaction did not reduce files: {files_before} -> {files_after}")
+        rows = sql(verify, "select count(*), sum(n) from api_demo.fragmented")
+        require(rows == [(12, 66)], f"maintenance changed the data: {rows}")
+    finally:
+        verify.close()
+
+    # In history under the real principal, and metered like any execution.
+    history = json.loads(admin.request("GET", "/v1/queries?limit=20"))["queries"]
+    swept = [q for q in history
+             if q["context"].get("operation") == "lake_maintenance"]
+    require(swept, "maintenance left no history record")
+    require(swept[0]["status"] == "succeeded", str(swept[0]["status"]))
+    require(swept[0]["principal"] == "bootstrap-admin", str(swept[0].get("principal")))
+    events = json.loads(admin.request(
+        "GET", "/v1/usage?execution_id=" + swept[0]["query_id"]))["events"]
+    require(len(events) == 1 and events[0]["amount_micro_usd"] > 0,
+            "maintenance escaped the ledger")
+    print("PASS: maintenance compacted and expired the lake, metered and in history, "
+          "with the expiry lever held by the bootstrap alone")
+
+
 def dbt_isolated_checks():
     """A dbt model on a session pod of its own, run exactly as a user would run it.
 
@@ -752,6 +828,9 @@ def main():
         return
     if "--dbt-isolated" in sys.argv:
         dbt_isolated_checks()
+        return
+    if "--maintenance" in sys.argv:
+        maintenance_checks()
         return
     if "--isolated" in sys.argv:
         isolated_checks()

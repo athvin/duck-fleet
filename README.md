@@ -272,6 +272,8 @@ credential from the environment, or a credential it issued; see
 | GET | `/v1/usage` | Append-only usage events with cursor pagination |
 | GET | `/v1/budget` | Prepaid balance, held reservations, spend, caps, rate card |
 | PUT | `/v1/budget` | Set the prepaid balance and per-job cost cap |
+| GET | `/v1/lake/snapshots` | DuckLake snapshots, as an Arrow stream |
+| POST | `/v1/lake/maintenance` | Expire snapshots, compact small files, clean unreferenced files (bootstrap only) |
 | POST | `/v1/credentials` | Issue a credential for a principal; the token appears only in this response (bootstrap only) |
 | GET | `/v1/credentials` | List credentials without any secret material (bootstrap only) |
 | DELETE | `/v1/credentials/{id}` | Revoke one credential immediately (bootstrap only) |
@@ -637,6 +639,28 @@ Parquet written after the backup survives in the bucket as unreferenced objects;
 they are harmless to correctness and belong to table maintenance (#14) to reap.
 The two databases are dumped sequentially, each internally consistent, so history
 may lead or trail the catalog by the dump gap.
+
+## Lake maintenance
+
+DuckLake accumulates snapshots and small Parquet files as models rematerialize;
+left alone, storage grows and scans slow. `GET /v1/lake/snapshots` lists
+snapshots (any principal — looking is how you decide what expiry would cost),
+and `POST /v1/lake/maintenance` takes any combination of
+`{"expire_older_than_days": N, "compact": true, "cleanup": true}`: expire
+snapshots older than the window (`0` keeps only the current state, which is
+exactly as destructive as it sounds), merge adjacent small files, and delete
+files no snapshot references. Maintenance is **bootstrap-only** — expiry
+forfeits time travel and cleanup deletes files, which is the operator's call.
+
+The operations run through the ordinary execution machinery rather than a side
+door, so each lands in query history under the real principal, is admitted and
+settled by the usage ledger, and a maintenance commit that loses a race to a
+concurrent write fails classified `transaction_conflict`, retry-safe, like
+anyone else's — DuckLake resolves the conflict at the catalog, maintenance gets
+no special lock. Each call is bounded by the 60-second statement cap; a very
+large lake may need repeated calls, which are safe to repeat. The harness
+fragments a table into a dozen files, runs the sweep, and asserts files and
+snapshots shrink while the data stays identical to the row.
 
 ## External PostgreSQL
 
