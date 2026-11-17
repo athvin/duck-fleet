@@ -700,6 +700,30 @@ class OwnershipBoundaryTests(unittest.TestCase):
         # which is what makes `suspended: true` stop costing money.
         self.assertEqual(pool['spec']['disruption']['consolidationPolicy'], 'WhenEmpty')
 
+    def test_the_boundary_is_required_wherever_duckfleet_deploys(self):
+        # The namespace label is applied by apply-boundary.sh alongside the grant, the
+        # quota and the node pool, so its absence means a deploy is about to install a
+        # release whose gateway cannot create the pods it advertises. Required by
+        # default, and required on a cluster DuckFleet owns too: owning it changes who
+        # may apply the boundary, not whether one is needed.
+        target = (ROOT/'scripts/aws/target.env').read_text()
+        self.assertRegex(target, r'DUCKFLEET_REQUIRE_BOOTSTRAP=\$\{[^:]+:-true\}')
+        cluster = (ROOT/'infra/terraform/cluster/main.tf').read_text()
+        self.assertIn('DUCKFLEET_REQUIRE_BOOTSTRAP=true', cluster)
+        self.assertNotIn('DUCKFLEET_REQUIRE_BOOTSTRAP=false', cluster)
+        # The one exception, and the reason it is overridable at all: the script that
+        # establishes the boundary cannot require it to already exist.
+        self.assertIn('DUCKFLEET_REQUIRE_BOOTSTRAP=false',
+                      (ROOT/'scripts/aws/apply-boundary.sh').read_text())
+        # The gate and the label have to be the same label. Renaming it on either side
+        # leaves a deploy that can never satisfy its own precondition, and says only
+        # "apply the boundary first" about a boundary that has been applied.
+        namespace = next(d for d in self.render() if d['kind'] == 'Namespace')
+        label, value = next(iter(namespace['metadata']['labels'].items()))
+        common = (ROOT/'scripts/aws/common.sh').read_text()
+        self.assertIn(label.replace('.', r'\.'), common, label)
+        self.assertIn(f'== {value}', common)
+
     def test_a_cluster_scoped_object_must_be_named_for_duckfleet(self):
         render = load('render_boundary', 'scripts/aws/render_boundary.py')
         # Cluster-scoped objects sit outside the namespace that bounds everything else
