@@ -568,8 +568,16 @@ DuckDB may materialize a result before serialization. Canceling or losing an HTT
 request is not proof that a write was rolled back. Conflicting writes from multiple
 DuckLake workers are covered above, but this harness does not yet test crash
 recovery during a commit or backup restoration.
-A gateway restart loses its in-memory session routes;
-clients must open new sessions and inspect uncertain write outcomes.
+A gateway restart loses its in-memory session routes; the recovery contract is
+classified rather than magical, and the Kubernetes harness proves it against a
+gateway killed without grace. A request severed in transport fails as
+`transport_failure`, never retry-safe — its true outcome is read back from
+`/v1/queries` by `request_id`, because the worker finishes what it was running
+whether or not the gateway survives. A lost session answers `unknown_session`
+with instructions, its uncommitted work can only be rolled back, and the Python
+client rides new-session opens through a rollout's `draining` window and the
+replacement gap on a bounded wait. Statements are never replayed by the client,
+under any classification.
 
 ## Design and upstream contracts
 

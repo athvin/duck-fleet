@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbt-duckfleet"
-version = "0.1.0"
+version = "0.1.1"
 description = "Experimental dbt adapter for the local DuckFleet HTTP server"
 requires-python = ">=3.12"
 # The wire protocol comes from the standalone client, so the adapter and a
 # non-dbt caller cannot drift apart on it.
-dependencies = ["dbt-core==1.11.11", "dbt-duckdb==1.11.1", "duckdb==1.5.4", "duckfleet==0.1.0"]
+dependencies = ["dbt-core==1.11.11", "dbt-duckdb==1.11.1", "duckdb==1.5.4", "duckfleet==0.2.0"]
 
 [tool.setuptools.packages.find]
 include = ["dbt.adapters.duckfleet*", "dbt.include.duckfleet*"]

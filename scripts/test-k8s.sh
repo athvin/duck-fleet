@@ -283,6 +283,35 @@ for deployment in worker-small worker-medium; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
 
+# The gateway's own version of the abrupt eviction: kill it with no grace while a
+# statement is mid-flight *through* it. The drain covers the graceful path; this is
+# the one with no chance to drain. The caller must get classified outcomes — never a
+# raw socket error — a plain reopen must ride through the replacement window on the
+# client's bounded open retry, and the statement's true outcome must be knowable
+# from history even though the gateway that proxied it is gone.
+harness duckfleet-gateway-replaced 'python /app/tests/harness.py --gateway-replaced' 900 &
+replaced=$!
+busy=""
+for _ in $(seq 1 120); do
+  busy=$("${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
+    "SELECT 1 FROM query_history WHERE status='running'
+       AND sql LIKE 'insert into api_demo.gateway_replaced%' LIMIT 1" 2> /dev/null | tr -d '[:space:]')
+  [[ -n "$busy" ]] && break
+  sleep 2
+done
+if [[ -z "$busy" ]]; then
+  echo 'no statement ever reached running through the gateway' >&2
+  kill "$replaced" 2> /dev/null || true
+  exit 1
+fi
+echo 'killing the gateway outright while a statement is in flight through it'
+"${KUBE[@]}" delete pod -l app=duckfleet-gateway --grace-period=0 --force --wait=false
+wait "$replaced"
+grep -q 'PASS: the in-flight request failed classified' artifacts/kind/duckfleet-gateway-replaced.log
+grep -q 'PASS: a reopen rode through the gateway replacement' artifacts/kind/duckfleet-gateway-replaced.log
+grep -q 'PASS: a gateway replaced without grace left classified outcomes' artifacts/kind/duckfleet-gateway-replaced.log
+"${KUBE[@]}" rollout status deployment/server --timeout=420s
+
 "${KUBE[@]}" apply -f infra/kind/bucket-verify.yaml
 python3 scripts/kind/await_job.py --context "$CONTEXT" --namespace "$NS" \
   --job bucket-verify --timeout 300
