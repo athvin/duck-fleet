@@ -26,8 +26,9 @@ pub(crate) enum Mode {
     /// A prestarted worker, shared with other sessions of the same resources.
     #[default]
     Persistent,
-    /// A worker created for this session alone and discarded afterwards. Accepted by
-    /// the contract and not yet runnable; see the `COMPUTE_UNAVAILABLE` failure.
+    /// A worker created for this session alone and discarded afterwards. Served
+    /// only where the gateway holds the pod grant (see `isolated.rs`); refused
+    /// with the `COMPUTE_UNAVAILABLE` failure everywhere else.
     Isolated,
 }
 impl Mode {

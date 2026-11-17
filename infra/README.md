@@ -1,9 +1,10 @@
 # DuckFleet AWS development harness
 
-Status: CI deployment code prepared; **not yet tested on AWS**. The Docker gates
-passed on main after the query-history release. Live deployment requires the
+Status: **tested on AWS.** The AWS development harness — publish, deploy, live
+dbt run, suspend — passed on main for `5808e99`, which required the
 [shared-platform bootstrap](https://github.com/athvin/entity-resolution-engine/issues/1082)
-to merge and apply first. Docker and mock-provider tests are not AWS evidence.
+to be applied first. Docker and mock-provider tests remain the credential-free
+pull-request gates; only main touches AWS.
 
 The deploy target is configuration, named once in `scripts/aws/target.env` and read
 from there by the operator scripts and by CI, so moving it is a change to that file

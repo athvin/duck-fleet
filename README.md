@@ -4,6 +4,32 @@ A managed DuckLake platform, starting with a local Docker feasibility harness.
 DuckFleet is planned as a separate entity from DupeZero, using the same AWS
 organization. The intended domain is `duckfleet.com`, pending purchase.
 
+## What DuckFleet is
+
+An open-source, self-hosted data warehouse for a single organization, built on
+DuckDB and DuckLake. A Rust gateway routes SQL to a fleet of DuckDB workers
+sharing one DuckLake — PostgreSQL holds the catalog, S3 holds the Parquet — so
+many processes read and write the same tables concurrently. DuckLake, not
+DuckFleet, removes DuckDB's single-writer limit: writers commit through the
+catalog, conflicts surface at commit, and the losing transaction is discarded
+whole and reported retry-safe. What DuckFleet adds is the warehouse around
+that: routing, admission control, per-model compute sizing, query history,
+profiling, failure classification, and metering.
+
+The scaling model is horizontal across queries, not within one. Each query runs
+on a single DuckDB process bounded by the node it is on; the fleet scales by
+running more processes against the same lake. A workload whose individual
+queries need more than the largest node you will buy has outgrown DuckFleet and
+belongs on a distributed engine such as Trino or Snowflake. Most do not.
+
+Compute comes in two tiers: prestarted persistent workers for everyday queries,
+and an isolated per-session pod with exactly the requested CPU and memory for
+jobs that need more. The namespace boundary is per team or environment, each
+running its own DuckLake; the trust model is teams within one organization, not
+hostile tenants. Clients speak HTTP with Arrow IPC results today — a Python
+client, CLI, and dbt adapter exist — and a Postgres wire-protocol front is
+planned later so Postgres drivers and BI tools connect directly.
+
 ## Run locally
 
 Requires Docker Engine with Compose v2 (Docker Desktop works). No host Rust,
@@ -519,9 +545,12 @@ administrator SQL connection; it is not a SQL sandbox. Do not expose it publicly
 or use customer data. Query history includes SQL text and errors. Logical model
 IDs and tags are caller-supplied correlation data, not authenticated billing data.
 
-Only the two persistent Docker compute classes and SQL models are implemented.
-There is no on-demand instance provisioning, warm pool, durable job queue,
-multi-tenant authorization, production secret management, or automatic write retry.
+Only SQL models are implemented. The Docker harness runs the two persistent
+compute classes; isolated per-session pods are implemented in the Kubernetes
+chart and exercised by the kind harness, and are refused with `501` wherever the
+pod grant is absent — which includes everywhere in Docker. There is no warm
+pool, durable job queue, multi-tenant authorization, production secret
+management, or automatic write retry.
 The usage ledger meters compute only, against a placeholder rate card, and nothing
 reconciles it against a real AWS bill; see
 [Metering and budgets](#metering-and-budgets).
