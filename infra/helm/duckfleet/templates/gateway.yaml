@@ -19,6 +19,10 @@ spec:
     metadata:
       labels: {app: duckfleet-gateway}
     spec:
+      # The gateway drains like a worker: proxied statements share the same 60-second
+      # cap, so the same grace period is what lets one finish. check-chart.py asserts
+      # the coupling here as it does for the workers.
+      {{- include "duckfleet.termination" . | nindent 6 }}
       # Identity follows capability: a gateway that creates pods needs a token, and
       # one that cannot must not have one.
       serviceAccountName: {{ ternary "duckfleet-gateway" "duckfleet-no-aws" .Values.isolatedCompute.enabled }}

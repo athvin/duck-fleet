@@ -165,6 +165,14 @@ python3 scripts/assert_draining.py artifacts/drain-refusal.json
 # And the statement that was already running finished.
 wait "$inflight"
 grep -q 'PASS: a statement already in flight finished' artifacts/drain-inflight.log
+# The settle window runs after the last statement, so wait for the process to leave
+# before reading its log: the "drain complete" line is written on the way out, and
+# reading too early fails the order assertion on a drain that was in fact correct.
+for _ in $(seq 1 90); do
+  [ "$(docker inspect -f '{{.State.Running}}' "$draining_id")" = false ] && break
+  sleep 1
+done
+test "$(docker inspect -f '{{.State.Running}}' "$draining_id")" = false
 # The log must show the signal arriving before that statement finished. Without this
 # the check above passes whenever the statement is simply fast, which is how the first
 # version of this test proved nothing at all.
@@ -177,4 +185,56 @@ test "$(docker inspect -f '{{.State.ExitCode}}' "$draining_id")" = 0
 docker compose up -d --force-recreate --no-deps --wait worker-small
 docker compose up -d --wait server
 echo 'PASS: a worker drained on SIGTERM, refusing new sessions and finishing the one in flight'
+# The gateway is the other half of that: a rollout used to cut every proxied request
+# mid-flight into a transport failure the caller cannot classify. Drain it the same
+# way — the statement in flight finishes, a new session is refused with the worker's
+# own draining shape, and the process leaves of its own accord.
+rm -f artifacts/gateway-drain-inflight.started
+docker compose run --rm --no-deps -T dbt python /app/tests/harness.py --gateway-drain-inflight \
+  > artifacts/gateway-drain-inflight.log 2>&1 &
+gateway_inflight=$!
+for _ in $(seq 1 60); do
+  [ -s artifacts/gateway-drain-inflight.started ] && break
+  sleep 1
+done
+test -s artifacts/gateway-drain-inflight.started
+gateway_id=$(docker compose ps -q server)
+docker kill -s TERM "$gateway_id" > /dev/null
+# Reported at once, so a Service drops this endpoint before the process goes away.
+for _ in $(seq 1 15); do
+  status=$(docker compose exec -T server curl -sS http://localhost:8080/healthz 2>/dev/null || true)
+  case "$status" in *draining*) break ;; esac
+  sleep 1
+done
+case "$status" in
+  *draining*) ;;
+  *) echo "gateway healthz did not report draining: $status" >&2; exit 1 ;;
+esac
+# A new session through the draining gateway is refused in the worker's own terms.
+docker compose exec -T server sh -c 'curl -sS \
+  -X POST http://localhost:8080/v1/sessions \
+  -H "Authorization: Bearer $DUCKFLEET_TOKEN" -H "Content-Type: application/json" -d "{}"' \
+  > artifacts/gateway-drain-refusal.json
+python3 scripts/assert_draining.py artifacts/gateway-drain-refusal.json
+# And the statement that was already in flight through it finished.
+wait "$gateway_inflight"
+grep -q 'PASS: a statement already in flight finished' artifacts/gateway-drain-inflight.log
+# Same as the worker: let the settle window end and the process leave before reading
+# the log it writes on the way out.
+for _ in $(seq 1 90); do
+  [ "$(docker inspect -f '{{.State.Running}}' "$gateway_id")" = false ] && break
+  sleep 1
+done
+test "$(docker inspect -f '{{.State.Running}}' "$gateway_id")" = false
+# The gateway's own log must show the signal arriving before that request completed.
+# Without the ordering, the checks above pass whenever the statement is simply fast —
+# the same hollowness the worker's first drain test had.
+docker logs "$gateway_id" > artifacts/gateway-drain-order.log 2>&1
+python3 scripts/assert_drain_order.py artifacts/gateway-drain-order.log \
+  'termination signal received' \
+  'a request in flight when the signal arrived has completed' \
+  'drain complete'
+test "$(docker inspect -f '{{.State.ExitCode}}' "$gateway_id")" = 0
+docker compose up -d --force-recreate --no-deps --wait server
+echo 'PASS: the gateway drained on SIGTERM, refusing new sessions and finishing the request in flight'
 

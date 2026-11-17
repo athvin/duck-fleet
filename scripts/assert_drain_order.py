@@ -11,9 +11,12 @@ before the signal fails here instead of silently hollowing out the test.
 """
 import sys
 
-SIGNAL = "termination signal received"
-FINISHED = "query finished"
-COMPLETE = "drain complete"
+# Defaults are the worker's three events. The gateway drain passes its own marker for
+# the middle one — it has no engine, so what proves the wait is a request that was in
+# flight when the signal arrived completing afterwards.
+SIGNAL = sys.argv[2] if len(sys.argv) > 2 else "termination signal received"
+FINISHED = sys.argv[3] if len(sys.argv) > 3 else "query finished"
+COMPLETE = sys.argv[4] if len(sys.argv) > 4 else "drain complete"
 
 lines = open(sys.argv[1], errors="ignore").read().splitlines()
 

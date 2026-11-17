@@ -23,3 +23,9 @@ tokio = { version = "1.54.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.29.2", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# `test-util` enables paused time, which is what lets the drain-wait tests cover a
+# 75-second deadline without spending it. Tests only; the served binary keeps the
+# feature set above.
+tokio = { version = "1.54.1", features = ["full", "test-util"] }
