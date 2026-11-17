@@ -320,9 +320,15 @@ output "cluster_endpoint" { value = aws_eks_cluster.main.endpoint }
 output "worker_role_arn" { value = aws_iam_role.worker.arn }
 # What to put in scripts/aws/target.env once this has applied.
 output "target_env" {
+  # REQUIRE_BOOTSTRAP stays true. This previously emitted false, on the reasoning that a
+  # cluster DuckFleet owns creates its own namespace and so has nothing to wait for. That
+  # was wrong once the ownership boundary existed: the namespace, the pod grant, the
+  # quota and the node pool are applied by scripts/aws/apply-boundary.sh wherever
+  # DuckFleet deploys, and the label is how a deploy knows that happened. Owning the
+  # cluster changes who may apply the boundary, not whether one is needed.
   value = <<-EOT
     DUCKFLEET_CLUSTER=${aws_eks_cluster.main.name}
     DUCKFLEET_KUBE_CONTEXT=${aws_eks_cluster.main.arn}
-    DUCKFLEET_REQUIRE_BOOTSTRAP=false
+    DUCKFLEET_REQUIRE_BOOTSTRAP=true
   EOT
 }

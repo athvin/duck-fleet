@@ -80,10 +80,27 @@ AWS_PROFILE=<an administrative profile> bash scripts/aws/apply-boundary.sh
 ```
 
 It applies `infra/kubernetes/boundary`: the namespace and the label the deploy checks
-for, the Role and RoleBinding that let the gateway create session pods, and the
-ResourceQuota that caps them. Idempotent and additive — nothing in it removes or
-narrows an existing object — and it verifies the grant by reading it back rather than
-trusting that `apply` reported success.
+for, the Role and RoleBinding that let the gateway create session pods, the
+ResourceQuota that caps them, and the Karpenter NodePool DuckFleet's capacity comes
+from. Idempotent and additive — nothing in it removes or narrows an existing object —
+and it verifies the grant by reading it back rather than trusting that `apply` reported
+success.
+
+The NodePool is tainted `duckfleet.io/dedicated`, so the capacity is DuckFleet's in
+both directions: a neighbour cannot consume what DuckFleet pays for, and DuckFleet
+cannot consume theirs. It permits `xlarge` as well as `large`, which is what makes a
+2-CPU Guaranteed worker provisionable at all — the shared pool is capped to `large`,
+2 vCPU with ~1780m allocatable, against a 2-CPU pod claiming 2050m with daemonset
+overhead. `limits.cpu` is the spend ceiling and `WhenEmpty` consolidation is what makes
+`suspended: true` actually stop costing money.
+
+It references an existing **NodeClass** by name — `DUCKFLEET_NODE_CLASS` in
+`scripts/aws/target.env`, defaulting to the `default` that EKS Auto Mode creates. A
+NodeClass carries the node IAM role and the subnet and security group selectors, which
+are facts about a cluster DuckFleet does not own; restating them here would mean keeping
+a copy in step with infrastructure we do not control. The script checks the named
+NodeClass exists **before** applying, because a pool pointing at a missing one applies
+cleanly and then silently provisions nothing.
 
 **It needs cluster admin, and the deploy identity deliberately is not.** That split is
 the point. `scripts/aws/check-access.sh` asserts the deploy can create none of a Role,
@@ -105,7 +122,25 @@ be created. Removing the RoleBinding is therefore a supported way to turn the fe
 off. `make test-k8s` applies this same boundary to its kind cluster, so a boundary that
 stops matching the chart fails on a pull request.
 
-## Create the cluster DuckFleet owns
+## The exit: a cluster DuckFleet owns
+
+**Not applied, and not the plan.** DuckFleet deploys into a namespace it owns on a
+shared cluster, and the ownership boundary above is what makes that work. This module
+exists so the decision stays reversible, and is kept `validate`-clean and mock-tested
+on every pull request so it does not rot.
+
+What is still shared, and deliberately accepted: the control plane, the VPC, and the
+cluster's lifecycle. Their upgrades and outages are DuckFleet's too, and an
+administrator there can change the boundary objects. The taint and the quota bound
+DuckFleet's impact on its neighbours, not the reverse. The trade is the standing cost
+below against accepting that coupling — worth making when the coupling starts costing
+more than the cluster does, and not before.
+
+Note that owning a cluster would not have removed the need for the boundary. The two
+capabilities that looked blocked by shared ownership — 2-CPU workers and pod-create
+RBAC — were really the release trying to grant its own permissions and assuming someone
+else's node pool was sized for it. On a cluster DuckFleet owned, the first of those
+would have silently succeeded, which is worse than failing loudly.
 
 `infra/terraform/cluster` defines an EKS Auto Mode cluster, its VPC, the IAM roles
 Auto Mode requires, the worker identity and Pod Identity association, and a CI access
@@ -138,10 +173,16 @@ terraform -chdir=infra/terraform/cluster apply    # about 15 minutes
 terraform -chdir=infra/terraform/cluster output -raw target_env
 ```
 
-The last command prints the three values to put in `scripts/aws/target.env`. Changing
-them there is what moves the lane onto the new cluster, and it is a separate reviewed
-pull request — with `DUCKFLEET_REQUIRE_BOOTSTRAP=false`, because the namespace label
-that check waits for is applied by a bootstrap that only exists on the shared cluster.
+The last command prints the values to put in `scripts/aws/target.env`. Changing them
+there is what moves the lane onto the new cluster, and it is a separate reviewed pull
+request.
+
+Then apply the ownership boundary to the new cluster, exactly as above. Owning the
+cluster changes who may grant a capability, not whether granting one is the deploy's
+job — `check-access.sh` still asserts the deploy identity can create no Role, and the
+module's CI access entry is scoped to `AmazonEKSEditPolicy` so that stays true. Confirm
+`DUCKFLEET_NODE_CLASS` names a NodeClass that exists on the new cluster;
+`apply-boundary.sh` lists the candidates if it does not.
 
 Expect the first apply to need iteration. The module is `validate`-clean and passes
 mocked-provider tests, which catches schema and scope errors but cannot establish that
