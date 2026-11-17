@@ -13,6 +13,9 @@ postgres = "0.19.14"
 # gateway trusts for the Kubernetes API is the cluster CA the kubelet mounts, which
 # is tighter than the public root set a default build would accept.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+# Already in the tree via rustls; used directly for credential hashing, so issued
+# tokens are stored and compared only as digests.
+ring = "0.17"
 # The provider is named explicitly rather than taken by default: the default is
 # aws-lc, which needs cmake and a C toolchain, while ring is already in this tree
 # by way of libduckdb-sys and so costs nothing to reuse.

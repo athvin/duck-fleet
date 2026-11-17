@@ -52,6 +52,10 @@ struct Session {
     /// reads this rather than the worker's own class, so a future placement that
     /// exceeds the request cannot quietly start charging for the provision.
     placement: Placement,
+    /// Who the gateway authenticated when this session opened, recorded on every
+    /// history row the session writes. Server-derived, never caller-supplied:
+    /// the caller's own context cannot name someone else.
+    principal: String,
 }
 pub(crate) struct Worker {
     root: Connection,
@@ -452,6 +456,7 @@ impl Worker {
             ALTER TABLE query_history ADD COLUMN IF NOT EXISTS metrics TEXT NOT NULL DEFAULT '{}';
             ALTER TABLE query_history ADD COLUMN IF NOT EXISTS failure_kind TEXT;
             ALTER TABLE query_history ADD COLUMN IF NOT EXISTS retry_safe BOOLEAN;
+            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS principal TEXT NOT NULL DEFAULT 'direct';
             CREATE UNIQUE INDEX IF NOT EXISTS query_history_order ON query_history(history_id DESC);
             CREATE INDEX IF NOT EXISTS query_history_failure ON query_history(failure_kind,history_id DESC);
             CREATE INDEX IF NOT EXISTS query_history_model ON query_history((context::jsonb #>> '{dbt,node_id}'),history_id DESC);
@@ -469,6 +474,7 @@ impl Worker {
                 &failure::INTERRUPTED.retry_safe,
             ],
         )?;
+        crate::credentials::migrate(&mut transaction)?;
         // The budget starts from configuration only the first time it is created; a
         // restart must not refill a balance that has already been spent.
         metering::migrate(
@@ -526,7 +532,7 @@ impl Worker {
     fn handle(&mut self, op: Operation) -> Reply {
         match op {
             Operation::Info => Ok(Output::Json(self.placement.clone())),
-            Operation::Open(mut request) => {
+            Operation::Open(mut request, principal) => {
                 // The gateway already routed by mode and size; this is the worker
                 // refusing to serve a placement that is not its own.
                 let placement = request.validate()?;
@@ -576,6 +582,7 @@ impl Worker {
                         touched: Instant::now(),
                         context: request.context,
                         placement,
+                        principal,
                     },
                 );
                 self.served += 1;
@@ -613,10 +620,11 @@ impl Worker {
             query.extend(session.clone());
         }
         let query_id = req.request_id.to_string();
+        let principal = session.principal.clone();
         let inserted = self.ledger.execute(
             "recording an accepted execution",
-            "INSERT INTO query_history (query_id, session_id, sql, context, status, worker_id, placement) VALUES ($1,$2,$3,$4,'running',$5,$6) ON CONFLICT DO NOTHING",
-            &[&query_id, &id.to_string(), &req.sql, &req.context.to_string(), &self.worker_id, &self.placement.to_string()],
+            "INSERT INTO query_history (query_id, session_id, sql, context, status, worker_id, placement, principal) VALUES ($1,$2,$3,$4,'running',$5,$6,$7) ON CONFLICT DO NOTHING",
+            &[&query_id, &id.to_string(), &req.sql, &req.context.to_string(), &self.worker_id, &self.placement.to_string(), &principal],
         )?;
         if inserted == 0 {
             return Err(ApiError::new(
