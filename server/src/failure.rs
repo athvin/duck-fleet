@@ -156,6 +156,18 @@ pub(crate) const COMPUTE_UNAVAILABLE: Failure = Failure {
 /// The worker has not attached its catalog yet, so the request never reached the
 /// engine. Unlike `UNAVAILABLE` there is no partial effect to reason about: nothing
 /// ran, which makes resending safe once the worker reports ready.
+/// This worker is shutting down and will not take new sessions.
+///
+/// Distinct from `STARTING`, which means the same thing about readiness and the
+/// opposite thing about waiting: a starting worker will serve this caller shortly, a
+/// draining one never will. Retry-safe because no session was opened and no statement
+/// ran, so the caller may open one elsewhere immediately.
+pub(crate) const DRAINING: Failure = Failure {
+    status: None,
+    kind: "draining",
+    retry_safe: true,
+    http: StatusCode::SERVICE_UNAVAILABLE,
+};
 pub(crate) const STARTING: Failure = Failure {
     status: None,
     kind: "starting",
