@@ -18,8 +18,20 @@ if not re.fullmatch(r's3://duckfleet-dev-[a-z0-9-]+/lake/', prefix):
 connection = RemoteConnection(harness.URL, harness.TOKEN)
 try:
     # Executes on the worker using Pod Identity, not in the dbt test process.
-    files = harness.sql(connection, f"SELECT DISTINCT filename FROM read_parquet('{prefix}**/*.parquet', filename=true, union_by_name=true) LIMIT 5")
+    # glob() lists keys without opening a single file: the old read_parquet form
+    # schema-merged every object in the lake to name five of them, and once the
+    # scale stage started depositing a hundred tables per run, the accumulated
+    # bucket blew the statement deadline.
+    files = harness.sql(connection, f"SELECT file FROM glob('{prefix}**/*.parquet') LIMIT 5")
     harness.require(files and all(row[0].startswith(prefix) for row in files), 'no Parquet in the AWS lake')
+    # And the reason the bucket accumulates gets its own remedy: the development
+    # lake is maintained with the platform's own lever, so each run expires what
+    # a week of runs no longer needs and compacts what the scale stage fragmented.
+    from duckfleet import Client
+    Client(harness.URL, harness.TOKEN).request(
+        'POST', '/v1/lake/maintenance',
+        {'expire_older_than_days': 7, 'compact': True, 'cleanup': True})
+    print('PASS: the development lake was compacted and expired with its own maintenance API')
 finally:
     connection.close()
 evidence = {
