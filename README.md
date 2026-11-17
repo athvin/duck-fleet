@@ -300,6 +300,31 @@ Every principal reaches the same full SQL surface and the same platform
 endpoints apart from credential management — per-principal SQL or budget
 scoping is explicitly not built.
 
+## Exposure
+
+By default the API is a ClusterIP Service: reachable from inside the namespace
+and by `kubectl port-forward`, and from nowhere else. The chart's `exposure`
+values opt into an Ingress that terminates TLS at the controller, for a team
+that queries the warehouse from laptops and CI:
+
+```yaml
+exposure:
+  enabled: true
+  host: duckfleet.example.com
+  tlsSecretName: duckfleet-tls        # a kubernetes.io/tls Secret in this namespace
+  controllerNamespace: ingress-nginx  # where the ingress controller pods run
+```
+
+All three facts are required, not defaulted, because each belongs to the
+operator: the DNS name, the certificate (this chart never mints one — bring
+cert-manager or your own), and the controller's namespace, which the isolation
+NetworkPolicy otherwise keeps out. A bearer token must never cross plain HTTP:
+the render always carries the TLS block, `check-chart.py` asserts every exposed
+host terminates TLS, and the nginx-family `ssl-redirect` annotation is set by
+default — an operator running a different controller owns configuring its
+equivalent through `exposure.annotations`. The AWS development lane stays
+unexposed; its render checks prove the default produces no Ingress at all.
+
 A session request can supply `{"compute":{"cpu":2,"memory":"2Gi"},"context":{}}`.
 Compute is fixed when the session opens; query bodies cannot override it.
 A query request has this shape:
