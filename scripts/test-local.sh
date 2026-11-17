@@ -238,3 +238,63 @@ test "$(docker inspect -f '{{.State.ExitCode}}' "$gateway_id")" = 0
 docker compose up -d --force-recreate --no-deps --wait server
 echo 'PASS: the gateway drained on SIGTERM, refusing new sessions and finishing the request in flight'
 
+# The catalog IS the lake, and a backup that has never been restored is a hope, not
+# a backup. Full drill: dump both databases, commit more work, destroy PostgreSQL's
+# volume outright, restore into the fresh instance, and prove the platform serves
+# from the restored map — pre-backup data reads from the bucket, post-backup work is
+# honestly gone (that is what a recovery point means), history and the ledger are
+# back, and a new write commits cleanly against the restored snapshot chain.
+rm -rf artifacts/catalog-backup
+bash scripts/backup-catalog.sh compose artifacts/catalog-backup
+test -s artifacts/catalog-backup/lake.dump
+test -s artifacts/catalog-backup/platform.dump
+# Work the restore must forget.
+docker compose run --rm --no-deps dbt python - <<'PY'
+import os
+from duckfleet import RemoteConnection
+connection = RemoteConnection(os.environ["DUCKFLEET_URL"], os.environ["DUCKFLEET_TOKEN"])
+try:
+    cursor = connection.cursor()
+    cursor.execute("create schema if not exists api_demo")
+    cursor.execute("create or replace table api_demo.after_backup as select 42 as n")
+    assert cursor.execute("select count(*) from api_demo.after_backup").fetchall() == [(1,)]
+finally:
+    connection.close()
+PY
+docker compose stop server worker-small worker-medium
+docker compose rm -sf postgres
+docker volume rm duckfleet-local_postgres-data > /dev/null
+docker compose up -d --no-deps --wait postgres
+DUCKFLEET_CONFIRM_RESTORE=yes bash scripts/restore-catalog.sh compose artifacts/catalog-backup
+docker compose up -d --wait server
+docker compose run --rm --no-deps dbt python - <<'PY'
+import json
+import os
+from duckfleet import Client, RemoteConnection, RemoteError
+url, token = os.environ["DUCKFLEET_URL"], os.environ["DUCKFLEET_TOKEN"]
+connection = RemoteConnection(url, token)
+try:
+    cursor = connection.cursor()
+    # Data committed before the backup reads through the restored catalog: the
+    # Parquet never left the bucket, and the restored rows still name it.
+    rows = cursor.execute("select count(*) from lake.analytics.customer_totals").fetchall()
+    assert rows == [(2,)], rows
+    # The recovery point is real: work committed after the backup is gone.
+    try:
+        cursor.execute("select count(*) from api_demo.after_backup")
+        raise AssertionError("a post-backup table survived the restore")
+    except RemoteError as error:
+        assert error.failure_kind == "sql_error", error.failure_kind
+    # And the restored snapshot chain accepts new commits.
+    cursor.execute("create or replace table api_demo.after_restore as select 1 as n")
+    assert cursor.execute("select count(*) from api_demo.after_restore").fetchall() == [(1,)]
+finally:
+    connection.close()
+# History and the ledger came back with the platform database.
+client = Client(url, token)
+assert b"query_id" in client.request("GET", "/v1/queries?limit=5")
+budget = json.loads(client.request("GET", "/v1/budget"))
+assert budget["usage_events"] > 0, budget
+PY
+echo 'PASS: the catalog was destroyed and restored from backup; old data read, newer work was gone, and a fresh write committed'
+
