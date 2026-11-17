@@ -140,6 +140,14 @@ rate_version, rate_value = next(iter(cards.values()))
 assert rate_version and rate_value and rate_value.isdigit() and int(rate_value) >= 1, (
     f'the rate card must be a named version and a positive integer rate: '
     f'{rate_version!r} {rate_value!r}')
+# The wire front is opt-in: a default render neither listens for it nor
+# advertises it, and an enabled one must do both.
+server_ports = {p['port'] for p in by_name['Service', 'server']['spec']['ports']}
+gateway_env = {e['name']: e.get('value') for e in gateway['env']}
+if gateway_env.get('DUCKFLEET_PGWIRE') == 'true':
+    assert 5432 in server_ports, 'pgwire is enabled but the Service does not carry 5432'
+else:
+    assert 5432 not in server_ports, 'the Service advertises a wire front nothing listens for'
 # The catalog is either bundled or the operator's, never a partial mix: a render
 # carrying the StatefulSet without its Service or init would start a database
 # nothing can reach or seed. Whether named external addresses reach the egress

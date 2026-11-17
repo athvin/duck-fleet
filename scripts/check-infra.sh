@@ -151,6 +151,12 @@ if helm template duckfleet infra/helm/duckfleet --namespace someone-elses-namesp
 fi
 helm template duckfleet infra/helm/duckfleet --namespace duckfleet-team-b -f "$values" > /dev/null
 echo 'PASS: the chart renders for duckfleet-* namespaces and refuses everything else'
+# The wire front, enabled: the Service carries 5432 and the invariants hold.
+wire="$validation_dir/pgwire.yaml"
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set pgwire.enabled=true > "$wire"
+python3 scripts/check-chart.py "$wire" > /dev/null
+echo 'PASS: the wire front renders only when asked for'
 for script in scripts/*.sh scripts/aws/*.sh scripts/ci/*.sh; do bash -n "$script"; done
 # The local Kubernetes harness renders the real chart, so a chart change that moves
 # something out from under the transform is caught here rather than in a cluster.

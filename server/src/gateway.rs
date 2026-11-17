@@ -674,6 +674,125 @@ async fn lake_snapshots(
     .await
 }
 
+/// The gateway as the pgwire front sees it: authenticate a credential, run
+/// statements through an ordinary worker session under the named principal.
+/// Nothing here is pgwire-shaped — which is the point; the front stays a
+/// compatibility layer over machinery that neither knows nor cares it exists.
+struct PgPlatform(Gateway);
+impl crate::pgwire::Platform for PgPlatform {
+    async fn authenticate(&self, token: String) -> Option<String> {
+        self.0
+            .authn
+            .principal(&token)
+            .await
+            .ok()
+            .map(|principal| principal.name().to_owned())
+    }
+
+    async fn open_session(&self, principal: String) -> anyhow::Result<crate::pgwire::Session> {
+        let endpoint = self
+            .0
+            .endpoint_for(Resources::default())
+            .await
+            .map_err(|refusal| anyhow::anyhow!("{}", refusal.1))?;
+        let opened = self
+            .0
+            .client
+            .request(Method::POST, format!("{endpoint}/v1/sessions"))
+            .bearer_auth(&self.0.token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(credentials::PRINCIPAL_HEADER, &principal)
+            .body(json!({"compute": {}, "context": {"operation": "pgwire"}}).to_string())
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("the worker did not answer"))?;
+        anyhow::ensure!(
+            opened.status().is_success(),
+            "the worker refused the session"
+        );
+        let session_id = opened
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|info| info["session_id"].as_str().map(str::to_owned))
+            .ok_or_else(|| anyhow::anyhow!("the worker's answer had no session id"))?;
+        Ok(crate::pgwire::Session {
+            endpoint,
+            session_id,
+        })
+    }
+
+    async fn query(
+        &self,
+        session: &crate::pgwire::Session,
+        sql: String,
+    ) -> crate::pgwire::QueryOutcome {
+        use crate::pgwire::QueryOutcome;
+        let sent = self
+            .0
+            .send(
+                &session.endpoint,
+                Method::POST,
+                &format!("/v1/sessions/{}/queries", session.session_id),
+                json!({
+                    "request_id": Uuid::new_v4(),
+                    "sql": sql,
+                    "timeout_seconds": 60,
+                    "context": {"operation": "pgwire"},
+                })
+                .to_string()
+                .into(),
+            )
+            .await;
+        let upstream = match sent {
+            Ok(upstream) => upstream,
+            Err(refusal) => {
+                return QueryOutcome::Refused {
+                    kind: refusal.0.kind.to_owned(),
+                    message: refusal.1,
+                };
+            }
+        };
+        if upstream.status().is_success() {
+            match upstream.bytes().await {
+                Ok(bytes) => QueryOutcome::Rows(bytes.to_vec()),
+                Err(_) => QueryOutcome::Refused {
+                    kind: "unavailable".to_owned(),
+                    message: "the result did not arrive whole".to_owned(),
+                },
+            }
+        } else {
+            let refused = upstream.json::<Value>().await.unwrap_or_default();
+            QueryOutcome::Refused {
+                kind: refused["failure_kind"]
+                    .as_str()
+                    .unwrap_or("unavailable")
+                    .to_owned(),
+                message: refused["error"]
+                    .as_str()
+                    .unwrap_or("the worker refused the statement")
+                    .to_owned(),
+            }
+        }
+    }
+
+    async fn close_session(&self, session: crate::pgwire::Session) {
+        let _ = self
+            .0
+            .send(
+                &session.endpoint,
+                Method::DELETE,
+                &format!("/v1/sessions/{}", session.session_id),
+                Bytes::new(),
+            )
+            .await;
+    }
+
+    fn draining(&self) -> bool {
+        self.0.draining.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MaintenanceRequest {
@@ -997,6 +1116,16 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             (app.draining.clone(), app.inflight.clone()),
             track_inflight,
         ));
+    // The pgwire front, where the deployment asked for one: a compatibility
+    // listener over the same sessions, principals, and meters as everything else.
+    if std::env::var("DUCKFLEET_PGWIRE").as_deref() == Ok("true") {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:5432").await?;
+        tracing::info!(port = 5432, "pgwire front listening");
+        tokio::spawn(crate::pgwire::serve(
+            Arc::new(PgPlatform(app.clone())),
+            listener,
+        ));
+    }
     let draining = app.draining.clone();
     let inflight = app.inflight.clone();
     let router = Router::new()

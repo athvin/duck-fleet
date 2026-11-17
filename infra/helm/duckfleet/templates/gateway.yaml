@@ -4,7 +4,11 @@ metadata:
   name: server
 spec:
   selector: {app: duckfleet-gateway}
-  ports: [{port: 8080, targetPort: 8080}]
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+    {{- if .Values.pgwire.enabled }}
+    - {name: pgwire, port: 5432, targetPort: 5432}
+    {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -39,6 +43,7 @@ spec:
             limits: {cpu: 500m, memory: 256Mi}
           env:
             - {name: DUCKFLEET_ROLE, value: gateway}
+            - {name: DUCKFLEET_PGWIRE, value: {{ .Values.pgwire.enabled | quote }}}
             # The same card the workers price with: the gateway reports it on the
             # budget position and settles abandoned session-pod reservations.
             - {name: DUCKFLEET_RATE_CARD_VERSION, value: {{ .Values.rateCard.version | quote }}}

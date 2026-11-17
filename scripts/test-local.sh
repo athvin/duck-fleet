@@ -59,6 +59,47 @@ docker compose run --rm dbt
 # any worker is stopped below.
 docker compose run --rm dbt python /app/tests/harness.py --concurrency
 docker compose run --rm dbt python /app/tests/harness.py --metering
+# The Postgres wire front: psql — the simple protocol drivers and BI tools are
+# built on — speaks to the warehouse with a platform credential as the password.
+# Typed results, classified errors carrying the platform's kind, a clean refusal
+# for bind parameters, authentication that refuses bad credentials, and the same
+# history attribution as every other path.
+PGTOKEN="${DUCKFLEET_TOKEN:-duckfleet-local-development-token}"
+pgw() { docker compose exec -T -e PGPASSWORD="$PGTOKEN" postgres \
+  psql -h server -p 5432 -U operator -d lake -v ON_ERROR_STOP=1 -qtAX -c "$1"; }
+test "$(pgw 'select 1 + 1')" = 2
+test "$(pgw "select 42::bigint, 'text value', true, 1.5::double")" = '42|text value|t|1.5'
+test "$(pgw "select date '2026-01-02', timestamp '2026-01-02 03:04:05'")" = '2026-01-02|2026-01-02 03:04:05.000000'
+test "$(pgw "select 12.34::decimal(6,2)")" = '12.34'
+test "$(pgw 'select count(*) from lake.analytics.customer_totals')" = 2
+if pgw 'select * from no_such_table_for_pgwire' 2> artifacts/pgwire-error.txt; then
+  echo 'a missing table did not fail over the wire' >&2; exit 1
+fi
+grep -q 'sql_error' artifacts/pgwire-error.txt
+# Extended-protocol bind parameters are a stated refusal, not a surprise. Driven
+# through stdin because psql's -c sends mixed SQL and metacommands as one query.
+if printf 'select $1::int \\bind 7 \\g\n' | docker compose exec -T -e PGPASSWORD="$PGTOKEN" postgres \
+  psql -h server -p 5432 -U operator -d lake -v ON_ERROR_STOP=1 -qtAX 2> artifacts/pgwire-bind.txt; then
+  echo 'a bind parameter was not refused' >&2; exit 1
+fi
+grep -q 'not supported' artifacts/pgwire-bind.txt
+if docker compose exec -T -e PGPASSWORD=not-a-credential postgres \
+  psql -h server -p 5432 -U operator -d lake -c 'select 1' > /dev/null 2>&1; then
+  echo 'the wire front accepted a bad credential' >&2; exit 1
+fi
+docker compose run --rm --no-deps dbt python - <<'PY'
+import json, os
+from duckfleet import Client
+client = Client(os.environ["DUCKFLEET_URL"], os.environ["DUCKFLEET_TOKEN"])
+queries = json.loads(client.request("GET", "/v1/queries?limit=50"))["queries"]
+wire = [q for q in queries if q["context"].get("operation") == "pgwire"]
+assert wire, "no pgwire history records"
+assert all(q["principal"] == "bootstrap-admin" for q in wire), wire[0].get("principal")
+assert any(q["status"] == "succeeded" for q in wire), "no successful wire statement"
+assert any(q["status"] == "failed" for q in wire), "the wire's SQL error left no record"
+PY
+echo 'PASS: psql spoke to the warehouse through the wire front — typed results, classified errors, clean refusals, attributed history'
+
 # The usage ledger must reject edits in the database, not merely in application code.
 for statement in 'UPDATE usage_events SET amount_micro_usd = 0' 'DELETE FROM usage_events'; do
   { docker compose exec -T postgres psql -U duckfleet -d platform -c "$statement" 2>&1 || true; } \

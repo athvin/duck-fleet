@@ -82,6 +82,15 @@ postgres:
 # storage half of namespace isolation, and it lives with whoever owns IAM.
 lakePrefix: lake
 
+# The Postgres wire-protocol front: psql and simple-protocol drivers speak to
+# the gateway on 5432 with a platform credential as the password, through the
+# same sessions, principals, and meters as everything else. Off by default —
+# it is a compatibility surface, and a deployment that does not use it should
+# not listen for it. In-cluster plain TCP: transport security stays with the
+# exposure layer, and the in-namespace NetworkPolicy already admits 5432.
+pgwire:
+  enabled: false
+
 # Reaching the API from outside the cluster: an Ingress terminating TLS at the
 # controller, plus the NetworkPolicy door that admits the controller's namespace.
 # Off by default and off in the dev lane permanently. Enabling it requires naming

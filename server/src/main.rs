@@ -7,6 +7,7 @@ mod history;
 mod isolated;
 mod kube;
 mod metering;
+mod pgwire;
 mod pricing;
 mod profiling;
 mod secrets;
