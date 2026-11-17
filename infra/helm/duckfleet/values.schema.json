@@ -73,6 +73,14 @@
           {"type": "string", "pattern": "^[0-9]+m$"}
         ]
       }
+    },
+    "rateCard": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {"type": "string", "minLength": 1, "maxLength": 64},
+        "computeMicroUsdPerUnitHour": {"type": "integer", "minimum": 1}
+      }
     }
   }
 }

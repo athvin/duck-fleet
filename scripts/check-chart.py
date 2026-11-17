@@ -120,6 +120,26 @@ for url in worker_urls.split(','):
     assert ('Deployment', host) in by_name, f'no Deployment backs {host}'
 assert len(worker_urls.split(',')) == len([n for k, n in by_name
                                            if k == 'Deployment' and n.startswith('worker-')])
+# One rate card per deployment. Every container that prices or reports work must
+# carry the same pair, or admission and the budget position would disagree about
+# what a unit-hour costs.
+def rate_pair(env_list):
+    env = {e['name']: e.get('value') for e in env_list}
+    return (env.get('DUCKFLEET_RATE_CARD_VERSION'),
+            env.get('DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR'))
+cards = {'server': rate_pair(gateway['env'])}
+for kind, name in by_name:
+    if kind == 'Deployment' and name.startswith('worker-'):
+        cards[name] = rate_pair(
+            by_name[kind, name]['spec']['template']['spec']['containers'][0]['env'])
+if ('ConfigMap', 'duckfleet-isolated-pod') in by_name:
+    session_pod = json.loads(by_name['ConfigMap', 'duckfleet-isolated-pod']['data']['pod.json'])
+    cards['isolated-pod'] = rate_pair(session_pod['spec']['containers'][0]['env'])
+assert len(set(cards.values())) == 1, f'rate cards disagree: {cards}'
+rate_version, rate_value = next(iter(cards.values()))
+assert rate_version and rate_value and rate_value.isdigit() and int(rate_value) >= 1, (
+    f'the rate card must be a named version and a positive integer rate: '
+    f'{rate_version!r} {rate_value!r}')
 
 isolation = by_name['NetworkPolicy', 'duckfleet-isolation']['spec']
 assert isolation['policyTypes'] == ['Ingress', 'Egress']

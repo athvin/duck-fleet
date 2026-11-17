@@ -39,6 +39,10 @@ spec:
             limits: {cpu: 500m, memory: 256Mi}
           env:
             - {name: DUCKFLEET_ROLE, value: gateway}
+            # The same card the workers price with: the gateway reports it on the
+            # budget position and settles abandoned session-pod reservations.
+            - {name: DUCKFLEET_RATE_CARD_VERSION, value: {{ .Values.rateCard.version | quote }}}
+            - {name: DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR, value: {{ .Values.rateCard.computeMicroUsdPerUnitHour | quote }}}
             - name: PLATFORM_DSN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.secretName }}, key: PLATFORM_DSN}

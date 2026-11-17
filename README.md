@@ -466,6 +466,15 @@ has to be a new row whose `corrects` column points at what it compensates. Each
 event stores the `rate_card_version` it was priced with, so an old event keeps the
 price it was charged at.
 
+The rate card is deployment configuration: `DUCKFLEET_RATE_CARD_VERSION` and
+`DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR` (the chart's `rateCard` values),
+defaulting to the development placeholder below. Change both together. Each
+reservation copies the pair at admission, and settlement and recovery price an
+execution at the card it was admitted under — so changing rates affects only new
+work, and the ledger is never repriced, even by a restart that recovers old holds
+under a new card. The isolated-pod cold-start measurements are what should turn
+the placeholder into real numbers.
+
 Money is integer micro-USD throughout; a ledger must not accumulate floating-point
 error. Charges round **up** and affordable time rounds **down**, so a budget is
 never overrun by rounding.
@@ -551,7 +560,8 @@ chart and exercised by the kind harness, and are refused with `501` wherever the
 pod grant is absent — which includes everywhere in Docker. There is no warm
 pool, durable job queue, multi-tenant authorization, production secret
 management, or automatic write retry.
-The usage ledger meters compute only, against a placeholder rate card, and nothing
+The usage ledger meters compute only, against a configurable rate card whose
+default is a placeholder, and nothing
 reconciles it against a real AWS bill; see
 [Metering and budgets](#metering-and-budgets).
 Arbitrary DuckDB SQL can access worker files and network resources. Python models,
