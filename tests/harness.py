@@ -444,8 +444,13 @@ def gateway_replaced():
         try:
             connection.client.request("POST", connection.path + "/queries", {
                 "request_id": request_id,
+                # Sized to outlive the script's 2-second history polling plus the
+                # kill's latency on fast hardware — at 200M a local run finished
+                # before the kill landed and the stage proved nothing — while
+                # staying inside the explicit timeout on the slowest runner seen.
                 "sql": "insert into api_demo.gateway_replaced "
-                       "select range from range(200000000) where range % 13 = 5",
+                       "select range from range(2000000000) where range % 13 = 5",
+                "timeout_seconds": 58,
             })
             outcome["completed"] = True
         except RemoteError as error:
@@ -500,8 +505,9 @@ def gateway_replaced():
                 f"the severed insert ended {record['status']}")
         committed = sql(reopened,
                         "select count(*) from api_demo.gateway_replaced")[0][0]
-        expected = sql(reopened,
-                       "select count(*) from range(200000000) where range % 13 = 5")[0][0]
+        # Arithmetic rather than a second scan: recomputing the predicate over the
+        # range would take as long as the insert and could time out on its own.
+        expected = len(range(5, 2_000_000_000, 13))
         require(committed == expected,
                 f"{committed} rows committed, {expected} expected — a partial commit")
     finally:

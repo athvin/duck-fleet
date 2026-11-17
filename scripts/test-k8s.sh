@@ -318,6 +318,19 @@ python3 scripts/kind/await_job.py --context "$CONTEXT" --namespace "$NS" \
 "${KUBE[@]}" logs job/bucket-verify > artifacts/kind/bucket-verify.log
 grep -q 'PASS:' artifacts/kind/bucket-verify.log
 
+# The backup path an operator would actually run, against a real cluster. The full
+# destroy-and-restore drill lives in the Compose harness; here the kube mode of the
+# same script must produce archives pg_restore recognises for both databases, or
+# the drill is proving a path nobody runs in production.
+DUCKFLEET_KUBE_CONTEXT="$CONTEXT" DUCKFLEET_NAMESPACE="$NS" \
+  bash scripts/backup-catalog.sh kube "$work/catalog-backup"
+for database in lake platform; do
+  test -s "$work/catalog-backup/$database.dump"
+  "${KUBE[@]}" exec -i statefulset/duckfleet-postgres -- pg_restore --list \
+    < "$work/catalog-backup/$database.dump" > /dev/null
+done
+echo 'PASS: the kube backup produced restorable archives for both databases'
+
 # Pod replacement, which Compose cannot exercise: these are new pods on a new
 # sandbox, not restarted containers, so committed data and history must come from
 # the catalog rather than from anything the old pod held.

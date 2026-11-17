@@ -546,6 +546,33 @@ compensating event yet; `corrects` and the append-only trigger establish how a
 correction must work, not a feature that performs one. Spend is not reconciled
 against an AWS bill, so of the blueprint's three numbers this is only the third.
 
+## Backup and restore
+
+The catalog **is** the lake: every Parquet object in the bucket is unreachable
+without the catalog rows that name it, so losing the single PostgreSQL loses the
+warehouse however intact S3 is. `scripts/backup-catalog.sh <compose|kube> <dir>`
+dumps both databases — `lake` (the DuckLake catalog) and `platform` (query
+history, usage ledger, budget) — as custom-format archives, and
+`scripts/restore-catalog.sh` restores them into a freshly initialised PostgreSQL,
+refusing to run without `DUCKFLEET_CONFIRM_RESTORE=yes`. Stop workers and the
+gateway around a restore; their startup migrations are idempotent against the
+restored schema.
+
+The harness proves the whole cycle, not just the dump: it backs up, commits more
+work, destroys the PostgreSQL volume outright, restores, and asserts that
+pre-backup data reads through the restored catalog from the bucket, that work
+committed after the backup is gone, that history and the ledger are back, and
+that a fresh write commits cleanly against the restored snapshot chain. The kind
+harness additionally exercises the `kube` mode an operator would actually run.
+
+The recovery point is the age of the newest backup you kept — scheduling and
+retention are the operator's policy, and the honest statement of loss is:
+everything committed after that backup, including its history and ledger rows.
+Parquet written after the backup survives in the bucket as unreferenced objects;
+they are harmless to correctness and belong to table maintenance (#14) to reap.
+The two databases are dumped sequentially, each internally consistent, so history
+may lead or trail the catalog by the dump gap.
+
 ## Scope and limitations
 
 This is a **trusted, single-tenant development environment** with known local
@@ -576,8 +603,9 @@ excess requests return 429. A database outage returns 503. Cancellation bypasses
 the execution queue. The response limit applies to returned data;
 DuckDB may materialize a result before serialization. Canceling or losing an HTTP
 request is not proof that a write was rolled back. Conflicting writes from multiple
-DuckLake workers are covered above, but this harness does not yet test crash
-recovery during a commit or backup restoration.
+DuckLake workers are covered above, and the backup/restore cycle is drilled in
+[Backup and restore](#backup-and-restore), but this harness does not yet test
+crash recovery during a commit.
 A gateway restart loses its in-memory session routes; the recovery contract is
 classified rather than magical, and the Kubernetes harness proves it against a
 gateway killed without grace. A request severed in transport fails as

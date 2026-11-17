@@ -43,6 +43,23 @@ whole model lifecycles to these workers. They may share an EC2 node. This does
 PostgreSQL is separate from ER's Aurora databases for this disposable experiment.
 This is not a production database/backup/HA design.
 
+## Back up the catalog
+
+The catalog is the lake: the bucket's Parquet is unreachable without the rows that
+name it. The same script the harness drills runs against this namespace:
+
+```sh
+DUCKFLEET_KUBE_CONTEXT=$DUCKFLEET_KUBE_CONTEXT DUCKFLEET_NAMESPACE=duckfleet-dev \
+  bash scripts/backup-catalog.sh kube backups/$(date -u +%Y-%m-%d)
+```
+
+Dumps both databases as custom-format archives. Restore with
+`scripts/restore-catalog.sh kube` into a freshly initialised PostgreSQL, with
+compute suspended around it; the README's "Backup and restore" section states the
+recovery-point semantics, which the Compose harness proves on every run. How often
+this runs, and how many directories are kept, is the operator's policy — nothing
+schedules it automatically.
+
 ## Rotate the catalog credential
 
 The development password was written to pod logs in plaintext until #20 scrubbed it, so
