@@ -60,6 +60,20 @@ recovery-point semantics, which the Compose harness proves on every run. How oft
 this runs, and how many directories are kept, is the operator's policy — nothing
 schedules it automatically.
 
+## Bounding the development lake
+
+The scale acceptance run deposits roughly a hundred Parquet tables per deploy, and
+DuckLake snapshots and small files accumulate on top across runs. The AWS lane
+bounds this with the platform's own maintenance — `scripts/aws/maintain.sh` runs
+compaction, then expiry of snapshots older than a week, then cleanup of the files
+that leaves unreferenced — as a **continue-on-error** step after the smoke test's
+verdict and before compute is suspended. Deliberately not in `test.sh`: a
+destructive, file-deleting operation must never be able to fail a deploy or
+corrupt the lake mid-verification, so it is best-effort and the next run continues
+where an interrupted sweep left off (duck-fleet#80). Expiry forfeits time travel
+past a week on the dev lake, which is disposable; a production target would keep a
+longer window or move maintenance to a dedicated schedule.
+
 ## Rotate the catalog credential
 
 The development password was written to pod logs in plaintext until #20 scrubbed it, so
