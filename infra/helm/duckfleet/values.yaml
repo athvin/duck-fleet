@@ -61,6 +61,20 @@ rateCard:
 # what it cost. Workers sweep at startup and hourly, in bounded batches.
 historyRetentionDays: 0
 
+# The bundled PostgreSQL is a development fixture: one replica, one PVC, no HA.
+# A self-hoster running DuckFleet as their warehouse should set bundled: false
+# and point the Secret's CATALOG_DSN and PLATFORM_DSN at managed PostgreSQL —
+# the catalog is the write-coordination point for the whole lake, and deserves a
+# server with its own availability and backup story. scripts/backup-catalog.sh
+# and restore-catalog.sh are how data moves between the two. A database outside
+# the namespace also needs its address in externalCidrs: the isolation policy
+# otherwise permits 5432 only between this namespace's own pods, and an
+# unreachable catalog presents as workers that never become ready.
+postgres:
+  bundled: true
+  externalCidrs: []
+  port: 5432
+
 # Reaching the API from outside the cluster: an Ingress terminating TLS at the
 # controller, plus the NetworkPolicy door that admits the controller's namespace.
 # Off by default and off in the dev lane permanently. Enabling it requires naming

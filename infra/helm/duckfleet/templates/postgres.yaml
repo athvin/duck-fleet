@@ -1,3 +1,10 @@
+{{/*
+The bundled PostgreSQL: a development fixture — one replica, one PVC, no HA.
+postgres.bundled=false removes all of it, for a deployment whose Secret DSNs
+point at a server the operator runs (RDS, or any PostgreSQL); the release
+itself never needed to know where the catalog lives, only the DSNs do.
+*/}}
+{{- if .Values.postgres.bundled -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -72,3 +79,4 @@ spec:
         storageClassName: {{ .Values.storageClass }}
         resources:
           requests: {storage: 10Gi}
+{{- end -}}

@@ -629,8 +629,16 @@ def evicted_midquery(expect_classified=False):
 
     def write():
         try:
-            sql(connection, f"insert into {table} "
-                            "select range from range(200000000) where range % 13 = 5")
+            connection.client.request("POST", connection.path + "/queries", {
+                "request_id": str(uuid.uuid4()),
+                # Sized to outlive the script's 2-second history polling plus the
+                # kill's latency on fast hardware — at 200M a local run finished
+                # before the kill landed and the hard mode proved nothing — while
+                # staying inside the explicit timeout on the slowest runner seen.
+                "sql": f"insert into {table} "
+                       "select range from range(2000000000) where range % 13 = 5",
+                "timeout_seconds": 58,
+            })
             outcome["committed"] = True
         except RemoteError as error:
             outcome["classified"] = {"status": error.status, "kind": error.failure_kind,

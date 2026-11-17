@@ -11,6 +11,16 @@ spec:
   egress:
     - to: [{podSelector: {}}]
       ports: [{port: 8080}, {port: 5432}]
+    {{- if and (not .Values.postgres.bundled) .Values.postgres.externalCidrs }}
+    # The catalog lives outside the namespace, at addresses the operator named —
+    # a database cannot be selected by pod, and defaulting this would open egress
+    # to a server nobody declared.
+    - to:
+        {{- range .Values.postgres.externalCidrs }}
+        - ipBlock: {cidr: {{ . | quote }}}
+        {{- end }}
+      ports: [{port: {{ .Values.postgres.port }}}]
+    {{- end }}
     # Cluster DNS is permitted both by selector and by address, because no single
     # form works on every topology. A cluster with CoreDNS pods in kube-system is
     # matched by the selector below. EKS Auto Mode runs DNS as a managed component

@@ -140,6 +140,14 @@ rate_version, rate_value = next(iter(cards.values()))
 assert rate_version and rate_value and rate_value.isdigit() and int(rate_value) >= 1, (
     f'the rate card must be a named version and a positive integer rate: '
     f'{rate_version!r} {rate_value!r}')
+# The catalog is either bundled or the operator's, never a partial mix: a render
+# carrying the StatefulSet without its Service or init would start a database
+# nothing can reach or seed. Whether named external addresses reach the egress
+# policy is proven in check-infra, which knows the values the render was given.
+bundled_parts = [('StatefulSet', 'duckfleet-postgres'), ('Service', 'postgres'),
+                 ('ConfigMap', 'duckfleet-postgres-init')]
+present = [part for part in bundled_parts if part in by_name]
+assert present in ([], bundled_parts), f'a partial bundled postgres: {present}'
 # Exposure is opt-in. A default render stays ClusterIP-only with no Ingress at all;
 # an exposed render must terminate TLS on every host it serves, refuse plain HTTP,
 # point only at the gateway, and come with the NetworkPolicy door the controller

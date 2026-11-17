@@ -33,7 +33,7 @@ access and a decision about recurring cost.
 | Object storage | `duckfleet-dev-797781631727-us-east-2`, private, TLS, encryption, versioning |
 | Worker IAM | `duckfleet-dev-worker`, one Pod Identity association for `duckfleet-dev/duckfleet-worker` |
 | Registry | `duckfleet-dev/worker`, `duckfleet-dev/dbt`, immutable tags/digests |
-| Metadata + history | dedicated PostgreSQL StatefulSet, separate `lake` and `platform` databases, 10 GiB encrypted gp3 PVC |
+| Metadata + history | dedicated PostgreSQL StatefulSet, separate `lake` and `platform` databases, 10 GiB encrypted gp3 PVC; the chart's `postgres.bundled: false` swaps it for an operator-run server |
 | API | private ClusterIP; no ingress, public IP, DNS or load balancer — the chart's opt-in `exposure` values stay off here, and the render checks prove the default produces no Ingress |
 
 The smallest test uses two **prestarted pods**, 1 CPU / 1 GiB and 2 CPU / 2 GiB,
