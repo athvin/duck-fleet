@@ -82,6 +82,7 @@
         "computeMicroUsdPerUnitHour": {"type": "integer", "minimum": 1}
       }
     },
+    "historyRetentionDays": {"type": "integer", "minimum": 0, "maximum": 3650},
     "exposure": {
       "type": "object",
       "additionalProperties": false,

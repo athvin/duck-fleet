@@ -75,6 +75,10 @@ pub(crate) struct Worker {
     /// reservation copies it, so recovery prices work at the card it was admitted
     /// under rather than whatever a later process runs with.
     rate: pricing::RateCard,
+    /// How long query history is kept, `None` meaning forever — the default. The
+    /// ledger has no retention at all: it is billing evidence, not diagnostics.
+    retention_days: Option<i32>,
+    last_prune: Instant,
     ledger: Ledger,
     sessions: HashMap<Uuid, Session>,
     active: ActiveSlot,
@@ -103,6 +107,25 @@ fn env_micro_usd(name: &str, default: i64) -> Result<i64> {
             Ok(value)
         }
     }
+}
+
+/// Parses `DUCKFLEET_HISTORY_RETENTION_DAYS`. Absent or `0` keeps history forever,
+/// which is the default: throwing away records is a decision an operator makes,
+/// never one a default makes for them.
+fn retention_days_from(value: Option<String>) -> Result<Option<i32>> {
+    let Some(text) = value else { return Ok(None) };
+    let days: i64 = text
+        .trim()
+        .parse()
+        .ok()
+        .filter(|days| (0..=3650).contains(days))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DUCKFLEET_HISTORY_RETENTION_DAYS must be a whole number of days, \
+                 0 (keep forever) to 3650 ({text:?})"
+            )
+        })?;
+    Ok((days > 0).then_some(days as i32))
 }
 
 /// How long startup waits for a catalog that is not reachable yet. Bounded so a
@@ -498,6 +521,10 @@ impl Worker {
             dedicated,
             served: 0,
             rate,
+            retention_days: retention_days_from(
+                std::env::var("DUCKFLEET_HISTORY_RETENTION_DAYS").ok(),
+            )?,
+            last_prune: Instant::now(),
             ledger: Ledger {
                 client: ledger,
                 dsn: platform_dsn,
@@ -520,12 +547,75 @@ impl Worker {
     }
 
     pub(crate) fn run(&mut self, mut receiver: mpsc::Receiver<Envelope>) {
+        // Startup drains any backlog the hourly sweeps missed while this worker was
+        // down; afterwards one bounded batch per hour keeps up with new expiry
+        // without ever holding the engine's queue behind a long delete.
+        self.prune_history(1000);
+        self.last_prune = Instant::now();
         while let Some(envelope) = receiver.blocking_recv() {
             // Dropping a connection rolls back an abandoned transaction.
             self.sessions
                 .retain(|_, s| s.touched.elapsed() < Duration::from_secs(300));
+            if self.last_prune.elapsed() >= Duration::from_secs(3600) {
+                self.prune_history(1);
+                self.last_prune = Instant::now();
+            }
             let response = self.handle(envelope.op);
             let _ = envelope.reply.send(response);
+        }
+    }
+
+    /// Deletes history older than the configured retention, in bounded batches so a
+    /// sweep between two statements cannot stall the engine behind it. Only
+    /// `query_history` is touched — the ledger has no retention, so a pruned
+    /// query's usage event remains the proof of what ran, when, and at what cost.
+    /// A sweep that removed anything records itself in history under the
+    /// `platform` principal, making the operation as visible as what it removed.
+    fn prune_history(&mut self, max_batches: usize) {
+        let Some(days) = self.retention_days else {
+            return;
+        };
+        let mut pruned: u64 = 0;
+        for _ in 0..max_batches {
+            match self.ledger.execute(
+                "pruning expired history",
+                "DELETE FROM query_history WHERE ctid IN (
+                     SELECT ctid FROM query_history
+                     WHERE accepted_at < now() - ($1::int * interval '1 day')
+                       AND status <> 'running'
+                     LIMIT 5000)",
+                &[&days],
+            ) {
+                Ok(0) => break,
+                Ok(removed) => pruned += removed,
+                // Already reported by the ledger; the next sweep tries again.
+                Err(_) => break,
+            }
+        }
+        if pruned > 0 {
+            let audit = json!({
+                "operation": "history_retention",
+                "pruned": pruned,
+                "retention_days": days,
+            });
+            let _ = self.ledger.execute(
+                "recording a retention sweep",
+                "INSERT INTO query_history (query_id, session_id, sql, context, status,
+                     worker_id, placement, principal, finished_at, elapsed_ms, result_rows)
+                 VALUES ($1, 'platform', '-- history retention sweep', $2, 'succeeded',
+                     $3, '{}', 'platform', now(), 0, $4)",
+                &[
+                    &Uuid::new_v4().to_string(),
+                    &audit.to_string(),
+                    &self.worker_id,
+                    &i64::try_from(pruned).unwrap_or(i64::MAX),
+                ],
+            );
+            tracing::info!(
+                pruned,
+                retention_days = days,
+                "pruned expired query history"
+            );
         }
     }
 
@@ -797,6 +887,21 @@ fn execute(conn: &Connection, sql: &str, parameters: Vec<SqlValue>) -> Result<(V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_defaults_to_forever_and_rejects_what_it_cannot_keep() {
+        // Absent and explicit zero both mean "keep everything".
+        assert_eq!(retention_days_from(None).unwrap(), None);
+        assert_eq!(retention_days_from(Some("0".into())).unwrap(), None);
+        assert_eq!(retention_days_from(Some("365".into())).unwrap(), Some(365));
+        assert_eq!(retention_days_from(Some(" 90 ".into())).unwrap(), Some(90));
+        for bad in ["-1", "3651", "0.5", "forever", ""] {
+            assert!(
+                retention_days_from(Some(bad.into())).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn only_unestablished_connections_are_waited_out() {
