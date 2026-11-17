@@ -89,8 +89,17 @@ for o in objects:
 assert len(set(placements.values())) == 1, (
     f'pods disagree about where they run: {placements}')
 selector, tolerations = next(iter(placements.values()))
-assert 'karpenter.sh/nodepool' in selector, selector
-assert tolerations != 'null' and 'duckfleet.io/dedicated' in tolerations, tolerations
+# The invariant is that the two halves agree, not that either is present. Pinning the
+# DuckFleet node pool without tolerating its taint renders a release whose every pod is
+# permanently Pending; tolerating it without pinning lets a pod land on a neighbour's
+# node. Requiring the pin outright would be a different claim — that the ownership
+# boundary has already been applied wherever this chart is rendered — which is for
+# values to decide, not for this gate.
+pinned = 'karpenter.sh/nodepool' in selector
+tolerated = tolerations != 'null' and 'duckfleet.io/dedicated' in tolerations
+assert pinned == tolerated, (
+    f'the DuckFleet node pool is {"pinned" if pinned else "not pinned"} but '
+    f'{"tolerated" if tolerated else "not tolerated"}: {selector} / {tolerations}')
 # The gateway routes to endpoints it was given, so every one must name a Service the
 # release actually renders. A URL pointing at nothing would look like a missing
 # worker class at request time rather than a packaging mistake at render time.
