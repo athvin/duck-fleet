@@ -13,7 +13,14 @@ from duckfleet import Client, RemoteConnection, RemoteError
 SMALL = {"cpu": 1, "memory": "1Gi"}
 MEDIUM = {"cpu": 2, "memory": "2Gi"}
 # Large enough to need interrupting, without allocating a huge table.
-LONG_SQL = "select sum(a.i * b.i) from range(1000000000) a(i), range(1000000000) b(i)"
+# Long in time, flat in memory, deliberately: this statement exists to outlive a
+# 1-second timeout and a ~2-second cost cap, nothing more. The cross join it
+# replaced buffered its build side up to the engine's memory cap and spilled the
+# rest, and the dirty spill pages count against the container's cgroup — on a fast
+# disk that crossed worker-small's 1 GiB and the OOM killer won the race against
+# the budget interrupt. A single range scan streams in constant memory, so the
+# interrupt always wins (duck-fleet#64).
+LONG_SQL = "select count(*) from range(4000000000) where range % 7 = 3"
 
 
 def require(condition, message):
