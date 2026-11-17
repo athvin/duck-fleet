@@ -56,7 +56,16 @@ for size, cpu in [('small', 1), ('medium', 2)]:
     probe = container['startupProbe']
     assert int(env['DUCKFLEET_CATALOG_WAIT_SECONDS']) <= probe['periodSeconds'] * probe['failureThreshold']
 for o in objects:
-    assert o['kind'] not in ['Ingress', 'ClusterRole', 'ClusterRoleBinding', 'NodePool']
+    # The release contains only what the deploy identity may create. Roles,
+    # RoleBindings and ResourceQuotas belong to the ownership boundary an operator
+    # applies (infra/kubernetes/boundary) — check-access.sh asserts the deploy cannot
+    # create any of the three, so a chart that rendered one could not install itself.
+    # That is exactly how isolated compute came to be undeployable, so it is asserted
+    # here rather than left to be rediscovered.
+    assert o['kind'] not in ['Ingress', 'ClusterRole', 'ClusterRoleBinding', 'NodePool',
+                             'Role', 'RoleBinding', 'ResourceQuota'], (
+        f"{o['kind']}/{o['metadata']['name']} is a boundary object, not a release "
+        'object; move it to infra/kubernetes/boundary')
     if o['kind'] == 'Service':
         assert o['spec'].get('type', 'ClusterIP') == 'ClusterIP'
     if o['kind'] in ['Deployment', 'StatefulSet', 'Job']:
@@ -103,46 +112,36 @@ assert any('ipBlock' in peer for rule in dns_rules for peer in rule['to']), (
     'DNS must also be reachable by address; a selector matches nothing on EKS Auto Mode'
 )
 
-# On-demand compute is the one capability that needs the gateway to hold a Kubernetes
-# token, so the whole of it renders together or not at all. A release with the token
-# but not the Role, or the Role but not the egress rule, would fail somewhere less
-# obvious than here.
-ISOLATED = [('ServiceAccount', 'duckfleet-gateway'),
-            ('Role', 'duckfleet-isolated-pods'),
-            ('RoleBinding', 'duckfleet-isolated-pods'),
-            ('NetworkPolicy', 'duckfleet-gateway-kubernetes'),
+# On-demand compute needs the gateway to hold a Kubernetes token, so the parts of it
+# the release owns render together or not at all. The Role that makes that token useful
+# is not among them: the deploy identity cannot create Roles, so it belongs to the
+# ownership boundary an operator applies (#39), where tests/test_aws_ci.py asserts its
+# shape. A release with the token but not the egress rule would still fail somewhere
+# less obvious than here.
+ISOLATED = [('NetworkPolicy', 'duckfleet-gateway-kubernetes'),
             ('ConfigMap', 'duckfleet-isolated-pod')]
 present = [key for key in ISOLATED if key in by_name]
 assert not present or len(present) == len(ISOLATED), (
     f'isolated compute is half-rendered: {present}')
 
+# Rendered whether or not isolation is wired up, so the gateway pod can always start:
+# a ServiceAccount the Deployment named but nothing created leaves the pod unable to
+# mount its token. Unbound, it grants nothing.
+assert by_name['ServiceAccount', 'duckfleet-gateway']['automountServiceAccountToken'] is True
+# Only the gateway holds one. A worker runs user SQL, so a token there would let a
+# query reach the API server.
+for account in ['duckfleet-worker', 'duckfleet-no-aws']:
+    assert by_name['ServiceAccount', account]['automountServiceAccountToken'] is False
+
 gateway_pod = by_name['Deployment', 'server']['spec']['template']['spec']
 if not present:
-    # The default, and what every deploy into a namespace DuckFleet does not own must
-    # keep producing: no token, so no ability to create pods, so `compute: isolated`
-    # is refused rather than served from a shared worker.
+    # The default: the gateway runs as the identity that mounts no token at all, so it
+    # cannot reach the API server whatever RBAC exists, and `compute: isolated` is
+    # refused rather than served from a shared worker.
     assert gateway_pod['serviceAccountName'] == 'duckfleet-no-aws'
     assert not gateway_pod.get('volumes'), gateway_pod.get('volumes')
-    for account in ['duckfleet-worker', 'duckfleet-no-aws']:
-        assert by_name['ServiceAccount', account]['automountServiceAccountToken'] is False
 else:
     assert gateway_pod['serviceAccountName'] == 'duckfleet-gateway'
-    assert by_name['ServiceAccount', 'duckfleet-gateway']['automountServiceAccountToken'] is True
-    # Only the gateway. A worker runs user SQL, so a token there would let a query
-    # reach the API server.
-    for account in ['duckfleet-worker', 'duckfleet-no-aws']:
-        assert by_name['ServiceAccount', account]['automountServiceAccountToken'] is False
-
-    # Pods in this namespace and nothing else. `secrets` would hand the gateway the
-    # catalog password it deliberately never reads; roles would let it widen itself.
-    rules = by_name['Role', 'duckfleet-isolated-pods']['rules']
-    assert len(rules) == 1, rules
-    assert rules[0]['apiGroups'] == [''] and rules[0]['resources'] == ['pods'], rules
-    assert sorted(rules[0]['verbs']) == ['create', 'delete', 'get', 'list', 'watch'], rules
-    binding = by_name['RoleBinding', 'duckfleet-isolated-pods']
-    assert binding['roleRef'] == {'apiGroup': 'rbac.authorization.k8s.io', 'kind': 'Role',
-                                  'name': 'duckfleet-isolated-pods'}, binding['roleRef']
-    assert [s['name'] for s in binding['subjects']] == ['duckfleet-gateway']
 
     # Reaching the API server is a new egress edge. It stays the gateway's alone, on
     # HTTPS, to declared private addresses: a SQL engine that could reach port 443

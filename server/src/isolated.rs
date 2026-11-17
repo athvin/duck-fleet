@@ -49,10 +49,12 @@ pub(crate) struct Pod {
 }
 
 impl Isolation {
-    /// `Ok(None)` when this deployment does not run isolated compute, which is the
-    /// normal case: the gateway needs RBAC to create pods and the deploy asserts it
-    /// cannot grant itself any, so the chart renders none of this unless it is
-    /// explicitly enabled. See #39.
+    /// `Ok(None)` when this deployment is not wired for isolated compute, which is
+    /// what the chart renders unless it is explicitly enabled.
+    ///
+    /// Being wired for it is not the same as being permitted: the grant lives outside
+    /// the release, so `permitted` below is what settles whether this can actually
+    /// create pods. See #39.
     pub fn configure() -> anyhow::Result<Option<Self>> {
         let Ok(path) = std::env::var("DUCKFLEET_ISOLATED_POD") else {
             return Ok(None);
@@ -92,6 +94,20 @@ impl Isolation {
         }))
     }
 
+    /// Whether the cluster permits what this deployment is configured to do.
+    ///
+    /// The Role that allows pod creation is applied by an operator with cluster
+    /// admin, separately from the release, because the deploy identity cannot create
+    /// Roles and `scripts/aws/check-access.sh` fails the deploy if it ever can. So a
+    /// chart value records an intention and this is the only statement of fact.
+    ///
+    /// Checked at startup rather than per session: a caller asking for isolation
+    /// should be refused up front with a reason, not have a statement fail once a pod
+    /// could not be created.
+    pub async fn permitted(&self) -> anyhow::Result<()> {
+        self.kube.assert_pod_grant().await
+    }
+
     /// Creates a pod and waits for it to be ready, or removes it and says why.
     ///
     /// No path here falls back to a persistent worker. A caller asking for isolation
@@ -104,13 +120,31 @@ impl Isolation {
             ApiError::internal()
         })?;
         self.kube.create_pod(&spec).await.map_err(|error| {
-            tracing::error!(%error, "creating a session pod failed");
-            // Deliberately not NOT_PLACEABLE: a call that timed out may still have
-            // created a pod, so this cannot promise the request left nothing behind.
-            ApiError::new(
-                failure::UNAVAILABLE,
-                format!("could not create a pod for this session; no statement ran: {error}"),
-            )
+            tracing::error!(
+                error = format!("{error:#}"),
+                "creating a session pod failed"
+            );
+            if crate::kube::declined(&error) {
+                // The API server refused before the pod existed — the namespace quota
+                // or an admission webhook — so this provably left nothing behind and a
+                // smaller request may succeed. Same answer as an unschedulable pod,
+                // reached without creating one, and carrying the refusal's own words so
+                // the ceiling that was hit is named rather than guessed.
+                ApiError::new(
+                    failure::NOT_PLACEABLE,
+                    format!(
+                        "this session could not be placed: {error:#}. No statement ran and \
+                         the request was not downgraded to a shared worker"
+                    ),
+                )
+            } else {
+                // Deliberately not NOT_PLACEABLE: a call that timed out may still have
+                // created a pod, so this cannot promise the request left nothing behind.
+                ApiError::new(
+                    failure::UNAVAILABLE,
+                    format!("could not create a pod for this session; no statement ran: {error:#}"),
+                )
+            }
         })?;
         match self.await_ready(&name).await {
             Ok(endpoint) => Ok(Pod { name, endpoint }),
@@ -130,7 +164,7 @@ impl Isolation {
                 .pod(name)
                 .await
                 .map_err(|error| {
-                    tracing::warn!(%error, "reading a session pod failed");
+                    tracing::warn!(error = format!("{error:#}"), "reading a session pod failed");
                     ApiError::internal()
                 })?
                 .ok_or_else(|| {
@@ -186,7 +220,11 @@ impl Isolation {
     /// ran. The ledger is settled by the caller either way.
     pub async fn stop(&self, name: &str) {
         if let Err(error) = self.kube.delete_pod(name).await {
-            tracing::error!(%error, pod = name, "could not delete a session pod");
+            tracing::error!(
+                error = format!("{error:#}"),
+                pod = name,
+                "could not delete a session pod"
+            );
         }
     }
 
@@ -219,7 +257,10 @@ impl Isolation {
                     }
                 }
             }
-            Err(error) => tracing::error!(%error, "could not list session pods to sweep"),
+            Err(error) => tracing::error!(
+                error = format!("{error:#}"),
+                "could not list session pods to sweep"
+            ),
         }
     }
 }

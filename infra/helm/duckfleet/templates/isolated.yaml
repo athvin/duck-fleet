@@ -1,12 +1,17 @@
 {{/*
 On-demand compute: one pod per session, with the resources the caller asked for.
 
-Everything here renders only when `isolatedCompute.enabled` is true, because the
-gateway cannot create pods without RBAC and `scripts/aws/check-access.sh` asserts the
-deploy identity *cannot* grant it — failing the deploy if that permission ever
-appears. Rendering a Role unconditionally would therefore break every deploy into a
-namespace DuckFleet does not own. Where this is off, `compute: isolated` is refused
-with `compute_unavailable` and no statement runs. See #39.
+Only application objects, because only those are the deploy's to create. The gateway's
+ServiceAccount, the Role that lets it create pods and the quota that caps them live in
+infra/kubernetes/boundary and are applied by an operator holding cluster admin — the
+deploy identity can create none of the three, and `scripts/aws/check-access.sh` asserts
+it cannot. A chart that rendered them could not install itself.
+
+So this flag no longer decides whether the gateway *may* create pods, only whether this
+deployment is wired to. The gateway asks the API server whether it holds the grant and
+reports the answer, so enabling this without the boundary applied degrades to the same
+`compute_unavailable` refusal as leaving it off: no statement runs, and the request is
+never downgraded to a shared worker.
 */}}
 {{- if .Values.isolatedCompute.enabled }}
 {{- if not .Values.isolatedCompute.apiServerCidrs }}
@@ -15,39 +20,6 @@ with `compute_unavailable` and no statement runs. See #39.
 {{- if not .Values.isolatedCompute.apiServerPorts }}
 {{- fail "isolatedCompute.enabled requires apiServerPorts: the API server's endpoint port is not always 443, and an empty list would render a rule matching every port" }}
 {{- end }}
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: duckfleet-gateway
-# The one identity in this release that holds a token. The workers and the default
-# gateway identity mount none.
-automountServiceAccountToken: true
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: duckfleet-isolated-pods
-# Pods in this namespace and nothing else. Notably absent: secrets, which the pods
-# read through the kubelet rather than through the gateway; and roles/rolebindings,
-# so the gateway cannot widen its own grant.
-rules:
-  - apiGroups: [""]
-    resources: [pods]
-    verbs: [create, get, list, watch, delete]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: duckfleet-isolated-pods
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: duckfleet-isolated-pods
-subjects:
-  - kind: ServiceAccount
-    name: duckfleet-gateway
-    namespace: {{ .Release.Namespace }}
----
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

@@ -124,16 +124,26 @@ A request carries a mode as well as a size. `persistent` selects an exact
 matching, prestarted worker, shared with other sessions of the same size.
 `isolated` creates a pod for that session alone, with requests equal to limits,
 and removes it afterwards; nothing else is admitted to that pod, before or after.
-An unplaceable isolated request is refused with the scheduler's own reason and is
-never downgraded to a shared worker.
+An isolated request that cannot be served is refused with the refusing component's
+own reason — the namespace quota's, when the size is beyond what the namespace may
+hold at all, or the scheduler's, when no node can hold it — and is never downgraded
+to a shared worker. Both are retry-safe: no statement ran, and a smaller request
+may succeed.
 
 Isolated compute is **off by default**, and where it is off the mode is refused
 with `501 compute_unavailable` rather than quietly served. It needs the gateway to
-hold a namespaced Role over pods, and the development deploy identity is not
-permitted to create Roles — `scripts/aws/check-access.sh` asserts it cannot and
-fails the deploy if that ever changes. So `make test-k8s` is where the feature
-actually runs, against a cluster that is ours to grant; `duck-fleet#39` tracks the
-grant that would turn it on in the shared development namespace.
+hold a namespaced Role over pods, which is not the deploy's to create:
+`scripts/aws/check-access.sh` asserts the deploy identity cannot create Roles and
+fails the deploy if that ever changes. The grant lives in
+`infra/kubernetes/boundary` and an operator applies it once with
+`scripts/aws/apply-boundary.sh`; see `infra/README.md`.
+
+The gateway asks the API server whether it actually holds that grant and reports
+the answer as `isolated_compute` on `GET /v1/workers`, so the chart value records
+an intention and the cluster is the only statement of fact. Enabling the mode
+without the grant is inert rather than broken — the same refusal, and no statement
+runs — and removing the `RoleBinding` is a supported way to turn the feature off.
+`duck-fleet#39` tracks switching it on for the shared development namespace.
 
 The harness builds `fct_orders` on medium and `customer_totals` on small, checks
 resource settings inside the materialized results, then rebuilds `fct_orders` on

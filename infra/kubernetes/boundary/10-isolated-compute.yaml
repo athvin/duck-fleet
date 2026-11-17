@@ -1,0 +1,46 @@
+# The one grant isolated compute needs.
+#
+# This is deliberately not in the Helm chart. The deploy identity cannot create Roles,
+# and scripts/aws/check-access.sh asserts it cannot — failing the deploy if that
+# permission ever appears. A chart that rendered this would therefore be unable to
+# install itself, which is why isolated compute was disabled everywhere but the kind
+# harness until this file existed (#39).
+#
+# Applied by an operator holding cluster admin. Granting a capability is a different
+# act from deploying a release, and keeping them separate is what lets the deploy stay
+# unable to widen its own permissions.
+#
+# The subject is created by the chart, not here, so that a gateway pod can start
+# whether or not this file has been applied. A RoleBinding naming a ServiceAccount
+# that does not exist yet is legal and inert — RBAC resolves subjects by name when a
+# request arrives — so the two may be applied in either order.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: duckfleet-isolated-pods
+  namespace: "${namespace}"
+# Pods in this namespace and nothing else. Notably absent: secrets, which the session
+# pods read through the kubelet rather than through the gateway; and roles and
+# rolebindings, so the gateway cannot widen its own grant even though the identity
+# that created this one could.
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, get, list, watch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duckfleet-isolated-pods
+  namespace: "${namespace}"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: duckfleet-isolated-pods
+subjects:
+  # Named with its namespace rather than relying on the binding's: a RoleBinding may
+  # bind a ServiceAccount from anywhere, so leaving this implicit is how a grant ends
+  # up pointing at a different deployment's gateway.
+  - kind: ServiceAccount
+    name: duckfleet-gateway
+    namespace: "${namespace}"

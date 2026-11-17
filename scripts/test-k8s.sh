@@ -57,7 +57,12 @@ docker build --tag duckfleet-dbt:local -f docker/dbt.Dockerfile .
 docker build --tag duckfleet-s3:local -f docker/s3.Dockerfile .
 kind load docker-image --name "$CLUSTER" duckfleet-worker:local duckfleet-dbt:local duckfleet-s3:local
 
-kubectl --context "$CONTEXT" create namespace "$NS"
+# The same boundary an operator applies to the real cluster, rather than a convenient
+# local equivalent: it creates the namespace, the pod grant isolated compute needs and
+# the quota that caps it. Applying the real thing is what makes this harness able to
+# catch a boundary that no longer matches the chart — a quota that rejected a pod, or a
+# grant missing a verb, would show up here instead of on a deploy.
+python3 scripts/aws/render_boundary.py "$NS" | kubectl --context "$CONTEXT" apply -f -
 # Same shape the AWS deploy generates, created here rather than committed.
 python3 - <<'PY' | "${KUBE[@]}" create -f -
 import json, secrets
@@ -165,7 +170,13 @@ await_no_isolated_pods() {
 await_no_isolated_pods
 harness duckfleet-isolated 'python /app/tests/harness.py --isolated' 600
 grep -q 'PASS: an isolated session ran on its own pod' artifacts/kind/duckfleet-isolated.log
-grep -q 'PASS: an unplaceable isolated request was refused' artifacts/kind/duckfleet-isolated.log
+# Both ceilings, named separately, because they refuse at different moments: the
+# namespace quota before a pod exists and the scheduler after one does. Asserting only
+# one would pass while the other path went untested.
+for ceiling in 'the namespace quota' 'the scheduler'; do
+  grep -q "PASS: an isolated request $ceiling cannot serve was refused" \
+    artifacts/kind/duckfleet-isolated.log
+done
 # Closed sessions leave no pods. Checked after the run rather than during it, because
 # "the pod existed" is proven by the session having answered at all.
 for _ in $(seq 1 30); do

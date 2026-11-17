@@ -54,14 +54,16 @@ dnsEgressCidrs:
 
 # On-demand compute: a pod per session, sized to the request.
 #
-# Off here, and not as a rollout gate. The gateway would need a Role to create pods,
-# and the deploy identity cannot create Roles — check-access.sh asserts it cannot and
-# fails the deploy if that ever changes. Enabling this in a namespace DuckFleet does
-# not own would therefore break the release, so the local Kubernetes harness is where
-# it runs. #39 tracks the grant; #12 removes the need for it.
+# This wires the deployment for it; it does not grant it. The Role that lets the
+# gateway create pods lives in infra/kubernetes/boundary and an operator applies it,
+# because the deploy identity cannot create Roles and check-access.sh fails the deploy
+# if it ever can. So turning this on where the boundary has not been applied is safe
+# but inert: the gateway asks the API server whether it holds the grant and reports the
+# answer, and the deploy warns rather than claiming the feature shipped (#39).
 #
-# Where this is false, `compute: isolated` returns compute_unavailable, no statement
-# runs, and the request is never downgraded to a shared worker.
+# Off here until the boundary is applied to the development cluster. Where it is off —
+# or on without the grant — `compute: isolated` returns compute_unavailable, no
+# statement runs, and the request is never downgraded to a shared worker.
 isolatedCompute:
   enabled: false
   # Hard ceiling on a session pod's life, enforced by the kubelet rather than by the

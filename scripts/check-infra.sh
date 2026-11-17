@@ -44,7 +44,29 @@ helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$valu
   --set isolatedCompute.enabled=true \
   --set 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32' > "$isolated"
 python3 scripts/check-chart.py "$isolated" > /dev/null
-echo 'PASS: isolated compute renders its own identity, scoped RBAC and API egress'
+echo 'PASS: isolated compute renders its pod template and API egress, and no RBAC'
+# The grant and the quota live outside the release because the deploy identity cannot
+# create either. Render the boundary for the same namespace the chart is restricted to
+# and prove the two do not overlap: anything in both would be applied twice, by two
+# identities, with the operator's copy silently losing to the release's.
+boundary="$validation_dir/boundary.yaml"
+python3 scripts/aws/render_boundary.py duckfleet-dev > "$boundary"
+python3 - "$isolated" "$boundary" <<'PY'
+import sys, yaml
+def identify(path):
+    with open(path) as handle:
+        return {(d['kind'], d['metadata']['name'])
+                for d in yaml.safe_load_all(handle) if d}
+release, boundary = identify(sys.argv[1]), identify(sys.argv[2])
+both = release & boundary
+assert not both, f'claimed by both the release and the boundary: {sorted(both)}'
+# The gateway's identity is the hinge: the chart must create it so its pod can start,
+# and the boundary must bind it so it can do anything. One without the other is a
+# gateway that either cannot run or cannot work.
+assert ('ServiceAccount', 'duckfleet-gateway') in release
+assert ('RoleBinding', 'duckfleet-isolated-pods') in boundary
+PY
+echo 'PASS: the release and the ownership boundary are disjoint and meet at the gateway identity'
 # Enabling it without saying where the API server is must fail the render. Defaulting
 # that would mean opening egress to reach an address nobody declared.
 if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \

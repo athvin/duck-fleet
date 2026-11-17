@@ -282,19 +282,31 @@ def isolated_checks():
         require(row["placement"]["worker_id"] == pod, str(row["placement"]))
     print(f"PASS: an isolated session ran on its own pod {pod} and reported its real cgroup")
 
-    # A size no node can hold must be refused with the scheduler's reason, and must
-    # never be quietly served by a persistent worker.
-    refused = expect_error(503, lambda: Client(URL, TOKEN).request(
-        "POST", "/v1/sessions",
-        {"compute": {"compute": "isolated", "cpu": 64, "memory": "512Gi"}}))
-    require("not downgraded" in str(refused), str(refused))
-    # The scheduler's own words, so the shortfall is actionable rather than guessed.
-    require("Insufficient" in str(refused), str(refused))
-    # Its own kind, not the generic one an internal failure shares: nothing ran, and
-    # unlike a deployment that cannot isolate at all, capacity may differ later.
-    require(refused.failure_kind == "not_placeable", str(refused))
-    require(refused.retry_safe is True, str(refused))
-    print("PASS: an unplaceable isolated request was refused, not downgraded")
+    # A size that cannot be served must be refused, must say which ceiling it hit, and
+    # must never be quietly served by a persistent worker. There are two ceilings and
+    # they fail at different moments, so both are exercised: the namespace quota
+    # refuses at admission before a pod exists, while a size within the quota but
+    # larger than any node is refused by the scheduler after one does.
+    for wanted, expected, what in [
+        ({"cpu": 64, "memory": "512Gi"}, "exceeded quota", "the namespace quota"),
+        # Comfortably inside the quota — it has headroom for several more pods this
+        # size — and far beyond what one node holds, so which ceiling answers is not a
+        # matter of timing.
+        ({"cpu": 11, "memory": "12Gi"}, "Insufficient", "the scheduler"),
+    ]:
+        refused = expect_error(503, lambda w=wanted: Client(URL, TOKEN).request(
+            "POST", "/v1/sessions", {"compute": {"compute": "isolated", **w}}))
+        require("not downgraded" in str(refused), str(refused))
+        # The refusing component's own words, so the shortfall is actionable rather
+        # than guessed.
+        require(expected in str(refused), f"expected {what}: {refused}")
+        # Its own kind, not the generic one an internal failure shares: nothing ran,
+        # and unlike a deployment that cannot isolate at all, capacity may differ
+        # later. A quota refusal reaches this too — it changed nothing, so retrying a
+        # smaller request is safe.
+        require(refused.failure_kind == "not_placeable", str(refused))
+        require(refused.retry_safe is True, str(refused))
+        print(f"PASS: an isolated request {what} cannot serve was refused, not downgraded")
 
     # Metered under the pod's own identity, which is what makes an isolated bill
     # attributable: the pod is gone, so this row is the only remaining record of it.

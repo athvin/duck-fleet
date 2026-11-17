@@ -1,0 +1,41 @@
+# What bounds the grant above.
+#
+# The gateway creates pods on demand, so a bug in session cleanup is a bill rather
+# than an error — and on a shared cluster it is someone else's capacity. The four
+# removal layers in server/src/isolated.rs are what make that unlikely; this is what
+# makes it survivable. A runaway creation loop stops here instead of filling the
+# cluster.
+#
+# Set by the operator, not by DuckFleet: scripts/aws/check-access.sh asserts the
+# deploy identity cannot create resourcequotas, so this is a ceiling the deploy cannot
+# raise on its own behalf.
+#
+# The numbers, measured rather than estimated. The kind harness is the tighter case,
+# because it runs a local object store the AWS lane does not: with the gateway, both
+# persistent workers, PostgreSQL, the object store and a harness Job all up, it reports
+# `requests.cpu=2300m requests.memory=7Gi limits.cpu=9500m limits.memory=8960Mi` — and
+# the AWS lane sits below that on limits while requesting more, since the local
+# transform lowers CPU requests to fit one node.
+#
+# The headroom above that is what isolated sessions draw from, and `count/pods` is the
+# cap that matters: six pods are the standing fleet, so 24 leaves about eighteen session
+# pods at once, which is a working development lane and nowhere near a cluster.
+#
+# Only cpu and memory are bounded. Quotas are conditional — naming a resource here
+# makes it mandatory on every container in the namespace — and while every container
+# in the chart declares cpu and memory, the gateway and PostgreSQL declare no
+# ephemeral-storage. Adding it would reject them rather than bound them.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: duckfleet
+  namespace: "${namespace}"
+spec:
+  hard:
+    # Terminal pods are excluded by Kubernetes, so completed harness Jobs do not
+    # accumulate against this.
+    count/pods: "24"
+    requests.cpu: "16"
+    requests.memory: 24Gi
+    limits.cpu: "24"
+    limits.memory: 32Gi

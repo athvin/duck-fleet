@@ -452,6 +452,29 @@ fn worker_endpoints() -> anyhow::Result<Vec<String>> {
 }
 
 pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
+    // Configured and permitted are different questions, and only the API server can
+    // answer the second: the Role that allows pod creation is applied outside this
+    // release by an operator. Resolved here, once, so `isolated_compute` below reports
+    // what this gateway can actually do.
+    let isolation = match Isolation::configure()? {
+        None => None,
+        Some(isolation) => match isolation.permitted().await {
+            Ok(()) => Some(Arc::new(isolation)),
+            // Not fatal, deliberately. Everything else this gateway does still works,
+            // and reporting the capability as absent refuses `isolated` with a reason
+            // the caller can act on instead of failing their statement at pod-create
+            // time. At error level because this deployment asked for a feature that is
+            // not there — the message names the fix.
+            Err(error) => {
+                tracing::error!(
+                    error = format!("{error:#}"),
+                    "isolated compute is configured but this gateway is not permitted to \
+                     create pods; serving without it"
+                );
+                None
+            }
+        },
+    };
     let app = Gateway {
         client: Client::builder()
             .timeout(Duration::from_secs(75))
@@ -464,7 +487,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         capacity: Arc::new(Semaphore::new(64)),
         history: crate::history::Reader::new(std::env::var("PLATFORM_DSN")?),
         usage: crate::usage::Reader::new(std::env::var("PLATFORM_DSN")?),
-        isolation: Isolation::configure()?.map(Arc::new),
+        isolation,
     };
     // Before serving, so a pod this gateway is about to create can never be mistaken
     // for one a previous gateway abandoned.
