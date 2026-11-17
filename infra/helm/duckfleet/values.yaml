@@ -70,6 +70,14 @@ isolatedCompute:
   maxSessionSeconds: 1800
   # How long to wait for a pod to become ready before giving up and deleting it.
   readySeconds: 120
-  # Where the Kubernetes API server may be reached. Required when enabled: defaulting
-  # it would mean opening egress to reach an address nobody declared.
+  # Where the Kubernetes API server may be reached, and on which port. Both required
+  # when enabled: defaulting them would mean opening egress to reach an address nobody
+  # declared.
+  #
+  # These describe the API server's *endpoints*, not its Service address. Egress policy
+  # is evaluated after kube-proxy rewrites the destination, so a rule written against
+  # the ClusterIP matches nothing — which denied the gateway outright the first time
+  # the local harness enforced policy at all. `scripts/aws/check-api-egress.py`
+  # asserts these cover the cluster's real endpoints before a release is applied.
   apiServerCidrs: []
+  apiServerPorts: [443]

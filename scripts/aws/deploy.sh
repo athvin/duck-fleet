@@ -8,6 +8,10 @@ assert_cluster
 # A policy that cannot reach the cluster's resolver presents as an unreachable
 # catalog, which cost six deploys to diagnose. Fail here instead.
 python3 scripts/aws/check-dns-egress.py "$DUCKFLEET_CLUSTER" "$AWS_REGION"
+# And that the gateway may reach the API server, when isolated compute is enabled. A
+# rule written against the Service address matches nothing once kube-proxy has
+# rewritten the destination; see #32.
+python3 scripts/aws/check-api-egress.py "$KUBE_CONTEXT"
 # Require the existing EKS Auto Mode storage class, never change ER cluster objects.
 [[ $("${KUBE[@]}" get storageclass gp3 -o jsonpath='{.provisioner}') == ebs.csi.eks.amazonaws.com ]] || {
   echo 'Expected Auto Mode gp3 storage class is unavailable' >&2; exit 1;

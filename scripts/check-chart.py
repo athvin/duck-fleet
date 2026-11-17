@@ -134,7 +134,12 @@ else:
     assert api['podSelector']['matchLabels'] == {'app': 'duckfleet-gateway'}
     assert api['policyTypes'] == ['Egress']
     for rule in api['egress']:
-        assert {port['port'] for port in rule['ports']} == {443}, rule
+        # A port must be named, and only ports an API server actually listens on. An
+        # empty list would render a rule matching every port; 443 is the Service port
+        # and 6443 the usual endpoint port, and which one applies depends on the
+        # cluster because egress is matched after the destination is rewritten (#32).
+        declared = {port['port'] for port in rule['ports']}
+        assert declared and declared <= {443, 6443}, rule
         for peer in rule['to']:
             network = ipaddress.ip_network(peer['ipBlock']['cidr'])
             assert network.is_private, f'API egress must stay private, got {network}'
