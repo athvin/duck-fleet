@@ -87,7 +87,7 @@ impl Filter {
     }
 }
 
-const COLUMNS: &str = "query_id,session_id,sql,context,status,accepted_at::text,finished_at::text,elapsed_ms,result_rows,error,placement,history_id,worker_id,profile_status,metrics,failure_kind,retry_safe";
+const COLUMNS: &str = "query_id,session_id,sql,context,status,accepted_at::text,finished_at::text,elapsed_ms,result_rows,error,placement,history_id,worker_id,profile_status,metrics,failure_kind,retry_safe,principal";
 fn record(row: &Row) -> Value {
     fn json_column(row: &Row, column: usize) -> Value {
         serde_json::from_str(row.get::<_, &str>(column)).unwrap_or(Value::Null)
@@ -103,7 +103,10 @@ fn record(row: &Row) -> Value {
         "metrics":json_column(row,14),
         // Null on success, and on records written before this column existed.
         "failure_kind":row.get::<_, Option<String>>(15),
-        "retry_safe":row.get::<_, Option<bool>>(16)
+        "retry_safe":row.get::<_, Option<bool>>(16),
+        // Who the gateway authenticated for the session; `direct` for a worker
+        // addressed without one, and for records older than the column.
+        "principal":row.get::<_, String>(17)
     })
 }
 impl Reader {
@@ -184,8 +187,12 @@ impl Reader {
                 .map_err(|_| ApiError::internal())?
                 .ok_or_else(|| ApiError::new(failure::NOT_FOUND, "query not found"))?;
             let mut value = record(&row);
+            // Appended after COLUMNS above, so it is always the last column —
+            // counted from the end rather than hardcoded, which is how adding
+            // `principal` to COLUMNS once silently moved this to a column that
+            // happened to parse as null.
             value["profile"] = row
-                .get::<_, Option<&str>>(17)
+                .get::<_, Option<&str>>(row.len() - 1)
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(Value::Null);
             Ok(value)

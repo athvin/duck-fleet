@@ -98,6 +98,16 @@ pub(crate) const UNAUTHORIZED: Failure = Failure {
     http: StatusCode::UNAUTHORIZED,
 };
 
+/// A valid credential asking for something only the bootstrap may do. Distinct
+/// from `UNAUTHORIZED`: the caller is known, the request is understood, and
+/// resending it with the same credential can never succeed.
+pub(crate) const FORBIDDEN: Failure = Failure {
+    status: None,
+    kind: "forbidden",
+    retry_safe: false,
+    http: StatusCode::FORBIDDEN,
+};
+
 /// The request never reached the engine and needs correcting, not replaying.
 pub(crate) const INVALID_REQUEST: Failure = Failure {
     status: None,

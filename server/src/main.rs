@@ -1,5 +1,6 @@
 //! Local, single-tenant DuckFleet SQL service. All DuckDB work stays on one worker thread.
 mod compute;
+mod credentials;
 mod failure;
 mod gateway;
 mod history;
@@ -56,7 +57,9 @@ struct Envelope {
     reply: oneshot::Sender<Reply>,
 }
 enum Operation {
-    Open(SessionRequest),
+    /// The string is the principal the gateway authenticated, or `direct` for a
+    /// worker addressed without one.
+    Open(SessionRequest, String),
     Info,
     Close(Uuid),
     Query(Uuid, QueryRequest),
@@ -246,7 +249,11 @@ async fn dispatch(app: App, op: Operation) -> Reply {
         .map_err(|_| ApiError::new(failure::CAPACITY, "worker queue full or closed"))?;
     receiver.await.map_err(|_| ApiError::internal())?
 }
-async fn open(State(app): State<App>, request: Option<Json<SessionRequest>>) -> Reply {
+async fn open(
+    State(app): State<App>,
+    headers: HeaderMap,
+    request: Option<Json<SessionRequest>>,
+) -> Reply {
     // Only new sessions are refused. Queries on sessions already open continue, which
     // is the drain: the grace period bounds how long that can take, so a client cannot
     // hold this worker open indefinitely by continuing to send work.
@@ -259,7 +266,16 @@ async fn open(State(app): State<App>, request: Option<Json<SessionRequest>>) -> 
     }
     let request = request.map(|Json(r)| r).unwrap_or_default();
     request.validate()?;
-    dispatch(app, Operation::Open(request)).await
+    // The gateway names who it authenticated; reaching this worker at all already
+    // required the internal token, which is what makes the header trustworthy.
+    // Addressed directly, there is no authenticated principal to name.
+    let principal = headers
+        .get(credentials::PRINCIPAL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|principal| !principal.is_empty() && principal.len() <= 64)
+        .unwrap_or("direct")
+        .to_owned();
+    dispatch(app, Operation::Open(request, principal)).await
 }
 async fn info(State(app): State<App>) -> Reply {
     dispatch(app, Operation::Info).await

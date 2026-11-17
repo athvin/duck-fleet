@@ -1,12 +1,12 @@
 //! Pins each session to one configured worker. It never retries or reroutes SQL.
 use crate::{
-    ApiError, authorize,
+    ApiError,
     compute::{Mode, Resources, SessionRequest},
-    failure,
+    credentials, failure,
     isolated::Isolation,
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{StatusCode, header},
@@ -14,7 +14,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use postgres::NoTls;
 use reqwest::{Client, Method};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -63,6 +65,132 @@ struct Fleet {
     discovered: Instant,
 }
 
+/// Who a request authenticated as, attached by `authenticate` so handlers read a
+/// fact the middleware established rather than re-deriving it.
+#[derive(Clone)]
+enum Principal {
+    /// The environment token: the operator's bootstrap credential, and the only
+    /// principal allowed to manage credentials.
+    Bootstrap,
+    Named(Arc<str>),
+}
+impl Principal {
+    fn name(&self) -> &str {
+        match self {
+            Self::Bootstrap => credentials::BOOTSTRAP_PRINCIPAL,
+            Self::Named(name) => name,
+        }
+    }
+}
+
+/// Resolves bearer tokens: the bootstrap by comparison, issued credentials by
+/// digest lookup against the platform database, behind a short positive cache.
+struct Authn {
+    bootstrap: Arc<str>,
+    dsn: String,
+    /// digest → (principal, resolved at). Positive entries only, and cleared
+    /// whole on any revocation, so on this gateway a revocation bites at once and
+    /// `FRESH` only bounds how long a *deleted-underneath* database row lingers.
+    cache: Mutex<HashMap<String, (Arc<str>, Instant)>>,
+    /// Admission for lookups and credential management, separate from the history
+    /// readers' pool so an auth storm cannot starve history or vice versa.
+    lookups: Arc<Semaphore>,
+}
+impl Authn {
+    const FRESH: Duration = Duration::from_secs(15);
+
+    fn new(bootstrap: Arc<str>, dsn: String) -> Arc<Self> {
+        Arc::new(Self {
+            bootstrap,
+            dsn,
+            cache: Mutex::new(HashMap::new()),
+            lookups: Arc::new(Semaphore::new(8)),
+        })
+    }
+
+    async fn principal(&self, token: &str) -> Result<Principal, ApiError> {
+        if token == self.bootstrap.as_ref() {
+            return Ok(Principal::Bootstrap);
+        }
+        let hashed = credentials::digest(token);
+        if let Some((name, resolved)) = self.cache.lock().await.get(&hashed)
+            && resolved.elapsed() < Self::FRESH
+        {
+            return Ok(Principal::Named(name.clone()));
+        }
+        let lookup = hashed.clone();
+        let resolved = self
+            .with_db(false, move |client| credentials::resolve(client, &lookup))
+            .await?;
+        match resolved {
+            Some(principal) => {
+                let name: Arc<str> = principal.into();
+                self.cache
+                    .lock()
+                    .await
+                    .insert(hashed, (name.clone(), Instant::now()));
+                Ok(Principal::Named(name))
+            }
+            // Unknown, revoked and expired answer alike: a probe learns nothing
+            // about which it was, and none of them is worth a distinct code path.
+            None => Err(ApiError::new(failure::UNAUTHORIZED, "invalid bearer token")),
+        }
+    }
+
+    /// One blocking connection per call, like the history readers: credential
+    /// traffic is cache-absorbed reads and rare writes, not a pool's workload.
+    async fn with_db<T: Send + 'static>(
+        &self,
+        writable: bool,
+        operation: impl FnOnce(&mut postgres::Client) -> anyhow::Result<T> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let permit = self
+            .lookups
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::new(failure::CAPACITY, "credential capacity reached"))?;
+        let dsn = self.dsn.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut config: postgres::Config = dsn.parse().map_err(|_| ApiError::internal())?;
+            config.connect_timeout(Duration::from_secs(3));
+            config.options(if writable {
+                "-c statement_timeout=3000"
+            } else {
+                "-c default_transaction_read_only=on -c statement_timeout=3000"
+            });
+            let mut client = config.connect(NoTls).map_err(|_| ApiError::internal())?;
+            operation(&mut client).map_err(|_| ApiError::internal())
+        })
+        .await
+        .map_err(|_| ApiError::internal())?
+    }
+}
+
+/// Authenticates every `/v1` request and attaches the principal.
+async fn authenticate(
+    State(authn): State<Arc<Authn>>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    let Some(token) = presented else {
+        return ApiError::new(failure::UNAUTHORIZED, "invalid bearer token").into_response();
+    };
+    match authn.principal(&token).await {
+        Ok(principal) => {
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        Err(refused) => refused.into_response(),
+    }
+}
+
 #[derive(Clone)]
 struct Gateway {
     client: Client,
@@ -88,6 +216,7 @@ struct Gateway {
     /// Requests currently inside a `/v1` handler. What the drain waits on — the
     /// gateway has no engine slot to watch, so this count is its notion of busy.
     inflight: Arc<AtomicUsize>,
+    authn: Arc<Authn>,
 }
 
 /// Counts a request in on construction and out on `Drop`.
@@ -307,6 +436,7 @@ async fn response(upstream: reqwest::Response) -> Result<Response, ApiError> {
 }
 async fn open(
     State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
     request: Option<Json<SessionRequest>>,
 ) -> Result<Response, ApiError> {
     // Only new sessions are refused. Requests on sessions already open continue,
@@ -341,10 +471,20 @@ async fn open(
     // From here a session pod exists, so every exit below releases it. The worker's
     // own response is still relayed unchanged on the way out: it says why it refused,
     // and replacing that with a gateway error would lose the only useful detail.
+    // The principal rides the internal hop as a header the worker records at open:
+    // trusted because the hop requires the internal token, and set here rather than
+    // taken from the body so a caller cannot name someone else.
     let body = serde_json::to_vec(&request).map_err(|_| ApiError::internal())?;
     let upstream = match app
-        .send(&endpoint, Method::POST, "/v1/sessions", body.into())
+        .client
+        .request(Method::POST, format!("{endpoint}/v1/sessions"))
+        .bearer_auth(&app.token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(credentials::PRINCIPAL_HEADER, principal.name())
+        .body(body)
+        .send()
         .await
+        .map_err(|_| ApiError::internal())
     {
         Ok(upstream) => upstream,
         Err(error) => {
@@ -455,6 +595,91 @@ async fn set_budget(
 ) -> Result<Json<Value>, ApiError> {
     app.usage.set_budget(update).await.map(Json)
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MintRequest {
+    principal: String,
+    #[serde(default)]
+    expires_seconds: Option<i64>,
+}
+
+/// Credential management is the bootstrap's alone. A named credential that could
+/// mint credentials could quietly become every principal at once.
+fn admin_only(principal: &Principal) -> Result<(), ApiError> {
+    match principal {
+        Principal::Bootstrap => Ok(()),
+        Principal::Named(_) => Err(ApiError::new(
+            failure::FORBIDDEN,
+            "only the bootstrap credential manages credentials",
+        )),
+    }
+}
+
+/// Issues a credential. The token in the response is the only time it exists in
+/// plaintext anywhere the caller can reach — the database holds its digest.
+async fn mint_credential(
+    State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<MintRequest>,
+) -> Result<Json<Value>, ApiError> {
+    admin_only(&principal)?;
+    // Validated here so a bad request is the caller's 400, not a swallowed
+    // internal error from the issuing transaction.
+    if !credentials::valid_principal(&request.principal) {
+        return Err(ApiError::bad(
+            "principal must be 1-64 characters of [a-zA-Z0-9._@-], \
+             and not the bootstrap's own name",
+        ));
+    }
+    if request.expires_seconds.is_some_and(|seconds| seconds < 1) {
+        return Err(ApiError::bad("expires_seconds must be at least 1"));
+    }
+    let issued = app
+        .authn
+        .with_db(true, move |client| {
+            credentials::issue(client, &request.principal, request.expires_seconds)
+        })
+        .await?;
+    Ok(Json(json!({
+        "credential_id": issued.credential_id,
+        "principal": issued.principal,
+        "token": issued.token,
+    })))
+}
+
+async fn list_credentials(
+    State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Value>, ApiError> {
+    admin_only(&principal)?;
+    Ok(Json(app.authn.with_db(false, credentials::list).await?))
+}
+
+async fn revoke_credential(
+    State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
+    Path(credential_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    admin_only(&principal)?;
+    let revoked = app
+        .authn
+        .with_db(true, move |client| {
+            credentials::revoke(client, &credential_id)
+        })
+        .await?;
+    if !revoked {
+        return Err(ApiError::new(
+            failure::NOT_FOUND,
+            "no such credential, or it is already revoked",
+        ));
+    }
+    // The whole cache rather than one entry: revocation is rare, the cache is
+    // small, and clearing it makes a revocation bite this gateway immediately
+    // instead of after the cache window.
+    app.authn.cache.lock().await.clear();
+    Ok(Json(json!({"revoked": true})))
+}
+
 /// Wraps every `/v1` route so the drain can see work in flight.
 ///
 /// The completion log line fires only for a request that *spanned* the signal:
@@ -555,12 +780,14 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             }
         },
     };
+    let token: Arc<str> = token.into();
     let app = Gateway {
         client: Client::builder()
             .timeout(Duration::from_secs(75))
             .retry(reqwest::retry::never())
             .build()?,
-        token: token.into(),
+        authn: Authn::new(token.clone(), std::env::var("PLATFORM_DSN")?),
+        token,
         endpoints: Arc::new(worker_endpoints()?),
         fleet: Arc::new(Mutex::new(None)),
         routes: Arc::new(Mutex::new(HashMap::new())),
@@ -618,7 +845,18 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/usage", get(usage_events))
         .route("/v1/budget", get(budget).put(set_budget))
         .route("/v1/workers", get(workers))
-        .route_layer(middleware::from_fn_with_state(app.token.clone(), authorize))
+        .route(
+            "/v1/credentials",
+            get(list_credentials).post(mint_credential),
+        )
+        .route(
+            "/v1/credentials/{id}",
+            axum::routing::delete(revoke_credential),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            app.authn.clone(),
+            authenticate,
+        ))
         .route_layer(middleware::from_fn_with_state(
             (app.draining.clone(), app.inflight.clone()),
             track_inflight,
@@ -681,6 +919,28 @@ mod tests {
         assert_eq!(count.load(Ordering::Acquire), 1);
         drop(second);
         assert_eq!(count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn only_the_bootstrap_may_manage_credentials() {
+        assert!(admin_only(&Principal::Bootstrap).is_ok());
+        let refused = admin_only(&Principal::Named("analyst".into())).unwrap_err();
+        assert_eq!(refused.0.kind, "forbidden");
+        assert!(!refused.0.retry_safe);
+        assert_eq!(refused.0.http, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn the_bootstrap_resolves_by_comparison_alone() {
+        // No database behind this Authn; reaching for one would hang the test,
+        // so passing proves the bootstrap path never needs it.
+        let authn = Authn::new("the-bootstrap-token".into(), "host=nowhere".into());
+        let resolved = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(authn.principal("the-bootstrap-token"))
+            .unwrap();
+        assert_eq!(resolved.name(), credentials::BOOTSTRAP_PRINCIPAL);
     }
 
     /// A caller that disconnects has its handler future dropped mid-await. The drain

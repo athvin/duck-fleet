@@ -255,7 +255,9 @@ would show that the API works rather than that it works without dbt.
 
 ## Local execution API
 
-All `/v1` endpoints require `Authorization: Bearer <token>`.
+All `/v1` endpoints require `Authorization: Bearer <token>` — the bootstrap
+credential from the environment, or a credential it issued; see
+[Credentials](#credentials).
 
 | Method | Path | Behavior |
 | --- | --- | --- |
@@ -270,6 +272,33 @@ All `/v1` endpoints require `Authorization: Bearer <token>`.
 | GET | `/v1/usage` | Append-only usage events with cursor pagination |
 | GET | `/v1/budget` | Prepaid balance, held reservations, spend, caps, rate card |
 | PUT | `/v1/budget` | Set the prepaid balance and per-job cost cap |
+| POST | `/v1/credentials` | Issue a credential for a principal; the token appears only in this response (bootstrap only) |
+| GET | `/v1/credentials` | List credentials without any secret material (bootstrap only) |
+| DELETE | `/v1/credentials/{id}` | Revoke one credential immediately (bootstrap only) |
+
+## Credentials
+
+The environment token (`DUCKFLEET_TOKEN`) is the **bootstrap credential**: the
+operator-held secret that issues, lists, and revokes everything else, and the
+only principal allowed to — a named credential that could mint could quietly
+become every principal at once, so management refusals are a classified `403
+forbidden`. Issue per-user and per-service credentials with
+`POST /v1/credentials` (`{"principal": "analyst", "expires_seconds": 86400}`,
+expiry optional); the token is shown exactly once, in that response, and the
+database stores only its SHA-256, so neither a listing, a history row, a log
+line, nor a database backup discloses a usable secret. Every query's history
+record names the `principal` the gateway authenticated — server-derived, so a
+caller's context cannot claim to be someone else; a worker addressed directly
+inside the cluster records `direct`.
+
+Revocation takes effect immediately on the gateway that processed it. Unknown,
+revoked, and expired tokens are all refused with the same `401 unauthorized`,
+so a probing caller learns nothing about which it was.
+
+Credentials authenticate and attribute; they do not yet authorize differently.
+Every principal reaches the same full SQL surface and the same platform
+endpoints apart from credential management — per-principal SQL or budget
+scoping is explicitly not built.
 
 A session request can supply `{"compute":{"cpu":2,"memory":"2Gi"},"context":{}}`.
 Compute is fixed when the session opens; query bodies cannot override it.
@@ -576,10 +605,12 @@ may lead or trail the catalog by the dump gap.
 ## Scope and limitations
 
 This is a **trusted, single-tenant development environment** with known local
-credentials and plain HTTP inside Docker. The bearer token controls access to an
-administrator SQL connection; it is not a SQL sandbox. Do not expose it publicly
-or use customer data. Query history includes SQL text and errors. Logical model
-IDs and tags are caller-supplied correlation data, not authenticated billing data.
+credentials and plain HTTP inside Docker. Every credential — bootstrap or
+issued — controls access to an administrator SQL connection; credentials
+authenticate and attribute, they are not a SQL sandbox. Do not expose the API
+publicly or use customer data. Query history includes SQL text and errors.
+Logical model IDs and tags are caller-supplied correlation data, not
+authenticated billing data; the `principal` column is the authenticated part.
 
 Only SQL models are implemented. The Docker harness runs the two persistent
 compute classes; isolated per-session pods are implemented in the Kubernetes

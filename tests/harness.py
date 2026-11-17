@@ -416,6 +416,90 @@ def drain_inflight(marker_name="drain-inflight.started", drained="its worker"):
           f"({outcome['elapsed']:.1f}s)")
 
 
+def credentials_checks():
+    """Issued credentials: per-principal, revocable, recorded, and never echoed.
+
+    The environment token is the bootstrap credential: it mints everything else
+    and is the only principal allowed to. A token exists in plaintext only in the
+    response that minted it; listings carry no secret material, not even digests.
+    History rows name the principal the gateway authenticated — server-derived,
+    so a caller's own context cannot claim to be someone else.
+    """
+    admin = Client(URL, TOKEN)
+    issued = json.loads(admin.request("POST", "/v1/credentials", {"principal": "analyst"}))
+    require(issued["principal"] == "analyst", str(issued.keys()))
+    require(issued["token"].startswith("dfk_"), "tokens carry a greppable prefix")
+
+    # The issued credential works like any caller, and its work is attributed.
+    connection = RemoteConnection(URL, issued["token"], name="analyst-session")
+    try:
+        cursor = connection.cursor()
+        require(cursor.execute("select 1").fetchall() == [(1,)], "issued token could not query")
+        analyst_query = cursor.query_id
+    finally:
+        connection.close()
+    record = json.loads(admin.request("GET", "/v1/queries/" + analyst_query))
+    require(record["principal"] == "analyst", f"history named {record.get('principal')!r}")
+    bootstrap = RemoteConnection(URL, TOKEN, name="bootstrap-session")
+    try:
+        cursor = bootstrap.cursor()
+        cursor.execute("select 2")
+        bootstrap_query = cursor.query_id
+    finally:
+        bootstrap.close()
+    record = json.loads(admin.request("GET", "/v1/queries/" + bootstrap_query))
+    require(record["principal"] == "bootstrap-admin", f"history named {record.get('principal')!r}")
+
+    # Listing discloses no secret material: not the token, and not its digest.
+    listed = json.loads(admin.request("GET", "/v1/credentials"))["credentials"]
+    require(any(c["credential_id"] == issued["credential_id"] for c in listed),
+            "the minted credential is missing from the list")
+    require(issued["token"] not in json.dumps(listed), "a listing leaked a token")
+    require(all("token" not in key and "sha" not in key for c in listed for key in c),
+            str(sorted(listed[0])))
+
+    # Revocation bites immediately, even for a credential that was just used.
+    require(json.loads(admin.request("DELETE", "/v1/credentials/" + issued["credential_id"]))
+            == {"revoked": True}, "revocation did not report")
+    refused = expect_error(401, lambda: RemoteConnection(URL, issued["token"]))
+    require(refused.failure_kind == "unauthorized", str(refused.failure_kind))
+    # Revoking it again says so rather than pretending.
+    expect_error(404, lambda: admin.request("DELETE", "/v1/credentials/" + issued["credential_id"]))
+
+    # Expiry: a one-second credential is dead before anyone here can use it.
+    brief = json.loads(admin.request("POST", "/v1/credentials",
+                                     {"principal": "contractor", "expires_seconds": 1}))
+    time.sleep(2)
+    expect_error(401, lambda: RemoteConnection(URL, brief["token"]))
+
+    # Wrong, malformed, and missing credentials are refused alike, and the mint
+    # payload is policed: no blanks, no spoofing the bootstrap's name, no
+    # already-expired credentials.
+    expect_error(401, lambda: RemoteConnection(URL, "dfk_" + "0" * 64))
+    expect_error(401, lambda: RemoteConnection(URL, "not-even-token-shaped"))
+    expect_error(401, lambda: Client(URL, "").request("GET", "/v1/queries?limit=1"))
+    expect_error(400, lambda: admin.request("POST", "/v1/credentials", {"principal": "has space"}))
+    expect_error(400, lambda: admin.request("POST", "/v1/credentials", {"principal": "bootstrap-admin"}))
+    expect_error(400, lambda: admin.request("POST", "/v1/credentials",
+                                            {"principal": "x", "expires_seconds": 0}))
+
+    # Management is the bootstrap's alone: a named credential that could mint
+    # could quietly become every principal at once.
+    service = json.loads(admin.request("POST", "/v1/credentials", {"principal": "etl-service"}))
+    client = Client(URL, service["token"])
+    for attempt in [
+        lambda: client.request("POST", "/v1/credentials", {"principal": "sneaky"}),
+        lambda: client.request("GET", "/v1/credentials"),
+        lambda: client.request("DELETE", "/v1/credentials/" + service["credential_id"]),
+    ]:
+        refused = expect_error(403, attempt)
+        require(refused.failure_kind == "forbidden", str(refused.failure_kind))
+    # Removed afterwards, so repeated runs do not accumulate live credentials.
+    admin.request("DELETE", "/v1/credentials/" + service["credential_id"])
+    print("PASS: credentials are issued, attributed in history, listed without secrets, "
+          "revoked at once, expired on time, and managed by the bootstrap alone")
+
+
 def gateway_replaced():
     """What a caller holding a session experiences when the gateway dies without grace.
 
@@ -615,6 +699,9 @@ def main():
     if "--gateway-replaced" in sys.argv:
         gateway_replaced()
         return
+    if "--credentials" in sys.argv:
+        credentials_checks()
+        return
     if "--isolated" in sys.argv:
         isolated_checks()
         return
@@ -646,6 +733,7 @@ def main():
             return
         resource_checks(connection)
         protocol_checks(connection)
+        credentials_checks()
         profile_query_id = observability.checks(URL, TOKEN)
         (ARTIFACTS / "profile-query-id.txt").write_text(profile_query_id)
         dbt("debug", "debug")

@@ -636,6 +636,7 @@ dependencies = [
  "duckdb",
  "postgres",
  "reqwest 0.13.5",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

@@ -81,9 +81,10 @@ environment), and finally requires the fleet to answer before reporting success.
 
 Only the password changes. The DSNs are edited rather than rebuilt, so host, port,
 database and user survive exactly; `DUCKFLEET_TOKEN` is left alone because it is the
-API bearer token, not a database credential, and rotating it here would log every
-caller out as a side effect of database maintenance. #17 replaces that token with
-per-tenant credentials.
+bootstrap credential, not a database credential, and rotating it here would log the
+operator out as a side effect of database maintenance. Humans and services should
+hold credentials issued through `POST /v1/credentials` (see the README's
+Credentials section), which are revocable one at a time instead.
 
 Statements already running finish within the worker's drain window (#16); sessions open
 at that moment end.
