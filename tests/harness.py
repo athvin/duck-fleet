@@ -416,6 +416,46 @@ def drain_inflight(marker_name="drain-inflight.started", drained="its worker"):
           f"({outcome['elapsed']:.1f}s)")
 
 
+def dbt_isolated_checks():
+    """A dbt model on a session pod of its own, run exactly as a user would run it.
+
+    The adapter must carry `compute: isolated` through resolved node config before
+    the first statement; the model's whole lifecycle — hooks included — must stay
+    pinned to the one session on the one pod; and the committed table must outlive
+    the pod that built it, because a DuckLake commit lives in the catalog and the
+    bucket, not in the compute that produced it.
+    """
+    dbt("isolated", "run", "--select", "isolated_model",
+        "--vars", '{"exercise_isolated":true}')
+    connection = RemoteConnection(URL, TOKEN)
+    try:
+        rows = sql(connection,
+                   "select count(*), min(hook_value), max(worker_threads) "
+                   "from lake.analytics.isolated_model")
+        require(rows[0][0] > 0, "the isolated model committed no rows")
+        require(rows[0][1] == 7, "the pre-hook's temp table did not reach the model")
+        require(rows[0][2] == 1, f"ran with {rows[0][2]} threads, not the requested 1")
+        run = json.loads((ARTIFACTS / "isolated/target/run_results.json").read_text())
+        invocation = run["metadata"]["invocation_id"]
+        history = json.loads(connection.client.request("GET", "/v1/queries"))["queries"]
+        queries = [q for q in history
+                   if q["context"].get("dbt", {}).get("invocation_id") == invocation
+                   and q["context"]["dbt"].get("node_id")
+                   == "model.duckfleet_harness.isolated_model"]
+        require(queries, "no history for the isolated model")
+        require({q["placement"]["compute"] for q in queries} == {"isolated"},
+                f"placements: { {q['placement']['compute'] for q in queries} }")
+        require(all(q["worker_id"].startswith("duckfleet-session-") for q in queries),
+                f"workers: { {q['worker_id'] for q in queries} }")
+        require(len({q["session_id"] for q in queries}) == 1,
+                "the isolated model crossed sessions")
+        require(any("isolated_hook" in q["sql"] for q in queries),
+                "the hooks did not reach the pinned session")
+    finally:
+        connection.close()
+    print("PASS: a dbt model ran isolated on its own pod, hooks pinned, table durable")
+
+
 def credentials_checks():
     """Issued credentials: per-principal, revocable, recorded, and never echoed.
 
@@ -710,6 +750,9 @@ def main():
     if "--credentials" in sys.argv:
         credentials_checks()
         return
+    if "--dbt-isolated" in sys.argv:
+        dbt_isolated_checks()
+        return
     if "--isolated" in sys.argv:
         isolated_checks()
         return
@@ -773,9 +816,19 @@ def main():
         require(len(failed_run["results"]) == 1 and failed_run["results"][0]["status"] == "error", "expected a real model error")
         dbt("unsupported-size", "run", "--select", "unsupported_size", "--vars", '{"exercise_unsupported_size":true}', expected_code=1)
         require(sql(connection, "select count(*) from checks.replay") == [(1,)], "unsupported size executed its pre-hook")
+        # Where this deployment cannot isolate, a model that demands isolation must
+        # fail without running SQL — never quietly run on shared compute. Where it
+        # can (the kind cluster), the dedicated --dbt-isolated stage proves the
+        # positive path instead, so this refusal is only meaningful to assert here.
+        if not json.loads(connection.client.request("GET", "/v1/workers"))["isolated_compute"]:
+            dbt("unsupported-isolated", "run", "--select", "unsupported_isolated",
+                "--vars", '{"exercise_unsupported_isolated":true}', expected_code=1)
+            require(sql(connection, "select count(*) from checks.replay") == [(1,)],
+                    "an isolated request this deployment cannot serve executed its pre-hook")
         history = json.loads(connection.client.request("GET", "/v1/queries"))["queries"]
         bad_invocation = json.loads((ARTIFACTS / "unsupported-size/target/run_results.json").read_text())["metadata"]["invocation_id"]
         require(not any(q["context"].get("dbt", {}).get("node_id") == "model.duckfleet_harness.unsupported_size" and q["context"]["dbt"]["invocation_id"] == bad_invocation for q in history), "unsupported model ran SQL")
+        require(not any(q["context"].get("dbt", {}).get("node_id") == "model.duckfleet_harness.unsupported_isolated" for q in history), "an unavailable isolated mode ran SQL")
         verify_model_placement(history)
         observability.save_model_profile(connection.client, history, ARTIFACTS)
         model_queries = [q for q in history if q["context"].get("dbt", {}).get("node_id") == "model.duckfleet_harness.fct_orders"]
