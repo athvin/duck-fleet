@@ -187,6 +187,21 @@ test -z "$(isolated_pods)" || {
   echo "session pods outlived their sessions: $(isolated_pods)" >&2; exit 1; }
 echo 'PASS: closing an isolated session removed its pod'
 
+# The dbt layer over the same capability: a model whose meta.platform requests a
+# pod of its own, run exactly as a user runs models. The --isolated stage above
+# proved the API; this proves the adapter carries the mode through resolved node
+# config with the session, hook, and durability guarantees intact — the other
+# half of #19, whose refusal half runs where isolation is absent (Compose).
+harness duckfleet-dbt-isolated 'python /app/tests/harness.py --dbt-isolated' 900
+grep -q 'PASS: a dbt model ran isolated on its own pod' artifacts/kind/duckfleet-dbt-isolated.log
+for _ in $(seq 1 30); do
+  [[ -z "$(isolated_pods)" ]] && break
+  sleep 2
+done
+test -z "$(isolated_pods)" || {
+  echo "the dbt model's session pod outlived the model: $(isolated_pods)" >&2; exit 1; }
+echo 'PASS: the dbt-requested session pod was removed once the model finished'
+
 # The layer that does not depend on the gateway behaving well: abandon a session, then
 # destroy the gateway. The owner reference must have the pod collected regardless, and
 # the replacement gateway must settle what the pod was holding.
