@@ -416,6 +416,83 @@ def drain_inflight(marker_name="drain-inflight.started", drained="its worker"):
           f"({outcome['elapsed']:.1f}s)")
 
 
+def scale_checks():
+    """The blueprint's Phase 1 acceptance bar, counted rather than assumed.
+
+    A generated 110-model project builds through the platform, and then three
+    claims are proven by arithmetic: every statement of the run reached a
+    terminal history state, every one of them settled exactly one usage event,
+    and the whole run's wall time and attributed cost are written down as
+    evidence rather than remembered as an impression.
+    """
+    project = Path("/tmp/duckfleet-scale")
+    subprocess.run([sys.executable, "/app/tests/dbt/scale/generate.py", str(project)],
+                   check=True)
+    started = time.monotonic()
+    build = subprocess.run(
+        ["dbt", "--no-use-colors", "--log-path", str(ARTIFACTS / "scale/logs"),
+         "build", "--project-dir", str(project), "--profiles-dir", "/app/tests/dbt"],
+        check=False,
+        env=dict(os.environ, DBT_TARGET_PATH=str(ARTIFACTS / "scale/target")))
+    wall = time.monotonic() - started
+    require(build.returncode == 0, f"scale dbt build exited {build.returncode}")
+    run = json.loads((ARTIFACTS / "scale/target/run_results.json").read_text())
+    invocation = run["metadata"]["invocation_id"]
+    models = [n for n in run["results"] if n["unique_id"].startswith("model.")]
+    require(len(models) >= 100, f"only {len(models)} models ran; the bar is 100")
+    failed = [n["unique_id"] for n in run["results"]
+              if n["status"] not in ("success", "pass")]
+    require(not failed, f"nodes did not succeed: {failed[:5]}")
+
+    client = Client(URL, TOKEN)
+    records, cursor = [], None
+    while True:
+        path = f"/v1/queries?limit=500&invocation_id={invocation}"
+        page = json.loads(client.request(
+            "GET", path + (f"&before={cursor}" if cursor else "")))
+        records.extend(page["queries"])
+        cursor = page.get("next_before")
+        if not cursor:
+            break
+    require(len(records) >= len(models),
+            f"{len(records)} history records for {len(models)} models")
+    require(all(q["status"] != "running" for q in records),
+            "a scale statement never reached a terminal state")
+
+    # Every execution settled exactly one usage event — found by walking the
+    # ledger backwards, since the run's events are its newest.
+    wanted = {q["query_id"] for q in records}
+    events, cursor = {}, None
+    total_micro_usd = 0
+    while wanted - set(events):
+        page = json.loads(client.request(
+            "GET", "/v1/usage?limit=500" + (f"&before={cursor}" if cursor else "")))
+        for event in page["events"]:
+            if event["execution_id"] in wanted:
+                events[event["execution_id"]] = events.get(event["execution_id"], 0) + 1
+                total_micro_usd += event["amount_micro_usd"]
+        cursor = page.get("next_before")
+        if not cursor:
+            break
+    missing = wanted - set(events)
+    require(not missing, f"{len(missing)} executions escaped the ledger")
+    require(all(count == 1 for count in events.values()),
+            "an execution settled more than one event")
+
+    evidence = {
+        "models": len(models),
+        "nodes": len(run["results"]),
+        "statements": len(records),
+        "wall_seconds": round(wall, 1),
+        "total_micro_usd": total_micro_usd,
+        "invocation_id": invocation,
+    }
+    (ARTIFACTS / "scale-run.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    print(f"PASS: {len(models)} models and {len(run['results'])} nodes built in "
+          f"{wall:.0f}s; {len(records)} statements all terminal, each settling "
+          f"exactly one event, {total_micro_usd} micro-USD attributed")
+
+
 def maintenance_checks():
     """Snapshot listing, expiry, compaction, and cleanup as platform operations.
 
@@ -831,6 +908,9 @@ def main():
         return
     if "--maintenance" in sys.argv:
         maintenance_checks()
+        return
+    if "--scale" in sys.argv:
+        scale_checks()
         return
     if "--isolated" in sys.argv:
         isolated_checks()
