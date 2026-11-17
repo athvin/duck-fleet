@@ -116,6 +116,13 @@ jobs:
           path: artifacts/aws/evidence.json
           if-no-files-found: error
           retention-days: 14
+      # Bounds the lake after the verdict is in, never blocking it. continue-on-error
+      # is the guarantee a slow or interrupted sweep cannot fail a deploy; the script
+      # exits 0 anyway, so this is belt and suspenders. Runs only on a green test —
+      # a broken deploy goes straight to suspend.
+      - name: Bound the development lake
+        run: bash scripts/aws/maintain.sh
+        continue-on-error: true
   suspend:
     needs: deploy
     if: always() && needs.deploy.outputs.deployment_started == 'true'
