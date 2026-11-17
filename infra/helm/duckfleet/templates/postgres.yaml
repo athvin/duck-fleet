@@ -29,7 +29,7 @@ spec:
       labels: {app: duckfleet-postgres}
     spec:
       serviceAccountName: duckfleet-no-aws
-      nodeSelector: {{ toJson .Values.nodeSelector }}
+      {{- include "duckfleet.placement" . | nindent 6 }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 999

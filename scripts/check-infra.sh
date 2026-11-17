@@ -36,6 +36,17 @@ if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$v
   exit 1
 fi
 echo 'PASS: a CPU request above its limit is rejected'
+# The node pool DuckFleet owns is tainted, so selecting it without tolerating it
+# renders a release whose every pod is permanently Pending. Prove that is rejected at
+# render time rather than discovered as an unschedulable fleet.
+untolerated="$validation_dir/untolerated.yaml"
+if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+     --set-json 'tolerations=[]' > "$untolerated" 2>/dev/null \
+   && python3 scripts/check-chart.py "$untolerated" > /dev/null 2>&1; then
+  echo 'Selecting the DuckFleet node pool without tolerating its taint must fail' >&2
+  exit 1
+fi
+echo 'PASS: pinning the DuckFleet node pool without tolerating its taint is rejected'
 # Isolated compute is off by default, so the assertions covering it only run against
 # a render that turns it on. Both states are checked: the default must keep producing
 # a gateway with no Kubernetes token at all.

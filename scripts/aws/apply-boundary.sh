@@ -37,11 +37,23 @@ EOF
   exit 1
 fi
 
-boundary=$(python3 scripts/aws/render_boundary.py "$NAMESPACE")
+# Checked before rendering, because a node pool pointing at a NodeClass that does not
+# exist applies cleanly and then provisions nothing — a pool that looks established and
+# silently cannot place a pod.
+if ! "${KUBE[@]}" get nodeclass.eks.amazonaws.com "$DUCKFLEET_NODE_CLASS" > /dev/null 2>&1; then
+  echo "No NodeClass named $DUCKFLEET_NODE_CLASS on $DUCKFLEET_CLUSTER. Available:" >&2
+  kubectl --context "$KUBE_CONTEXT" get nodeclass.eks.amazonaws.com \
+    -o custom-columns=NAME:.metadata.name --no-headers >&2 || true
+  echo 'Set DUCKFLEET_NODE_CLASS in scripts/aws/target.env to one of these.' >&2
+  exit 1
+fi
+
+boundary=$(python3 scripts/aws/render_boundary.py "$NAMESPACE" "$DUCKFLEET_NODE_CLASS")
 cat <<EOF
 Applying the DuckFleet ownership boundary
   cluster    $DUCKFLEET_CLUSTER
   namespace  $NAMESPACE
+  node class $DUCKFLEET_NODE_CLASS
 $(printf '%s\n' "$boundary" | python3 -c "
 import sys, yaml
 for document in yaml.safe_load_all(sys.stdin):
@@ -73,6 +85,17 @@ granted = {verb for rule in rules if 'pods' in rule['resources'] for verb in rul
 missing = {'create', 'get', 'list', 'watch', 'delete'} - granted
 if missing:
     raise SystemExit(f'the pod grant is missing {sorted(missing)}; it has {sorted(granted)}')
+"
+# The node pool is cluster-scoped, so it is read without the namespace. Reported rather
+# than merely checked: whether it can provision the largest worker the release asks for
+# is the question this pool exists to answer, and `kubectl get` says nothing about it.
+kubectl --context "$KUBE_CONTEXT" get nodepool.karpenter.sh duckfleet -o json | python3 -c "
+import json, sys
+spec = json.load(sys.stdin)['spec']
+sizes = next(r['values'] for r in spec['template']['spec']['requirements']
+             if r['key'].endswith('instance-size'))
+taints = [f\"{t['key']}={t['value']}:{t['effect']}\" for t in spec['template']['spec']['taints']]
+print(f\"node pool: sizes {sorted(sizes)}, cpu ceiling {spec['limits']['cpu']}, taints {taints}\")
 "
 
 # The gateway asks the API server about its own access once, at startup, so a grant

@@ -22,7 +22,7 @@ spec:
       # Identity follows capability: a gateway that creates pods needs a token, and
       # one that cannot must not have one.
       serviceAccountName: {{ ternary "duckfleet-gateway" "duckfleet-no-aws" .Values.isolatedCompute.enabled }}
-      nodeSelector: {{ toJson .Values.nodeSelector }}
+      {{- include "duckfleet.placement" . | nindent 6 }}
       securityContext:
         {{- include "duckfleet.podSecurity" . | nindent 8 }}
       containers:

@@ -1,0 +1,69 @@
+# Capacity DuckFleet owns, on a cluster it may be sharing.
+#
+# Without this, DuckFleet draws from whatever NodePool the host cluster happens to
+# offer, and is bounded by choices made for something else. Measured on the shared
+# development cluster: its pool is capped to `large`, which is 2 vCPU with about 1780m
+# allocatable, so a 2-CPU worker claiming 2050m with daemonset overhead could not be
+# *provisioned* at all — Karpenter answered "no instance type has enough resources".
+# The workaround lowered the CPU request to 1 so a fresh `large` would take the pod,
+# which cost Guaranteed QoS and left a 2-CPU limit no single node could deliver.
+#
+# A pool of our own fixes both, and the taint means it is ours in both directions: our
+# pods go nowhere else, and nothing else lands here. `limits` is the spend ceiling.
+#
+# Cluster-scoped, so it is an operator's to apply and not the deploy's — the same
+# reason the Role beside it is. scripts/check-chart.py asserts the chart never renders
+# a NodePool.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: duckfleet
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: duckfleet
+    spec:
+      # An existing NodeClass, by name, rather than one defined here. A NodeClass
+      # carries the node IAM role and the subnet and security group selectors — host
+      # cluster facts that this repository deliberately does not name (see
+      # scripts/aws/target.env). Pointing at one that is already correct avoids
+      # restating infrastructure we do not own and would have to guess at.
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: ${node_class}
+      # Ours in both directions. The pods tolerate this and nothing else does, so a
+      # neighbour cannot consume capacity DuckFleet is paying for, and DuckFleet cannot
+      # consume theirs.
+      taints:
+        - key: duckfleet.io/dedicated
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        # `xlarge` is the point: it makes a true 2-CPU Guaranteed worker provisionable
+        # on demand rather than impossible. It does not run one continuously — see
+        # `limits` below, the consolidation policy, and the `suspended` chart value.
+        - key: eks.amazonaws.com/instance-family
+          operator: In
+          values: [m6i, m6a]
+        - key: eks.amazonaws.com/instance-size
+          operator: In
+          values: [large, xlarge]
+        # On-demand only. A worker holds a DuckLake write transaction, and spot
+        # reclamation mid-statement is a rollback the caller did not ask for.
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+  # The hard ceiling on what this pool will ever provision: four xlarge nodes. A
+  # runaway session loop is already bounded by the namespace quota beside this; this
+  # bounds the bill if anything gets past it.
+  limits:
+    cpu: "16"
+  disruption:
+    # `WhenEmpty`, not `WhenEmptyOrUnderutilized`. Consolidating a busy node would
+    # evict a worker mid-statement; the drain added in #16 handles that gracefully, but
+    # gracefully ending someone's query is still ending it. An emptied node still goes
+    # away, which is what makes `suspended: true` actually stop costing money.
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
