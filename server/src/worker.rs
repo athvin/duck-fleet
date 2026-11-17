@@ -783,11 +783,14 @@ impl Worker {
         let capture = session.profile.capture(cleared);
         session.profile.clear();
         // A DuckLake error can quote the catalog connection string long after startup,
-        // and this text reaches both the history row and the caller.
+        // and this text reaches both the history row and the caller. The redactor
+        // masks the platform's own credentials; the generic pass masks the ones it
+        // cannot know — a caller's connection string quoted back by the engine must
+        // not put a live password into a durable history row.
         let error = result
             .as_ref()
             .err()
-            .map(|e| self.redactor.scrub(&format!("{e:#}")));
+            .map(|e| crate::secrets::scrub_passwords(&self.redactor.scrub(&format!("{e:#}"))));
         // A timer racing with a completed statement must not imply the write rolled
         // back, so an interruption reason outranks whatever the engine reported.
         let failure = error

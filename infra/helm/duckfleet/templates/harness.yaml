@@ -42,7 +42,7 @@ spec:
             limits: {cpu: "2", memory: 2Gi}
           env:
             - {name: DUCKFLEET_URL, value: "http://server:8080"}
-            - {name: EXPECT_S3_PREFIX, value: {{ printf "s3://%s/lake/" .Values.bucket | quote }}}
+            - {name: EXPECT_S3_PREFIX, value: {{ printf "s3://%s/%s/" .Values.bucket .Values.lakePrefix | quote }}}
             - {name: HOME, value: /tmp}
             - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
             - name: DUCKFLEET_TOKEN

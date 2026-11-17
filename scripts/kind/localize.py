@@ -20,6 +20,8 @@ import yaml
 OBJECT_STORE = "object-store:9000"
 S3_ACCESS_KEY = "DUCKFLEETLOCAL"
 S3_SECRET_KEY = "local-object-store-password"
+# Overridable so a provisioned team namespace keeps its own prefix when
+# localized; the default matches the primary namespace.
 DATA_PATH = "s3://duckfleet/lake/"
 # A GitHub runner has 4 vCPU and the release requests more than that in total. The
 # cgroup quota a worker asserts comes from its limit, not its request, so lowering
@@ -138,13 +140,21 @@ class Localizer:
 
 
 def main():
+    global DATA_PATH
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--expect",
         required=True,
         help="comma-separated rewrites this render must contain, no more and no less",
     )
-    expected = [name for name in parser.parse_args().expect.split(",") if name]
+    parser.add_argument(
+        "--data-path",
+        default=DATA_PATH,
+        help="the local object-store path S3 paths are rewritten to",
+    )
+    arguments = parser.parse_args()
+    expected = [name for name in arguments.expect.split(",") if name]
+    DATA_PATH = arguments.data_path
 
     localizer = Localizer()
     documents = [

@@ -74,7 +74,7 @@ template and the code that patches it from drifting silently.
 - {name: DUCKFLEET_RATE_CARD_VERSION, value: {{ $.Values.rateCard.version | quote }}}
 - {name: DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR, value: {{ $.Values.rateCard.computeMicroUsdPerUnitHour | quote }}}
 - {name: DUCKFLEET_HISTORY_RETENTION_DAYS, value: {{ $.Values.historyRetentionDays | quote }}}
-- {name: S3_DATA_PATH, value: {{ printf "s3://%s/lake/" $.Values.bucket | quote }}}
+- {name: S3_DATA_PATH, value: {{ printf "s3://%s/%s/" $.Values.bucket $.Values.lakePrefix | quote }}}
 - {name: AWS_REGION, value: {{ $.Values.region }}}
 - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
 - name: DUCKFLEET_TOKEN
