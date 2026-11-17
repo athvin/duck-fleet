@@ -1,6 +1,7 @@
 """Safety regressions for the live deployment lane; no AWS calls."""
 import importlib.util
 import ipaddress
+import json
 import os
 import tempfile
 import fnmatch
@@ -225,6 +226,90 @@ class RolloutWaitTests(unittest.TestCase):
         self.assertIn('== duckfleet-*', bootstrap)
         # And it must check the account before touching anything.
         self.assertLess(bootstrap.index('get-caller-identity'), bootstrap.index('create-bucket'))
+
+    def test_rotation_replaces_only_the_password(self):
+        """Rebuilding the DSNs would repoint the workers the moment one differed."""
+        rotate = load('rotate_secret', 'scripts/aws/rotate_secret.py')
+        before = {
+            'apiVersion': 'v1', 'kind': 'Secret', 'type': 'Opaque',
+            'metadata': {'name': 'duckfleet-dev', 'namespace': 'duckfleet-dev'},
+            'stringData': {
+                'POSTGRES_PASSWORD': 'leaked',
+                # Deliberately not the values this script would have guessed: a
+                # non-default port and database are what a reconstruction would break.
+                'CATALOG_DSN': 'host=postgres port=6543 dbname=lake_v2 user=duckfleet password=leaked',
+                'PLATFORM_DSN': 'host=postgres port=6543 dbname=platform_v2 user=duckfleet password=leaked',
+                'DUCKFLEET_TOKEN': 'bearer-token-unchanged',
+            },
+        }
+        after = rotate.rotate(before, 'fresh')['stringData']
+        self.assertEqual(after['POSTGRES_PASSWORD'], 'fresh')
+        # Everything but the password survives exactly.
+        self.assertEqual(after['CATALOG_DSN'],
+                         'host=postgres port=6543 dbname=lake_v2 user=duckfleet password=fresh')
+        self.assertEqual(after['PLATFORM_DSN'],
+                         'host=postgres port=6543 dbname=platform_v2 user=duckfleet password=fresh')
+        # The bearer token is not a database credential. Rotating it here would log
+        # every caller out as a side effect of database maintenance.
+        self.assertEqual(after['DUCKFLEET_TOKEN'], 'bearer-token-unchanged')
+        # And the old password appears nowhere.
+        self.assertNotIn('leaked', json.dumps(after))
+
+    def test_rotation_reads_a_secret_however_it_is_stored(self):
+        """A live Secret comes back base64 in `data`, not `stringData`."""
+        rotate = load('rotate_secret', 'scripts/aws/rotate_secret.py')
+        import base64
+        encoded = {
+            'apiVersion': 'v1', 'kind': 'Secret',
+            'metadata': {'name': 'duckfleet-dev', 'namespace': 'duckfleet-dev'},
+            'data': {key: base64.b64encode(value.encode()).decode() for key, value in {
+                'POSTGRES_PASSWORD': 'leaked',
+                'CATALOG_DSN': 'host=postgres port=5432 dbname=lake user=duckfleet password=leaked',
+                'PLATFORM_DSN': 'host=postgres port=5432 dbname=platform user=duckfleet password=leaked',
+            }.items()},
+        }
+        after = rotate.rotate(encoded, 'fresh')['stringData']
+        self.assertTrue(after['CATALOG_DSN'].endswith('password=fresh'), after)
+        self.assertNotIn('leaked', json.dumps(after))
+
+    def test_rotation_refuses_a_partial_secret(self):
+        """Rotating half a credential is worse than not rotating: the database would
+        accept a password the workers no longer carry."""
+        rotate = load('rotate_secret', 'scripts/aws/rotate_secret.py')
+        partial = {
+            'apiVersion': 'v1', 'kind': 'Secret',
+            'metadata': {'name': 'duckfleet-dev', 'namespace': 'duckfleet-dev'},
+            'stringData': {'POSTGRES_PASSWORD': 'leaked'},
+        }
+        with self.assertRaises(KeyError):
+            rotate.rotate(partial, 'fresh')
+        # A DSN with no password to replace is the same class of mistake.
+        passwordless = {
+            'apiVersion': 'v1', 'kind': 'Secret',
+            'metadata': {'name': 'duckfleet-dev', 'namespace': 'duckfleet-dev'},
+            'stringData': {'POSTGRES_PASSWORD': 'leaked',
+                           'CATALOG_DSN': 'host=postgres dbname=lake user=duckfleet',
+                           'PLATFORM_DSN': 'host=postgres dbname=platform user=duckfleet'},
+        }
+        with self.assertRaises(KeyError):
+            rotate.rotate(passwordless, 'fresh')
+
+    def test_rotation_changes_the_database_and_the_secret_together(self):
+        """`deploy.sh` writes that Secret once and the PVC outlives a redeploy, so
+        changing either alone leaves workers holding a password the server rejects —
+        which shows up as an unreachable catalog rather than a credential problem."""
+        script = (ROOT/'scripts/aws/rotate-catalog-credential.sh').read_text()
+        commands = '\n'.join(line for line in script.splitlines()
+                             if not line.lstrip().startswith('#'))
+        self.assertIn('ALTER USER duckfleet PASSWORD', commands)
+        self.assertIn('rotate_secret.py', commands)
+        # The database moves first: the inverse would leave the database reachable
+        # only with a credential that no longer exists anywhere.
+        self.assertLess(commands.index('ALTER USER'), commands.index('apply -f -'))
+        # And the fleet is restarted, because a Secret change does not reach a running
+        # pod's environment.
+        self.assertIn('rollout restart', commands)
+        self.assertLess(commands.index('apply -f -'), commands.index('rollout restart'))
 
     def test_api_egress_must_cover_the_endpoint_not_the_service(self):
         """The rule shipped in #9 matched neither half of the real destination.
