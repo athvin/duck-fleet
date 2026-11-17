@@ -26,9 +26,10 @@ Compute comes in two tiers: prestarted persistent workers for everyday queries,
 and an isolated per-session pod with exactly the requested CPU and memory for
 jobs that need more. The namespace boundary is per team or environment, each
 running its own DuckLake; the trust model is teams within one organization, not
-hostile tenants. Clients speak HTTP with Arrow IPC results today — a Python
-client, CLI, and dbt adapter exist — and a Postgres wire-protocol front is
-planned later so Postgres drivers and BI tools connect directly.
+hostile tenants. Clients speak HTTP with Arrow IPC results natively — a Python
+client, CLI, and dbt adapter exist — and an opt-in
+[Postgres wire-protocol front](#the-postgres-wire-front) lets `psql` and
+simple-protocol drivers connect directly.
 
 ## Run locally
 
@@ -301,6 +302,29 @@ Credentials authenticate and attribute; they do not yet authorize differently.
 Every principal reaches the same full SQL surface and the same platform
 endpoints apart from credential management — per-principal SQL or budget
 scoping is explicitly not built.
+
+## The Postgres wire front
+
+`pgwire.enabled: true` (env `DUCKFLEET_PGWIRE`) has the gateway listen on 5432
+speaking enough of the v3 protocol for `psql` and the simple-protocol path
+drivers and BI tools are built on. The password is a platform credential — the
+bootstrap token or one issued through `/v1/credentials`; the startup `user` is
+advisory, identity comes from the credential exactly as over HTTP. Each
+connection pins to one ordinary worker session, so transactions and temp tables
+behave, and history, principal attribution, metering, and failure
+classification all hold with no wire-specific code: classified failures arrive
+as `ERROR` with a SQLSTATE a driver can act on (`40001` for a lost commit race,
+`57014` for a deadline, `42601` for SQL errors) and the platform's
+`failure_kind` in the message.
+
+The honest limits, refused rather than fudged: no extended-protocol bind
+parameters (interpolate client-side, as `psql` and psycopg2 already do), no
+COPY, LISTEN/NOTIFY, cursors, or CancelRequest, and SSLRequests are answered
+`N` — this listener is in-cluster plain TCP, off by default, and transport
+security belongs to the exposure layer. Results travel in text format with
+typed OIDs (ints, floats, booleans, text, decimals, dates, microsecond
+timestamps); anything else says to cast to `VARCHAR`. A gateway rollout ends
+wire connections; reconnect and the session-recovery contract applies.
 
 ## Exposure
 

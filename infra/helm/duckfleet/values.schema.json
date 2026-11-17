@@ -87,6 +87,13 @@
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9/_.-]*[A-Za-z0-9]$"
     },
+    "pgwire": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"}
+      }
+    },
     "postgres": {
       "type": "object",
       "additionalProperties": false,
