@@ -7,7 +7,9 @@ there is one definition of the wire protocol rather than two that can drift.
 """
 import datetime
 import decimal
+import http.client
 import json
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -22,11 +24,17 @@ def encode_parameter(value):
 
 
 class RemoteError(RuntimeError):
-    """A failure the server classified.
+    """A failure the server classified — or one the transport could not deliver.
 
     `retry_safe` repeats the server's judgement and is true only where the platform
     proved the request left no partial effect. Acting on it is the caller's choice:
     this transport never replays a statement by itself.
+
+    A request that dies in transport (reset, refused, timed out) is raised as
+    `failure_kind="transport_failure"` with `status=None` and `retry_safe=False`:
+    whether it ran is unknown to the client, but not unknowable — the server records
+    every statement in `query_history` before executing it, so its true outcome can
+    be read back by `request_id`.
     """
 
     def __init__(self, status, message, failure_kind=None, retry_safe=False):
@@ -62,15 +70,47 @@ class Client:
             except (ValueError, KeyError):
                 pass
             raise RemoteError(error.code, message, kind, retry_safe) from error
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+            # A raw socket error is the one shape a caller cannot act on, so it is
+            # classified here. Never retry-safe: the request may have reached the
+            # server and run, and only `query_history` can say.
+            raise RemoteError(
+                None,
+                "the request failed in transport before any response arrived, so "
+                "whether it ran is unknown; check /v1/queries for its request_id "
+                f"before resending a write ({type(error).__name__}: {error})",
+                "transport_failure", False) from error
+
+
+# Refusals a new session may simply wait out: a rollout drains the old gateway
+# (`draining`), replaces it (transport failures, or an unclassified 5xx from a
+# Service with no ready endpoint), and a worker may still be attaching its catalog
+# (`starting`). Opening a session runs no SQL, so waiting costs nothing but time.
+# Statements are never retried by this client under any classification.
+_OPEN_WAITABLE_KINDS = frozenset({"draining", "starting", "transport_failure"})
 
 
 class RemoteConnection:
-    def __init__(self, endpoint, token, name="client", compute=None, context=None):
+    def __init__(self, endpoint, token, name="client", compute=None, context=None,
+                 open_retry_seconds=90):
         self.client = Client(endpoint, token)
         self.context = dict(context or {}, connection_name=name)
-        info = json.loads(self.client.request("POST", "/v1/sessions", {
-            "compute": compute or {}, "context": self.context,
-        }))
+        # Bounded by wall clock rather than attempts, sized to a rollout: the old
+        # gateway may drain for up to 75 seconds before its replacement serves.
+        # `open_retry_seconds=0` disables the wait entirely.
+        deadline = time.monotonic() + open_retry_seconds
+        while True:
+            try:
+                info = json.loads(self.client.request("POST", "/v1/sessions", {
+                    "compute": compute or {}, "context": self.context,
+                }))
+                break
+            except RemoteError as error:
+                waitable = error.failure_kind in _OPEN_WAITABLE_KINDS or (
+                    error.failure_kind is None and error.status in (502, 503, 504))
+                if not waitable or time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
         self.session_id = info["session_id"]
         self.placement = info["placement"]
         self.closed = False
@@ -78,6 +118,25 @@ class RemoteConnection:
     @property
     def path(self):
         return f"/v1/sessions/{self.session_id}"
+
+    def _request(self, method, suffix="", payload=None):
+        """A session-scoped request, with the one session-scoped failure explained.
+
+        `unknown_session` is what a gateway restart or idle expiry looks like from
+        here, and the server's one-liner does not say what to do about it.
+        """
+        try:
+            return self.client.request(method, self.path + suffix, payload)
+        except RemoteError as error:
+            if error.failure_kind != "unknown_session":
+                raise
+            raise RemoteError(
+                error.status,
+                f"{error} — this session no longer exists (the gateway restarted, or "
+                "it sat idle past expiry); uncommitted work from it can only be "
+                "rolled back, never committed. Open a new connection, and check "
+                "/v1/queries by request_id before resending any write",
+                error.failure_kind, error.retry_safe) from error
 
     def cursor(self):
         if self.closed:
@@ -92,11 +151,17 @@ class RemoteConnection:
 
     def close(self):
         if not self.closed:
-            self.client.request("DELETE", self.path)
+            try:
+                self.client.request("DELETE", self.path)
+            except RemoteError as error:
+                # The session being already gone is what closing wanted; anything
+                # else still raises, because the session has not been released.
+                if error.failure_kind != "unknown_session":
+                    raise
             self.closed = True
 
     def cancel(self):
-        return json.loads(self.client.request("POST", self.path + "/cancel"))
+        return json.loads(self._request("POST", "/cancel"))
 
 
 class RemoteCursor:
@@ -110,7 +175,7 @@ class RemoteCursor:
     def execute(self, sql, parameters=None):
         context = dict(self.connection.context)
         self.query_id = str(uuid.uuid4())
-        result = self.connection.client.request("POST", self.connection.path + "/queries", {
+        result = self.connection._request("POST", "/queries", {
             "request_id": self.query_id, "sql": sql, "parameters": list(parameters or []), "context": context,
         })
         table = pyarrow.ipc.open_stream(result).read_all()

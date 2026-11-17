@@ -106,8 +106,10 @@ pub(crate) const INVALID_REQUEST: Failure = Failure {
     http: StatusCode::BAD_REQUEST,
 };
 
-/// The session is gone or expired. A caller must open a new one, and any write it
-/// had open was rolled back when the connection was dropped.
+/// The session is gone or expired. A caller must open a new one. Any write the lost
+/// session had open can only be rolled back, never committed — immediately where the
+/// session was closed, and at idle expiry where a gateway restart orphaned it on its
+/// worker.
 pub(crate) const UNKNOWN_SESSION: Failure = Failure {
     status: None,
     kind: "unknown_session",

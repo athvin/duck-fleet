@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckfleet"
-version = "0.1.0"
+version = "0.2.0"
 description = "Client and CLI for the DuckFleet HTTP API"
 requires-python = ">=3.12"
 # pyarrow only, because results arrive as Arrow IPC. Notably absent: dbt-core, which

@@ -416,6 +416,100 @@ def drain_inflight(marker_name="drain-inflight.started", drained="its worker"):
           f"({outcome['elapsed']:.1f}s)")
 
 
+def gateway_replaced():
+    """What a caller holding a session experiences when the gateway dies without grace.
+
+    The script kills the gateway pod the moment history shows the insert running —
+    the ledger is the signal, as with the evictions, because a kind harness Job
+    writes artifacts to a claim the host cannot read. Four things must be true
+    afterwards: the in-flight request failed *classified* rather than as a raw
+    socket error; a plain reopen rode through the replacement window on the client's
+    bounded open retry; the lost session refuses further use with guidance rather
+    than a bare 404; and the insert's true outcome was knowable from history — the
+    worker finishes the statement whether or not the gateway that proxied it
+    survives, and the committed rows must match that record.
+    """
+    setup = RemoteConnection(URL, TOKEN, compute={"cpu": 1, "memory": "1Gi"})
+    try:
+        sql(setup, "create schema if not exists api_demo")
+        sql(setup, "create or replace table api_demo.gateway_replaced (n bigint)")
+    finally:
+        setup.close()
+
+    connection = RemoteConnection(URL, TOKEN, compute={"cpu": 1, "memory": "1Gi"})
+    outcome = {}
+    request_id = str(uuid.uuid4())
+
+    def write():
+        try:
+            connection.client.request("POST", connection.path + "/queries", {
+                "request_id": request_id,
+                "sql": "insert into api_demo.gateway_replaced "
+                       "select range from range(200000000) where range % 13 = 5",
+            })
+            outcome["completed"] = True
+        except RemoteError as error:
+            outcome["classified"] = {"kind": error.failure_kind,
+                                     "retry_safe": error.retry_safe}
+        except Exception as error:  # noqa: BLE001 - the shape under test
+            outcome["unclassified"] = f"{type(error).__name__}: {error}"
+
+    thread = threading.Thread(target=write)
+    thread.start()
+    # The transport timeout is 75s, so a severed connection that dies silently still
+    # returns within this window.
+    thread.join(timeout=300)
+    require(not thread.is_alive(), "the request never returned after the gateway was killed")
+    require("unclassified" not in outcome,
+            f"the gateway's death surfaced unclassified: {outcome.get('unclassified')}")
+    require("classified" in outcome,
+            f"the statement completed, so the kill came after it: {outcome}")
+    require(outcome["classified"]["kind"] == "transport_failure", str(outcome))
+    require(outcome["classified"]["retry_safe"] is False,
+            "a severed request must never be reported retry-safe")
+    print("PASS: the in-flight request failed classified, not as a raw socket error")
+
+    # A plain constructor call, no special handling: the bounded open retry is what
+    # rides through refused connections until the replacement gateway serves.
+    waited = time.monotonic()
+    reopened = RemoteConnection(URL, TOKEN, compute={"cpu": 1, "memory": "1Gi"})
+    print(f"PASS: a reopen rode through the gateway replacement "
+          f"({time.monotonic() - waited:.1f}s)")
+    try:
+        # The lost session refuses further use, and says what to do instead.
+        try:
+            sql(connection, "select 1")
+            raise AssertionError("a session route survived a gateway replacement")
+        except RemoteError as error:
+            require(error.failure_kind == "unknown_session", str(error))
+            require("Open a new connection" in str(error), str(error))
+        # Closing it is tolerated: the session being gone is what closing wanted.
+        connection.close()
+
+        # The severed insert's outcome is in history. The worker ran it to the end
+        # with no gateway to answer to, and a single-statement insert autocommits,
+        # so history must say succeeded and the table must hold every row.
+        record = None
+        for _ in range(120):
+            record = json.loads(
+                reopened.client.request("GET", "/v1/queries/" + request_id))
+            if record["status"] != "running":
+                break
+            time.sleep(2)
+        require(record["status"] == "succeeded",
+                f"the severed insert ended {record['status']}")
+        committed = sql(reopened,
+                        "select count(*) from api_demo.gateway_replaced")[0][0]
+        expected = sql(reopened,
+                       "select count(*) from range(200000000) where range % 13 = 5")[0][0]
+        require(committed == expected,
+                f"{committed} rows committed, {expected} expected — a partial commit")
+    finally:
+        reopened.close()
+    print("PASS: a gateway replaced without grace left classified outcomes "
+          "and a knowable history")
+
+
 def evicted_midquery(expect_classified=False):
     """Reports how a statement ends when its worker pod is deleted underneath it.
 
@@ -511,6 +605,9 @@ def main():
         return
     if "--gateway-drain-inflight" in sys.argv:
         drain_inflight("gateway-drain-inflight.started", "the gateway")
+        return
+    if "--gateway-replaced" in sys.argv:
+        gateway_replaced()
         return
     if "--isolated" in sys.argv:
         isolated_checks()
