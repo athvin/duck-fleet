@@ -188,6 +188,19 @@ assert med['nodeSelector'].get('karpenter.sh/nodepool') == 'duckfleet', 'medium 
 # requiring it (the isolated session pod never scheduled until this was dropped).
 assert 'eks.amazonaws.com/compute-type' not in med['nodeSelector'], 'compute-type blocks Karpenter'
 assert any(t['key'] == 'duckfleet.io/dedicated' for t in med['tolerations']), 'taint not tolerated'
+# The isolated session pod is the object #90 was actually about: the gateway creates it
+# from this template, and it carried `compute-type: null` — an impossible label match
+# Karpenter will not provision for — until the placement helper learned to drop
+# null-valued keys. Assert it here on the exact manifest, not only on the worker it
+# shares the helper with, and reject any null the merge might leave behind.
+import json
+iso = json.loads(next(d for d in docs if d['kind'] == 'ConfigMap'
+                      and d['metadata']['name'] == 'duckfleet-isolated-pod')
+                 ['data']['pod.json'])['spec']
+assert 'eks.amazonaws.com/compute-type' not in iso['nodeSelector'], 'isolated pod carries compute-type (#90)'
+assert all(v is not None for v in iso['nodeSelector'].values()), \
+    f"isolated pod has a null selector value, an impossible match (#90): {iso['nodeSelector']}"
+assert iso['nodeSelector'].get('karpenter.sh/nodepool') == 'duckfleet', 'isolated pod not pinned'
 PY
 echo 'PASS: the AWS flip render — isolated on, pinned, medium at its full 2 CPU — is valid'
 # And deploy_values builds exactly that overlay from the CIDRs and ports the

@@ -15,24 +15,18 @@ harness.scale_checks()
 # Isolated compute is enabled on this lane (the boundary grants it, deploy_values
 # turns it on), so the harness asserts it is actually live — the deploy identity
 # cannot check from outside the cluster, so this in-cluster run is where a missing
-# or broken grant is caught (#39). routing_contract_checks above already exercised
-# an isolated open; the cold-start measurement (#18) needs a pod to actually run, so
-# it is attempted but tolerated when the shared cluster cannot schedule one. That
-# scheduling gap on EKS Auto Mode is duck-fleet#90; the kind harness records the
-# measurement where scheduling is not contended.
+# or broken grant is caught (#39). The cold-start measurement (#18) then opens real
+# isolated sessions on EKS: the gateway's pod schedules on the duckfleet NodePool,
+# Karpenter provisions a node for it on demand, and the pod runs to ready. That
+# EKS Auto Mode scheduling was duck-fleet#90 — resolved by dropping the null
+# compute-type selector the pod carried — so a failure to place is now a defect this
+# lane must catch, not a tolerated gap.
 harness.require(
     json.loads(harness.Client(harness.URL, harness.TOKEN).request(
         "GET", "/v1/workers"))["isolated_compute"],
     "isolated compute is not live: the gateway does not hold the pod grant. "
     "Run scripts/aws/apply-boundary.sh with an administrative profile (#39).")
-try:
-    harness.cold_start_checks()
-except harness.RemoteError as error:
-    harness.require(error.failure_kind == "not_placeable",
-                    f"the isolated open failed as {error.failure_kind}, not a "
-                    f"placement limit: {error}")
-    print("cold start not measured on EKS: the shared cluster could not schedule an "
-          "isolated pod (not_placeable); see duck-fleet#90")
+harness.cold_start_checks()
 prefix = os.environ['EXPECT_S3_PREFIX']
 if not re.fullmatch(r's3://duckfleet-dev-[a-z0-9-]+/lake/', prefix):
     raise ValueError('AWS harness must target the DuckFleet development lake')
