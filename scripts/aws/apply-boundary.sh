@@ -107,20 +107,29 @@ if "${KUBE[@]}" get deployment server > /dev/null 2>&1; then
   "${KUBE[@]}" rollout status deployment/server --timeout=300s
 fi
 
-# The API server's endpoints, recorded where the deploy can read them. The deploy
-# identity is scoped to its own namespace and cannot read the `default` namespace, so
-# it cannot discover the address its isolated-compute egress rule must name (#32) — a
-# rule against the Service ClusterIP would match nothing once kube-proxy rewrites the
-# destination. This has the admin access to read the real endpoints, so it writes them
-# into the namespace as a ConfigMap the deploy consumes; deploy_values.py turns them
-# into the egress CIDRs and enables isolated compute. Refreshed on every boundary apply.
+# Where the gateway's isolated-compute egress rule must let it reach the API server,
+# recorded where the deploy can read it — the deploy identity is scoped to its own
+# namespace and cannot read `default`. Both the Service ClusterIP and the endpoints it
+# resolves to go in, because which one the egress policy matches is CNI-dependent and
+# the two clusters this runs on disagree: kind's Calico matches the rewritten endpoint
+# (the node IP, #32), while EKS's VPC CNI matches the pre-rewrite ClusterIP — a rule
+# naming only the endpoints there blocks the gateway's call to the ClusterIP and the
+# pod create times out, exactly as DNS to 172.20.0.10 only works because its rule
+# names the Service CIDR. Recording both on the service port covers either CNI. The
+# deploy consumes this ConfigMap through deploy_values.py; refreshed on every apply.
+service=$(kubectl --context "$KUBE_CONTEXT" -n default get service kubernetes -o json)
 api=$(kubectl --context "$KUBE_CONTEXT" -n default get endpoints kubernetes -o json)
-python3 - "$NAMESPACE" "$api" <<'PY' | "${KUBE[@]}" apply -f -
+python3 - "$NAMESPACE" "$service" "$api" <<'PY' | "${KUBE[@]}" apply -f -
 import json, sys
-namespace, described = sys.argv[1], json.loads(sys.argv[2])
+namespace, svc, described = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
 subsets = described.get("subsets", [])
-cidrs = sorted({f"{a['ip']}/32" for s in subsets for a in s.get("addresses", [])})
-ports = sorted({p["port"] for s in subsets for p in s.get("ports", [])})
+cidrs = {f"{a['ip']}/32" for s in subsets for a in s.get("addresses", [])}
+ports = {p["port"] for s in subsets for p in s.get("ports", [])}
+# The ClusterIP on the Service's own port: what the gateway actually connects to, and
+# what EKS's VPC CNI evaluates the egress rule against.
+cidrs.add(f"{svc['spec']['clusterIP']}/32")
+ports.update(p["port"] for p in svc["spec"].get("ports", []))
+cidrs, ports = sorted(cidrs), sorted(ports)
 if not cidrs or not ports:
     raise SystemExit("the kubernetes Service resolves to no endpoints")
 print(json.dumps({
