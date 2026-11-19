@@ -192,6 +192,7 @@ o = dv.overlay(['10.42.9.4/32', '10.42.3.17/32'], [443])
 assert o['isolatedCompute']['enabled'] is True
 assert o['isolatedCompute']['apiServerCidrs'] == ['10.42.3.17/32', '10.42.9.4/32'], o['isolatedCompute']
 assert o['isolatedCompute']['apiServerPorts'] == [443]
+assert o['isolatedCompute']['readySeconds'] >= 300, 'cold Karpenter provisioning needs a generous ready wait'
 assert o['nodeSelector']['karpenter.sh/nodepool'] == 'duckfleet'
 assert o['tolerations'][0]['key'] == 'duckfleet.io/dedicated'
 assert o['workerCpuRequests'] == {'medium': 2}
