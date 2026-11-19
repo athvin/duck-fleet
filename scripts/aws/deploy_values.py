@@ -45,6 +45,13 @@ def overlay(cidrs, ports):
             "enabled": True,
             "apiServerCidrs": sorted(cidrs),
             "apiServerPorts": sorted(ports),
+            # The first isolated pod needs a node the pool does not have yet — the
+            # persistent workers fill the one that exists — so Karpenter provisions a
+            # fresh one: EC2 launch, node join, image pull, worker startup. The 120s
+            # chart default (kind, where scheduling is instant) is far too short for
+            # that cold path on EKS; this is the wait before the gateway gives up, so
+            # a generous ceiling only matters when provisioning is genuinely slow.
+            "readySeconds": 420,
         },
         # Merged over the chart's nodeSelector, adding the pool pin; the taint it
         # carries needs the toleration beside it, which check-chart.py asserts.
