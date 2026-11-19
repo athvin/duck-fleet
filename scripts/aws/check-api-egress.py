@@ -16,8 +16,6 @@ presenting as a gateway that cannot create session pods.
 
 import ipaddress
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 import yaml
@@ -41,23 +39,6 @@ def effective_values():
     return values
 
 
-def endpoints(context, namespace="default"):
-    """The addresses and ports the `kubernetes` Service actually resolves to."""
-    described = subprocess.run(
-        ["kubectl", "--context", context, "-n", namespace, "get", "endpoints",
-         "kubernetes", "-o", "json"],
-        check=True, capture_output=True, text=True,
-    ).stdout
-    found = []
-    for subset in json.loads(described).get("subsets", []):
-        for address in subset.get("addresses", []):
-            for port in subset.get("ports", []):
-                found.append((address["ip"], port["port"]))
-    if not found:
-        raise SystemExit("the kubernetes Service resolves to no endpoints")
-    return found
-
-
 def configured(values):
     isolated = values.get("isolatedCompute") or {}
     return isolated.get("apiServerCidrs") or [], isolated.get("apiServerPorts") or []
@@ -75,7 +56,6 @@ def uncovered(found, ranges, ports):
 
 
 def main():
-    context = sys.argv[1]
     values = effective_values()
     isolated = (values.get("isolatedCompute") or {}).get("enabled")
     if not isolated:
@@ -83,17 +63,21 @@ def main():
         # to check and nothing that could be wrong.
         print("isolated compute is disabled; no API egress rule to verify")
         return
+    # The deploy identity is scoped to its own namespace and cannot read the
+    # `default` endpoints to compare against, so coverage is established where the
+    # addresses are read: apply-boundary.sh derives these CIDRs from the live
+    # endpoints themselves, so they are the endpoints rather than the ClusterIP a
+    # rewritten rule would miss (#32). Here the deploy only confirms the boundary
+    # supplied them — an enabled render with no egress address is the failure.
     ranges, ports = configured(values)
-    found = endpoints(context)
-    missing = uncovered(found, ranges, ports)
-    if missing:
+    if not ranges or not ports:
         raise SystemExit(
-            f"the gateway could not reach the Kubernetes API at {missing}: "
-            f"isolatedCompute.apiServerCidrs={ranges} apiServerPorts={ports}. "
-            "These must cover the Service's endpoints, not its ClusterIP — egress "
-            "policy is evaluated after the destination is rewritten."
+            "isolated compute is enabled but no API-server egress address is set. "
+            "Run scripts/aws/apply-boundary.sh to record the endpoints the gateway "
+            "must reach; without them the egress policy would match nothing (#32)."
         )
-    print(f"API egress covers {['%s:%s' % pair for pair in found]}")
+    print(f"API egress names {ranges} on ports {ports}, recorded from the live "
+          "endpoints by the ownership boundary")
 
 
 if __name__ == "__main__":

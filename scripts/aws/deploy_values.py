@@ -3,14 +3,17 @@
 Enabling isolated compute needs the API server's real address: a rule written
 against the `kubernetes` Service ClusterIP matches nothing once kube-proxy has
 rewritten the destination (#32), so the egress policy must name the endpoints the
-Service actually resolves to — a fact about the cluster, unknown when the chart is
-authored. It is computed here and merged over the image digests already in
-values.json, so the flip the ownership boundary unblocks (#39) lives in the deploy
-rather than in chart defaults every other render would then have to carry: isolated
-compute on, the API-server CIDRs and ports its egress needs, the workers pinned to
-the DuckFleet node pool with the toleration its taint requires, and the medium
-worker requesting its full two CPUs now that it sits on a pool sized for it rather
-than squeezing onto a shared one.
+Service actually resolves to. The deploy identity is scoped to its own namespace
+and cannot read those endpoints, which live in `default` — so apply-boundary.sh,
+which has the admin access to read them, records them in a ConfigMap here that the
+deploy can read. That is where the flip the ownership boundary unblocks (#39)
+comes from, merged over the image digests already in values.json: isolated compute
+on with those CIDRs and ports, the workers pinned to the DuckFleet node pool with
+the toleration its taint needs, and the medium worker at its full two CPUs.
+
+Until the boundary is (re-)applied the ConfigMap is absent, in which case isolated
+compute stays off and the deploy renders exactly as it did before — the flip waits
+on the operator, it does not fail without them.
 """
 import json
 import subprocess
@@ -18,30 +21,30 @@ import sys
 from pathlib import Path
 
 
-def endpoints(context, namespace="default"):
-    """The addresses and ports the `kubernetes` Service actually resolves to."""
-    described = subprocess.run(
-        ["kubectl", "--context", context, "-n", namespace, "get", "endpoints",
-         "kubernetes", "-o", "json"],
-        check=True, capture_output=True, text=True,
-    ).stdout
-    found = []
-    for subset in json.loads(described).get("subsets", []):
-        for address in subset.get("addresses", []):
-            for port in subset.get("ports", []):
-                found.append((address["ip"], port["port"]))
-    if not found:
-        raise SystemExit("the kubernetes Service resolves to no endpoints")
-    return found
+def api_egress(context, namespace):
+    """The API-server CIDRs and ports apply-boundary.sh recorded, or None if it has
+    not run with this feature yet. Read from the deploy's own namespace, which it is
+    permitted to; the endpoints themselves live in `default`, which it is not."""
+    result = subprocess.run(
+        ["kubectl", "--context", context, "-n", namespace, "get", "configmap",
+         "duckfleet-api-egress", "-o", "json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    data = json.loads(result.stdout).get("data", {})
+    cidrs = json.loads(data.get("cidrs", "[]"))
+    ports = json.loads(data.get("ports", "[]"))
+    return (cidrs, ports) if cidrs and ports else None
 
 
-def overlay(found):
-    """The deploy-scoped values, from the endpoints the API server resolves to."""
+def overlay(cidrs, ports):
+    """The deploy-scoped values, from the API-server address the boundary recorded."""
     return {
         "isolatedCompute": {
             "enabled": True,
-            "apiServerCidrs": sorted({f"{ip}/32" for ip, _ in found}),
-            "apiServerPorts": sorted({port for _, port in found}),
+            "apiServerCidrs": sorted(cidrs),
+            "apiServerPorts": sorted(ports),
         },
         # Merged over the chart's nodeSelector, adding the pool pin; the taint it
         # carries needs the toleration beside it, which check-chart.py asserts.
@@ -65,14 +68,19 @@ def overlay(found):
 
 def main():
     context = sys.argv[1]
+    namespace = sys.argv[2] if len(sys.argv) > 2 else "duckfleet-dev"
     path = Path("artifacts/aws/values.json")
     values = json.loads(path.read_text())
-    found = endpoints(context)
-    values.update(overlay(found))
+    egress = api_egress(context, namespace)
+    if egress is None:
+        print("no duckfleet-api-egress ConfigMap; isolated compute stays off "
+              "(run scripts/aws/apply-boundary.sh to record the API-server address)")
+        return
+    cidrs, ports = egress
+    values.update(overlay(cidrs, ports))
     path.write_text(json.dumps(values, indent=2) + "\n")
-    reached = sorted({f"{ip}:{port}" for ip, port in found})
-    print(f"deploy values: isolated compute on, API egress to {reached}, "
-          "workers pinned to the duckfleet pool at a full 2-CPU request")
+    print(f"deploy values: isolated compute on, API egress to {sorted(cidrs)} "
+          f"ports {sorted(ports)}, workers pinned to the duckfleet pool at a full 2-CPU request")
 
 
 if __name__ == "__main__":

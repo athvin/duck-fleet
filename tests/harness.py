@@ -233,6 +233,57 @@ def isolated_session(compute):
     return connection, placement
 
 
+def cold_start_checks():
+    """Measures what an isolated pod costs in latency against a persistent worker.
+
+    The routing choice — shared worker vs a pod of one's own — only makes sense if
+    its price is known, and the blueprint flags worker economics as a feasibility
+    gate. This times three opens: a persistent session (no pod, the warm baseline);
+    the first isolated session (cold — a pod is created, scheduled, and pulled to
+    ready before the session answers); and a second isolated session right after
+    (warm-node — the image is cached and a node already stands, so this isolates
+    pod-lifecycle cost from node scale-up). Each number is wall-clock from the
+    client, which is the latency a caller actually waits, and all three land in an
+    evidence artifact rather than a log line. The persistent elapsed_ms the ledger
+    records for the same query gives the per-execution cost side its anchor.
+    """
+    def timed_open(compute):
+        started = time.monotonic()
+        connection = RemoteConnection(URL, TOKEN, compute=compute)
+        opened = time.monotonic() - started
+        require(sql(connection, "select 1") == [(1,)], "session did not answer")
+        return connection, opened
+
+    persistent, warm_persistent = timed_open({"cpu": 1, "memory": "1Gi"})
+    persistent.close()
+
+    isolated_compute = {"compute": "isolated", "cpu": 1, "memory": "1Gi"}
+    first, cold_isolated = timed_open(isolated_compute)
+    first_pod = first.placement["worker_id"]
+    first.close()
+    # Wait for the first pod to be gone so the second is genuinely a fresh pod rather
+    # than a reuse, while the node and image it left behind stay warm.
+    time.sleep(5)
+    second, warm_isolated = timed_open(isolated_compute)
+    require(second.placement["worker_id"] != first_pod, "the second isolated pod reused the first")
+    second.close()
+
+    evidence = {
+        "persistent_open_seconds": round(warm_persistent, 2),
+        "isolated_cold_open_seconds": round(cold_isolated, 2),
+        "isolated_warm_node_open_seconds": round(warm_isolated, 2),
+        "isolated_over_persistent_seconds": round(cold_isolated - warm_persistent, 2),
+    }
+    (ARTIFACTS / "cold-start.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    # Not a performance threshold — hardware and the scheduler make the absolute
+    # numbers vary — but the ordering is a real invariant: a pod that must be created
+    # cannot open faster than a worker that already exists.
+    require(cold_isolated >= warm_persistent,
+            f"isolated open {cold_isolated:.2f}s beat persistent {warm_persistent:.2f}s")
+    print(f"PASS: cold start measured — persistent {warm_persistent:.2f}s, "
+          f"isolated cold {cold_isolated:.2f}s, isolated warm-node {warm_isolated:.2f}s")
+
+
 def isolated_checks():
     """On-demand compute, against a real cluster.
 
@@ -905,6 +956,9 @@ def main():
         return
     if "--dbt-isolated" in sys.argv:
         dbt_isolated_checks()
+        return
+    if "--cold-start" in sys.argv:
+        cold_start_checks()
         return
     if "--maintenance" in sys.argv:
         maintenance_checks()
