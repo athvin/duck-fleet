@@ -81,6 +81,24 @@ services:
     cpus: 2
     stop_grace_period: 10s
 
+  # A second worker of the small size, for the scale-out stage: same resources, its
+  # own identity. Behind a profile so the default run keeps exactly two workers and
+  # its deterministic placement assertions; the harness brings this up and points the
+  # gateway at it via DUCKFLEET_WORKER_URLS.
+  worker-small-b:
+    profiles: [scale-out]
+    image: duckfleet-worker:local
+    environment:
+      <<: *worker-environment
+      DUCKFLEET_WORKER_ID: small-b
+    depends_on:
+      worker-small:
+        condition: service_healthy
+    healthcheck: *worker-health
+    mem_limit: 1g
+    cpus: 1
+    stop_grace_period: 10s
+
   server:
     image: duckfleet-worker:local
     environment:
@@ -93,7 +111,9 @@ services:
       DUCKFLEET_RATE_CARD_VERSION: local-dev-1
       DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR: "100000"
       # Endpoints, not classes: the gateway asks each worker what resources it has.
-      DUCKFLEET_WORKER_URLS: http://worker-small:8080,http://worker-medium:8080
+      # Overridable so the scale-out stage can add worker-small-b without editing
+      # this file; the default is the two-worker fleet everything else assumes.
+      DUCKFLEET_WORKER_URLS: ${DUCKFLEET_WORKER_URLS:-http://worker-small:8080,http://worker-medium:8080}
     ports:
       - '127.0.0.1:${DUCKFLEET_PORT:-18080}:8080'
     depends_on:

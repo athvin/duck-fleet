@@ -150,6 +150,28 @@ docker compose up -d --wait server
 docker compose run --rm dbt python /app/tests/harness.py --after-restart
 docker compose run --rm bucket-init --verify
 
+# Scale-out within a size class: the fleet's whole scaling claim is more processes
+# against one lake, but a second same-size worker was dead weight — the gateway took
+# the first match and relayed a full worker's refusal instead of trying the sibling.
+# Bring up a second small worker, point the gateway at all three endpoints, and prove
+# sessions spread across both and that a draining worker fails over to its sibling.
+SCALE_URLS=http://worker-small:8080,http://worker-small-b:8080,http://worker-medium:8080
+DUCKFLEET_WORKER_URLS="$SCALE_URLS" docker compose --profile scale-out up -d --wait worker-small-b
+DUCKFLEET_WORKER_URLS="$SCALE_URLS" docker compose up -d --wait --no-deps server
+docker compose run --rm --no-deps dbt python /app/tests/harness.py --spread
+# SIGTERM leaves the worker draining — serving in-flight work, refusing new opens with
+# the retry-safe `draining` kind — which is exactly the classified, nothing-ran refusal
+# the gateway may fail over. Both opens must still land, on the surviving sibling.
+docker compose stop -t 30 worker-small &
+sleep 2
+docker compose run --rm --no-deps dbt python /app/tests/harness.py --spread-failover
+wait
+# Restore the two-worker fleet the rest of the suite and repeated runs assume.
+docker compose --profile scale-out stop worker-small-b
+docker compose up -d --wait worker-small
+docker compose up -d --wait --no-deps server
+echo 'PASS: same-size workers shared load and failed over when one drained'
+
 # A pod can start before DNS and PostgreSQL are ready. The worker has to wait rather
 # than exit: a restart backoff outlives the deploy wait, which is what turned this
 # race into a failed release rather than a slow one.

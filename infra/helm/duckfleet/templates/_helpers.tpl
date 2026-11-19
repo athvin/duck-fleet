@@ -56,7 +56,10 @@ medium: 2
 {{- define "duckfleet.workerUrls" -}}
 {{- $urls := list -}}
 {{- range $size, $cpu := include "duckfleet.workerClasses" . | fromYaml -}}
-{{- $urls = append $urls (printf "http://worker-%s:8080" $size) -}}
+{{- range $index := until (int (dig $size 1 ($.Values.workerReplicas | default dict))) -}}
+{{- $id := ternary $size (printf "%s-%d" $size $index) (eq $index 0) -}}
+{{- $urls = append $urls (printf "http://worker-%s:8080" $id) -}}
+{{- end -}}
 {{- end -}}
 {{- join "," $urls -}}
 {{- end -}}

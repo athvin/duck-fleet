@@ -974,9 +974,64 @@ def evicted_midquery(expect_classified=False):
           f"and committed state stayed consistent ({rows} rows)")
 
 
+def spread_checks():
+    """Two workers of the same size share the load, so a fleet can scale a class.
+
+    Run with worker-small-b added to DUCKFLEET_WORKER_URLS. Four small sessions,
+    routed least-loaded-first, must land on both small workers rather than piling
+    onto whichever answered discovery first.
+    """
+    small = {"cpu": 1, "memory": "1Gi"}
+    sessions = [RemoteConnection(URL, TOKEN, compute=small) for _ in range(4)]
+    try:
+        placements = [s.placement["worker_id"] for s in sessions]
+        for session in sessions:
+            require(sql(session, "select 1") == [(1,)], "a spread session did not answer")
+        require(set(placements) >= {"small", "small-b"},
+                f"four small sessions did not spread across both workers: {placements}")
+        # Least-loaded routing splits an even count evenly rather than 3/1 or 4/0.
+        require(all(placements.count(worker) == 2 for worker in {"small", "small-b"}),
+                f"sessions did not balance evenly: {placements}")
+    finally:
+        for session in sessions:
+            session.close()
+    print(f"PASS: same-size sessions spread across both small workers ({placements})")
+
+
+def spread_failover_checks():
+    """A full or draining worker fails over to its sibling, so one worker refusing
+    an open does not refuse the fleet.
+
+    Run after SIGTERM to worker-small: a draining worker refuses new opens with the
+    retry-safe `draining` kind, which is exactly the classified, nothing-ran refusal
+    the gateway is allowed to fail over. Both small sessions must still open, and
+    both must land on the surviving sibling.
+    """
+    small = {"cpu": 1, "memory": "1Gi"}
+    sessions = []
+    try:
+        for _ in range(2):
+            session = RemoteConnection(URL, TOKEN, compute=small)
+            require(sql(session, "select 1") == [(1,)], "a failover session did not answer")
+            sessions.append(session)
+        placements = [s.placement["worker_id"] for s in sessions]
+        require(all(worker == "small-b" for worker in placements),
+                f"opens did not fail over to the surviving small worker: {placements}")
+    finally:
+        for session in sessions:
+            session.close()
+    print("PASS: opens failed over from a draining small worker to its sibling")
+
+
 def main():
     ARTIFACTS.mkdir(exist_ok=True)
     import observability
+    if "--spread" in sys.argv:
+        spread_checks()
+        return
+    if "--spread-failover" in sys.argv:
+        spread_failover_checks()
+        return
     if "--history-without-workers" in sys.argv:
         observability.history_without_workers(URL, TOKEN)
         return

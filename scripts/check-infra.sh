@@ -157,6 +157,43 @@ helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$valu
   --set pgwire.enabled=true > "$wire"
 python3 scripts/check-chart.py "$wire" > /dev/null
 echo 'PASS: the wire front renders only when asked for'
+# Scale-out within a class: a second small worker renders as its own Deployment and
+# Service with its own recurring identity, the gateway's endpoint list names every
+# replica, and the legacy objects keep the exact names and selectors an existing
+# deployment already has — a Deployment selector is immutable, so index 0 changing
+# it would fail every in-place upgrade.
+scaled="$validation_dir/scaled.yaml"
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set workerReplicas.small=2 > "$scaled"
+python3 scripts/check-chart.py "$scaled" > /dev/null
+python3 - "$scaled" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+workers = {d['metadata']['name']: d for d in docs
+           if d['kind'] == 'Deployment' and d['metadata']['name'].startswith('worker-')}
+assert set(workers) == {'worker-small', 'worker-small-1', 'worker-medium'}, sorted(workers)
+identities = []
+for deployment in workers.values():
+    env = {e['name']: e.get('value') for e in
+           deployment['spec']['template']['spec']['containers'][0]['env']}
+    identities.append(env['DUCKFLEET_WORKER_ID'])
+assert len(set(identities)) == len(identities), f'worker identities collide: {identities}'
+assert workers['worker-small']['spec']['selector']['matchLabels'] == \
+    {'app': 'duckfleet-worker', 'size': 'small'}, 'index 0 selector changed: upgrades break'
+assert workers['worker-small-1']['spec']['selector']['matchLabels'].get('worker-index') == '1'
+gateway = next(d for d in docs if d['kind'] == 'Deployment' and d['metadata']['name'] == 'server')
+env = {e['name']: e.get('value') for e in
+       gateway['spec']['template']['spec']['containers'][0]['env']}
+urls = env['DUCKFLEET_WORKER_URLS'].split(',')
+assert sorted(urls) == ['http://worker-medium:8080', 'http://worker-small-1:8080',
+                        'http://worker-small:8080'], urls
+services = {d['metadata']['name']: d['spec']['selector'] for d in docs
+            if d['kind'] == 'Service' and d['metadata']['name'].startswith('worker-')}
+assert all('worker-index' in selector for selector in services.values()), \
+    'a worker Service without worker-index balances across siblings mid-session'
+assert services['worker-small-1']['worker-index'] == '1', services['worker-small-1']
+PY
+echo 'PASS: a second same-size worker renders its own identity, Service, and endpoint entry'
 # The #39 flip, as the AWS deploy computes it: isolated compute on, workers pinned to
 # the DuckFleet pool with the toleration its taint needs, the medium worker at its
 # full 2-CPU request. Chart defaults stay unpinned — the flip is a deploy-time overlay

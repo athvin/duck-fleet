@@ -122,6 +122,17 @@ exposure:
 workerCpuRequests:
   medium: 1
 
+# How many workers of each class to run. One by default — the topology every
+# existing deployment already has, byte for byte. Raising a count adds siblings
+# (worker-small-1, identity small-1, its own Service) that the gateway's discovery
+# ranks least-loaded first and fails over to when one refuses with a condition that
+# provably ran nothing. Each sibling is its own single-replica Recreate Deployment
+# because a worker identity must have at most one live process, and must recur after
+# a restart for history reconciliation and reservation recovery to find its rows.
+workerReplicas:
+  small: 1
+  medium: 1
+
 # Where cluster DNS may be reached, by address, because it cannot be selected by pod
 # on every topology. Deliberately the service and VPC ranges rather than 0.0.0.0/0:
 # opening port 53 generally is the usual shortcut, and it would permit resolution

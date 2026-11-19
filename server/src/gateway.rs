@@ -69,6 +69,42 @@ struct Fleet {
     discovered: Instant,
 }
 
+/// How an attempt to open a persistent session ended: on a worker, or with the last
+/// candidate's refusal, already shaped for relaying to the caller unchanged.
+enum OpenOutcome {
+    Opened {
+        endpoint: String,
+        upstream: reqwest::Response,
+    },
+    Refused(Response),
+}
+
+/// Whether a worker's refusal of an open is safe grounds to try its sibling: the
+/// worker classified it, promised nothing ran, and named a condition that is about
+/// this worker rather than the request — full, draining, or still starting. Not
+/// every retry-safe kind qualifies: `budget_exhausted` is about the deployment's
+/// funds and would refuse identically everywhere.
+fn failover_worthy(status: StatusCode, refusal: &Value) -> bool {
+    !status.is_success()
+        && refusal["retry_safe"] == json!(true)
+        && matches!(
+            refusal["failure_kind"].as_str(),
+            Some("capacity" | "draining" | "starting")
+        )
+}
+
+/// Every worker providing the size, least-loaded first; the configured order breaks
+/// ties, so a deployment with one worker per size behaves exactly as before.
+fn ranked_endpoints(
+    workers: &[WorkerInfo],
+    wanted: Resources,
+    census: &HashMap<String, usize>,
+) -> Vec<String> {
+    let mut matches: Vec<&WorkerInfo> = workers.iter().filter(|w| w.serves(wanted)).collect();
+    matches.sort_by_key(|w| census.get(&w.endpoint).copied().unwrap_or(0));
+    matches.iter().map(|w| w.endpoint.clone()).collect()
+}
+
 /// Who a request authenticated as, attached by `authenticate` so handlers read a
 /// fact the middleware established rather than re-deriving it.
 #[derive(Clone)]
@@ -311,23 +347,40 @@ impl Gateway {
     /// the catalog wait removed. A miss refreshes once, so a worker that was still
     /// starting when the table was built is not reported as a class that does not
     /// exist.
-    async fn endpoint_for(&self, wanted: Resources) -> Result<String, ApiError> {
+    ///
+    /// Every worker providing the size is returned, least-loaded first, so running a
+    /// second worker with the same resources adds capacity rather than dead weight —
+    /// which is the fleet's whole scaling claim. The load measure is this gateway's
+    /// own routed-session census; sessions opened outside the route table (platform
+    /// statements, pgwire) are short-lived and uncounted, an approximation that
+    /// self-corrects as counted sessions close.
+    async fn endpoints_for(&self, wanted: Resources) -> Result<Vec<String>, ApiError> {
         const FRESH: Duration = Duration::from_secs(30);
+        let census: HashMap<String, usize> = {
+            let routes = self.routes.lock().await;
+            let mut census = HashMap::new();
+            for route in routes.values() {
+                *census.entry(route.endpoint.clone()).or_insert(0) += 1;
+            }
+            census
+        };
         let cached = {
             let fleet = self.fleet.lock().await;
             fleet
                 .clone()
                 .filter(|f| f.discovered.elapsed() < FRESH && f.unreachable.is_empty())
         };
-        if let Some(fleet) = cached
-            && let Some(worker) = fleet.workers.iter().find(|w| w.serves(wanted))
-        {
-            return Ok(worker.endpoint.clone());
+        if let Some(fleet) = cached {
+            let candidates = ranked_endpoints(&fleet.workers, wanted, &census);
+            if !candidates.is_empty() {
+                return Ok(candidates);
+            }
         }
         let fleet = self.discover().await;
         *self.fleet.lock().await = Some(fleet.clone());
-        if let Some(worker) = fleet.workers.iter().find(|w| w.serves(wanted)) {
-            return Ok(worker.endpoint.clone());
+        let candidates = ranked_endpoints(&fleet.workers, wanted, &census);
+        if !candidates.is_empty() {
+            return Ok(candidates);
         }
         // Never falls back to a different size. Which failure it is matters: a
         // degraded fleet is worth retrying, a missing class is not.
@@ -355,6 +408,58 @@ impl Gateway {
                 ),
             )
         })
+    }
+
+    /// Opens a session on the least-loaded worker providing the size, failing over
+    /// to the next only on a refusal that provably ran nothing — the worker's own
+    /// classified `retry_safe` answer for a full, draining, or still-starting
+    /// sibling. A transport failure never fails over: an unanswered open may have
+    /// created a session, and opening a second would leak the first.
+    async fn open_persistent(
+        &self,
+        wanted: Resources,
+        body: Vec<u8>,
+        principal: &str,
+    ) -> Result<OpenOutcome, ApiError> {
+        let candidates = self.endpoints_for(wanted).await?;
+        let total = candidates.len();
+        for (position, endpoint) in candidates.into_iter().enumerate() {
+            let upstream = self
+                .client
+                .request(Method::POST, format!("{endpoint}/v1/sessions"))
+                .bearer_auth(&self.token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(credentials::PRINCIPAL_HEADER, principal)
+                .body(body.clone())
+                .send()
+                .await
+                .map_err(|_| ApiError::internal())?;
+            if upstream.status().is_success() {
+                return Ok(OpenOutcome::Opened { endpoint, upstream });
+            }
+            let status = upstream.status();
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(value) = upstream.headers().get(header::CONTENT_TYPE) {
+                headers.insert(header::CONTENT_TYPE, value.clone());
+            }
+            let bytes = upstream.bytes().await.map_err(|_| ApiError::internal())?;
+            let refusal: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            if position + 1 < total && failover_worthy(status, &refusal) {
+                tracing::info!(
+                    endpoint,
+                    kind = refusal["failure_kind"].as_str().unwrap_or(""),
+                    "a worker refused an open it provably did not start; trying its sibling"
+                );
+                continue;
+            }
+            // The last worker's own words, relayed unchanged: it says why it
+            // refused, and a gateway paraphrase would lose the only useful detail.
+            return Ok(OpenOutcome::Refused(
+                (status, headers, bytes).into_response(),
+            ));
+        }
+        // `endpoints_for` never returns an empty list.
+        Err(ApiError::internal())
     }
     async fn send(
         &self,
@@ -474,48 +579,59 @@ async fn open(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::new(failure::CAPACITY, "gateway session limit reached"))?;
-    // An isolated session gets a pod of its own; a persistent one gets whichever
-    // worker already reports these resources. Neither substitutes for the other.
-    let (endpoint, pod) = match placement.mode {
-        Mode::Persistent => (app.endpoint_for(placement.resources).await?, None),
+    // The principal rides the internal hop as a header the worker records at open:
+    // trusted because the hop requires the internal token, and set here rather than
+    // taken from the body so a caller cannot name someone else.
+    let body = serde_json::to_vec(&request).map_err(|_| ApiError::internal())?;
+    // An isolated session gets a pod of its own; a persistent one gets the
+    // least-loaded worker already reporting these resources, with a full or draining
+    // worker failed over to its sibling. Neither mode substitutes for the other.
+    let (endpoint, pod, upstream) = match placement.mode {
+        Mode::Persistent => {
+            match app
+                .open_persistent(placement.resources, body, principal.name())
+                .await?
+            {
+                OpenOutcome::Opened { endpoint, upstream } => (endpoint, None, upstream),
+                OpenOutcome::Refused(relay) => return Ok(relay),
+            }
+        }
         Mode::Isolated => {
             let isolation = app
                 .isolation
                 .as_ref()
                 .ok_or_else(crate::compute::unavailable)?;
             let started = isolation.start(placement.resources).await?;
-            (started.endpoint, Some(started.name))
+            // From here a session pod exists, so every exit below releases it. The
+            // worker's own response is still relayed unchanged on the way out: it
+            // says why it refused, and replacing that with a gateway error would
+            // lose the only useful detail.
+            let pod = Some(started.name);
+            let upstream = match app
+                .client
+                .request(Method::POST, format!("{}/v1/sessions", started.endpoint))
+                .bearer_auth(&app.token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(credentials::PRINCIPAL_HEADER, principal.name())
+                .body(body)
+                .send()
+                .await
+                .map_err(|_| ApiError::internal())
+            {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    app.release(pod).await;
+                    return Err(error);
+                }
+            };
+            if !upstream.status().is_success() {
+                let refused = response(upstream).await;
+                app.release(pod).await;
+                return refused;
+            }
+            (started.endpoint, pod, upstream)
         }
     };
-    // From here a session pod exists, so every exit below releases it. The worker's
-    // own response is still relayed unchanged on the way out: it says why it refused,
-    // and replacing that with a gateway error would lose the only useful detail.
-    // The principal rides the internal hop as a header the worker records at open:
-    // trusted because the hop requires the internal token, and set here rather than
-    // taken from the body so a caller cannot name someone else.
-    let body = serde_json::to_vec(&request).map_err(|_| ApiError::internal())?;
-    let upstream = match app
-        .client
-        .request(Method::POST, format!("{endpoint}/v1/sessions"))
-        .bearer_auth(&app.token)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(credentials::PRINCIPAL_HEADER, principal.name())
-        .body(body)
-        .send()
-        .await
-        .map_err(|_| ApiError::internal())
-    {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            app.release(pod).await;
-            return Err(error);
-        }
-    };
-    if !upstream.status().is_success() {
-        let refused = response(upstream).await;
-        app.release(pod).await;
-        return refused;
-    }
     let opened = upstream.json::<Value>().await.ok().and_then(|info| {
         let id = info
             .get("session_id")
@@ -642,20 +758,16 @@ async fn platform_statement(
     if app.draining.load(Ordering::Acquire) {
         return Err(draining_refusal());
     }
-    let endpoint = app.endpoint_for(Resources::default()).await?;
-    let open = app
-        .client
-        .request(Method::POST, format!("{endpoint}/v1/sessions"))
-        .bearer_auth(&app.token)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(credentials::PRINCIPAL_HEADER, principal.name())
-        .body(json!({"compute": {}, "context": {"operation": operation}}).to_string())
-        .send()
-        .await
-        .map_err(|_| ApiError::internal())?;
-    if !open.status().is_success() {
-        return response(open).await;
-    }
+    let body = json!({"compute": {}, "context": {"operation": operation}})
+        .to_string()
+        .into_bytes();
+    let (endpoint, open) = match app
+        .open_persistent(Resources::default(), body, principal.name())
+        .await?
+    {
+        OpenOutcome::Opened { endpoint, upstream } => (endpoint, upstream),
+        OpenOutcome::Refused(relay) => return Ok(relay),
+    };
     let session = open
         .json::<Value>()
         .await
@@ -723,26 +835,18 @@ impl crate::pgwire::Platform for PgPlatform {
     }
 
     async fn open_session(&self, principal: String) -> anyhow::Result<crate::pgwire::Session> {
-        let endpoint = self
+        let body = json!({"compute": {}, "context": {"operation": "pgwire"}})
+            .to_string()
+            .into_bytes();
+        let (endpoint, opened) = match self
             .0
-            .endpoint_for(Resources::default())
+            .open_persistent(Resources::default(), body, &principal)
             .await
-            .map_err(|refusal| anyhow::anyhow!("{}", refusal.1))?;
-        let opened = self
-            .0
-            .client
-            .request(Method::POST, format!("{endpoint}/v1/sessions"))
-            .bearer_auth(&self.0.token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(credentials::PRINCIPAL_HEADER, &principal)
-            .body(json!({"compute": {}, "context": {"operation": "pgwire"}}).to_string())
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("the worker did not answer"))?;
-        anyhow::ensure!(
-            opened.status().is_success(),
-            "the worker refused the session"
-        );
+            .map_err(|refusal| anyhow::anyhow!("{}", refusal.1))?
+        {
+            OpenOutcome::Opened { endpoint, upstream } => (endpoint, upstream),
+            OpenOutcome::Refused(_) => anyhow::bail!("the worker refused the session"),
+        };
         let session_id = opened
             .json::<Value>()
             .await
@@ -1245,6 +1349,91 @@ mod tests {
         assert_eq!(refused.0.http, StatusCode::FORBIDDEN);
         // The refusal names the action, so a caller knows which lever was refused.
         assert!(refused.1.contains("set budget limits"), "{}", refused.1);
+    }
+
+    #[test]
+    fn failover_is_earned_only_by_a_worker_condition_that_ran_nothing() {
+        // The three conditions that are about the worker, not the request.
+        for kind in ["capacity", "draining", "starting"] {
+            let refusal = json!({"failure_kind": kind, "retry_safe": true});
+            assert!(
+                failover_worthy(StatusCode::SERVICE_UNAVAILABLE, &refusal),
+                "{kind}"
+            );
+        }
+        // Retry-safe but about the deployment, not this worker: every sibling would
+        // refuse identically, so trying one is noise.
+        assert!(!failover_worthy(
+            StatusCode::PAYMENT_REQUIRED,
+            &json!({"failure_kind": "budget_exhausted", "retry_safe": true})
+        ));
+        // Not retry-safe, unclassified, and success are never failover grounds.
+        assert!(!failover_worthy(
+            StatusCode::BAD_REQUEST,
+            &json!({"failure_kind": "invalid_request", "retry_safe": false})
+        ));
+        assert!(!failover_worthy(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({})
+        ));
+        assert!(!failover_worthy(
+            StatusCode::OK,
+            &json!({"failure_kind": "capacity", "retry_safe": true})
+        ));
+    }
+
+    #[test]
+    fn same_size_workers_rank_least_loaded_first_and_other_sizes_never_appear() {
+        let small = Resources {
+            cpu: 1,
+            memory_bytes: 1024 * 1024 * 1024,
+        };
+        let workers = vec![
+            WorkerInfo {
+                endpoint: "http://worker-small:8080".into(),
+                cpu: 1,
+                memory_bytes: small.memory_bytes,
+            },
+            WorkerInfo {
+                endpoint: "http://worker-small-b:8080".into(),
+                cpu: 1,
+                memory_bytes: small.memory_bytes,
+            },
+            WorkerInfo {
+                endpoint: "http://worker-medium:8080".into(),
+                cpu: 2,
+                memory_bytes: 2 * small.memory_bytes,
+            },
+        ];
+        // Empty census: the configured order breaks the tie, so a one-worker-per-size
+        // deployment routes exactly as it always has.
+        let ranked = ranked_endpoints(&workers, small, &HashMap::new());
+        assert_eq!(
+            ranked,
+            ["http://worker-small:8080", "http://worker-small-b:8080"]
+        );
+        // Three sessions on the first worker, one on the second: the sibling leads.
+        let census = HashMap::from([
+            ("http://worker-small:8080".to_owned(), 3),
+            ("http://worker-small-b:8080".to_owned(), 1),
+        ]);
+        let ranked = ranked_endpoints(&workers, small, &census);
+        assert_eq!(
+            ranked,
+            ["http://worker-small-b:8080", "http://worker-small:8080"]
+        );
+        // A size nobody provides ranks nobody.
+        assert!(
+            ranked_endpoints(
+                &workers,
+                Resources {
+                    cpu: 4,
+                    memory_bytes: 8 * small.memory_bytes
+                },
+                &census
+            )
+            .is_empty()
+        );
     }
 
     #[test]
