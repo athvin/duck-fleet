@@ -451,6 +451,11 @@ impl Worker {
             [],
             |r| r.get::<_, String>(0)
         )?);
+        // Asked of the engine rather than written as a literal: a DuckDB bump moves
+        // one pin (scripts/install-duckdb.sh), and the version this reports follows
+        // it instead of quietly disagreeing with the binary that is actually loaded.
+        placement["duckdb_version"] =
+            json!(root.query_row("SELECT version()", [], |r| r.get::<_, String>(0))?);
         let platform_dsn = required("PLATFORM_DSN")?;
         let mut ledger = retrying(
             "platform database",
@@ -670,9 +675,8 @@ impl Worker {
                     },
                 );
                 self.served += 1;
-                Ok(Output::Json(
-                    json!({"session_id":id, "database":"lake", "duckdb_version":"1.5.4", "placement":self.placement}),
-                ))
+                Ok(Output::Json(json!({"session_id":id, "database":"lake",
+                        "duckdb_version": self.placement["duckdb_version"], "placement":self.placement})))
             }
             Operation::Close(id) => {
                 self.sessions.remove(&id);

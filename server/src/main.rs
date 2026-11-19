@@ -206,7 +206,7 @@ async fn authorize(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|v| v == token.as_ref());
+        .is_some_and(|v| crate::credentials::tokens_match(v, &token));
     if !valid {
         return ApiError::new(failure::UNAUTHORIZED, "invalid bearer token").into_response();
     }

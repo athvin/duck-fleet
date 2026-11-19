@@ -103,6 +103,12 @@ assert pinned == tolerated, (
 # The gateway drains like a worker: a statement it is proxying runs under the same
 # 60-second cap, so its grace period is coupled to the same number. Unset it defaults
 # to 30, which would SIGKILL the drain partway however well it was written.
+#
+# Deliberately coupled to the statement cap, NOT to isolatedCompute.readySeconds: a
+# cold isolated open can take minutes (node scale-up), and stretching the grace to
+# cover it would make every rollout block that long even when idle. An open abandoned
+# by a rollout is retry-safe and the client reopens — see the README's isolated
+# compute section. Do not "fix" this by raising the grace to readySeconds.
 assert by_name['Deployment', 'server']['spec']['template']['spec'][
     'terminationGracePeriodSeconds'] > MAX_STATEMENT_SECONDS, (
     'the gateway grace period is not longer than the longest statement it may proxy')

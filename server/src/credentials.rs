@@ -54,6 +54,25 @@ pub(crate) fn digest(token: &str) -> String {
         })
 }
 
+/// Whether a presented token equals a secret, compared without leaking how far the
+/// two agree. Both are hashed to a fixed-length digest first — so the comparison's
+/// timing cannot even reveal the secret's length — then verified byte-for-byte in
+/// constant time. The bootstrap token's `==` check was timing-variable, which over
+/// many probes narrows a shared secret a byte at a time.
+pub(crate) fn tokens_match(presented: &str, secret: &str) -> bool {
+    let presented = ring::digest::digest(&ring::digest::SHA256, presented.as_bytes());
+    let secret = ring::digest::digest(&ring::digest::SHA256, secret.as_bytes());
+    // Both digests are 32 bytes, so this loop runs a fixed number of times and folds
+    // every byte into the accumulator before deciding — no early return on the first
+    // mismatch, which is the whole point.
+    let (presented, secret) = (presented.as_ref(), secret.as_ref());
+    let mut difference = 0u8;
+    for (a, b) in presented.iter().zip(secret.iter()) {
+        difference |= a ^ b;
+    }
+    presented.len() == secret.len() && difference == 0
+}
+
 /// A principal a caller may name: short, printable, and never the bootstrap's own
 /// name, so a history row saying `bootstrap-admin` can only mean the bootstrap.
 pub(crate) fn valid_principal(principal: &str) -> bool {
@@ -162,6 +181,18 @@ mod tests {
             assert_eq!(token.len(), 4 + 64, "{token}");
             assert!(token[4..].chars().all(|c| c.is_ascii_hexdigit()));
         }
+    }
+
+    #[test]
+    fn tokens_match_accepts_the_secret_and_rejects_everything_else() {
+        let secret = "duckfleet-local-development-token";
+        assert!(tokens_match(secret, secret));
+        // A prefix, a different-length string, and the empty string all fail —
+        // nothing short of the whole secret matches.
+        assert!(!tokens_match("duckfleet-local-development-toke", secret));
+        assert!(!tokens_match("duckfleet-local-development-tokenX", secret));
+        assert!(!tokens_match("", secret));
+        assert!(!tokens_match(secret, ""));
     }
 
     #[test]

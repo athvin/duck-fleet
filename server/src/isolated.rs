@@ -108,9 +108,9 @@ impl Isolation {
             kube: Kube::from_service_account()?,
             template,
             owner,
-            ready: env_seconds("DUCKFLEET_ISOLATED_READY_SECONDS", 120),
-            provisioning: env_seconds("DUCKFLEET_ISOLATED_PROVISIONING_SECONDS", 0),
-            quota_wait: env_seconds("DUCKFLEET_ISOLATED_QUOTA_WAIT_SECONDS", 90),
+            ready: env_seconds("DUCKFLEET_ISOLATED_READY_SECONDS", 120)?,
+            provisioning: env_seconds("DUCKFLEET_ISOLATED_PROVISIONING_SECONDS", 0)?,
+            quota_wait: env_seconds("DUCKFLEET_ISOLATED_QUOTA_WAIT_SECONDS", 90)?,
         }))
     }
 
@@ -321,15 +321,24 @@ impl Isolation {
     }
 }
 
-/// A duration from an environment variable, falling back to `default` seconds when it
-/// is unset or unparseable. The two session-timing budgets are read the same way.
-fn env_seconds(name: &str, default: u64) -> Duration {
-    Duration::from_secs(
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default),
-    )
+/// A duration from an environment variable: `default` seconds when unset, but a
+/// hard error when set to something that is not a number.
+///
+/// Silently falling back on an unparseable value is how a typo in
+/// PROVISIONING_SECONDS would quietly restore the zero-grace behaviour that kept
+/// every isolated session from placing on EKS (#90) — with no log line to find it
+/// by. A gateway that was handed a nonsense budget refuses to start instead, the
+/// same way a worker refuses a cgroup it cannot read.
+fn env_seconds(name: &str, default: u64) -> anyhow::Result<Duration> {
+    match std::env::var(name) {
+        Err(_) => Ok(Duration::from_secs(default)),
+        Ok(value) => {
+            let seconds = value.parse::<u64>().map_err(|_| {
+                anyhow::anyhow!("{name} must be a whole number of seconds, not {value:?}")
+            })?;
+            Ok(Duration::from_secs(seconds))
+        }
+    }
 }
 
 fn owner(name: &str, uid: &str) -> Value {
@@ -664,6 +673,23 @@ mod tests {
         let mut empty = template();
         empty["spec"]["containers"] = json!([]);
         assert!(patchable(&empty).is_err());
+    }
+
+    #[test]
+    fn env_seconds_defaults_when_unset_but_refuses_nonsense() {
+        let name = format!("DUCKFLEET_TEST_SECONDS_{}", uuid::Uuid::new_v4().simple());
+        // Unset: the default stands.
+        assert_eq!(env_seconds(&name, 42).unwrap(), Duration::from_secs(42));
+        // SAFETY: a uniquely named variable, set and removed around its only reads.
+        unsafe { std::env::set_var(&name, "7") };
+        assert_eq!(env_seconds(&name, 42).unwrap(), Duration::from_secs(7));
+        // A typo fails startup rather than silently restoring the default — which for
+        // PROVISIONING_SECONDS would quietly bring back the #90 zero-grace behaviour.
+        unsafe { std::env::set_var(&name, "soon") };
+        let error = format!("{:#}", env_seconds(&name, 42).unwrap_err());
+        unsafe { std::env::remove_var(&name) };
+        assert!(error.contains(&name), "{error}");
+        assert!(error.contains("soon"), "{error}");
     }
 
     #[test]

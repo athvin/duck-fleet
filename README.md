@@ -182,6 +182,16 @@ without the grant is inert rather than broken — the same refusal, and no state
 runs — and removing the `RoleBinding` is a supported way to turn the feature off.
 `duck-fleet#39` tracks switching it on for the shared development namespace.
 
+A cold isolated open can take as long as `readySeconds` (420s on the AWS lane,
+to pay node scale-up), which is longer than a gateway's drain budget. A gateway
+rollout that lands during one therefore abandons the open — but retry-safe: no
+statement ran, and the client's bounded new-session wait rides through the
+replacement gap and reopens. The drain budget is deliberately **not** stretched
+to cover the full node-provisioning window; doing so would make every rollout
+block for minutes even with nothing in flight, on a single-replica deployment
+where a rollout is already a brief outage. A pod already serving statements
+drains normally within the grace period.
+
 The harness builds `fct_orders` on medium and `customer_totals` on small, checks
 resource settings inside the materialized results, then rebuilds `fct_orders` on
 small and medium again by changing config. It verifies Docker's actual CPU/memory

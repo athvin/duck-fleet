@@ -155,7 +155,7 @@ impl Authn {
     }
 
     async fn principal(&self, token: &str) -> Result<Principal, ApiError> {
-        if token == self.bootstrap.as_ref() {
+        if credentials::tokens_match(token, &self.bootstrap) {
             return Ok(Principal::Bootstrap);
         }
         let hashed = credentials::digest(token);
