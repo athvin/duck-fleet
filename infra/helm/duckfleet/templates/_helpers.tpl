@@ -16,7 +16,20 @@ session pod template matches the persistent workers, so a caller asking for isol
 cannot be placed somewhere the shared tier would not have been.
 */}}
 {{- define "duckfleet.placement" -}}
-nodeSelector: {{ toJson .Values.nodeSelector }}
+{{- /*
+Null-valued nodeSelector keys are dropped, not emitted. A deploy overlay removes the
+chart's default compute-type selector by setting it null (Helm's documented way to
+delete a default key on merge), but whether that null is erased or kept depends on the
+Helm version and the render path — and a null that survives becomes `key: null` in the
+pod, an impossible label match that leaves the pod unschedulable and Karpenter unable
+to provision for it (the isolated session pod's exact failure, #90). Filtering here
+makes the outcome deterministic regardless of how the merge resolved the null.
+*/ -}}
+{{- $selector := dict -}}
+{{- range $key, $value := .Values.nodeSelector -}}
+{{- if not (kindIs "invalid" $value) -}}{{- $_ := set $selector $key $value -}}{{- end -}}
+{{- end -}}
+nodeSelector: {{ toJson $selector }}
 {{- if .Values.tolerations }}
 tolerations: {{ toJson .Values.tolerations }}
 {{- end }}
