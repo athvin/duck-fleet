@@ -63,6 +63,7 @@ spec:
             - {name: DUCKFLEET_ISOLATED_POD, value: /etc/duckfleet/pod.json}
             - {name: DUCKFLEET_ISOLATED_READY_SECONDS, value: {{ .Values.isolatedCompute.readySeconds | quote }}}
             - {name: DUCKFLEET_ISOLATED_PROVISIONING_SECONDS, value: {{ .Values.isolatedCompute.provisioningSeconds | quote }}}
+            - {name: DUCKFLEET_ISOLATED_QUOTA_WAIT_SECONDS, value: {{ .Values.isolatedCompute.quotaWaitSeconds | quote }}}
             # Session pods are owned by this pod, so losing the gateway has the
             # garbage collector remove them rather than leaving them billing.
             - name: DUCKFLEET_POD_NAME

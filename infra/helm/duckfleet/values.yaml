@@ -163,6 +163,14 @@ isolatedCompute:
   # (see scripts/aws/deploy_values.py): without the wait the gateway deletes the pod
   # before Karpenter can provision for it, and no isolated session places (#90).
   provisioningSeconds: 0
+  # How long a pod create refused by the namespace quota is retried before the refusal
+  # is relayed. Separate from provisioningSeconds, which is a node-model property and
+  # deliberately zero on fixed nodes: quota occupancy is transient on every cluster,
+  # because a closed session's pod counts against count/pods while it is Terminating,
+  # so back-to-back isolated opens hit a full quota that clears within the pod's
+  # termination grace (#94). The default covers that grace; a request the quota could
+  # never fit, even empty, is still refused at once. Zero restores relay-immediately.
+  quotaWaitSeconds: 90
   # Where the Kubernetes API server may be reached, and on which port. Both required
   # when enabled: defaulting them would mean opening egress to reach an address nobody
   # declared.

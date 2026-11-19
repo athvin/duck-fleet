@@ -269,25 +269,15 @@ def cold_start_checks():
     first, cold_isolated = timed_open(isolated_compute)
     first_pod = first.placement["worker_id"]
     first.close()
-    # The second open is meant to land on the warm node the first left behind, so the
-    # first must be gone first — genuinely a fresh pod, not a reuse. A closed pod is not
-    # instantly reclaimed: it terminates, and until it does it still counts against the
-    # namespace quota, which is sized to one isolated pod beyond the persistent workers.
-    # So the second open can be refused (retry-safe, nothing ran) until the first frees;
-    # retry it out rather than racing a fixed sleep. Only the successful open is timed,
-    # so the warm-node measurement stays clean of the wait.
-    deadline = time.monotonic() + 180
-    while True:
-        try:
-            second, warm_isolated = timed_open(isolated_compute)
-            break
-        except RemoteError as error:
-            require(error.failure_kind == "not_placeable",
-                    f"the second isolated open failed as {error.failure_kind}, not a "
-                    f"placement limit it can wait out: {error}")
-            require(time.monotonic() < deadline,
-                    f"the first isolated pod never freed the quota for a second: {error}")
-            time.sleep(3)
+    # The second open lands on the warm node the first left behind — genuinely a fresh
+    # pod, not a reuse. A closed pod is not instantly reclaimed: it terminates, and
+    # until it does it still counts against the namespace quota, which is sized to one
+    # isolated pod beyond the persistent workers. The gateway waits that overlap out
+    # itself (quotaWaitSeconds, #94), so this open is deliberately bare: a
+    # not_placeable here is a regression in that wait, not a race for this test to
+    # absorb. The warm-node measurement honestly includes any quota wait the gateway
+    # paid — that is the time a caller actually waits for a second isolated session.
+    second, warm_isolated = timed_open(isolated_compute)
     require(second.placement["worker_id"] != first_pod, "the second isolated pod reused the first")
     second.close()
 

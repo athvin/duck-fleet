@@ -52,6 +52,17 @@ pub(crate) struct Isolation {
     /// provision for it, which is why no isolated session ever placed there
     /// (duck-fleet#90).
     provisioning: Duration,
+    /// How long a create refused by the namespace quota is retried before the refusal
+    /// is relayed.
+    ///
+    /// Its own knob, not `provisioning`: that one is a property of the cluster's node
+    /// model and is deliberately zero on fixed nodes, while quota occupancy is
+    /// transient on every cluster — a closed session's pod counts against `count/pods`
+    /// for as long as it is Terminating, so back-to-back isolated opens routinely hit
+    /// a quota that clears within the pod's termination grace (duck-fleet#94). The
+    /// default covers that grace. A refusal no emptiness could cure — the request
+    /// alone exceeds the limit — is never waited on.
+    quota_wait: Duration,
 }
 
 /// A running session pod.
@@ -99,6 +110,7 @@ impl Isolation {
             owner,
             ready: env_seconds("DUCKFLEET_ISOLATED_READY_SECONDS", 120),
             provisioning: env_seconds("DUCKFLEET_ISOLATED_PROVISIONING_SECONDS", 0),
+            quota_wait: env_seconds("DUCKFLEET_ISOLATED_QUOTA_WAIT_SECONDS", 90),
         }))
     }
 
@@ -127,22 +139,61 @@ impl Isolation {
             tracing::error!(%error, "could not build a session pod from the template");
             ApiError::internal()
         })?;
-        self.kube.create_pod(&spec).await.map_err(|error| {
+        self.create_waiting_out_quota(&spec).await?;
+        match self.await_ready(&name).await {
+            Ok(endpoint) => Ok(Pod { name, endpoint }),
+            Err(error) => {
+                // The pod exists and is not usable. It does not outlive this call.
+                self.stop(&name).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Creates the pod, retrying a quota refusal the cluster can cure by itself.
+    ///
+    /// A closed session's pod still counts against the namespace quota while it is
+    /// Terminating, so back-to-back isolated opens hit a full quota that clears
+    /// within the pod's termination grace (duck-fleet#94). That is the cluster
+    /// needing a moment to make room — the same shape as the provisioning grace
+    /// (#93), absorbed server-side so every client benefits. A refusal no emptiness
+    /// could cure is relayed at once: `quota_never_fits` proves the request alone
+    /// exceeds the limit, and waiting on it would only delay the honest answer.
+    async fn create_waiting_out_quota(&self, spec: &serde_json::Value) -> Result<(), ApiError> {
+        const POLL: Duration = Duration::from_secs(2);
+        let started = Instant::now();
+        // The ready budget bounds everything, as it does for the provisioning grace.
+        let deadline = started + self.quota_wait.min(self.ready);
+        loop {
+            let error = match self.kube.create_pod(spec).await {
+                Ok(_) => return Ok(()),
+                Err(error) => error,
+            };
+            let transient_quota = crate::kube::quota_message(&error)
+                .is_some_and(|message| !crate::kube::quota_never_fits(message));
+            if transient_quota && Instant::now() + POLL <= deadline {
+                tokio::time::sleep(POLL).await;
+                continue;
+            }
             tracing::error!(
                 error = format!("{error:#}"),
                 "creating a session pod failed"
             );
-            if crate::kube::declined(&error) {
+            return Err(if crate::kube::declined(&error) {
                 // The API server refused before the pod existed — the namespace quota
                 // or an admission webhook — so this provably left nothing behind and a
                 // smaller request may succeed. Same answer as an unschedulable pod,
                 // reached without creating one, and carrying the refusal's own words so
                 // the ceiling that was hit is named rather than guessed.
+                let waited = match started.elapsed().as_secs() {
+                    0 => String::new(),
+                    seconds => format!("; waited {seconds}s for the namespace quota to free"),
+                };
                 ApiError::new(
                     failure::NOT_PLACEABLE,
                     format!(
-                        "this session could not be placed: {error:#}. No statement ran and \
-                         the request was not downgraded to a shared worker"
+                        "this session could not be placed: {error:#}{waited}. No statement \
+                         ran and the request was not downgraded to a shared worker"
                     ),
                 )
             } else {
@@ -152,15 +203,7 @@ impl Isolation {
                     failure::UNAVAILABLE,
                     format!("could not create a pod for this session; no statement ran: {error:#}"),
                 )
-            }
-        })?;
-        match self.await_ready(&name).await {
-            Ok(endpoint) => Ok(Pod { name, endpoint }),
-            Err(error) => {
-                // The pod exists and is not usable. It does not outlive this call.
-                self.stop(&name).await;
-                Err(error)
-            }
+            });
         }
     }
 
