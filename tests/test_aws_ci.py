@@ -762,16 +762,20 @@ class OwnershipBoundaryTests(unittest.TestCase):
                 int(str(container['resources']['limits']['cpu']).rstrip('m')), name)
         self.assertGreaterEqual(workers, 3, 'expected both persistent workers and the session pod')
 
-    def test_the_deploy_asks_the_gateway_rather_than_inspecting_rbac(self):
+    def test_the_harness_verifies_isolated_compute_not_the_deploy(self):
         deploy = (ROOT/'scripts/aws/deploy.sh').read_text()
-        # The deploy identity cannot read RBAC — the same scoping that makes the
-        # boundary worth separating — so a deploy that looked for the Role would be
-        # checking something it is not permitted to see. It asks the gateway, which
-        # asked the API server about its own access at startup.
-        self.assertIn('isolated_compute', deploy)
+        # The deploy identity cannot read RBAC, and cannot reach the gateway from
+        # outside the cluster either: the boundary grants it pods create/get/list/
+        # watch/delete but not exec or portforward. So it must not try — an earlier
+        # version exec'd the gateway to read isolated_compute and failed the deploy
+        # the moment the feature was enabled. The in-cluster harness asks instead.
         self.assertNotIn('can-i create roles', deploy)
-        # Read from inside the pod, so the bearer token never reaches a CI log.
-        self.assertIn('Bearer $DUCKFLEET_TOKEN', deploy)
+        self.assertNotIn('exec deployment/server', deploy)
+        self.assertNotIn('Bearer $DUCKFLEET_TOKEN', deploy)
+        # The AWS harness, which runs in-cluster, asserts the feature is live.
+        aws_harness = (ROOT/'tests/aws_harness.py').read_text()
+        self.assertIn('isolated_compute', aws_harness)
+        self.assertIn('cold_start_checks', aws_harness)
 
     def test_the_boundary_is_applied_by_an_operator_and_never_by_ci(self):
         script = (ROOT/'scripts/aws/apply-boundary.sh').read_text()
