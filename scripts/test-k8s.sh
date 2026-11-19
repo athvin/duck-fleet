@@ -257,19 +257,41 @@ echo 'PASS: a new gateway settled the reservations the abandoned pod was holding
 # The money and the diagnostics have to be reconciled together: an isolated identity
 # never restarts to mark its own rows, so a `running` record naming a dead session pod
 # would stand forever — unprunable, and claiming work is active on a worker that is gone.
+#
+# The stage above lets owner-reference GC collect the pod, which can outlast the 60s
+# statement cap, so the statement often self-terminates before the pod dies and leaves
+# a terminal row rather than a stuck `running` one. To exercise the reconciliation
+# deterministically, force the crash: a fresh isolated session with a statement
+# running, its pod SIGKILLed mid-flight so the row is left `running` and the
+# reservation `held`, then a gateway restart whose startup sweep must both settle the
+# funds and mark the orphaned record interrupted.
 stuck_running() {
   "${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
     "SELECT count(*) FROM query_history WHERE status='running' AND worker_id LIKE 'duckfleet-session-%'" \
     | tr -d '[:space:]'
 }
+harness duckfleet-leak-crash 'python /app/tests/harness.py --leak-isolated' 600
+crashed=$("${KUBE[@]}" get pods -l duckfleet-compute=isolated -o jsonpath='{.items[0].metadata.name}')
+test -n "$crashed"
+echo "session pod to crash mid-statement: $crashed"
+row_count() {
+  "${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
+    "SELECT count(*) FROM query_history WHERE worker_id='$crashed' AND status='$1'" | tr -d '[:space:]'
+}
+# The statement must be running before the kill, or there is no orphaned row to prove
+# anything about.
+test "$(row_count running)" -ge 1 || {
+  echo "the session left no running record to reconcile" >&2; exit 1; }
+"${KUBE[@]}" delete pod "$crashed" --grace-period=0 --force
+"${KUBE[@]}" delete pod -l app=duckfleet-gateway --wait=true
+"${KUBE[@]}" rollout status deployment/server --timeout=420s
+for _ in $(seq 1 30); do [[ "$(held)" == 0 ]] && break; sleep 2; done
+test "$(held)" == 0 || { echo "the crashed pod's reservation was never settled" >&2; exit 1; }
 test "$(stuck_running)" == 0 || {
   echo "a dead session pod left query_history rows running: $(stuck_running)" >&2; exit 1; }
-interrupted=$("${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
-  "SELECT count(*) FROM query_history WHERE worker_id='$leaked' AND status='interrupted' AND failure_kind='interrupted'" \
-  | tr -d '[:space:]')
-test "$interrupted" -ge 1 || {
-  echo "the abandoned pod's running record was not marked interrupted" >&2; exit 1; }
-echo 'PASS: the abandoned pod query records were reconciled to interrupted with the settle'
+test "$(row_count interrupted)" -ge 1 || {
+  echo "the crashed pod's running record was not reconciled to interrupted" >&2; exit 1; }
+echo 'PASS: a crashed session pod had its running record reconciled to interrupted'
 
 # Eviction mid-statement, which nothing else here exercises: the tests below delete
 # pods *between* runs. The signal is the ledger rather than a file, because the harness
