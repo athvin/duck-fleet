@@ -15,6 +15,8 @@ source "$ROOT/scripts/aws/target.env"
 
 bucket=$DUCKFLEET_STATE_BUCKET
 region=$DUCKFLEET_REGION
+key=$DUCKFLEET_STATE_KEY
+ci_role="arn:aws:iam::$DUCKFLEET_ACCOUNT:role/$DUCKFLEET_CI_ROLE"
 
 account=$(aws sts get-caller-identity --query Account --output text)
 [[ "$account" == "$DUCKFLEET_ACCOUNT" ]] || {
@@ -52,13 +54,23 @@ aws s3api put-public-access-block --bucket "$bucket" \
   'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
 aws s3api put-bucket-ownership-controls --bucket "$bucket" \
   --ownership-controls 'Rules=[{ObjectOwnership=BucketOwnerEnforced}]'
-# Terraform state in transit is as sensitive as the resources it describes.
+# Terraform state in transit is as sensitive as the resources it describes, and the
+# CI deploy identity reaches the state through the bucket's own policy: same account,
+# so a resource-policy allow is enough, and it keeps the grant on a bucket DuckFleet
+# owns rather than on a role the shared platform does — which is what let the state
+# move without an entity-resolution change (#12). Scoped to the one state key and its
+# lock, mirroring the access the role used to hold on the borrowed bucket.
 aws s3api put-bucket-policy --bucket "$bucket" --policy "$(
   cat <<JSON
-{"Version":"2012-10-17","Statement":[{
-  "Sid":"RequireTLS","Effect":"Deny","Principal":"*","Action":"s3:*",
-  "Resource":["arn:aws:s3:::$bucket","arn:aws:s3:::$bucket/*"],
-  "Condition":{"Bool":{"aws:SecureTransport":"false"}}}]}
+{"Version":"2012-10-17","Statement":[
+  {"Sid":"RequireTLS","Effect":"Deny","Principal":"*","Action":"s3:*",
+   "Resource":["arn:aws:s3:::$bucket","arn:aws:s3:::$bucket/*"],
+   "Condition":{"Bool":{"aws:SecureTransport":"false"}}},
+  {"Sid":"DeployListsState","Effect":"Allow","Principal":{"AWS":"$ci_role"},
+   "Action":["s3:ListBucket"],"Resource":"arn:aws:s3:::$bucket"},
+  {"Sid":"DeployReadsWritesState","Effect":"Allow","Principal":{"AWS":"$ci_role"},
+   "Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],
+   "Resource":["arn:aws:s3:::$bucket/$key","arn:aws:s3:::$bucket/$key.tflock"]}]}
 JSON
 )"
 # Old state versions accumulate forever otherwise. Ninety days is well past any

@@ -27,12 +27,22 @@ Migrating Terraform state
 
 The source copy is left untouched. Terraform will ask you to confirm the copy.
 EOF
-[[ "${DUCKFLEET_ASSUME_YES:-false}" == true ]] || read -r -p 'Continue? [y/N] ' reply
-[[ "${reply:-y}" == [yY] ]] || { echo 'Aborted'; exit 1; }
+# DUCKFLEET_ASSUME_YES is the confirmation when there is no terminal to prompt in —
+# a GitHub runner, or an agent shell. It is never set by accident, and the source
+# copy is left intact regardless, so it is a deliberate opt-in rather than a weakened
+# gate. Interactive otherwise, where terraform's own prompt is the confirmation.
+if [[ "${DUCKFLEET_ASSUME_YES:-false}" == true ]]; then
+  input=(-input=false -force-copy)
+else
+  read -r -p 'Continue? [y/N] ' reply
+  [[ "${reply:-y}" == [yY] ]] || { echo 'Aborted'; exit 1; }
+  input=(-input=true)
+fi
 
-# -migrate-state copies the existing state into the new backend. Terraform prompts
-# before writing, which is the confirmation that matters.
-terraform -chdir=infra/terraform/dev init -input=true -migrate-state \
+# -migrate-state copies the existing state into the new backend, leaving the source
+# untouched. -force-copy is the non-interactive form of the prompt the confirmation
+# above stands in for.
+terraform -chdir=infra/terraform/dev init "${input[@]}" -migrate-state \
   -backend-config="bucket=$DUCKFLEET_STATE_BUCKET" \
   -backend-config="key=$DUCKFLEET_STATE_KEY" \
   -backend-config="region=$DUCKFLEET_REGION"
