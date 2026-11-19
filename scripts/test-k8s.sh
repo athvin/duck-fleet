@@ -254,6 +254,22 @@ done
 held > artifacts/kind/held-isolated.txt
 grep -qx 0 artifacts/kind/held-isolated.txt
 echo 'PASS: a new gateway settled the reservations the abandoned pod was holding'
+# The money and the diagnostics have to be reconciled together: an isolated identity
+# never restarts to mark its own rows, so a `running` record naming a dead session pod
+# would stand forever — unprunable, and claiming work is active on a worker that is gone.
+stuck_running() {
+  "${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
+    "SELECT count(*) FROM query_history WHERE status='running' AND worker_id LIKE 'duckfleet-session-%'" \
+    | tr -d '[:space:]'
+}
+test "$(stuck_running)" == 0 || {
+  echo "a dead session pod left query_history rows running: $(stuck_running)" >&2; exit 1; }
+interrupted=$("${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
+  "SELECT count(*) FROM query_history WHERE worker_id='$leaked' AND status='interrupted' AND failure_kind='interrupted'" \
+  | tr -d '[:space:]')
+test "$interrupted" -ge 1 || {
+  echo "the abandoned pod's running record was not marked interrupted" >&2; exit 1; }
+echo 'PASS: the abandoned pod query records were reconciled to interrupted with the settle'
 
 # Eviction mid-statement, which nothing else here exercises: the tests below delete
 # pods *between* runs. The signal is the ledger rather than a file, because the harness

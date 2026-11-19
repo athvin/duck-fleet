@@ -1086,6 +1086,20 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
                 );
             }
         }
+        // After the sweep, so every session-pod identity is provably dead. Tolerant
+        // for the same reason as the held read above: on a first boot the history
+        // table does not exist yet, and there is nothing to repair in it either.
+        match app
+            .usage
+            .reconcile_isolated_history(crate::isolated::PREFIX)
+            .await
+        {
+            Ok(0) | Err(_) => {}
+            Ok(repaired) => tracing::warn!(
+                repaired,
+                "marked interrupted the running records of session pods that are gone"
+            ),
+        }
         tracing::info!("isolated compute is available");
     }
     let api = Router::new()

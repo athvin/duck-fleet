@@ -484,19 +484,10 @@ impl Worker {
             CREATE INDEX IF NOT EXISTS query_history_failure ON query_history(failure_kind,history_id DESC);
             CREATE INDEX IF NOT EXISTS query_history_model ON query_history((context::jsonb #>> '{dbt,node_id}'),history_id DESC);
             CREATE INDEX IF NOT EXISTS query_history_invocation ON query_history((context::jsonb #>> '{dbt,invocation_id}'),history_id DESC);
-            CREATE INDEX IF NOT EXISTS query_history_model_run ON query_history((context::jsonb ->> 'model_run_id'),history_id DESC);")?;
+            CREATE INDEX IF NOT EXISTS query_history_model_run ON query_history((context::jsonb ->> 'model_run_id'),history_id DESC);
+            CREATE INDEX IF NOT EXISTS query_history_running ON query_history(worker_id) WHERE status='running';")?;
         // Starting one worker must not terminate records owned by the other worker.
-        transaction.execute(
-            "UPDATE query_history SET status='interrupted', finished_at=now(),
-            error='worker restarted; commit outcome may be unknown, do not blindly retry',
-            failure_kind=$2, retry_safe=$3
-            WHERE status='running' AND worker_id=$1",
-            &[
-                &worker_id,
-                &failure::INTERRUPTED.kind,
-                &failure::INTERRUPTED.retry_safe,
-            ],
-        )?;
+        metering::interrupt_abandoned_history(&mut transaction, &worker_id)?;
         crate::credentials::migrate(&mut transaction)?;
         // The budget starts from configuration only the first time it is created; a
         // restart must not refill a balance that has already been spent.

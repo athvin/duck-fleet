@@ -91,6 +91,12 @@ pub(crate) const INTERRUPTED: Failure = Failure {
     http: StatusCode::SERVICE_UNAVAILABLE,
 };
 
+/// The error text every reconciler writes on an interrupted record. One constant,
+/// because a worker's own restart and the gateway settling a dead session pod are
+/// the same fact to a reader, and the wording must not drift between them.
+pub(crate) const UNKNOWN_COMMIT_MESSAGE: &str =
+    "worker restarted; commit outcome may be unknown, do not blindly retry";
+
 pub(crate) const UNAUTHORIZED: Failure = Failure {
     status: None,
     kind: "unauthorized",

@@ -241,6 +241,47 @@ pub(crate) fn recover(
     Ok(orphans.len() as u64)
 }
 
+/// Marks one dead worker identity's `running` history rows `interrupted`, with the
+/// shared unknown-commit wording. The worker calls this for itself at startup; the
+/// gateway calls it for a session pod it is settling, because that pod's identity
+/// never recurs and so no restart would ever reconcile its rows.
+pub(crate) fn interrupt_abandoned_history(
+    transaction: &mut Transaction,
+    worker_id: &str,
+) -> Result<u64> {
+    Ok(transaction.execute(
+        "UPDATE query_history SET status='interrupted', finished_at=now(),
+            error=$2, failure_kind=$3, retry_safe=$4
+         WHERE status='running' AND worker_id=$1",
+        &[
+            &worker_id,
+            &failure::UNKNOWN_COMMIT_MESSAGE,
+            &failure::INTERRUPTED.kind,
+            &failure::INTERRUPTED.retry_safe,
+        ],
+    )?)
+}
+
+/// The prefix-wide form, for the gateway's startup pass: sound only after the pod
+/// sweep, when every identity matching the prefix is provably dead. This is also
+/// what repairs rows stranded before the per-settle reconciliation existed.
+pub(crate) fn interrupt_abandoned_prefix(
+    transaction: &mut Transaction,
+    prefix: &str,
+) -> Result<u64> {
+    Ok(transaction.execute(
+        "UPDATE query_history SET status='interrupted', finished_at=now(),
+            error=$2, failure_kind=$3, retry_safe=$4
+         WHERE status='running' AND worker_id LIKE $1 || '%'",
+        &[
+            &prefix,
+            &failure::UNKNOWN_COMMIT_MESSAGE,
+            &failure::INTERRUPTED.kind,
+            &failure::INTERRUPTED.retry_safe,
+        ],
+    )?)
+}
+
 /// Worker identities that still hold funds and whose names begin with `prefix`.
 ///
 /// For a session pod the identity is the pod's own name, so these are the holds that

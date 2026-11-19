@@ -222,11 +222,19 @@ impl Reader {
     /// Settles a session pod's abandoned reservations. Safe to call for a pod that
     /// settled its own, because recovery only touches rows still held; that is what
     /// lets every teardown path call it without first working out which one it is.
+    ///
+    /// The pod's `running` history rows become `interrupted` in the same
+    /// transaction, before recovery charges against the elapsed time they recorded —
+    /// the same order a persistent worker reconciles itself in at startup. Without
+    /// this, a pod identity that never recurs would leave its rows `running`
+    /// forever: unprunable, and claiming work is active on a worker that is gone.
     pub async fn settle_isolated(&self, worker: String) -> Result<u64, ApiError> {
         let rate = self.rate.clone();
         let settled = self
             .run(true, move |client| {
                 let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
+                metering::interrupt_abandoned_history(&mut transaction, &worker)
+                    .map_err(|_| ApiError::internal())?;
                 let settled = metering::recover(&mut transaction, &worker, &rate)
                     .map_err(|_| ApiError::internal())?;
                 transaction.commit().map_err(|_| ApiError::internal())?;
@@ -234,6 +242,23 @@ impl Reader {
             })
             .await?;
         Ok(settled.as_u64().unwrap_or(0))
+    }
+
+    /// The prefix-wide history pass behind the gateway's startup sweep: every
+    /// session pod is gone by then, so every `running` row under the prefix is
+    /// provably dead — including rows stranded by gateways that predate the
+    /// per-settle reconciliation above.
+    pub async fn reconcile_isolated_history(&self, prefix: &'static str) -> Result<u64, ApiError> {
+        let repaired = self
+            .run(true, move |client| {
+                let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
+                let repaired = metering::interrupt_abandoned_prefix(&mut transaction, prefix)
+                    .map_err(|_| ApiError::internal())?;
+                transaction.commit().map_err(|_| ApiError::internal())?;
+                Ok(json!(repaired))
+            })
+            .await?;
+        Ok(repaired.as_u64().unwrap_or(0))
     }
 }
 
