@@ -157,6 +157,46 @@ helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$valu
   --set pgwire.enabled=true > "$wire"
 python3 scripts/check-chart.py "$wire" > /dev/null
 echo 'PASS: the wire front renders only when asked for'
+# The #39 flip, as the AWS deploy computes it: isolated compute on, workers pinned to
+# the DuckFleet pool with the toleration its taint needs, the medium worker at its
+# full 2-CPU request. Chart defaults stay unpinned — the flip is a deploy-time overlay
+# (scripts/aws/deploy_values.py), since the API-server CIDR is a fact about the
+# cluster — so this renders that overlay shape to keep it from regressing unnoticed.
+flip="$validation_dir/isolated-pinned.yaml"
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set isolatedCompute.enabled=true \
+  --set 'isolatedCompute.apiServerCidrs[0]=10.42.3.17/32' \
+  --set 'isolatedCompute.apiServerPorts[0]=443' \
+  --set-json 'nodeSelector={"kubernetes.io/os":"linux","eks.amazonaws.com/compute-type":"auto","karpenter.sh/nodepool":"duckfleet"}' \
+  --set-json 'tolerations=[{"key":"duckfleet.io/dedicated","operator":"Equal","value":"true","effect":"NoSchedule"}]' \
+  --set-json 'workerCpuRequests={"medium":2}' > "$flip"
+python3 scripts/check-chart.py "$flip" > /dev/null
+python3 - "$flip" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+med = next(d for d in docs if d['kind'] == 'Deployment'
+           and d['metadata']['name'] == 'worker-medium')['spec']['template']['spec']
+assert str(med['containers'][0]['resources']['requests']['cpu']) == '2', 'medium not at 2 CPU'
+assert med['nodeSelector'].get('karpenter.sh/nodepool') == 'duckfleet', 'medium not pinned'
+assert any(t['key'] == 'duckfleet.io/dedicated' for t in med['tolerations']), 'taint not tolerated'
+PY
+echo 'PASS: the AWS flip render — isolated on, pinned, medium at its full 2 CPU — is valid'
+# And deploy_values builds exactly that overlay from the endpoints the API server
+# resolves to, which is what makes the egress rule name them rather than the ClusterIP.
+python3 - <<'PY'
+import importlib.util, pathlib
+spec = importlib.util.spec_from_file_location('dv', 'scripts/aws/deploy_values.py')
+dv = importlib.util.module_from_spec(spec); spec.loader.exec_module(dv)
+o = dv.overlay([('10.42.3.17', 443), ('10.42.9.4', 443)])
+assert o['isolatedCompute']['enabled'] is True
+assert o['isolatedCompute']['apiServerCidrs'] == ['10.42.3.17/32', '10.42.9.4/32'], o['isolatedCompute']
+assert o['isolatedCompute']['apiServerPorts'] == [443]
+assert o['nodeSelector']['karpenter.sh/nodepool'] == 'duckfleet'
+assert o['tolerations'][0]['key'] == 'duckfleet.io/dedicated'
+assert o['workerCpuRequests'] == {'medium': 2}
+print('deploy_values overlay: enabled, cidrs from endpoints, pinned, tolerated, medium at 2')
+PY
+echo 'PASS: deploy_values computes the egress CIDRs from the API server endpoints'
 for script in scripts/*.sh scripts/aws/*.sh scripts/ci/*.sh; do bash -n "$script"; done
 # The local Kubernetes harness renders the real chart, so a chart change that moves
 # something out from under the transform is caught here rather than in a cluster.

@@ -5,6 +5,11 @@ source "$(dirname "$0")/common.sh"
 cd "$ROOT"
 assert_cluster
 [[ -f artifacts/aws/values.json ]] || { echo 'Publish images first' >&2; exit 1; }
+# The values only the live cluster can supply — isolated compute on with the API
+# server's real egress address, workers pinned to the DuckFleet pool — merged into
+# values.json before anything reads it. Written here rather than baked into chart
+# defaults because the API server address is a fact about the cluster (#39).
+python3 scripts/aws/deploy_values.py "$KUBE_CONTEXT"
 # A policy that cannot reach the cluster's resolver presents as an unreachable
 # catalog, which cost six deploys to diagnose. Fail here instead.
 python3 scripts/aws/check-dns-egress.py "$DUCKFLEET_CLUSTER" "$AWS_REGION"
@@ -39,8 +44,8 @@ python3 scripts/aws/wait-rollout.py --namespace "$NAMESPACE" --context "$KUBE_CO
 # Read from inside the pod so the bearer token stays in the environment the kubelet
 # gave it and never reaches a CI log.
 if python3 -c "
-import sys, yaml
-values = yaml.safe_load(open('infra/helm/duckfleet/values.yaml'))
+import json, sys
+values = json.load(open('artifacts/aws/values.json'))
 sys.exit(0 if (values.get('isolatedCompute') or {}).get('enabled') else 1)
 "; then
   reported=$("${KUBE[@]}" exec deployment/server -- sh -c 'curl -sS \

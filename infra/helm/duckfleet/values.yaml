@@ -9,20 +9,17 @@ storageClass: gp3
 #
 # DuckFleet has a node pool of its own in infra/kubernetes/boundary/eks, and pinning it
 # is what stops DuckFleet drawing on a neighbour's capacity and being bounded by sizing
-# decisions made for something else. It is *not* pinned here yet, because that pool is
-# cluster-scoped and so an operator creates it: a release that selected a pool nobody
-# had created would leave every pod permanently Pending.
+# decisions made for something else. It is *not* pinned here, deliberately: the chart
+# default must render anywhere, and that pool is cluster-scoped, so a default that
+# selected it would leave every pod Pending on any cluster that lacks it.
 #
-# Pinning it is three coupled edits, and `scripts/aws/apply-boundary.sh` has to have run
-# first:
-#
-#   1. add `karpenter.sh/nodepool: duckfleet` below
-#   2. add the matching toleration, because that pool is tainted — scripts/check-chart.py
-#      fails the render if one appears without the other
-#   3. remove `workerCpuRequests` below, which exists only to fit the shared pool
-#
-# duck-fleet#39 tracks the flip, alongside enabling isolated compute; both wait on the
-# same one command.
+# The pin is a deploy-time overlay instead (scripts/aws/deploy_values.py), applied once
+# the ownership boundary exists — `scripts/aws/apply-boundary.sh` first. The overlay
+# adds `karpenter.sh/nodepool: duckfleet` here, the matching toleration below (the pool
+# is tainted; check-chart.py fails a render where one appears without the other), and
+# raises the medium worker's request to its full 2 CPU, retiring the shared-pool shim.
+# It is bundled with enabling isolated compute, whose apiServerCidrs likewise cannot be
+# a chart default — both are facts about the cluster, not the chart (duck-fleet#39).
 nodeSelector:
   eks.amazonaws.com/compute-type: auto
   kubernetes.io/os: linux
