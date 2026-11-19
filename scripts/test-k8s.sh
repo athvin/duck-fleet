@@ -192,6 +192,18 @@ test -z "$(isolated_pods)" || {
   echo "session pods outlived their sessions: $(isolated_pods)" >&2; exit 1; }
 echo 'PASS: closing an isolated session removed its pod'
 
+# What the pod costs in latency against a persistent worker (#18). Times a
+# persistent open, a cold isolated open (pod created, scheduled, ready), and a
+# second isolated open with the node and image warm. The absolute numbers vary
+# with the sandbox; the ordering — a pod that must be created cannot open faster
+# than a worker that already exists — is the invariant the stage asserts.
+harness duckfleet-cold-start 'python /app/tests/harness.py --cold-start' 600
+grep -q 'PASS: cold start measured' artifacts/kind/duckfleet-cold-start.log
+for _ in $(seq 1 30); do
+  [[ -z "$(isolated_pods)" ]] && break
+  sleep 2
+done
+
 # The dbt layer over the same capability: a model whose meta.platform requests a
 # pod of its own, run exactly as a user runs models. The --isolated stage above
 # proved the API; this proves the adapter carries the mode through resolved node

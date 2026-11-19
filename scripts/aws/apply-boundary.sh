@@ -107,6 +107,28 @@ if "${KUBE[@]}" get deployment server > /dev/null 2>&1; then
   "${KUBE[@]}" rollout status deployment/server --timeout=300s
 fi
 
+# The API server's endpoints, recorded where the deploy can read them. The deploy
+# identity is scoped to its own namespace and cannot read the `default` namespace, so
+# it cannot discover the address its isolated-compute egress rule must name (#32) — a
+# rule against the Service ClusterIP would match nothing once kube-proxy rewrites the
+# destination. This has the admin access to read the real endpoints, so it writes them
+# into the namespace as a ConfigMap the deploy consumes; deploy_values.py turns them
+# into the egress CIDRs and enables isolated compute. Refreshed on every boundary apply.
+api=$(kubectl --context "$KUBE_CONTEXT" -n default get endpoints kubernetes -o json)
+python3 - "$NAMESPACE" "$api" <<'PY' | "${KUBE[@]}" apply -f -
+import json, sys
+namespace, described = sys.argv[1], json.loads(sys.argv[2])
+subsets = described.get("subsets", [])
+cidrs = sorted({f"{a['ip']}/32" for s in subsets for a in s.get("addresses", [])})
+ports = sorted({p["port"] for s in subsets for p in s.get("ports", [])})
+if not cidrs or not ports:
+    raise SystemExit("the kubernetes Service resolves to no endpoints")
+print(json.dumps({
+    "apiVersion": "v1", "kind": "ConfigMap",
+    "metadata": {"name": "duckfleet-api-egress", "namespace": namespace},
+    "data": {"cidrs": json.dumps(cidrs), "ports": json.dumps(ports)},
+}))
+PY
 printf '%s\n' 'PASS: the boundary is established; the deploy may enable isolated compute'
 cat <<'EOF'
 

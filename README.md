@@ -157,6 +157,16 @@ hold at all, or the scheduler's, when no node can hold it — and is never downg
 to a shared worker. Both are retry-safe: no statement ran, and a smaller request
 may succeed.
 
+A pod of one's own is not free, and the routing choice turns on how much it costs.
+The harness measures three opens — a persistent session, a cold isolated session
+(a pod created, scheduled, and pulled to ready), and a second isolated session with
+the node and image warm — and records the wall-clock a caller waits for each to
+`artifacts/cold-start.json`, on EKS where a cold open also pays node scale-up. The
+guidance that falls out: reach for an isolated pod when a statement's own runtime
+dwarfs that open cost (large ETL, a job that needs more memory or cores than the
+shared tier offers), and stay on a persistent worker for everything interactive,
+where the pod's startup would dominate the work.
+
 Isolated compute is **off by default**, and where it is off the mode is refused
 with `501 compute_unavailable` rather than quietly served. It needs the gateway to
 hold a namespaced Role over pods, which is not the deploy's to create:

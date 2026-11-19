@@ -12,6 +12,18 @@ harness.main()
 # EKS, every statement terminal in history and settled in the ledger, wall time
 # and attributed cost written to the evidence artifacts.
 harness.scale_checks()
+# Isolated-pod cold start against a persistent worker, measured on real EKS where
+# a cold open also pays node scale-up — the number the routing choice turns on (#18).
+# Degrades honestly: where the grant is absent the isolated open is refused and this
+# records nothing rather than inventing a figure.
+try:
+    if json.loads(harness.Client(harness.URL, harness.TOKEN).request(
+            "GET", "/v1/workers"))["isolated_compute"]:
+        harness.cold_start_checks()
+    else:
+        print("isolated compute is not enabled here; skipping the cold-start measurement")
+except Exception as error:  # noqa: BLE001 - a measurement must never fail the deploy
+    print(f"cold-start measurement skipped: {error}")
 prefix = os.environ['EXPECT_S3_PREFIX']
 if not re.fullmatch(r's3://duckfleet-dev-[a-z0-9-]+/lake/', prefix):
     raise ValueError('AWS harness must target the DuckFleet development lake')
