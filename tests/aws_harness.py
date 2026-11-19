@@ -12,18 +12,18 @@ harness.main()
 # EKS, every statement terminal in history and settled in the ledger, wall time
 # and attributed cost written to the evidence artifacts.
 harness.scale_checks()
-# Isolated-pod cold start against a persistent worker, measured on real EKS where
-# a cold open also pays node scale-up — the number the routing choice turns on (#18).
-# Degrades honestly: where the grant is absent the isolated open is refused and this
-# records nothing rather than inventing a figure.
-try:
-    if json.loads(harness.Client(harness.URL, harness.TOKEN).request(
-            "GET", "/v1/workers"))["isolated_compute"]:
-        harness.cold_start_checks()
-    else:
-        print("isolated compute is not enabled here; skipping the cold-start measurement")
-except Exception as error:  # noqa: BLE001 - a measurement must never fail the deploy
-    print(f"cold-start measurement skipped: {error}")
+# Isolated compute is enabled on this lane (the boundary grants it, deploy_values
+# turns it on), so the harness asserts it is actually live rather than skipping —
+# the deploy identity cannot check from outside the cluster, so this in-cluster run
+# is where a missing or broken grant is caught (#39). Then it measures cold start
+# against a persistent worker, on real EKS where a cold open also pays node
+# scale-up — the number the routing choice turns on (#18).
+harness.require(
+    json.loads(harness.Client(harness.URL, harness.TOKEN).request(
+        "GET", "/v1/workers"))["isolated_compute"],
+    "isolated compute is not live: the gateway does not hold the pod grant. "
+    "Run scripts/aws/apply-boundary.sh with an administrative profile (#39).")
+harness.cold_start_checks()
 prefix = os.environ['EXPECT_S3_PREFIX']
 if not re.fullmatch(r's3://duckfleet-dev-[a-z0-9-]+/lake/', prefix):
     raise ValueError('AWS harness must target the DuckFleet development lake')

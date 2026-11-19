@@ -36,30 +36,10 @@ helm upgrade --install duckfleet infra/helm/duckfleet --kube-context "$KUBE_CONT
   --namespace "$NAMESPACE" -f artifacts/aws/values.json --set suspended=false --timeout 5m
 python3 scripts/aws/wait-rollout.py --namespace "$NAMESPACE" --context "$KUBE_CONTEXT"
 
-# Isolated compute is configured by the release but granted outside it, by the
-# ownership boundary an operator applies — and this identity cannot read RBAC to check,
-# which is the same scoping that makes the separation worth having. So the question is
-# put to the gateway, which asks the API server at startup and reports the answer.
-#
-# Read from inside the pod so the bearer token stays in the environment the kubelet
-# gave it and never reaches a CI log.
-if python3 -c "
-import json, sys
-values = json.load(open('artifacts/aws/values.json'))
-sys.exit(0 if (values.get('isolatedCompute') or {}).get('enabled') else 1)
-"; then
-  reported=$("${KUBE[@]}" exec deployment/server -- sh -c 'curl -sS \
-    -H "Authorization: Bearer $DUCKFLEET_TOKEN" http://localhost:8080/v1/workers' \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["isolated_compute"])')
-  if [[ "$reported" != True ]]; then
-    # A warning rather than a failure: the platform is serving, and `isolated` is
-    # refused with a reason instead of failing a caller's statement when a pod could
-    # not be created. But a release that ships the feature switched off by a missing
-    # grant should say so rather than look deployed.
-    echo "WARNING: this release enables isolated compute but the gateway is not" >&2
-    echo "permitted to create pods. Apply the ownership boundary with an" >&2
-    echo "administrative profile: bash scripts/aws/apply-boundary.sh (#39)" >&2
-  else
-    printf '%s\n' 'isolated compute is enabled and the gateway holds the pod grant'
-  fi
-fi
+# Whether the gateway holds the pod grant is asked and answered by the harness, not
+# here: it runs in-cluster and reaches the gateway directly, where it reads
+# isolated_compute on GET /v1/workers and exercises an isolated session. The deploy
+# identity cannot — it holds pods create/get/list/watch/delete from the boundary but
+# not pods/exec or pods/portforward, so it has no in-cluster path to the gateway, and
+# putting the question here failed the deploy the moment isolated compute was on.
+# aws_harness.py asserts the feature is live (#39).
