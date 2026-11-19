@@ -49,6 +49,7 @@
         "enabled": {"type": "boolean"},
         "maxSessionSeconds": {"type": "integer", "minimum": 60, "maximum": 7200},
         "readySeconds": {"type": "integer", "minimum": 5, "maximum": 600},
+        "provisioningSeconds": {"type": "integer", "minimum": 0, "maximum": 600},
         "apiServerPorts": {
           "type": "array",
           "items": {"type": "integer", "minimum": 1, "maximum": 65535}

@@ -215,6 +215,13 @@ assert o['isolatedCompute']['enabled'] is True
 assert o['isolatedCompute']['apiServerCidrs'] == ['10.42.3.17/32', '10.42.9.4/32'], o['isolatedCompute']
 assert o['isolatedCompute']['apiServerPorts'] == [443]
 assert o['isolatedCompute']['readySeconds'] >= 300, 'cold Karpenter provisioning needs a generous ready wait'
+# The gateway must wait out a cold node launch before reading Unschedulable as a
+# verdict, or it deletes the pod before Karpenter provisions for it (#90). The chart
+# default is 0 (fixed-node kind, where Unschedulable is terminal at once); the deploy
+# must raise it, and never past the ready budget that bounds the whole wait.
+assert o['isolatedCompute']['provisioningSeconds'] >= 120, 'on-demand nodes need a provisioning grace'
+assert o['isolatedCompute']['provisioningSeconds'] <= o['isolatedCompute']['readySeconds'], \
+    'the provisioning grace cannot outlast the ready budget'
 assert o['nodeSelector']['karpenter.sh/nodepool'] == 'duckfleet'
 # Carried as null — the overlay's instruction to Helm to delete the chart default,
 # which the flip render above confirms is gone from the rendered pod.

@@ -52,6 +52,13 @@ def overlay(cidrs, ports):
             # that cold path on EKS; this is the wait before the gateway gives up, so
             # a generous ceiling only matters when provisioning is genuinely slow.
             "readySeconds": 420,
+            # The pod is Unschedulable until Karpenter brings that node up, and the
+            # gateway must not read that transient state as a verdict and delete the
+            # pod before provisioning completes — which is exactly why no isolated
+            # session placed on EKS (#90). Zero on the fixed-node chart default (kind),
+            # raised here to span a cold node launch so an on-demand node is waited out
+            # rather than refused.
+            "provisioningSeconds": 240,
         },
         # The pool pin, and the chart's compute-type selector explicitly removed
         # (null deletes a default key under Helm's merge, which a bare omission would
