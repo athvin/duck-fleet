@@ -162,14 +162,19 @@ echo 'PASS: the wire front renders only when asked for'
 # full 2-CPU request. Chart defaults stay unpinned — the flip is a deploy-time overlay
 # (scripts/aws/deploy_values.py), since the API-server CIDR is a fact about the
 # cluster — so this renders that overlay shape to keep it from regressing unnoticed.
+# Rendered through the real overlay deploy_values.py writes, not an approximation —
+# a -f values file, so Helm's null-delete of the compute-type selector takes effect
+# exactly as it does on a deploy, which --set-json would merge away.
 flip="$validation_dir/isolated-pinned.yaml"
+flip_overlay="$validation_dir/isolated-overlay.json"
+python3 - "$flip_overlay" <<'PY'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('dv', 'scripts/aws/deploy_values.py')
+dv = importlib.util.module_from_spec(spec); spec.loader.exec_module(dv)
+json.dump(dv.overlay(['10.42.3.17/32', '10.42.9.4/32'], [443]), open(sys.argv[1], 'w'))
+PY
 helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
-  --set isolatedCompute.enabled=true \
-  --set 'isolatedCompute.apiServerCidrs[0]=10.42.3.17/32' \
-  --set 'isolatedCompute.apiServerPorts[0]=443' \
-  --set-json 'nodeSelector={"kubernetes.io/os":"linux","eks.amazonaws.com/compute-type":"auto","karpenter.sh/nodepool":"duckfleet"}' \
-  --set-json 'tolerations=[{"key":"duckfleet.io/dedicated","operator":"Equal","value":"true","effect":"NoSchedule"}]' \
-  --set-json 'workerCpuRequests={"medium":2}' > "$flip"
+  -f "$flip_overlay" > "$flip"
 python3 scripts/check-chart.py "$flip" > /dev/null
 python3 - "$flip" <<'PY'
 import sys, yaml
@@ -178,6 +183,10 @@ med = next(d for d in docs if d['kind'] == 'Deployment'
            and d['metadata']['name'] == 'worker-medium')['spec']['template']['spec']
 assert str(med['containers'][0]['resources']['requests']['cpu']) == '2', 'medium not at 2 CPU'
 assert med['nodeSelector'].get('karpenter.sh/nodepool') == 'duckfleet', 'medium not pinned'
+# The Auto Mode compute-type label must NOT ride along with the pool pin: it is added
+# at node bootstrap, so Karpenter would not provision a new custom-pool node for a pod
+# requiring it (the isolated session pod never scheduled until this was dropped).
+assert 'eks.amazonaws.com/compute-type' not in med['nodeSelector'], 'compute-type blocks Karpenter'
 assert any(t['key'] == 'duckfleet.io/dedicated' for t in med['tolerations']), 'taint not tolerated'
 PY
 echo 'PASS: the AWS flip render — isolated on, pinned, medium at its full 2 CPU — is valid'
@@ -194,6 +203,9 @@ assert o['isolatedCompute']['apiServerCidrs'] == ['10.42.3.17/32', '10.42.9.4/32
 assert o['isolatedCompute']['apiServerPorts'] == [443]
 assert o['isolatedCompute']['readySeconds'] >= 300, 'cold Karpenter provisioning needs a generous ready wait'
 assert o['nodeSelector']['karpenter.sh/nodepool'] == 'duckfleet'
+# Carried as null — the overlay's instruction to Helm to delete the chart default,
+# which the flip render above confirms is gone from the rendered pod.
+assert o['nodeSelector']['eks.amazonaws.com/compute-type'] is None, 'compute-type must be null-deleted'
 assert o['tolerations'][0]['key'] == 'duckfleet.io/dedicated'
 assert o['workerCpuRequests'] == {'medium': 2}
 print('deploy_values overlay: enabled, pinned, tolerated, medium at 2')
