@@ -13,18 +13,21 @@ cluster is named anywhere else.
 
 Today it resolves to the namespace `duckfleet-dev` on the shared entity-resolution
 development EKS Auto Mode cluster, in account `797781631727`, region `us-east-2`.
-This adds an AWS test lane alongside Docker Compose. DuckFleet owns its S3 bucket and
-image repositories; the cluster, networking, node pools, and `gp3` StorageClass are
-owned by the ER platform, and so is the **Terraform state bucket** — DuckFleet owns
-only the state *key* within it. The AWS account, cluster capacity, and bill are
-shared.
+This adds an AWS test lane alongside Docker Compose. DuckFleet owns its S3 bucket,
+image repositories, and now its **Terraform state bucket** (#12 moved the state out
+of the entity-resolution bucket it used to borrow a key within); the cluster,
+networking, node pools, and `gp3` StorageClass are owned by the ER platform. The AWS
+account, cluster capacity, and bill are shared.
 
 That sharing is a real constraint rather than a detail. Capacity is not ours to
 grant, and it has already blocked two capabilities: 2-CPU worker scheduling
 (entity-resolution-engine#1086) and the pod-create RBAC that isolated compute needs
-(#39). Each one leaves a deliberately-disabled code path in this repository. #12
-tracks giving DuckFleet a target it owns; the remaining work there needs AWS write
-access and a decision about recurring cost.
+(#39, both now resolved — the ownership boundary grants the RBAC and a DuckFleet node
+pool provides the capacity). What remains shared is the cluster itself, which #12
+accepted rather than removed: DuckFleet owns a namespace on it, its own node pool,
+and now its own Terraform state, so ER can no longer block its RBAC, capacity, or
+state — the dependencies that mattered — without DuckFleet taking on a standing
+cluster bill for a lane that is idle most of the time.
 
 | Boundary | DuckFleet resource |
 | --- | --- |
@@ -226,12 +229,14 @@ Expect the first apply to need iteration. The module is `validate`-clean and pas
 mocked-provider tests, which catches schema and scope errors but cannot establish that
 the cluster converges. Keep the plan output if it fails.
 
-## Move Terraform state to a bucket DuckFleet owns
+## Moving Terraform state to a bucket DuckFleet owns
 
-State currently lives under a key inside an entity-resolution bucket. The location is
-configuration now (`DUCKFLEET_STATE_BUCKET`, `DUCKFLEET_STATE_KEY`), and the Terraform
-backend takes it through `-backend-config` rather than pinning it, so the bucket is
-named in the same one place as the rest of the target.
+Done (#12): state lived under a key inside an entity-resolution bucket and now lives
+in `duckfleet-terraform-state-797781631727`, which DuckFleet owns outright. The
+location is configuration (`DUCKFLEET_STATE_BUCKET`, `DUCKFLEET_STATE_KEY`) taken
+through `-backend-config`, so the bucket is named in the same one place as the rest
+of the target. The steps below are the record of how it moved, and how to move it
+again for another target.
 
 Terraform cannot create the bucket that holds its own state, so this is the one piece
 of infrastructure outside Terraform. It holds state and nothing else.
@@ -241,9 +246,10 @@ of infrastructure outside Terraform. It holds state and nothing else.
 DUCKFLEET_STATE_BUCKET=duckfleet-terraform-state-797781631727 \
   bash scripts/aws/bootstrap-state.sh
 
-# 2. Copy the state across. Prompts, leaves the old copy untouched, and verifies the
-#    resource count matches before reporting success.
-DUCKFLEET_STATE_BUCKET=duckfleet-terraform-state-797781631727 \
+# 2. Copy the state across. Leaves the old copy untouched and verifies the resource
+#    count matches before reporting success. Prompts to confirm; set
+#    DUCKFLEET_ASSUME_YES=true where there is no terminal (a runner, an agent shell).
+DUCKFLEET_ASSUME_YES=true DUCKFLEET_STATE_BUCKET=duckfleet-terraform-state-797781631727 \
   bash scripts/aws/migrate-state.sh
 
 # 3. Change the default in scripts/aws/target.env and open a pull request.
