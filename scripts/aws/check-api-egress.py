@@ -25,6 +25,22 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def effective_values():
+    """The chart defaults with the deploy-time overlay applied, so this checks what
+    the deploy actually renders rather than what the chart ships. The overlay is
+    where isolated compute is enabled and its API-server CIDRs are set (#39); away
+    from a deploy it is absent and this falls back to the disabled default."""
+    values = yaml.safe_load((ROOT / "infra/helm/duckfleet/values.yaml").read_text())
+    overlay_path = ROOT / "artifacts/aws/values.json"
+    if overlay_path.exists():
+        for key, value in json.loads(overlay_path.read_text()).items():
+            if isinstance(value, dict) and isinstance(values.get(key), dict):
+                values[key] = {**values[key], **value}
+            else:
+                values[key] = value
+    return values
+
+
 def endpoints(context, namespace="default"):
     """The addresses and ports the `kubernetes` Service actually resolves to."""
     described = subprocess.run(
@@ -60,7 +76,7 @@ def uncovered(found, ranges, ports):
 
 def main():
     context = sys.argv[1]
-    values = yaml.safe_load((ROOT / "infra/helm/duckfleet/values.yaml").read_text())
+    values = effective_values()
     isolated = (values.get("isolatedCompute") or {}).get("enabled")
     if not isolated:
         # Where isolated compute is off the rule is not rendered, so there is nothing

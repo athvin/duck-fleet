@@ -147,13 +147,18 @@ Granting a capability and deploying a release are different acts by different
 identities. Keeping them apart is what lets the automated lane stay unable to widen its
 own permissions, on a cluster DuckFleet owns as much as on one it shares.
 
-Once applied, set `isolatedCompute.enabled=true` and deploy. The gateway asks the API
-server whether it holds the grant and reports the answer as `isolated_compute` on
-`GET /v1/workers`, so the two can be applied in either order and a missing grant is a
-`501 compute_unavailable` refusal rather than a session that fails once a pod could not
-be created. Removing the RoleBinding is therefore a supported way to turn the feature
-off. `make test-k8s` applies this same boundary to its kind cluster, so a boundary that
-stops matching the chart fails on a pull request.
+Once applied, nothing more is needed by hand: the next deploy computes the flip
+itself. `scripts/aws/deploy_values.py` reads the API server's live endpoints, enables
+isolated compute with the egress CIDRs those endpoints require, pins the workers to the
+`duckfleet` pool with its toleration, and raises the medium worker to its full 2-CPU
+request — all as a deploy-time overlay on `values.json`, because the API-server address
+is a fact about the cluster, not a chart default. The gateway then asks the API server
+whether it holds the grant and reports the answer as `isolated_compute` on
+`GET /v1/workers`, so the boundary and the deploy can land in either order and a missing
+grant is a `501 compute_unavailable` refusal rather than a session that fails once a pod
+could not be created. Removing the RoleBinding is therefore a supported way to turn the
+feature off. `make test-k8s` applies this same boundary to its kind cluster, so a
+boundary that stops matching the chart fails on a pull request.
 
 ## The exit: a cluster DuckFleet owns
 
