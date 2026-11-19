@@ -758,13 +758,49 @@ def credentials_checks():
         lambda: client.request("POST", "/v1/credentials", {"principal": "sneaky"}),
         lambda: client.request("GET", "/v1/credentials"),
         lambda: client.request("DELETE", "/v1/credentials/" + service["credential_id"]),
+        # The budget ceiling too: a spend control writable by the spenders it
+        # constrains would be an accident log, not a control.
+        lambda: client.request("PUT", "/v1/budget", {"max_job_micro_usd": 1}),
     ]:
         refused = expect_error(403, attempt)
         require(refused.failure_kind == "forbidden", str(refused.failure_kind))
+    # Reading the position stays open: it is how any caller sizes a request.
+    require("available_micro_usd" in json.loads(client.request("GET", "/v1/budget")),
+            "a named credential could not read the budget position")
+
+    # A session answers only to its owner and the bootstrap. The session ID is in
+    # history, which every credential can read, so possession proves nothing.
+    analyst = json.loads(admin.request("POST", "/v1/credentials", {"principal": "analyst-2"}))
+    owned = RemoteConnection(URL, analyst["token"], name="owned-session")
+    try:
+        require(owned.cursor().execute("select 3").fetchall() == [(3,)], "owner refused")
+        session_path = owned.path  # /v1/sessions/<id>
+        for attempt in [
+            lambda: client.request("POST", session_path + "/queries",
+                                   {"request_id": str(uuid.uuid4()), "sql": "select 1"}),
+            lambda: client.request("POST", session_path + "/cancel"),
+            lambda: client.request("DELETE", session_path),
+        ]:
+            refused = expect_error(403, attempt)
+            require(refused.failure_kind == "forbidden", str(refused.failure_kind))
+        # Still the owner's after all that: the probes neither acted nor touched it.
+        require(owned.cursor().execute("select 4").fetchall() == [(4,)],
+                "an intruder's refusals broke the owner's session")
+        # The bootstrap is the operator and may close anyone's.
+        admin.request("DELETE", session_path)
+        refused = expect_error(404, lambda: owned.cursor().execute("select 5"))
+        require(refused.failure_kind == "unknown_session", str(refused.failure_kind))
+    finally:
+        try:
+            owned.close()
+        except Exception:
+            pass  # Already closed by the bootstrap above.
     # Removed afterwards, so repeated runs do not accumulate live credentials.
     admin.request("DELETE", "/v1/credentials/" + service["credential_id"])
+    admin.request("DELETE", "/v1/credentials/" + analyst["credential_id"])
     print("PASS: credentials are issued, attributed in history, listed without secrets, "
-          "revoked at once, expired on time, and managed by the bootstrap alone")
+          "revoked at once, expired on time, and managed by the bootstrap alone; "
+          "sessions and the budget ceiling answer only to their owners")
 
 
 def gateway_replaced():

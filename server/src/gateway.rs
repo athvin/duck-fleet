@@ -32,6 +32,10 @@ use uuid::Uuid;
 struct Route {
     endpoint: String,
     touched: Instant,
+    /// Who opened this session. Session IDs appear in history, which every
+    /// credential can read, so possession of an ID proves nothing — only the
+    /// opener (or the bootstrap) may run, cancel, or close the session.
+    principal: Arc<str>,
     /// The session pod to remove when this route goes away, for an isolated session.
     /// `None` for a persistent worker, which outlives every session it serves.
     pod: Option<String>,
@@ -80,6 +84,12 @@ impl Principal {
             Self::Bootstrap => credentials::BOOTSTRAP_PRINCIPAL,
             Self::Named(name) => name,
         }
+    }
+    /// Whether this caller may act on a session `owner` opened. The bootstrap may
+    /// act on anyone's — it is the operator, and cancelling a runaway statement is
+    /// its job — while a named principal is confined to its own.
+    fn may_act_on(&self, owner: &str) -> bool {
+        matches!(self, Self::Bootstrap) || self.name() == owner
     }
 }
 
@@ -362,12 +372,21 @@ impl Gateway {
             .await
             .map_err(|_| ApiError::internal())
     }
-    async fn route(&self, id: Uuid) -> Result<String, ApiError> {
+    async fn route(&self, id: Uuid, caller: &Principal) -> Result<String, ApiError> {
         self.expire().await;
         let mut routes = self.routes.lock().await;
         let route = routes
             .get_mut(&id)
             .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
+        // A 403 rather than a masked 404: the caller is a colleague, not an
+        // adversary, and naming the refusal is this API's idiom. Checked before the
+        // touch so a probing caller cannot keep someone else's session alive.
+        if !caller.may_act_on(&route.principal) {
+            return Err(ApiError::new(
+                failure::FORBIDDEN,
+                "this session belongs to another principal",
+            ));
+        }
         route.touched = Instant::now();
         Ok(route.endpoint.clone())
     }
@@ -513,6 +532,7 @@ async fn open(
         Route {
             endpoint,
             touched: Instant::now(),
+            principal: principal.name().into(),
             pod,
             _permit: permit,
         },
@@ -521,10 +541,11 @@ async fn open(
 }
 async fn query(
     State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<Uuid>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let endpoint = app.route(id).await?;
+    let endpoint = app.route(id, &principal).await?;
     response(
         app.send(
             &endpoint,
@@ -536,8 +557,12 @@ async fn query(
     )
     .await
 }
-async fn cancel(State(app): State<Gateway>, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
-    let endpoint = app.route(id).await?;
+async fn cancel(
+    State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let endpoint = app.route(id, &principal).await?;
     response(
         app.send(
             &endpoint,
@@ -549,8 +574,12 @@ async fn cancel(State(app): State<Gateway>, Path(id): Path<Uuid>) -> Result<Resp
     )
     .await
 }
-async fn close(State(app): State<Gateway>, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
-    let endpoint = app.route(id).await?;
+async fn close(
+    State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let endpoint = app.route(id, &principal).await?;
     let upstream = app
         .send(
             &endpoint,
@@ -591,8 +620,12 @@ async fn budget(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
 }
 async fn set_budget(
     State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
     Json(update): Json<crate::usage::BudgetUpdate>,
 ) -> Result<Json<Value>, ApiError> {
+    // Reading the balance stays open to every credential — it is how a caller
+    // sizes a request — but the ceiling belongs to whoever answers for the bill.
+    admin_only(&principal, "set budget limits")?;
     app.usage.set_budget(update).await.map(Json)
 }
 /// Runs one platform-owned statement through the ordinary execution machinery: a
@@ -814,7 +847,7 @@ async fn lake_maintenance(
     Extension(principal): Extension<Principal>,
     Json(request): Json<MaintenanceRequest>,
 ) -> Result<Response, ApiError> {
-    admin_only(&principal)?;
+    admin_only(&principal, "run lake maintenance")?;
     if request.expire_older_than_days.is_none() && !request.compact && !request.cleanup {
         return Err(ApiError::bad(
             "ask for at least one of expire_older_than_days, compact, or cleanup",
@@ -856,14 +889,16 @@ struct MintRequest {
     expires_seconds: Option<i64>,
 }
 
-/// Credential management is the bootstrap's alone. A named credential that could
-/// mint credentials could quietly become every principal at once.
-fn admin_only(principal: &Principal) -> Result<(), ApiError> {
+/// Operator-only actions. Credential management because a named credential that
+/// could mint could quietly become every principal at once; budget writes because a
+/// spend ceiling writable by the spenders it constrains is not a control; lake
+/// maintenance because expiry and cleanup destroy what they tidy.
+fn admin_only(principal: &Principal, what: &str) -> Result<(), ApiError> {
     match principal {
         Principal::Bootstrap => Ok(()),
         Principal::Named(_) => Err(ApiError::new(
             failure::FORBIDDEN,
-            "only the bootstrap credential manages credentials",
+            format!("only the bootstrap credential may {what}"),
         )),
     }
 }
@@ -875,7 +910,7 @@ async fn mint_credential(
     Extension(principal): Extension<Principal>,
     Json(request): Json<MintRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    admin_only(&principal)?;
+    admin_only(&principal, "manage credentials")?;
     // Validated here so a bad request is the caller's 400, not a swallowed
     // internal error from the issuing transaction.
     if !credentials::valid_principal(&request.principal) {
@@ -904,7 +939,7 @@ async fn list_credentials(
     State(app): State<Gateway>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Value>, ApiError> {
-    admin_only(&principal)?;
+    admin_only(&principal, "manage credentials")?;
     Ok(Json(app.authn.with_db(false, credentials::list).await?))
 }
 
@@ -913,7 +948,7 @@ async fn revoke_credential(
     Extension(principal): Extension<Principal>,
     Path(credential_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    admin_only(&principal)?;
+    admin_only(&principal, "manage credentials")?;
     let revoked = app
         .authn
         .with_db(true, move |client| {
@@ -1202,11 +1237,27 @@ mod tests {
 
     #[test]
     fn only_the_bootstrap_may_manage_credentials() {
-        assert!(admin_only(&Principal::Bootstrap).is_ok());
-        let refused = admin_only(&Principal::Named("analyst".into())).unwrap_err();
+        assert!(admin_only(&Principal::Bootstrap, "manage credentials").is_ok());
+        let refused =
+            admin_only(&Principal::Named("analyst".into()), "set budget limits").unwrap_err();
         assert_eq!(refused.0.kind, "forbidden");
         assert!(!refused.0.retry_safe);
         assert_eq!(refused.0.http, StatusCode::FORBIDDEN);
+        // The refusal names the action, so a caller knows which lever was refused.
+        assert!(refused.1.contains("set budget limits"), "{}", refused.1);
+    }
+
+    #[test]
+    fn a_session_answers_only_to_its_owner_and_the_bootstrap() {
+        let owner = Principal::Named("analyst".into());
+        let intruder = Principal::Named("intruder".into());
+        assert!(owner.may_act_on("analyst"));
+        assert!(!intruder.may_act_on("analyst"));
+        // The operator can cancel or close anyone's runaway session.
+        assert!(Principal::Bootstrap.may_act_on("analyst"));
+        // And nobody impersonates the bootstrap by name: minting refuses the name,
+        // so a route owned by it can only have been opened with the real token.
+        assert!(!owner.may_act_on(credentials::BOOTSTRAP_PRINCIPAL));
     }
 
     #[test]

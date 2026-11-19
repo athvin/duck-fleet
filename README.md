@@ -308,10 +308,18 @@ Revocation takes effect immediately on the gateway that processed it. Unknown,
 revoked, and expired tokens are all refused with the same `401 unauthorized`,
 so a probing caller learns nothing about which it was.
 
-Credentials authenticate and attribute; they do not yet authorize differently.
-Every principal reaches the same full SQL surface and the same platform
-endpoints apart from credential management — per-principal SQL or budget
-scoping is explicitly not built.
+Credentials authenticate and attribute, and they scope the platform's levers —
+not its SQL. Every principal reaches the same full SQL surface; per-principal
+SQL scoping is explicitly not built. On the platform API the mutations are
+owned: credential management, lake maintenance, and budget **writes** are
+bootstrap-only (a spend ceiling writable by the spenders it constrains would be
+an accident log, not a control), and a session answers only to the principal
+that opened it — another credential's query, cancel, or close is refused `403
+forbidden`, while the bootstrap may act on any session because interrupting a
+runaway statement is the operator's job. Reads stay org-global by design:
+budget position, query history, and usage — including SQL text — are visible to
+every credential, because debugging a teammate's run and seeing the one shared
+bill are what a single-organization warehouse is for.
 
 ## The Postgres wire front
 
