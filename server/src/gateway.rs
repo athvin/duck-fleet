@@ -247,6 +247,9 @@ struct Gateway {
     /// grant itself RBAC, so the workers are the only available authority.
     endpoints: Arc<Vec<String>>,
     fleet: Arc<Mutex<Option<Fleet>>>,
+    /// Held for the duration of one `discover`, so concurrent cache misses collapse
+    /// into a single fleet probe instead of each running the sequential scan.
+    discovering: Arc<Mutex<()>>,
     routes: Arc<Mutex<HashMap<Uuid, Route>>>,
     capacity: Arc<Semaphore>,
     history: crate::history::Reader,
@@ -364,20 +367,36 @@ impl Gateway {
             }
             census
         };
-        let cached = {
-            let fleet = self.fleet.lock().await;
-            fleet
-                .clone()
-                .filter(|f| f.discovered.elapsed() < FRESH && f.unreachable.is_empty())
-        };
-        if let Some(fleet) = cached {
+        // The cache is usable whether or not some endpoints were unreachable when it
+        // was built: a worker being down does not make the workers that answered
+        // stale. The old `unreachable.is_empty()` gate meant one down worker forced
+        // every request to re-probe the whole fleet at 5s per endpoint — so a partial
+        // outage became a gateway-wide slowdown. A size the cache cannot serve still
+        // refreshes below, which re-probes the down endpoint lazily.
+        let fresh =
+            |fleet: &Option<Fleet>| fleet.clone().filter(|f| f.discovered.elapsed() < FRESH);
+        if let Some(fleet) = fresh(&*self.fleet.lock().await) {
             let candidates = ranked_endpoints(&fleet.workers, wanted, &census);
             if !candidates.is_empty() {
                 return Ok(candidates);
             }
         }
-        let fleet = self.discover().await;
-        *self.fleet.lock().await = Some(fleet.clone());
+        // Single-flight: hold the discovery lock, then re-check the cache a concurrent
+        // discovery may have just filled. Without this, N simultaneous misses each run
+        // the full sequential probe; with it, the first probes and the rest read its
+        // result. The request path never holds this across anything but one discover.
+        let fleet = {
+            let _flight = self.discovering.lock().await;
+            if let Some(fleet) = fresh(&*self.fleet.lock().await)
+                && !ranked_endpoints(&fleet.workers, wanted, &census).is_empty()
+            {
+                fleet
+            } else {
+                let discovered = self.discover().await;
+                *self.fleet.lock().await = Some(discovered.clone());
+                discovered
+            }
+        };
         let candidates = ranked_endpoints(&fleet.workers, wanted, &census);
         if !candidates.is_empty() {
             return Ok(candidates);
@@ -517,9 +536,14 @@ impl Gateway {
             });
             expired
         };
+        // Released off the request path: each release is a kube DELETE plus a ledger
+        // settle, up to ~18s, and awaiting them here made the next unrelated request
+        // wait out every expired pod in turn. A spawned release that dies mid-flight
+        // is backstopped by the startup sweep, so nothing is lost by not awaiting.
         for pod in expired {
             tracing::warn!(pod, "releasing the pod of a session nobody closed");
-            self.release(Some(pod)).await;
+            let gateway = self.clone();
+            tokio::spawn(async move { gateway.release(Some(pod)).await });
         }
     }
 
@@ -865,6 +889,11 @@ impl crate::pgwire::Platform for PgPlatform {
         sql: String,
     ) -> crate::pgwire::QueryOutcome {
         use crate::pgwire::QueryOutcome;
+        // Counted into the same in-flight tally the HTTP handlers use, so the
+        // gateway's drain waits for a pgwire statement already running. The pgwire
+        // listener sits outside the axum router that carries `track_inflight`, so
+        // without this a rollout would close under a live wire-protocol query.
+        let _inflight = InFlight::enter(&self.0.inflight);
         let sent = self
             .0
             .send(
@@ -1108,20 +1137,35 @@ async fn health(State(app): State<Gateway>) -> Response {
 
 async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
     async fn info(app: &Gateway, endpoint: &str) -> Result<Value, ApiError> {
-        app.send(endpoint, Method::GET, "/v1/worker", Bytes::new())
-            .await?
-            .error_for_status()
-            .map_err(|_| ApiError::internal())?
-            .json()
-            .await
-            .map_err(|_| ApiError::internal())
+        // The 5s bound discovery uses, not the client's 75s statement timeout: one
+        // hung worker must not hold this report for over a minute, let alone that
+        // per endpoint, which is what sequential un-timed probing did.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            app.send(endpoint, Method::GET, "/v1/worker", Bytes::new()),
+        )
+        .await
+        .map_err(|_| ApiError::internal())??
+        .error_for_status()
+        .map_err(|_| ApiError::internal())?
+        .json()
+        .await
+        .map_err(|_| ApiError::internal())
     }
     // Every configured worker must answer: this endpoint reports the fleet, and a
-    // silently short list would read as a deployment that is smaller than it is.
-    let mut reported = Vec::with_capacity(app.endpoints.len());
-    for endpoint in app.endpoints.iter() {
-        reported.push(info(&app, endpoint).await?);
+    // silently short list would read as a deployment that is smaller than it is. Asked
+    // concurrently so the report takes one slow worker's time, not the sum of all.
+    let mut probes = tokio::task::JoinSet::new();
+    for (index, endpoint) in app.endpoints.iter().cloned().enumerate() {
+        let app = app.clone();
+        probes.spawn(async move { (index, info(&app, &endpoint).await) });
     }
+    let mut ordered: Vec<Option<Value>> = vec![None; app.endpoints.len()];
+    while let Some(joined) = probes.join_next().await {
+        let (index, result) = joined.map_err(|_| ApiError::internal())?;
+        ordered[index] = Some(result?);
+    }
+    let reported: Vec<Value> = ordered.into_iter().flatten().collect();
     // Reported rather than left to be discovered by being refused. Whether this
     // deployment can create pods is a property of the deployment, and a caller
     // deciding whether to ask for isolation should not have to learn it from a 501.
@@ -1182,6 +1226,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         token,
         endpoints: Arc::new(worker_endpoints()?),
         fleet: Arc::new(Mutex::new(None)),
+        discovering: Arc::new(Mutex::new(())),
         routes: Arc::new(Mutex::new(HashMap::new())),
         capacity: Arc::new(Semaphore::new(64)),
         history: crate::history::Reader::new(std::env::var("PLATFORM_DSN")?),

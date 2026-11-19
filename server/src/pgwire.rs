@@ -15,8 +15,20 @@ use anyhow::{Context, Result, bail};
 use arrow_array::{Array, RecordBatch, cast::AsArray, types};
 use arrow_schema::{DataType, TimeUnit};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+
+/// Concurrent pgwire connections this listener will hold, mirroring the gateway's
+/// own 64-session cap. A bound at all is the point: without one, every accepted
+/// socket spawned an unbounded task, so a client that connected and sent nothing
+/// parked a task forever.
+const MAX_CONNECTIONS: usize = 64;
+
+/// How long a connection has to get through the startup handshake. A peer that
+/// opens a socket and never speaks must not hold a connection slot indefinitely.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PROTOCOL_V3: i32 = 196_608;
 const SSL_REQUEST: i32 = 80_877_103;
@@ -55,11 +67,21 @@ pub(crate) enum QueryOutcome {
 }
 
 pub(crate) async fn serve<P: Platform>(platform: Arc<P>, listener: TcpListener) {
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         match listener.accept().await {
             Ok((socket, _)) => {
+                // A permit per connection, held for its whole life. When the cap is
+                // reached the socket is dropped at once rather than queued, so a flood
+                // of idle connections cannot grow an unbounded pile of parked tasks.
+                let Ok(permit) = connections.clone().try_acquire_owned() else {
+                    tracing::warn!("pgwire connection limit reached; refusing a connection");
+                    drop(socket);
+                    continue;
+                };
                 let platform = platform.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = connection(platform, socket).await {
                         tracing::debug!(error = format!("{error:#}"), "pgwire connection ended");
                     }
@@ -67,7 +89,7 @@ pub(crate) async fn serve<P: Platform>(platform: Arc<P>, listener: TcpListener) 
             }
             Err(error) => {
                 tracing::warn!(%error, "pgwire accept failed");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -75,9 +97,28 @@ pub(crate) async fn serve<P: Platform>(platform: Arc<P>, listener: TcpListener) 
 
 async fn connection<P: Platform>(platform: Arc<P>, socket: TcpStream) -> Result<()> {
     let mut stream = BufStream::new(socket);
-    // Startup phase: SSLRequests are answered 'N' (this listener is in-cluster
-    // plain TCP; transport security is the exposure layer's concern), and a
-    // client may retry the startup message afterwards.
+    // Only the startup exchange is bounded, not the serving loop beyond it: a peer
+    // that opens a socket and then says nothing used to park a connection slot until
+    // the process stopped, but an authenticated session may legitimately sit idle
+    // between statements.
+    let startup = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_startup(&mut stream))
+        .await
+        .context("pgwire startup timed out")??;
+    match startup {
+        // SSLRequest answered, CancelRequest dropped (no cancellation path over this
+        // front): both end the connection without a session.
+        None => Ok(()),
+        Some(rest) => established(platform, stream, &rest).await,
+    }
+}
+
+/// Reads the startup phase, returning the startup packet body once a v3 client
+/// speaks it, or `None` when the exchange ends without a session (an SSLRequest the
+/// client does not follow up, or a CancelRequest).
+async fn read_startup(stream: &mut BufStream<TcpStream>) -> Result<Option<Vec<u8>>> {
+    // SSLRequests are answered 'N' (this listener is in-cluster plain TCP; transport
+    // security is the exposure layer's concern), and a client may retry the startup
+    // message afterwards.
     loop {
         let length = stream.read_i32().await.context("startup length")?;
         anyhow::ensure!((8..=10_000).contains(&length), "malformed startup length");
@@ -87,11 +128,11 @@ async fn connection<P: Platform>(platform: Arc<P>, socket: TcpStream) -> Result<
                 stream.write_all(b"N").await?;
                 stream.flush().await?;
             }
-            CANCEL_REQUEST => return Ok(()),
+            CANCEL_REQUEST => return Ok(None),
             PROTOCOL_V3 => {
                 let mut rest = vec![0; usize::try_from(length - 8)?];
                 stream.read_exact(&mut rest).await?;
-                return established(platform, stream, &rest).await;
+                return Ok(Some(rest));
             }
             _ => bail!("unsupported protocol {code}"),
         }
@@ -120,7 +161,11 @@ async fn established<P: Platform>(
     // from the credential, exactly as it does over HTTP.
     write_message(&mut stream, b'R', &3_i32.to_be_bytes()).await?;
     stream.flush().await?;
-    let (kind, body) = read_message(&mut stream).await?;
+    // Bounded like the startup read above: a peer that is asked for a password and
+    // never sends one must not hold its connection slot open indefinitely.
+    let (kind, body) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_message(&mut stream))
+        .await
+        .context("pgwire password read timed out")??;
     anyhow::ensure!(kind == b'p', "expected a password message");
     let token = String::from_utf8_lossy(body.split(|b| *b == 0).next().unwrap_or(&[])).into_owned();
     let Some(principal) = platform.authenticate(token).await else {
