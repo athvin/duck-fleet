@@ -509,6 +509,9 @@ impl Worker {
         // its history row recorded, so nothing stays both unmetered and reserved.
         let rate = pricing::RateCard::from_env()?;
         let recovered = metering::recover(&mut transaction, &worker_id, &rate)?;
+        // After recovery, so the accumulators absorb what it just settled. This is
+        // the one remaining O(ledger) scan: once per worker start, never per query.
+        metering::reconcile(&mut transaction)?;
         transaction.commit()?;
         if recovered > 0 {
             tracing::warn!(recovered, "settled reservations abandoned by a restart");

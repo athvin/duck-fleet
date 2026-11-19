@@ -264,6 +264,32 @@ def sql_table_absent(url, token, name):
         connection.close()
 
 
+def accumulators_match_the_ledger(client, evidence):
+    """The budget's spent/held accumulators are a cache of the ledger, and a cache is
+    only trustworthy if it is checked against its source. Page the whole ledger and
+    recompute the sum the admission gate no longer has to."""
+    position = budget(client)
+    total, pages, before = 0, 0, None
+    while True:
+        path = "/v1/usage?limit=500" + (f"&before={before}" if before else "")
+        listing = json.loads(client.request("GET", path))
+        total += sum(event["amount_micro_usd"] for event in listing["events"])
+        pages += 1
+        before = listing["next_before"]
+        if before is None:
+            break
+    require(
+        total == position["spent_micro_usd"],
+        f"ledger sums to {total} but the accumulator says {position['spent_micro_usd']}",
+    )
+    # Nothing is running between stages, so no funds should be held either.
+    require(position["held_micro_usd"] == 0, f"idle stack holds funds: {position}")
+    require(position["held_reservations"] == 0, str(position))
+    evidence.append({"case": "accumulators", "events_summed_over_pages": pages,
+                     "spent_micro_usd": total})
+    print(f"PASS: the spent accumulator equals the ledger summed across {pages} page(s)")
+
+
 def the_ledger_only_grows(client, evidence):
     """Corrections are new rows, so the event count never decreases."""
     before = budget(client)["usage_events"]
@@ -290,6 +316,7 @@ def checks(url, token, artifacts):
         a_per_job_cap_stops_a_running_statement(client, url, token, evidence)
         an_exhausted_balance_refuses_admission(client, url, token, evidence)
         the_ledger_only_grows(client, evidence)
+        accumulators_match_the_ledger(client, evidence)
     finally:
         # However this ends, the next stage of the harness needs a working budget.
         set_budget(client, prepaid_micro_usd=opening["prepaid_micro_usd"],

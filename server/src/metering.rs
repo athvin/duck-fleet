@@ -12,6 +12,13 @@
 //!
 //! Source telemetry (`query_history`) and the billable ledger stay separate tables
 //! on purpose: diagnostics get rewritten as a query progresses, an invoice must not.
+//!
+//! The budget row carries `spent_micro_usd` and `held_micro_usd` accumulators so
+//! admission never has to sum a ledger that, by rule 2, only ever grows. They are a
+//! derived cache, not a second ledger: every writer updates them in the same
+//! transaction as its ledger write, and each worker start recomputes them from the
+//! true sums under the budget lock — so the one O(ledger) scan left runs per boot,
+//! not per admission, and a delta missed by an older binary heals at the next start.
 use crate::{ApiError, failure, pricing};
 use anyhow::Result;
 use postgres::{Client, Transaction};
@@ -106,13 +113,62 @@ pub(crate) fn migrate(transaction: &mut Transaction, prepaid: i64, max_job: i64)
         );
         CREATE INDEX IF NOT EXISTS reservations_held ON reservations(worker_id) WHERE state = 'held';
         ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rate_micro_usd_per_unit_hour BIGINT;
-        ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rate_card_version TEXT;",
+        ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rate_card_version TEXT;
+        ALTER TABLE budget ADD COLUMN IF NOT EXISTS spent_micro_usd BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE budget ADD COLUMN IF NOT EXISTS held_micro_usd BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE budget ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ;",
     )?;
     // Seed once. A restart must not silently refill a spent balance.
     transaction.execute(
         "INSERT INTO budget (budget_id, prepaid_micro_usd, max_job_micro_usd)
          VALUES ($1,$2,$3) ON CONFLICT (budget_id) DO NOTHING",
         &[&BUDGET_ID, &prepaid, &max_job],
+    )?;
+    Ok(())
+}
+
+/// Recomputes the budget accumulators from the ledger's true sums, under the budget
+/// lock. Run once per worker start: taking the row lock *before* reading the sums
+/// means any concurrent settle is either already visible to this snapshot or blocked
+/// until after the overwrite, when it applies its own delta — no update is lost in
+/// either order. This is also what heals a delta an older binary never applied.
+pub(crate) fn reconcile(transaction: &mut Transaction) -> Result<()> {
+    transaction.execute(
+        "SELECT 1 FROM budget WHERE budget_id=$1 FOR UPDATE",
+        &[&BUDGET_ID],
+    )?;
+    transaction.execute(
+        "UPDATE budget SET
+            spent_micro_usd = (SELECT COALESCE(SUM(amount_micro_usd),0) FROM usage_events),
+            held_micro_usd = (SELECT COALESCE(SUM(reserved_micro_usd),0) FROM reservations WHERE state='held'),
+            reconciled_at = now()
+         WHERE budget_id=$1",
+        &[&BUDGET_ID],
+    )?;
+    Ok(())
+}
+
+/// What one settlement moves on the budget row, decided by what its statements
+/// actually changed: a replayed event (`inserted == 0`) spends nothing a second
+/// time, and a hold someone else already released (`released == 0`) is not released
+/// again. Counting rows rather than assuming is what keeps the accumulators exact
+/// under crash-retry and concurrent recovery.
+fn budget_deltas(inserted: u64, released: u64, amount: i64, reserved: i64) -> (i64, i64) {
+    (
+        if inserted == 1 { amount } else { 0 },
+        if released == 1 { -reserved } else { 0 },
+    )
+}
+
+fn apply_deltas(transaction: &mut Transaction, spent: i64, held: i64) -> Result<()> {
+    if spent == 0 && held == 0 {
+        return Ok(());
+    }
+    transaction.execute(
+        "UPDATE budget SET spent_micro_usd = spent_micro_usd + $2,
+            held_micro_usd = held_micro_usd + $3
+         WHERE budget_id=$1",
+        &[&BUDGET_ID, &spent, &held],
     )?;
     Ok(())
 }
@@ -149,6 +205,7 @@ pub(crate) fn recover(
          WHERE r.state = 'held' AND r.worker_id = $1",
         &[&worker_id],
     )?;
+    let (mut spent_delta, mut held_delta) = (0i64, 0i64);
     for row in &orphans {
         let execution_id: String = row.get(0);
         let reserved: i64 = row.get(1);
@@ -158,7 +215,7 @@ pub(crate) fn recover(
         let stored_rate: Option<i64> = row.get(5);
         let stored_version: Option<String> = row.get(6);
         let amount = recovery_amount(stored_rate, current, units, elapsed_ms, reserved);
-        record(
+        let inserted = record(
             transaction,
             &execution_id,
             units,
@@ -169,12 +226,18 @@ pub(crate) fn recover(
             &context,
             "recovery",
         )?;
-        transaction.execute(
+        // `state='held'` guards a race with another settler of the same orphan: the
+        // counts say which of us actually moved it, and the deltas follow the counts.
+        let released = transaction.execute(
             "UPDATE reservations SET state='settled', settled_micro_usd=$2, settled_at=now()
-             WHERE execution_id=$1",
+             WHERE execution_id=$1 AND state='held'",
             &[&execution_id, &amount],
         )?;
+        let (spent, held) = budget_deltas(inserted, released, amount, reserved);
+        spent_delta += spent;
+        held_delta += held;
     }
+    apply_deltas(transaction, spent_delta, held_delta)?;
     Ok(orphans.len() as u64)
 }
 
@@ -207,28 +270,19 @@ pub(crate) fn admit(
     rate: &pricing::RateCard,
 ) -> Result<Admission, ApiError> {
     let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
+    // The accumulators ride the same locked row as the limits, so admission reads
+    // the whole position in one O(1) select however large the ledger has grown.
     let limits = transaction
         .query_one(
-            "SELECT prepaid_micro_usd, max_job_micro_usd FROM budget WHERE budget_id=$1 FOR UPDATE",
+            "SELECT prepaid_micro_usd, max_job_micro_usd, spent_micro_usd, held_micro_usd
+             FROM budget WHERE budget_id=$1 FOR UPDATE",
             &[&BUDGET_ID],
         )
         .map_err(|_| ApiError::internal())?;
     let prepaid: i64 = limits.get(0);
     let max_job: i64 = limits.get(1);
-    let spent: i64 = transaction
-        .query_one(
-            "SELECT COALESCE(SUM(amount_micro_usd),0)::BIGINT FROM usage_events",
-            &[],
-        )
-        .map_err(|_| ApiError::internal())?
-        .get(0);
-    let held: i64 = transaction
-        .query_one(
-            "SELECT COALESCE(SUM(reserved_micro_usd),0)::BIGINT FROM reservations WHERE state='held'",
-            &[],
-        )
-        .map_err(|_| ApiError::internal())?
-        .get(0);
+    let spent: i64 = limits.get(2);
+    let held: i64 = limits.get(3);
     let (deadline_seconds, reserved_micro_usd) = decide(
         prepaid - spent - held,
         max_job,
@@ -262,6 +316,7 @@ pub(crate) fn admit(
             ],
         )
         .map_err(|_| ApiError::internal())?;
+    apply_deltas(&mut transaction, 0, reserved_micro_usd).map_err(|_| ApiError::internal())?;
     transaction.commit().map_err(|_| ApiError::internal())?;
     Ok(Admission {
         execution_id: execution_id.to_owned(),
@@ -283,9 +338,10 @@ fn record(
     worker_id: &str,
     context: &str,
     source: &str,
-) -> Result<()> {
+) -> Result<u64> {
     // One event per execution per meter, keyed so a replayed settlement is a no-op.
-    transaction.execute(
+    // Returns the insert count so a caller can tell a first write from a replay.
+    let inserted = transaction.execute(
         "INSERT INTO usage_events (event_id, execution_id, meter_name, quantity, unit,
             resource_units, amount_micro_usd, rate_card_version, worker_id, context, source,
             started_at, ended_at)
@@ -305,7 +361,7 @@ fn record(
             &source,
         ],
     )?;
-    Ok(())
+    Ok(inserted)
 }
 
 /// Writes the usage event and releases the unused part of the reservation. Called
@@ -321,7 +377,7 @@ pub(crate) fn settle(
 ) -> Result<i64> {
     let amount = rate.charge_micro_usd(admission.units, u64::try_from(elapsed_ms).unwrap_or(0));
     let mut transaction = client.transaction()?;
-    record(
+    let inserted = record(
         &mut transaction,
         &admission.execution_id,
         admission.units,
@@ -332,11 +388,13 @@ pub(crate) fn settle(
         context,
         "worker",
     )?;
-    transaction.execute(
+    let released = transaction.execute(
         "UPDATE reservations SET state='settled', settled_micro_usd=$2, settled_at=now()
          WHERE execution_id=$1 AND state='held'",
         &[&admission.execution_id, &amount],
     )?;
+    let (spent, held) = budget_deltas(inserted, released, amount, admission.reserved_micro_usd);
+    apply_deltas(&mut transaction, spent, held)?;
     transaction.commit()?;
     Ok(amount)
 }
@@ -344,25 +402,26 @@ pub(crate) fn settle(
 /// Current budget position, for the operator view. The rate reported is the card
 /// this process prices *new* work with; recorded events carry their own.
 pub(crate) fn summary(client: &mut Client, rate: &pricing::RateCard) -> Result<Value, ApiError> {
+    // The accumulators, not fresh SUMs: the operator reads exactly the position the
+    // admission gate enforces, and the two can never disagree in a report.
     let limits = client
         .query_one(
-            "SELECT prepaid_micro_usd, max_job_micro_usd FROM budget WHERE budget_id=$1",
+            "SELECT prepaid_micro_usd, max_job_micro_usd, spent_micro_usd, held_micro_usd
+             FROM budget WHERE budget_id=$1",
             &[&BUDGET_ID],
         )
         .map_err(|_| ApiError::internal())?;
     let prepaid: i64 = limits.get(0);
     let max_job: i64 = limits.get(1);
+    let spent: i64 = limits.get(2);
+    let held: i64 = limits.get(3);
     let totals = client
         .query_one(
-            "SELECT (SELECT COALESCE(SUM(amount_micro_usd),0)::BIGINT FROM usage_events),
-                    (SELECT COALESCE(SUM(reserved_micro_usd),0)::BIGINT FROM reservations WHERE state='held'),
-                    (SELECT COUNT(*)::BIGINT FROM usage_events),
+            "SELECT (SELECT COUNT(*)::BIGINT FROM usage_events),
                     (SELECT COUNT(*)::BIGINT FROM reservations WHERE state='held')",
             &[],
         )
         .map_err(|_| ApiError::internal())?;
-    let spent: i64 = totals.get(0);
-    let held: i64 = totals.get(1);
     Ok(json!({
         "budget_id": BUDGET_ID,
         "prepaid_micro_usd": prepaid,
@@ -370,8 +429,8 @@ pub(crate) fn summary(client: &mut Client, rate: &pricing::RateCard) -> Result<V
         "held_micro_usd": held,
         "available_micro_usd": prepaid - spent - held,
         "max_job_micro_usd": max_job,
-        "usage_events": totals.get::<_, i64>(2),
-        "held_reservations": totals.get::<_, i64>(3),
+        "usage_events": totals.get::<_, i64>(0),
+        "held_reservations": totals.get::<_, i64>(1),
         "rate_card_version": rate.version,
         "compute_micro_usd_per_unit_hour": rate.compute_micro_usd_per_unit_hour,
     }))
@@ -465,6 +524,20 @@ mod tests {
         assert_eq!(at_double, 1800);
         // And the reservation is priced by the same card as the deadline.
         assert_eq!(reserved, doubled.charge_micro_usd(1, 1800 * 1000));
+    }
+
+    #[test]
+    fn budget_deltas_follow_the_row_counts_not_the_caller() {
+        // A first settlement moves both accumulators.
+        assert_eq!(budget_deltas(1, 1, 700, 1_000), (700, -1_000));
+        // A replayed event spends nothing a second time.
+        assert_eq!(budget_deltas(0, 1, 700, 1_000), (0, -1_000));
+        // A hold someone else already released is not released again.
+        assert_eq!(budget_deltas(1, 0, 700, 1_000), (700, 0));
+        // A full replay moves nothing at all.
+        assert_eq!(budget_deltas(0, 0, 700, 1_000), (0, 0));
+        // A free execution still releases its hold.
+        assert_eq!(budget_deltas(1, 1, 0, 1_000), (0, -1_000));
     }
 
     #[test]
