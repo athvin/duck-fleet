@@ -46,6 +46,15 @@ whole model lifecycles to these workers. They may share an EC2 node. This does
 PostgreSQL is separate from ER's Aurora databases for this disposable experiment.
 This is not a production database/backup/HA design.
 
+The account, bucket, and region above are *this* lane's, not the chart's. The Helm
+chart (`infra/helm/duckfleet`) takes `workerImage`, `dbtImage`, `bucket`, `region`,
+and `secretName` as values whose schema pins only their shape — a digest-pinned
+image, a legal S3 bucket name, a real region — so another organization installs it
+against its own account by supplying its own. The development lane's specific
+values are pinned where that pin belongs: once, in `scripts/aws/target.env`, built
+into the images and the deploy, and asserted by `tests/test_aws_ci.py`. The chart
+itself names no account.
+
 ## Back up the catalog
 
 The catalog is the lake: the bucket's Parquet is unreachable without the rows that

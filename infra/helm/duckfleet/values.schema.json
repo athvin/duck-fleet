@@ -1,5 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Shape, not identity. workerImage/dbtImage/bucket/region/secretName once pinned one AWS account's registry, bucket, and region as const — which made the chart uninstallable by anyone else, contradicting a self-hosted warehouse for any single organization. The security property kept is that images are digest-pinned (an immutable @sha256 reference, never a mutable tag); the identity is the operator's. The development lane's own account/bucket/region stay pinned at the deploy, single-sourced in scripts/aws/target.env and asserted by tests/test_aws_ci.py, which is where that pin belongs.",
   "type": "object",
   "required": [
     "workerImage",
@@ -8,23 +9,27 @@
   "properties": {
     "workerImage": {
       "type": "string",
-      "pattern": "^797781631727\\.dkr\\.ecr\\.us-east-2\\.amazonaws\\.com/duckfleet-dev/worker@sha256:[a-f0-9]{64}$"
+      "pattern": "^[a-z0-9][a-z0-9.-]*(:[0-9]+)?/[a-zA-Z0-9._/-]+@sha256:[a-f0-9]{64}$"
     },
     "dbtImage": {
       "type": "string",
-      "pattern": "^797781631727\\.dkr\\.ecr\\.us-east-2\\.amazonaws\\.com/duckfleet-dev/dbt@sha256:[a-f0-9]{64}$"
+      "pattern": "^[a-z0-9][a-z0-9.-]*(:[0-9]+)?/[a-zA-Z0-9._/-]+@sha256:[a-f0-9]{64}$"
     },
     "bucket": {
-      "const": "duckfleet-dev-797781631727-us-east-2"
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
     },
     "region": {
-      "const": "us-east-2"
+      "type": "string",
+      "pattern": "^[a-z]{2}-[a-z]+-[0-9]$"
     },
     "secretName": {
-      "const": "duckfleet-dev"
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
     },
     "storageClass": {
-      "const": "gp3"
+      "type": "string",
+      "minLength": 1
     },
     "profiling": {
       "type": "boolean"

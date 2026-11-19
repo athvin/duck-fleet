@@ -25,6 +25,34 @@ PY
 helm lint infra/helm/duckfleet --namespace duckfleet-dev -f "$values"
 helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" > "$rendered"
 python3 scripts/check-chart.py "$rendered"
+# The chart is a self-hosted warehouse for any single organization, so it must install
+# for an account that is not this one. A foreign registry, bucket, and region must pass
+# schema validation (the values schema pins shape — a digest-pinned image, a legal
+# bucket, a real region — not this account's identity). The dev lane's own values stay
+# pinned at the deploy, single-sourced in scripts/aws/target.env.
+foreign="$validation_dir/foreign.yaml"
+python3 - <<'PY' > "$validation_dir/foreign-values.json"
+import json
+reg = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/acme-analytics"
+print(json.dumps({
+    "workerImage": f"{reg}/worker@sha256:" + "b" * 64,
+    "dbtImage": f"{reg}/dbt@sha256:" + "b" * 64,
+    "bucket": "acme-ducklake-eu-west-1",
+    "region": "eu-west-1",
+    "secretName": "acme-duckfleet",
+}))
+PY
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-team-a \
+  -f "$validation_dir/foreign-values.json" > "$foreign"
+python3 scripts/check-chart.py "$foreign" > /dev/null
+# A mutable tag instead of a digest must still be refused: that is the one image
+# property the schema keeps, because a warehouse must pin what it runs.
+if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev \
+     --set workerImage=acme/worker:latest --set dbtImage=acme/dbt:latest > /dev/null 2>&1; then
+  echo 'A mutable image tag must fail schema validation' >&2
+  exit 1
+fi
+echo 'PASS: the chart installs for a foreign account and still refuses an unpinned image'
 # A CPU request may sit below its limit so a class fits constrained capacity, but a
 # request above the limit would schedule a worker onto a node that cannot honour the
 # limit its cgroup assertion depends on. Prove that is rejected, not merely rendered.
