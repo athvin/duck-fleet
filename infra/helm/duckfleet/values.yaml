@@ -155,6 +155,14 @@ isolatedCompute:
   maxSessionSeconds: 1800
   # How long to wait for a pod to become ready before giving up and deleting it.
   readySeconds: 120
+  # How long a session pod may sit Unschedulable before that is taken as terminal.
+  # Zero on a fixed-node cluster, where a pod is either placeable at once or never, so
+  # the gateway refuses an unplaceable size immediately and names the shortfall. On a
+  # cluster that adds nodes on demand (EKS Auto Mode / Karpenter) a pod is routinely
+  # Unschedulable for the seconds a new node takes to join, so the deploy raises this
+  # (see scripts/aws/deploy_values.py): without the wait the gateway deletes the pod
+  # before Karpenter can provision for it, and no isolated session places (#90).
+  provisioningSeconds: 0
   # Where the Kubernetes API server may be reached, and on which port. Both required
   # when enabled: defaulting them would mean opening egress to reach an address nobody
   # declared.

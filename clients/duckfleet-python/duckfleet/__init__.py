@@ -49,16 +49,20 @@ class Client:
         self.endpoint = endpoint.rstrip("/")
         self.token = token
 
-    def request(self, method, path, payload=None):
+    def request(self, method, path, payload=None, timeout=75):
         body = None if payload is None else json.dumps(payload, default=encode_parameter).encode()
         request = urllib.request.Request(
             self.endpoint + path, data=body, method=method,
             headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"},
         )
         try:
-            # Longer than the server's maximum statement deadline. Transport failure
-            # is an unknown outcome, never permission to replay a write.
-            with urllib.request.urlopen(request, timeout=75) as response:
+            # Default is longer than the server's maximum statement deadline. Transport
+            # failure is an unknown outcome, never permission to replay a write. Opening
+            # an isolated session is the one call that can legitimately run longer than
+            # a statement — the gateway holds the request while a node is provisioned —
+            # so that path passes its own, larger timeout rather than racing the server's
+            # own ready budget and retrying into a second pod (#90).
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 return response.read()
         except urllib.error.HTTPError as error:
             message = error.read().decode()
@@ -91,6 +95,12 @@ _OPEN_WAITABLE_KINDS = frozenset({"draining", "starting", "transport_failure"})
 
 
 class RemoteConnection:
+    # Covers the server's own ready budget with margin: an isolated open may hold the
+    # request while a node is provisioned, and the client should wait for the gateway's
+    # classified verdict rather than time out in transport first — a transport timeout
+    # is unknown-outcome and would retry into a second pod.
+    OPEN_TIMEOUT = 450
+
     def __init__(self, endpoint, token, name="client", compute=None, context=None,
                  open_retry_seconds=90):
         self.client = Client(endpoint, token)
@@ -103,7 +113,7 @@ class RemoteConnection:
             try:
                 info = json.loads(self.client.request("POST", "/v1/sessions", {
                     "compute": compute or {}, "context": self.context,
-                }))
+                }, timeout=self.OPEN_TIMEOUT))
                 break
             except RemoteError as error:
                 waitable = error.failure_kind in _OPEN_WAITABLE_KINDS or (

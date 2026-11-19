@@ -40,6 +40,18 @@ pub(crate) struct Isolation {
     template: Value,
     owner: Value,
     ready: Duration,
+    /// How long a session pod may sit Unschedulable before that is taken as terminal.
+    ///
+    /// A property of the cluster's provisioning model, so it is configured rather than
+    /// guessed. On a fixed-node cluster (kind) a pod is either placeable at once or
+    /// never, so Unschedulable is a verdict and this is left at zero — the gateway
+    /// refuses immediately, naming the shortfall. On one that adds nodes on demand (EKS
+    /// Auto Mode / Karpenter) the same condition is routine for the seconds between a
+    /// pod's creation and a new node joining, so the deploy sets this generously: the
+    /// gateway waits a new node out instead of deleting the pod before Karpenter can
+    /// provision for it, which is why no isolated session ever placed there
+    /// (duck-fleet#90).
+    provisioning: Duration,
 }
 
 /// A running session pod.
@@ -85,12 +97,8 @@ impl Isolation {
             kube: Kube::from_service_account()?,
             template,
             owner,
-            ready: Duration::from_secs(
-                std::env::var("DUCKFLEET_ISOLATED_READY_SECONDS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(120),
-            ),
+            ready: env_seconds("DUCKFLEET_ISOLATED_READY_SECONDS", 120),
+            provisioning: env_seconds("DUCKFLEET_ISOLATED_PROVISIONING_SECONDS", 0),
         }))
     }
 
@@ -158,6 +166,8 @@ impl Isolation {
 
     async fn await_ready(&self, name: &str) -> Result<String, ApiError> {
         let deadline = Instant::now() + self.ready;
+        // The grace never outlasts the ready budget: a shorter budget bounds everything.
+        let provisioning = Instant::now() + self.provisioning.min(self.ready);
         loop {
             let pod = self
                 .kube
@@ -175,8 +185,11 @@ impl Isolation {
                 })?;
             // Checked before readiness: a pod that cannot be placed will never become
             // ready, and waiting out the full budget would turn a definite answer into
-            // a timeout the caller cannot distinguish from a slow cluster.
-            if let Some(reason) = unschedulable(&pod) {
+            // a timeout the caller cannot distinguish from a slow cluster. But an
+            // Unschedulable condition is only terminal once a node has not been
+            // nominated for the pod and the autoscaler has had time to act — until
+            // then a new node may still be on its way (see PROVISIONING_GRACE).
+            if let Some(reason) = terminally_unplaceable(&pod, Instant::now() >= provisioning) {
                 return Err(ApiError::new(
                     failure::NOT_PLACEABLE,
                     format!(
@@ -263,6 +276,17 @@ impl Isolation {
             ),
         }
     }
+}
+
+/// A duration from an environment variable, falling back to `default` seconds when it
+/// is unset or unparseable. The two session-timing budgets are read the same way.
+fn env_seconds(name: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default),
+    )
 }
 
 fn owner(name: &str, uid: &str) -> Value {
@@ -361,6 +385,28 @@ fn unschedulable(pod: &Value) -> Option<String> {
                 .unwrap_or("no reason given")
                 .to_owned()
         })
+}
+
+/// A node the autoscaler has committed to bringing up for this pod. Its presence is
+/// positive evidence that an Unschedulable condition is transient — provisioning is
+/// underway — so the pod is waited on however long the ready budget allows, not given
+/// up on at the grace boundary.
+fn nominated(pod: &Value) -> bool {
+    pod["status"]["nominatedNodeName"]
+        .as_str()
+        .is_some_and(|name| !name.is_empty())
+}
+
+/// Whether an Unschedulable pod should be given up on now, carrying the scheduler's
+/// reason when so. Transient while a node is being provisioned — one already
+/// nominated, or the provisioning grace not yet elapsed — and terminal only once
+/// neither holds, which is the difference between a fixed-node cluster and one that
+/// adds nodes on demand.
+fn terminally_unplaceable(pod: &Value, past_provisioning_grace: bool) -> Option<String> {
+    match unschedulable(pod) {
+        Some(reason) if past_provisioning_grace && !nominated(pod) => Some(reason),
+        _ => None,
+    }
 }
 
 fn conditions(pod: &Value) -> impl Iterator<Item = &Value> {
@@ -588,6 +634,35 @@ mod tests {
             "0/1 nodes are available: 1 Insufficient cpu"
         );
         assert!(!ready(&pod));
+    }
+
+    #[test]
+    fn an_unschedulable_pod_is_waited_on_while_a_node_is_coming() {
+        let pending = json!({"status": {"conditions": [{
+            "type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+            "message": "0/4 nodes are available: no new claims to deallocate",
+        }]}});
+        // Within the provisioning grace, Unschedulable is not yet a verdict: a node
+        // may still be on its way, and bailing here deletes the pod before the
+        // autoscaler can provision for it (duck-fleet#90).
+        assert!(terminally_unplaceable(&pending, false).is_none());
+        // Once the grace has elapsed with no node nominated, it is terminal.
+        assert_eq!(
+            terminally_unplaceable(&pending, true).unwrap(),
+            "0/4 nodes are available: no new claims to deallocate"
+        );
+        // A node nominated for the pod is positive evidence provisioning is underway,
+        // so it is waited on even past the grace.
+        let mut nominated_pod = pending.clone();
+        nominated_pod["status"]["nominatedNodeName"] = json!("ip-10-0-1-2.ec2.internal");
+        assert!(nominated(&nominated_pod));
+        assert!(terminally_unplaceable(&nominated_pod, true).is_none());
+        // A pod that is not Unschedulable is never given up on, grace or not.
+        let scheduling = json!({"status": {"conditions": [
+            {"type": "PodScheduled", "status": "False", "reason": "SchedulerError"},
+        ]}});
+        assert!(terminally_unplaceable(&scheduling, true).is_none());
+        assert!(!nominated(&json!({})));
     }
 
     #[test]

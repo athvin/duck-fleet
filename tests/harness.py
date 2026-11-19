@@ -142,7 +142,10 @@ def routing_contract_checks(connection):
         # provision on demand both here (kind) and on EKS Auto Mode's duckfleet
         # NodePool (duck-fleet#90, resolved), so an open that cannot place is a defect,
         # not a tolerated capacity fact.
-        opened = json.loads(client.request("POST", "/v1/sessions", {"compute": isolated}))
+        # The open holds while a node is provisioned on a cluster that adds them on
+        # demand, so it gets the session-open timeout rather than the statement one.
+        opened = json.loads(client.request("POST", "/v1/sessions", {"compute": isolated},
+                                           timeout=RemoteConnection.OPEN_TIMEOUT))
         try:
             require(opened["placement"]["compute"] == "isolated", str(opened["placement"]))
         finally:
