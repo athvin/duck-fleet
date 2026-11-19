@@ -430,10 +430,12 @@ impl Gateway {
     }
 
     /// Opens a session on the least-loaded worker providing the size, failing over
-    /// to the next only on a refusal that provably ran nothing — the worker's own
-    /// classified `retry_safe` answer for a full, draining, or still-starting
-    /// sibling. A transport failure never fails over: an unanswered open may have
-    /// created a session, and opening a second would leak the first.
+    /// to the next when the current one provably ran nothing: its own classified
+    /// `retry_safe` refusal (full, draining, or still-starting), or a connection
+    /// that never established — a stale cache entry for a worker that is gone sends
+    /// no bytes, so no session was created. A transport error *after* connecting is
+    /// never failed over: the open may have been received, and opening a second
+    /// would leak the first.
     async fn open_persistent(
         &self,
         wanted: Resources,
@@ -443,7 +445,8 @@ impl Gateway {
         let candidates = self.endpoints_for(wanted).await?;
         let total = candidates.len();
         for (position, endpoint) in candidates.into_iter().enumerate() {
-            let upstream = self
+            let last = position + 1 == total;
+            let upstream = match self
                 .client
                 .request(Method::POST, format!("{endpoint}/v1/sessions"))
                 .bearer_auth(&self.token)
@@ -452,7 +455,20 @@ impl Gateway {
                 .body(body.clone())
                 .send()
                 .await
-                .map_err(|_| ApiError::internal())?;
+            {
+                Ok(upstream) => upstream,
+                // `is_connect` is the connection-never-established case: nothing was
+                // sent, so a worker that has gone away under a stale cache entry is
+                // safe to skip for its sibling. Anything else may have been received.
+                Err(error) if error.is_connect() && !last => {
+                    tracing::info!(
+                        endpoint,
+                        "a worker was unreachable at connect; trying its sibling"
+                    );
+                    continue;
+                }
+                Err(_) => return Err(ApiError::internal()),
+            };
             if upstream.status().is_success() {
                 return Ok(OpenOutcome::Opened { endpoint, upstream });
             }
@@ -463,7 +479,7 @@ impl Gateway {
             }
             let bytes = upstream.bytes().await.map_err(|_| ApiError::internal())?;
             let refusal: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-            if position + 1 < total && failover_worthy(status, &refusal) {
+            if !last && failover_worthy(status, &refusal) {
                 tracing::info!(
                     endpoint,
                     kind = refusal["failure_kind"].as_str().unwrap_or(""),

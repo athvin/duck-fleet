@@ -159,18 +159,17 @@ SCALE_URLS=http://worker-small:8080,http://worker-small-b:8080,http://worker-med
 DUCKFLEET_WORKER_URLS="$SCALE_URLS" docker compose --profile scale-out up -d --wait worker-small-b
 DUCKFLEET_WORKER_URLS="$SCALE_URLS" docker compose up -d --wait --no-deps server
 docker compose run --rm --no-deps dbt python /app/tests/harness.py --spread
-# SIGTERM leaves the worker draining — serving in-flight work, refusing new opens with
-# the retry-safe `draining` kind — which is exactly the classified, nothing-ran refusal
-# the gateway may fail over. Both opens must still land, on the surviving sibling.
-docker compose stop -t 30 worker-small &
-sleep 2
+# Stop one small worker outright. The gateway still holds it in its fleet cache and
+# tries it first, the connection is refused — nothing sent, so no session was created,
+# as safe to skip as a classified capacity refusal — and the open falls over to the
+# surviving sibling. Both opens must still land, both on small-b.
+docker compose stop -t 5 worker-small
 docker compose run --rm --no-deps dbt python /app/tests/harness.py --spread-failover
-wait
 # Restore the two-worker fleet the rest of the suite and repeated runs assume.
 docker compose --profile scale-out stop worker-small-b
 docker compose up -d --wait worker-small
 docker compose up -d --wait --no-deps server
-echo 'PASS: same-size workers shared load and failed over when one drained'
+echo 'PASS: same-size workers shared load and failed over when one was unreachable'
 
 # A pod can start before DNS and PostgreSQL are ready. The worker has to wait rather
 # than exit: a restart backoff outlives the deploy wait, which is what turned this

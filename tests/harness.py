@@ -999,13 +999,13 @@ def spread_checks():
 
 
 def spread_failover_checks():
-    """A full or draining worker fails over to its sibling, so one worker refusing
-    an open does not refuse the fleet.
+    """An unreachable worker fails over to its sibling, so one worker being gone does
+    not refuse the fleet.
 
-    Run after SIGTERM to worker-small: a draining worker refuses new opens with the
-    retry-safe `draining` kind, which is exactly the classified, nothing-ran refusal
-    the gateway is allowed to fail over. Both small sessions must still open, and
-    both must land on the surviving sibling.
+    Run after worker-small is stopped: the gateway still holds it in its fleet cache
+    and tries it first, the connection is refused (nothing sent, so no session was
+    created — as safe to skip as a classified capacity refusal), and the open falls
+    over to the surviving sibling. Both small sessions must open, both on small-b.
     """
     small = {"cpu": 1, "memory": "1Gi"}
     sessions = []
