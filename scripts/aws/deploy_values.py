@@ -53,11 +53,18 @@ def overlay(cidrs, ports):
             # a generous ceiling only matters when provisioning is genuinely slow.
             "readySeconds": 420,
         },
-        # Merged over the chart's nodeSelector, adding the pool pin; the taint it
-        # carries needs the toleration beside it, which check-chart.py asserts.
+        # The pool pin, and the chart's compute-type selector explicitly removed
+        # (null deletes a default key under Helm's merge, which a bare omission would
+        # not). On EKS Auto Mode the `eks.amazonaws.com/compute-type: auto` label is
+        # stamped onto a node at bootstrap, so Karpenter's scheduling simulation for a
+        # *new* node in a custom pool does not carry it — a pod requiring both that
+        # label and the pool is one Karpenter decides no new node could satisfy, and
+        # it declines to provision ("no new claims"). karpenter.sh/nodepool identifies
+        # the pool uniquely on its own; the taint needs the toleration beside it,
+        # which check-chart.py asserts.
         "nodeSelector": {
             "kubernetes.io/os": "linux",
-            "eks.amazonaws.com/compute-type": "auto",
+            "eks.amazonaws.com/compute-type": None,
             "karpenter.sh/nodepool": "duckfleet",
         },
         "tolerations": [{
