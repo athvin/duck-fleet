@@ -630,6 +630,38 @@ async fn dbt_isolated_checks(ctx: &Ctx) -> anyhow::Result<()> {
         rows.first().and_then(|r| r[0].as_deref()) != Some("0"),
         "the isolated model committed no rows",
     )?;
+    // Prove it actually ran isolated, not merely that it committed: the model's own
+    // statements must carry an isolated placement in history. Without this the stage
+    // passes even when the adapter silently drops meta.platform and runs the model on
+    // the persistent tier — which is exactly how that regression once hid.
+    let history = request_json(
+        connection.client(),
+        Method::GET,
+        "/v1/queries?limit=200",
+        None,
+    )
+    .await?;
+    let ran_isolated = history["queries"]
+        .as_array()
+        .map(|queries| {
+            queries.iter().any(|q| {
+                q["sql"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("isolated_model")
+                    && q["placement"]["compute"] == json!("isolated")
+                    && q["placement"]["worker_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .starts_with("duckfleet-session-")
+            })
+        })
+        .unwrap_or(false);
+    require(
+        ran_isolated,
+        "the dbt model committed but no statement ran on an isolated pod — the adapter \
+         did not carry meta.platform through to a dedicated session",
+    )?;
     println!("PASS: a dbt model ran isolated on its own pod");
     Ok(())
 }
@@ -725,6 +757,9 @@ async fn gateway_replaced(ctx: &Ctx) -> anyhow::Result<()> {
     println!("PASS: the in-flight request failed classified, not as a raw socket error");
 
     let reopened = ctx.open_named("harness-gwr3", None).await?;
+    // Opening at all means the client's bounded new-session retry rode through the
+    // gateway's replacement window rather than surfacing the gap as an error.
+    println!("PASS: a reopen rode through the gateway replacement");
     // The lost session refuses further use with guidance.
     let lost = match connection.execute("select 1", Vec::new()).await {
         Ok(_) => anyhow::bail!("a session route survived a gateway replacement"),
