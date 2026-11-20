@@ -1,8 +1,13 @@
 //! Local, single-tenant DuckFleet SQL service. All DuckDB work stays on one worker thread.
+#[allow(dead_code)]
+mod cli;
+#[allow(dead_code)]
+mod client;
 mod compute;
 mod credentials;
 mod failure;
 mod gateway;
+mod harness;
 mod history;
 mod isolated;
 mod kube;
@@ -250,11 +255,7 @@ async fn dispatch(app: App, op: Operation) -> Reply {
         .map_err(|_| ApiError::new(failure::CAPACITY, "worker queue full or closed"))?;
     receiver.await.map_err(|_| ApiError::internal())?
 }
-async fn open(
-    State(app): State<App>,
-    headers: HeaderMap,
-    request: Option<Json<SessionRequest>>,
-) -> Reply {
+async fn open(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Reply {
     // Only new sessions are refused. Queries on sessions already open continue, which
     // is the drain: the grace period bounds how long that can take, so a client cannot
     // hold this worker open indefinitely by continuing to send work.
@@ -265,7 +266,18 @@ async fn open(
              no statement was executed",
         ));
     }
-    let request = request.map(|Json(r)| r).unwrap_or_default();
+    // Empty body => default (persistent); malformed body => the gateway's own
+    // classified error, not axum's raw 422.
+    let request: SessionRequest = if body.is_empty() {
+        SessionRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            ApiError::new(
+                failure::INVALID_REQUEST,
+                format!("invalid session request: {e}"),
+            )
+        })?
+    };
     request.validate()?;
     // The gateway names who it authenticated; reaching this worker at all already
     // required the internal token, which is what makes the header trustworthy.
@@ -342,6 +354,20 @@ async fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
+    // The `cli` role talks to a remote gateway and carries its own --token/
+    // DUCKFLEET_TOKEN, so it runs before the server's own DUCKFLEET_TOKEN
+    // requirement below (which a shell invocation of the CLI would not satisfy).
+    if std::env::var("DUCKFLEET_ROLE").as_deref() == Ok("cli") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::process::exit(cli::run(args).await);
+    }
+    // The integration harness, like the CLI, is a client of a remote gateway and
+    // carries its own DUCKFLEET_URL/DUCKFLEET_TOKEN, so it runs before the server's
+    // own token requirement below.
+    if std::env::var("DUCKFLEET_ROLE").as_deref() == Ok("harness") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::process::exit(harness::run(args).await);
+    }
     let token = std::env::var("DUCKFLEET_TOKEN")?;
     anyhow::ensure!(
         token.len() >= 16,

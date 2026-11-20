@@ -80,10 +80,6 @@ def overlay(cidrs, ports):
             "value": "true",
             "effect": "NoSchedule",
         }],
-        # The shared-pool shim requested one CPU so a 2-CPU pod would fit a 2-vCPU
-        # node; on the dedicated pool the medium worker requests the two it is sized
-        # for, matching its limit.
-        "workerCpuRequests": {"medium": 2},
     }
 
 

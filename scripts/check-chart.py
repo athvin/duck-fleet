@@ -18,7 +18,7 @@ MAX_STATEMENT_SECONDS = int(re.search(
 
 objects = list(yaml.safe_load_all(open(sys.argv[1])))
 by_name = {(o['kind'], o['metadata']['name']): o for o in objects}
-for size, cpu in [('small', 1), ('medium', 2)]:
+for size, cpu in [('small', 1)]:
     worker = by_name['Deployment', f'worker-{size}']
     assert worker['spec']['strategy']['type'] == 'Recreate'
     pod = worker['spec']['template']['spec']
@@ -36,6 +36,9 @@ for size, cpu in [('small', 1), ('medium', 2)]:
     assert declared['DUCKFLEET_WORKER_MEMORY'] == f'{cpu}Gi', declared['DUCKFLEET_WORKER_MEMORY']
     assert declared['DUCKFLEET_WORKER_CPU'] == container['resources']['limits']['cpu']
     assert declared['DUCKFLEET_WORKER_MEMORY'] == container['resources']['limits']['memory']
+    # Disk is declared-only (no cgroup to check), so it must match the ephemeral-storage
+    # request the chart renders, or the worker would trust a size the pod does not have.
+    assert declared['DUCKFLEET_WORKER_DISK'] == container['resources']['requests']['ephemeral-storage'], declared.get('DUCKFLEET_WORKER_DISK')
     env = {e['name']:e.get('value') for e in container['env']}
     assert env['S3_AUTH_MODE'] == 'pod_identity'
     assert env['AWS_EC2_METADATA_DISABLED'] == 'true'
@@ -301,10 +304,10 @@ else:
     for quantity in ['cpu', 'memory']:
         assert container['resources']['requests'][quantity] == \
                container['resources']['limits'][quantity], quantity
-    # The gateway rewrites these three per session and refuses to start a pod without
+    # The gateway rewrites these four per session and refuses to start a pod without
     # them, so the template has to keep carrying them.
     declared = {e['name']: e.get('value') for e in container['env']}
-    for variable in ['DUCKFLEET_WORKER_ID', 'DUCKFLEET_WORKER_CPU', 'DUCKFLEET_WORKER_MEMORY']:
+    for variable in ['DUCKFLEET_WORKER_ID', 'DUCKFLEET_WORKER_CPU', 'DUCKFLEET_WORKER_MEMORY', 'DUCKFLEET_WORKER_DISK']:
         assert variable in declared, variable
     # Without this the pod would admit shared sessions and report an isolated
     # placement as persistent in history.

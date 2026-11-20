@@ -26,13 +26,14 @@ const LABEL: &str = "duckfleet-compute=isolated";
 /// worker's, whose funds are recovered by the worker itself when it restarts.
 pub(crate) const PREFIX: &str = "duckfleet-session-";
 
-/// The three template values the gateway replaces per session. Named here so a
+/// The template environment values the gateway replaces per session. Named here so a
 /// template that stops carrying one fails at startup rather than running a pod that
 /// claims another session's identity or a size nobody asked for.
-const PATCHED: [&str; 3] = [
+const PATCHED: [&str; 4] = [
     "DUCKFLEET_WORKER_ID",
     "DUCKFLEET_WORKER_CPU",
     "DUCKFLEET_WORKER_MEMORY",
+    "DUCKFLEET_WORKER_DISK",
 ];
 
 pub(crate) struct Isolation {
@@ -372,6 +373,7 @@ fn specify(
         (PATCHED[0], name.to_owned()),
         (PATCHED[1], wanted.cpu.to_string()),
         (PATCHED[2], wanted.memory()),
+        (PATCHED[3], wanted.disk()),
     ];
     let environment = pod["spec"]["containers"][0]["env"]
         .as_array_mut()
@@ -383,12 +385,24 @@ fn specify(
             }
         }
     }
-    // Only cpu and memory are replaced; anything else the release asked for, such as
-    // ephemeral storage, is left exactly as it was rendered.
+    // cpu, memory and disk are all sized per session; requests equal limits because a
+    // dedicated pod has no neighbour to borrow headroom from. Anything else the
+    // release asked for is left exactly as it was rendered.
     let quantities = &mut pod["spec"]["containers"][0]["resources"];
     for side in ["requests", "limits"] {
         quantities[side]["cpu"] = json!(wanted.cpu.to_string());
         quantities[side]["memory"] = json!(wanted.memory());
+        quantities[side]["ephemeral-storage"] = json!(wanted.disk());
+    }
+    // The spill volume holds the same disk the pod was sized for, since that is where
+    // a query spills; its cap must track the ephemeral-storage limit above or the two
+    // would disagree about how much disk the session actually has.
+    if let Some(volumes) = pod["spec"]["volumes"].as_array_mut() {
+        for volume in volumes.iter_mut() {
+            if volume["name"] == json!("tmp") {
+                volume["emptyDir"]["sizeLimit"] = json!(wanted.disk());
+            }
+        }
     }
     Ok(pod)
 }
@@ -495,15 +509,17 @@ mod tests {
                     "name": "worker",
                     "resources": {
                         "requests": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "2Gi"},
-                        "limits": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "3Gi"},
+                        "limits": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "2Gi"},
                     },
                     "env": [
                         {"name": "DUCKFLEET_WORKER_ID", "value": "replaced-per-session"},
                         {"name": "DUCKFLEET_WORKER_CPU", "value": "1"},
                         {"name": "DUCKFLEET_WORKER_MEMORY", "value": "1Gi"},
+                        {"name": "DUCKFLEET_WORKER_DISK", "value": "2Gi"},
                         {"name": "CATALOG_DSN", "valueFrom": {"secretKeyRef": {"name": "s", "key": "CATALOG_DSN"}}},
                     ],
                 }],
+                "volumes": [{"name": "tmp", "emptyDir": {"sizeLimit": "2Gi"}}],
             },
         })
     }
@@ -534,44 +550,71 @@ mod tests {
 
     /// The ticket's first requirement. Requests below limits would let the scheduler
     /// place a pod the node cannot sustain, which is the opposite of a dedicated
-    /// worker, so both sides carry the size that was asked for.
+    /// worker, so all three dimensions carry the size that was asked for.
     #[test]
     fn a_session_pod_requests_exactly_what_was_asked_for() {
         let pod = specified(Resources {
             cpu: 4,
             memory_bytes: 8 * GIB,
+            disk_bytes: 40 * GIB,
         });
         let quantities = &pod["spec"]["containers"][0]["resources"];
         for side in ["requests", "limits"] {
             assert_eq!(quantities[side]["cpu"], json!("4"), "{side}");
             assert_eq!(quantities[side]["memory"], json!("8Gi"), "{side}");
+            assert_eq!(
+                quantities[side]["ephemeral-storage"],
+                json!("40Gi"),
+                "{side}"
+            );
         }
     }
 
-    /// Sizes the old two classes never covered, which is the point of resolving a
-    /// request to resources rather than to a name.
+    /// Sizes no prestarted worker covers, which is the point of resolving a request to
+    /// resources rather than to a name — including the new disk dimension.
     #[test]
     fn any_resolvable_size_can_be_asked_for() {
-        for (cpu, memory_bytes, expected) in [
-            (1, 512 * 1024 * 1024, "512Mi"),
-            (3, 6 * GIB, "6Gi"),
-            (16, 64 * GIB, "64Gi"),
+        for (cpu, memory_bytes, mem_text, disk_bytes, disk_text) in [
+            (1, 512 * 1024 * 1024, "512Mi", 2 * GIB, "2Gi"),
+            (3, 6 * GIB, "6Gi", 30 * GIB, "30Gi"),
+            (16, 64 * GIB, "64Gi", 500 * GIB, "500Gi"),
         ] {
-            let pod = specified(Resources { cpu, memory_bytes });
+            let pod = specified(Resources {
+                cpu,
+                memory_bytes,
+                disk_bytes,
+            });
             let quantities = &pod["spec"]["containers"][0]["resources"];
             assert_eq!(quantities["limits"]["cpu"], json!(cpu.to_string()));
-            assert_eq!(quantities["limits"]["memory"], json!(expected));
-            assert_eq!(environment(&pod)["DUCKFLEET_WORKER_MEMORY"], expected);
+            assert_eq!(quantities["limits"]["memory"], json!(mem_text));
+            assert_eq!(quantities["limits"]["ephemeral-storage"], json!(disk_text));
+            let env = environment(&pod);
+            assert_eq!(env["DUCKFLEET_WORKER_MEMORY"], mem_text);
+            assert_eq!(env["DUCKFLEET_WORKER_DISK"], disk_text);
+            // The spill volume is sized to the same disk.
+            assert_eq!(
+                pod["spec"]["volumes"][0]["emptyDir"]["sizeLimit"],
+                json!(disk_text)
+            );
         }
     }
 
-    /// Whatever else the release asked for survives being sized.
+    /// Disk sizes ephemeral storage and the spill volume together; whatever else the
+    /// release asked for survives being sized.
     #[test]
-    fn sizing_leaves_the_rest_of_the_release_alone() {
-        let pod = specified(Resources::default());
+    fn sizing_sets_disk_and_leaves_the_rest_of_the_release_alone() {
+        let pod = specified(Resources {
+            cpu: 1,
+            memory_bytes: GIB,
+            disk_bytes: 25 * GIB,
+        });
         let quantities = &pod["spec"]["containers"][0]["resources"];
-        assert_eq!(quantities["requests"]["ephemeral-storage"], json!("2Gi"));
-        assert_eq!(quantities["limits"]["ephemeral-storage"], json!("3Gi"));
+        assert_eq!(quantities["requests"]["ephemeral-storage"], json!("25Gi"));
+        assert_eq!(quantities["limits"]["ephemeral-storage"], json!("25Gi"));
+        assert_eq!(
+            pod["spec"]["volumes"][0]["emptyDir"]["sizeLimit"],
+            json!("25Gi")
+        );
         assert_eq!(pod["spec"]["restartPolicy"], json!("Never"));
         assert_eq!(pod["spec"]["activeDeadlineSeconds"], json!(1800));
         // An isolated pod runs user SQL and must not inherit the gateway's ability to
@@ -597,6 +640,7 @@ mod tests {
         let pod = specified(Resources {
             cpu: 2,
             memory_bytes: 2 * GIB,
+            disk_bytes: 10 * GIB,
         });
         let env = environment(&pod);
         assert_eq!(env["DUCKFLEET_WORKER_ID"], "duckfleet-session-abc");
@@ -605,6 +649,10 @@ mod tests {
         assert_eq!(
             env["DUCKFLEET_WORKER_MEMORY"],
             limits["memory"].as_str().unwrap()
+        );
+        assert_eq!(
+            env["DUCKFLEET_WORKER_DISK"],
+            limits["ephemeral-storage"].as_str().unwrap()
         );
     }
 

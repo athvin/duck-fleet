@@ -601,14 +601,26 @@ async fn response(upstream: reqwest::Response) -> Result<Response, ApiError> {
 async fn open(
     State(app): State<Gateway>,
     Extension(principal): Extension<Principal>,
-    request: Option<Json<SessionRequest>>,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     // Only new sessions are refused. Requests on sessions already open continue,
     // which is the drain: the grace period bounds how long that can take.
     if app.draining.load(Ordering::Acquire) {
         return Err(draining_refusal());
     }
-    let mut request = request.map(|Json(r)| r).unwrap_or_default();
+    // An empty body is the default (persistent) request; a present-but-malformed
+    // body is a client error in the gateway's own {error,failure_kind,retry_safe}
+    // shape, not axum's raw 422 that bypasses the contract.
+    let mut request: SessionRequest = if body.is_empty() {
+        SessionRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            ApiError::new(
+                failure::INVALID_REQUEST,
+                format!("invalid session request: {e}"),
+            )
+        })?
+    };
     let placement = request.validate()?;
     // Carries the mode as well as the size, so an isolated session is recorded as
     // isolated rather than as whatever the pod would have assumed.
@@ -1448,6 +1460,7 @@ mod tests {
         let small = Resources {
             cpu: 1,
             memory_bytes: 1024 * 1024 * 1024,
+            disk_bytes: 2 * 1024 * 1024 * 1024,
         };
         let workers = vec![
             WorkerInfo {
@@ -1489,7 +1502,8 @@ mod tests {
                 &workers,
                 Resources {
                     cpu: 4,
-                    memory_bytes: 8 * small.memory_bytes
+                    memory_bytes: 8 * small.memory_bytes,
+                    disk_bytes: small.disk_bytes,
                 },
                 &census
             )

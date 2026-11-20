@@ -34,17 +34,17 @@ spec:
         - name: dbt
           image: {{ .Values.dbtImage | quote }}
           workingDir: /project
-          command: [python, /app/tests/aws_harness.py]
+          command: [duckfleet-server, --aws]
           securityContext:
             {{- include "duckfleet.containerSecurity" . | nindent 12 }}
           resources:
             requests: {cpu: "1", memory: 1Gi}
             limits: {cpu: "2", memory: 2Gi}
           env:
+            - {name: DUCKFLEET_ROLE, value: harness}
             - {name: DUCKFLEET_URL, value: "http://server:8080"}
             - {name: EXPECT_S3_PREFIX, value: {{ printf "s3://%s/%s/" .Values.bucket .Values.lakePrefix | quote }}}
             - {name: HOME, value: /tmp}
-            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
             - name: DUCKFLEET_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.secretName }}, key: DUCKFLEET_TOKEN}

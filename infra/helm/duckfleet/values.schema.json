@@ -69,22 +69,10 @@
         }
       }
     },
-    "workerCpuRequests": {
-      "type": "object",
-      "propertyNames": {
-        "enum": ["small", "medium"]
-      },
-      "additionalProperties": {
-        "oneOf": [
-          {"type": "integer", "minimum": 1},
-          {"type": "string", "pattern": "^[0-9]+m$"}
-        ]
-      }
-    },
     "workerReplicas": {
       "type": "object",
       "propertyNames": {
-        "enum": ["small", "medium"]
+        "enum": ["small"]
       },
       "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 16}
     },

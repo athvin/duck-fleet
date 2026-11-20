@@ -9,11 +9,11 @@ test-paths: [tests]
 query-comment: null
 models:
   duckfleet_harness:
+    # No cpu/memory/disk named ⇒ the shared persistent tier (the only mode Compose
+    # serves; naming a resource derives an isolated pod, which needs Kubernetes).
+    # `tags` are carried in context but never size compute.
     +meta:
       platform:
-        compute: persistent
-        cpu: 1
-        memory: 1Gi
         tags:
           team: harness
 seeds:

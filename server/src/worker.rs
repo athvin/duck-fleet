@@ -302,13 +302,16 @@ fn causes(error: &(dyn std::error::Error + 'static)) -> String {
 }
 
 /// What the cgroup says this container got, with the raw values kept for evidence.
+/// Only cpu and memory: disk is a kubelet-enforced ephemeral limit with no cgroup to
+/// read, so it is trusted from the declaration rather than observed.
 struct Observed {
-    resources: Resources,
+    cpu: u16,
+    memory_bytes: u64,
     cpu_quota: u64,
     cpu_period: u64,
 }
 
-/// The resources this container actually has, read from its cgroup.
+/// The cpu and memory this container actually has, read from its cgroup.
 ///
 /// The CPU quota is the *limit*, not the request: a request may sit lower so the pod
 /// fits constrained capacity, and the engine is sized from what it can actually use.
@@ -334,10 +337,8 @@ fn observed_resources() -> Result<Observed> {
         quota[1]
     );
     Ok(Observed {
-        resources: Resources {
-            cpu: u16::try_from(quota[0] / quota[1])?,
-            memory_bytes,
-        },
+        cpu: u16::try_from(quota[0] / quota[1])?,
+        memory_bytes,
         cpu_quota: quota[0],
         cpu_period: quota[1],
     })
@@ -356,26 +357,33 @@ impl Worker {
             !worker_id.is_empty() && worker_id.len() <= 63,
             "DUCKFLEET_WORKER_ID must be between 1 and 63 characters"
         );
-        // What this worker is configured to be. Any pair is allowed, so this is not a
+        // What this worker is configured to be. Any size is allowed, so this is not a
         // menu of classes, but it is declared rather than inferred so the container
-        // can be checked against it below.
+        // can be checked against it below. Disk has no cgroup, so it defaults when the
+        // chart leaves it unset — the shared default every persistent worker carries.
         let declared = Resources::parse(
             &required("DUCKFLEET_WORKER_CPU")?,
             &required("DUCKFLEET_WORKER_MEMORY")?,
+            &std::env::var("DUCKFLEET_WORKER_DISK").unwrap_or_else(|_| "2Gi".to_owned()),
         )
-        .map_err(|reason| anyhow::anyhow!("DUCKFLEET_WORKER_CPU/MEMORY: {reason}"))?;
-        // What the container actually got. These must agree: the chart renders the
-        // declaration from the same values as the container's limits, so a mismatch
-        // means something between the chart and the kubelet changed them — a
-        // LimitRange, an admission webhook, a hand-edited manifest. Serving a size
-        // nobody asked this worker to serve would then look like a correct placement
-        // in history and bill as the size that was requested, so it refuses to start.
+        .map_err(|reason| anyhow::anyhow!("DUCKFLEET_WORKER_CPU/MEMORY/DISK: {reason}"))?;
+        // What the container actually got. CPU and memory must agree with the
+        // declaration: the chart renders both from the same values as the container's
+        // limits, so a mismatch means something between the chart and the kubelet
+        // changed them — a LimitRange, an admission webhook, a hand-edited manifest.
+        // Serving a size nobody asked this worker to serve would then look like a
+        // correct placement in history and bill as the size that was requested, so it
+        // refuses to start. Disk is not among them: there is no cgroup for ephemeral
+        // storage, so it is trusted from the declaration.
         let observed = observed_resources()?;
         anyhow::ensure!(
-            observed.resources == declared,
-            "container limits {:?} do not match the configured {declared:?}; \
+            observed.cpu == declared.cpu && observed.memory_bytes == declared.memory_bytes,
+            "container limits cpu={} memory={} do not match the configured cpu={} memory={}; \
              refusing to serve resources this worker was not configured for",
-            observed.resources
+            observed.cpu,
+            observed.memory_bytes,
+            declared.cpu,
+            declared.memory_bytes
         );
         let resources = declared;
         // Whether this process is a pod created for one session, declared by the
@@ -390,7 +398,7 @@ impl Worker {
             Mode::Persistent
         };
         let mut placement = Placement { mode, resources }.describe(&worker_id);
-        placement["cgroup_memory_max"] = json!(observed.resources.memory_bytes);
+        placement["cgroup_memory_max"] = json!(observed.memory_bytes);
         placement["cgroup_cpu_quota"] = json!(observed.cpu_quota);
         placement["cgroup_cpu_period"] = json!(observed.cpu_period);
         placement["worker_boot_id"] = json!(Uuid::new_v4());
@@ -399,12 +407,15 @@ impl Worker {
         startup.run(
             "applying engine limits",
             &format!(
-                "SET memory_limit='{}'; SET threads={};",
+                // Spill is sized from the disk the pod was given, so asking for more
+                // disk is how a caller makes room for a larger out-of-core query.
+                "SET memory_limit='{}'; SET threads={}; SET max_temp_directory_size='{}';",
                 resources.engine_memory(),
-                resources.cpu
+                resources.cpu,
+                resources.spill_limit(),
             ),
         )?;
-        startup.run("loading extensions", " SET max_temp_directory_size='1GB'; SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; LOAD httpfs; LOAD postgres; LOAD ducklake;")?;
+        startup.run("loading extensions", " SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; LOAD httpfs; LOAD postgres; LOAD ducklake;")?;
         match std::env::var("S3_AUTH_MODE").as_deref().unwrap_or("local") {
             "local" => startup.run("creating the object store secret", &format!(
                 "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');",

@@ -743,12 +743,8 @@ class OwnershipBoundaryTests(unittest.TestCase):
         values = yaml.safe_load((ROOT/'infra/helm/duckfleet/values.yaml').read_text())
         pinned = 'karpenter.sh/nodepool' in values['nodeSelector']
         tolerated = bool(values.get('tolerations'))
-        workaround = 'workerCpuRequests' in values
         self.assertEqual(pinned, tolerated,
                          'the DuckFleet pool must be pinned and tolerated together')
-        self.assertEqual(pinned, not workaround,
-                         'pinning the DuckFleet pool retires workerCpuRequests; '
-                         'not pinning it requires the override')
         # Whichever state, a request may sit below its limit but never above it: the
         # cgroup the worker asserts against comes from the limit, so a request above it
         # schedules onto a node that cannot honour what the worker checks for.
@@ -760,7 +756,7 @@ class OwnershipBoundaryTests(unittest.TestCase):
             resources.assert_worker_resources(
                 container['resources'],
                 int(str(container['resources']['limits']['cpu']).rstrip('m')), name)
-        self.assertGreaterEqual(workers, 3, 'expected both persistent workers and the session pod')
+        self.assertGreaterEqual(workers, 1, 'expected at least the persistent worker')
 
     def test_the_harness_verifies_isolated_compute_not_the_deploy(self):
         deploy = (ROOT/'scripts/aws/deploy.sh').read_text()
