@@ -484,12 +484,56 @@ async fn isolated_checks(ctx: &Ctx) -> anyhow::Result<()> {
         format!("no history rows for {pod}"),
     )?;
     println!("PASS: an isolated session ran on its own pod {pod}");
+
+    // A size the fleet cannot serve must be refused with the refusing component's own
+    // reason, never downgraded to the persistent tier. The two ceilings fail at
+    // different moments: the namespace quota refuses at admission before a pod exists,
+    // while a size within the quota but larger than any node is refused by the
+    // scheduler after one does. Both are retry-safe — nothing ran.
+    let client = ctx.client()?;
+    for (wanted, expected, what) in [
+        (
+            json!({"cpu": 64, "memory": "512Gi"}),
+            "exceeded quota",
+            "the namespace quota",
+        ),
+        (
+            json!({"cpu": 11, "memory": "12Gi"}),
+            "Insufficient",
+            "the scheduler",
+        ),
+    ] {
+        let refused = expect_status(
+            request_json(
+                &client,
+                Method::POST,
+                "/v1/sessions",
+                Some(&json!({"compute": wanted})),
+            )
+            .await,
+            503,
+        )?;
+        require(
+            refused.message.contains("not downgraded"),
+            format!("{refused}"),
+        )?;
+        require(
+            refused.message.contains(expected),
+            format!("expected {what}: {refused}"),
+        )?;
+        require(
+            refused.failure_kind.as_deref() == Some("not_placeable"),
+            format!("{refused}"),
+        )?;
+        require(refused.retry_safe, format!("{refused}"))?;
+        println!("PASS: an isolated request {what} cannot serve was refused, not downgraded");
+    }
     Ok(())
 }
 
-async fn timed_open(ctx: &Ctx, compute: Value) -> anyhow::Result<(RemoteConnection, f64)> {
+async fn timed_open(ctx: &Ctx, compute: Option<Value>) -> anyhow::Result<(RemoteConnection, f64)> {
     let started = std::time::Instant::now();
-    let connection = ctx.open_named("harness-cold", Some(compute)).await?;
+    let connection = ctx.open_named("harness-cold", compute).await?;
     let opened = started.elapsed().as_secs_f64();
     require(
         rows_eq(&sql(&connection, "select 1").await?, &[&["1"]]),
@@ -499,17 +543,16 @@ async fn timed_open(ctx: &Ctx, compute: Value) -> anyhow::Result<(RemoteConnecti
 }
 
 async fn cold_start_checks(ctx: &Ctx) -> anyhow::Result<()> {
-    let (mut persistent, warm_persistent) =
-        timed_open(ctx, json!({"cpu": 1, "memory": "1Gi"})).await?;
+    let (mut persistent, warm_persistent) = timed_open(ctx, None).await?;
     persistent.close().await?;
     let isolated = json!({"cpu": 1, "memory": "1Gi"});
-    let (mut first, cold_isolated) = timed_open(ctx, isolated.clone()).await?;
+    let (mut first, cold_isolated) = timed_open(ctx, Some(isolated.clone())).await?;
     let first_pod = first.placement["worker_id"]
         .as_str()
         .unwrap_or_default()
         .to_owned();
     first.close().await?;
-    let (mut second, warm_isolated) = timed_open(ctx, isolated).await?;
+    let (mut second, warm_isolated) = timed_open(ctx, Some(isolated)).await?;
     require(
         second.placement["worker_id"].as_str() != Some(first_pod.as_str()),
         "the second isolated pod reused the first",
