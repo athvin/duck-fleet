@@ -743,12 +743,8 @@ class OwnershipBoundaryTests(unittest.TestCase):
         values = yaml.safe_load((ROOT/'infra/helm/duckfleet/values.yaml').read_text())
         pinned = 'karpenter.sh/nodepool' in values['nodeSelector']
         tolerated = bool(values.get('tolerations'))
-        workaround = 'workerCpuRequests' in values
         self.assertEqual(pinned, tolerated,
                          'the DuckFleet pool must be pinned and tolerated together')
-        self.assertEqual(pinned, not workaround,
-                         'pinning the DuckFleet pool retires workerCpuRequests; '
-                         'not pinning it requires the override')
         # Whichever state, a request may sit below its limit but never above it: the
         # cgroup the worker asserts against comes from the limit, so a request above it
         # schedules onto a node that cannot honour what the worker checks for.
@@ -760,7 +756,7 @@ class OwnershipBoundaryTests(unittest.TestCase):
             resources.assert_worker_resources(
                 container['resources'],
                 int(str(container['resources']['limits']['cpu']).rstrip('m')), name)
-        self.assertGreaterEqual(workers, 3, 'expected both persistent workers and the session pod')
+        self.assertGreaterEqual(workers, 1, 'expected at least the persistent worker')
 
     def test_the_harness_verifies_isolated_compute_not_the_deploy(self):
         deploy = (ROOT/'scripts/aws/deploy.sh').read_text()
@@ -772,10 +768,14 @@ class OwnershipBoundaryTests(unittest.TestCase):
         self.assertNotIn('can-i create roles', deploy)
         self.assertNotIn('exec deployment/server', deploy)
         self.assertNotIn('Bearer $DUCKFLEET_TOKEN', deploy)
-        # The AWS harness, which runs in-cluster, asserts the feature is live.
-        aws_harness = (ROOT/'tests/aws_harness.py').read_text()
-        self.assertIn('isolated_compute', aws_harness)
+        # The AWS harness, which runs in-cluster as the `harness` role of the Rust
+        # server binary, asserts the feature is live: its entrypoint drives the
+        # cold-start (isolated) path, and the shared harness inspects the gateway's
+        # isolated_compute flag rather than the deploy doing it from outside.
+        aws_harness = (ROOT/'server/src/harness/aws_harness.rs').read_text()
         self.assertIn('cold_start_checks', aws_harness)
+        harness = (ROOT/'server/src/harness.rs').read_text()
+        self.assertIn('isolated_compute', harness)
 
     def test_the_boundary_is_applied_by_an_operator_and_never_by_ci(self):
         script = (ROOT/'scripts/aws/apply-boundary.sh').read_text()

@@ -122,7 +122,7 @@ render --no-hooks \
 "${KUBE[@]}" rollout status statefulset/duckfleet-postgres --timeout=300s
 # Workers come up alongside PostgreSQL rather than after it, so reaching ready here
 # also exercises the catalog wait: without it they would exit and crash-loop.
-for deployment in worker-small worker-medium server; do
+for deployment in worker-small server; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
 
@@ -154,9 +154,9 @@ harness() { # harness <job-name> <command> [timeout]
   "${KUBE[@]}" logs "job/$name" -c dbt > "artifacts/kind/$name.log"
 }
 
-harness duckfleet-harness 'python /app/tests/harness.py'
+harness duckfleet-harness 'duckfleet-server'
 grep -q 'PASS: protocol checks and dbt lifecycle' artifacts/kind/duckfleet-harness.log
-grep -q 'PASS: model config selected small and medium workers' artifacts/kind/duckfleet-harness.log
+grep -q 'PASS: resource/sizing routing refuses what it cannot serve' artifacts/kind/duckfleet-harness.log
 
 # On-demand compute. The harness asserts what the API reports; these assert the
 # cluster facts it cannot see, which is the half that matters for a leak.
@@ -173,7 +173,7 @@ await_no_isolated_pods() {
   return 1
 }
 await_no_isolated_pods
-harness duckfleet-isolated 'python /app/tests/harness.py --isolated' 600
+harness duckfleet-isolated 'duckfleet-server --isolated' 600
 grep -q 'PASS: an isolated session ran on its own pod' artifacts/kind/duckfleet-isolated.log
 # Both ceilings, named separately, because they refuse at different moments: the
 # namespace quota before a pod exists and the scheduler after one does. Asserting only
@@ -197,7 +197,7 @@ echo 'PASS: closing an isolated session removed its pod'
 # second isolated open with the node and image warm. The absolute numbers vary
 # with the sandbox; the ordering — a pod that must be created cannot open faster
 # than a worker that already exists — is the invariant the stage asserts.
-harness duckfleet-cold-start 'python /app/tests/harness.py --cold-start' 600
+harness duckfleet-cold-start 'duckfleet-server --cold-start' 600
 grep -q 'PASS: cold start measured' artifacts/kind/duckfleet-cold-start.log
 for _ in $(seq 1 30); do
   [[ -z "$(isolated_pods)" ]] && break
@@ -209,7 +209,7 @@ done
 # proved the API; this proves the adapter carries the mode through resolved node
 # config with the session, hook, and durability guarantees intact — the other
 # half of #19, whose refusal half runs where isolation is absent (Compose).
-harness duckfleet-dbt-isolated 'python /app/tests/harness.py --dbt-isolated' 900
+harness duckfleet-dbt-isolated 'duckfleet-server --dbt-isolated' 900
 grep -q 'PASS: a dbt model ran isolated on its own pod' artifacts/kind/duckfleet-dbt-isolated.log
 for _ in $(seq 1 30); do
   [[ -z "$(isolated_pods)" ]] && break
@@ -222,7 +222,7 @@ echo 'PASS: the dbt-requested session pod was removed once the model finished'
 # The layer that does not depend on the gateway behaving well: abandon a session, then
 # destroy the gateway. The owner reference must have the pod collected regardless, and
 # the replacement gateway must settle what the pod was holding.
-harness duckfleet-leak 'python /app/tests/harness.py --leak-isolated' 600
+harness duckfleet-leak 'duckfleet-server --leak-isolated' 600
 leaked=$("${KUBE[@]}" get pods -l duckfleet-compute=isolated -o jsonpath='{.items[0].metadata.name}')
 test -n "$leaked"
 echo "abandoned session pod: $leaked"
@@ -254,6 +254,44 @@ done
 held > artifacts/kind/held-isolated.txt
 grep -qx 0 artifacts/kind/held-isolated.txt
 echo 'PASS: a new gateway settled the reservations the abandoned pod was holding'
+# The money and the diagnostics have to be reconciled together: an isolated identity
+# never restarts to mark its own rows, so a `running` record naming a dead session pod
+# would stand forever — unprunable, and claiming work is active on a worker that is gone.
+#
+# The stage above lets owner-reference GC collect the pod, which can outlast the 60s
+# statement cap, so the statement often self-terminates before the pod dies and leaves
+# a terminal row rather than a stuck `running` one. To exercise the reconciliation
+# deterministically, force the crash: a fresh isolated session with a statement
+# running, its pod SIGKILLed mid-flight so the row is left `running` and the
+# reservation `held`, then a gateway restart whose startup sweep must both settle the
+# funds and mark the orphaned record interrupted.
+stuck_running() {
+  "${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
+    "SELECT count(*) FROM query_history WHERE status='running' AND worker_id LIKE 'duckfleet-session-%'" \
+    | tr -d '[:space:]'
+}
+harness duckfleet-leak-crash 'duckfleet-server --leak-isolated' 600
+crashed=$("${KUBE[@]}" get pods -l duckfleet-compute=isolated -o jsonpath='{.items[0].metadata.name}')
+test -n "$crashed"
+echo "session pod to crash mid-statement: $crashed"
+row_count() {
+  "${KUBE[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d platform -tAc \
+    "SELECT count(*) FROM query_history WHERE worker_id='$crashed' AND status='$1'" | tr -d '[:space:]'
+}
+# The statement must be running before the kill, or there is no orphaned row to prove
+# anything about.
+test "$(row_count running)" -ge 1 || {
+  echo "the session left no running record to reconcile" >&2; exit 1; }
+"${KUBE[@]}" delete pod "$crashed" --grace-period=0 --force
+"${KUBE[@]}" delete pod -l app=duckfleet-gateway --wait=true
+"${KUBE[@]}" rollout status deployment/server --timeout=420s
+for _ in $(seq 1 30); do [[ "$(held)" == 0 ]] && break; sleep 2; done
+test "$(held)" == 0 || { echo "the crashed pod's reservation was never settled" >&2; exit 1; }
+test "$(stuck_running)" == 0 || {
+  echo "a dead session pod left query_history rows running: $(stuck_running)" >&2; exit 1; }
+test "$(row_count interrupted)" -ge 1 || {
+  echo "the crashed pod's running record was not reconciled to interrupted" >&2; exit 1; }
+echo 'PASS: a crashed session pod had its running record reconciled to interrupted'
 
 # Eviction mid-statement, which nothing else here exercises: the tests below delete
 # pods *between* runs. The signal is the ledger rather than a file, because the harness
@@ -265,7 +303,7 @@ running_worker() {
     "SELECT worker_id FROM query_history WHERE status='running'
        AND sql LIKE 'insert into api_demo.evicted%' LIMIT 1" 2> /dev/null | tr -d '[:space:]'
 }
-harness duckfleet-evicted 'python /app/tests/harness.py --evicted-midquery' 900 &
+harness duckfleet-evicted 'duckfleet-server --evicted-midquery' 900 &
 evicted=$!
 victim=""
 for _ in $(seq 1 120); do
@@ -282,7 +320,7 @@ echo "deleting worker-$victim while it is executing"
 "${KUBE[@]}" delete pod -l "app=duckfleet-worker,size=$victim" --wait=false
 wait "$evicted"
 grep -q 'PASS: a statement whose worker was deleted mid-run' artifacts/kind/duckfleet-evicted.log
-for deployment in worker-small worker-medium; do
+for deployment in worker-small; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
 
@@ -292,7 +330,7 @@ done
 # an interrupted transaction, so it does not establish how an interrupted one is
 # reported.
 harness duckfleet-evicted-hard \
-  'python /app/tests/harness.py --evicted-midquery --expect-classified' 900 &
+  'duckfleet-server --evicted-midquery --expect-classified' 900 &
 evicted_hard=$!
 victim=""
 for _ in $(seq 1 120); do
@@ -311,7 +349,7 @@ echo "killing worker-$victim outright while it is executing"
 "${KUBE[@]}" delete pod -l "app=duckfleet-worker,size=$victim" --grace-period=0 --force --wait=false
 wait "$evicted_hard"
 grep -q 'PASS: a statement whose worker was deleted mid-run' artifacts/kind/duckfleet-evicted-hard.log
-for deployment in worker-small worker-medium; do
+for deployment in worker-small; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
 
@@ -321,7 +359,7 @@ done
 # raw socket error — a plain reopen must ride through the replacement window on the
 # client's bounded open retry, and the statement's true outcome must be knowable
 # from history even though the gateway that proxied it is gone.
-harness duckfleet-gateway-replaced 'python /app/tests/harness.py --gateway-replaced' 900 &
+harness duckfleet-gateway-replaced 'duckfleet-server --gateway-replaced' 900 &
 replaced=$!
 busy=""
 for _ in $(seq 1 120); do
@@ -368,10 +406,10 @@ echo 'PASS: the kube backup produced restorable archives for both databases'
 # the catalog rather than from anything the old pod held.
 "${KUBE[@]}" delete pod -l app=duckfleet-worker
 "${KUBE[@]}" delete pod -l app=duckfleet-gateway
-for deployment in worker-small worker-medium server; do
+for deployment in worker-small server; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
-harness duckfleet-harness-replaced 'python /app/tests/harness.py --after-restart' 600
+harness duckfleet-harness-replaced 'duckfleet-server --after-restart' 600
 grep -q 'PASS: data and query history survived' artifacts/kind/duckfleet-harness-replaced.log
 
 # The external-catalog path, last because it swaps the catalog out from under the
@@ -401,19 +439,19 @@ render --no-hooks \
 # apply does not prune, so the bundled instance is removed by name — exactly what
 # an operator migrating to an external catalog does after restoring into it.
 "${KUBE[@]}" delete statefulset/duckfleet-postgres service/postgres configmap/duckfleet-postgres-init
-for deployment in worker-small worker-medium server; do
+for deployment in worker-small server; do
   "${KUBE[@]}" rollout restart "deployment/$deployment"
 done
-for deployment in worker-small worker-medium server; do
+for deployment in worker-small server; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
 # Two probes against the fresh external catalog: overlapping DuckLake writes from
 # both workers — commit races resolved through the catalog under test — and the
 # credential matrix, which exercises the platform database's whole surface.
-harness duckfleet-external 'python /app/tests/harness.py --concurrency' 600
-grep -q 'PASS: .* concurrent-write cases match the documented DuckLake semantics' \
+harness duckfleet-external 'duckfleet-server --concurrency' 600
+grep -q 'PASS: concurrent-write cases match the documented DuckLake semantics' \
   artifacts/kind/duckfleet-external.log
-harness duckfleet-external-credentials 'python /app/tests/harness.py --credentials' 600
+harness duckfleet-external-credentials 'duckfleet-server --credentials' 600
 grep -q 'PASS: credentials are issued' artifacts/kind/duckfleet-external-credentials.log
 if "${KUBE[@]}" get statefulset duckfleet-postgres > /dev/null 2>&1; then
   echo 'the bundled PostgreSQL survived postgres.bundled=false' >&2

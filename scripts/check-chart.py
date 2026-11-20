@@ -18,7 +18,7 @@ MAX_STATEMENT_SECONDS = int(re.search(
 
 objects = list(yaml.safe_load_all(open(sys.argv[1])))
 by_name = {(o['kind'], o['metadata']['name']): o for o in objects}
-for size, cpu in [('small', 1), ('medium', 2)]:
+for size, cpu in [('small', 1)]:
     worker = by_name['Deployment', f'worker-{size}']
     assert worker['spec']['strategy']['type'] == 'Recreate'
     pod = worker['spec']['template']['spec']
@@ -36,6 +36,9 @@ for size, cpu in [('small', 1), ('medium', 2)]:
     assert declared['DUCKFLEET_WORKER_MEMORY'] == f'{cpu}Gi', declared['DUCKFLEET_WORKER_MEMORY']
     assert declared['DUCKFLEET_WORKER_CPU'] == container['resources']['limits']['cpu']
     assert declared['DUCKFLEET_WORKER_MEMORY'] == container['resources']['limits']['memory']
+    # Disk is declared-only (no cgroup to check), so it must match the ephemeral-storage
+    # request the chart renders, or the worker would trust a size the pod does not have.
+    assert declared['DUCKFLEET_WORKER_DISK'] == container['resources']['requests']['ephemeral-storage'], declared.get('DUCKFLEET_WORKER_DISK')
     env = {e['name']:e.get('value') for e in container['env']}
     assert env['S3_AUTH_MODE'] == 'pod_identity'
     assert env['AWS_EC2_METADATA_DISABLED'] == 'true'
@@ -103,6 +106,12 @@ assert pinned == tolerated, (
 # The gateway drains like a worker: a statement it is proxying runs under the same
 # 60-second cap, so its grace period is coupled to the same number. Unset it defaults
 # to 30, which would SIGKILL the drain partway however well it was written.
+#
+# Deliberately coupled to the statement cap, NOT to isolatedCompute.readySeconds: a
+# cold isolated open can take minutes (node scale-up), and stretching the grace to
+# cover it would make every rollout block that long even when idle. An open abandoned
+# by a rollout is retry-safe and the client reopens — see the README's isolated
+# compute section. Do not "fix" this by raising the grace to readySeconds.
 assert by_name['Deployment', 'server']['spec']['template']['spec'][
     'terminationGracePeriodSeconds'] > MAX_STATEMENT_SECONDS, (
     'the gateway grace period is not longer than the longest statement it may proxy')
@@ -295,10 +304,10 @@ else:
     for quantity in ['cpu', 'memory']:
         assert container['resources']['requests'][quantity] == \
                container['resources']['limits'][quantity], quantity
-    # The gateway rewrites these three per session and refuses to start a pod without
+    # The gateway rewrites these four per session and refuses to start a pod without
     # them, so the template has to keep carrying them.
     declared = {e['name']: e.get('value') for e in container['env']}
-    for variable in ['DUCKFLEET_WORKER_ID', 'DUCKFLEET_WORKER_CPU', 'DUCKFLEET_WORKER_MEMORY']:
+    for variable in ['DUCKFLEET_WORKER_ID', 'DUCKFLEET_WORKER_CPU', 'DUCKFLEET_WORKER_MEMORY', 'DUCKFLEET_WORKER_DISK']:
         assert variable in declared, variable
     # Without this the pod would admit shared sessions and report an isolated
     # placement as persistent in history.

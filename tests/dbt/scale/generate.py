@@ -2,10 +2,12 @@
 
 Nothing random and nothing fetched — the same tree every run, so a failure
 diffs against a known shape. The mix mirrors a small team's project: wide
-staging, a joined core, incremental models, and a few models that ask for the
-medium class, with schema tests so `dbt build` pushes test nodes through the
-platform too. Generated at run time rather than committed: the generator is the
-artifact worth reviewing, and 110 near-identical SQL files are not.
+staging, a joined core, incremental models, and wide fan-ins, with schema tests
+so `dbt build` pushes test nodes through the platform too. Every model runs on
+the shared persistent tier (no cpu/memory/disk named): sized models derive an
+isolated pod, which needs Kubernetes, so the scale sweep stays persistent.
+Generated at run time rather than committed: the generator is the artifact
+worth reviewing, and 110 near-identical SQL files are not.
 """
 import sys
 from pathlib import Path
@@ -31,9 +33,6 @@ def main():
           "  duckfleet_scale:\n"
           "    +meta:\n"
           "      platform:\n"
-          "        compute: persistent\n"
-          "        cpu: 1\n"
-          "        memory: 1Gi\n"
           "        tags:\n"
           "          team: scale\n")
     for i in range(STAGING):
@@ -66,7 +65,6 @@ def main():
             for j in range(3))
         write(root / f"models/wide/wide_{i}.sql",
               "{{ config(materialized='table', meta={'platform': {"
-              "'compute': 'persistent', 'cpu': 2, 'memory': '2Gi', "
               "'tags': {'team': 'scale'}}}) }}\n"
               + parts + "\n")
     schema = "version: 2\nmodels:\n" + "".join(

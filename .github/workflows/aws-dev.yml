@@ -4,12 +4,16 @@ on:
     branches: [main]
     paths:
       - 'server/**'
-      - 'adapters/**'
       - 'docker/**'
       - 'tests/**'
       - 'scripts/**'
       - 'infra/terraform/**'
       - 'infra/helm/**'
+      # The ownership boundary — the Role, the ResourceQuota, the NodePool — is what
+      # this lane exercises when it places an isolated pod, so a change to it must be
+      # able to trigger the lane. Omitting it meant a quota or NodePool edit shipped
+      # with only the credential-free PR checks behind it.
+      - 'infra/kubernetes/**'
       - '.github/workflows/**'
   workflow_dispatch:
 permissions:

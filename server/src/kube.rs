@@ -231,6 +231,79 @@ pub(crate) fn declined(error: &anyhow::Error) -> bool {
         .is_some_and(|refused| refused.status == StatusCode::FORBIDDEN)
 }
 
+/// The API server's own words, when an error is a quota refusal — a `403` whose
+/// message names the quota. `None` for every other failure, including admission
+/// webhooks, whose refusals are verdicts rather than occupancy.
+pub(crate) fn quota_message(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<Refused>()
+        .filter(|refused| {
+            refused.status == StatusCode::FORBIDDEN && refused.message.contains("exceeded quota")
+        })
+        .map(|refused| refused.message.as_str())
+}
+
+/// Whether a quota refusal is hopeless: some requested quantity alone exceeds its
+/// limit, so the request cannot fit even an empty quota and waiting is pointless.
+///
+/// The message has a stable shape — `exceeded quota: <name>, requested: cpu=4,
+/// used: cpu=14, limited: cpu=16` — and anything this cannot parse reads as
+/// transient, because the wait is bounded and giving up on a request that would
+/// fit is the costlier mistake.
+pub(crate) fn quota_never_fits(message: &str) -> bool {
+    let (Some(requested), Some(limited)) = (
+        quota_section(message, "requested: "),
+        quota_section(message, "limited: "),
+    ) else {
+        return false;
+    };
+    requested.iter().any(|(resource, asked)| {
+        limited
+            .iter()
+            .find(|(limit_resource, _)| limit_resource == resource)
+            .is_some_and(|(_, limit)| asked > limit)
+    })
+}
+
+/// One `name: k=v,k=v` section of a quota message, with quantities normalized so
+/// `2` and `2000m` compare equal. `None` when the section is absent or any entry
+/// does not parse, which callers treat as "not provably hopeless".
+fn quota_section(message: &str, marker: &str) -> Option<Vec<(String, u128)>> {
+    let after = &message[message.find(marker)? + marker.len()..];
+    let section = after.split(' ').next()?.trim_end_matches([',', '.']);
+    section
+        .split(',')
+        .map(|entry| {
+            let (resource, amount) = entry.split_once('=')?;
+            Some((resource.to_owned(), parse_quantity(amount)?))
+        })
+        .collect()
+}
+
+/// A Kubernetes quantity in thousandths, covering the forms a quota message uses:
+/// plain integers, `m` millicores, and binary or decimal byte suffixes. Fractional
+/// or unrecognized forms return `None` rather than a guess.
+fn parse_quantity(amount: &str) -> Option<u128> {
+    const SUFFIXES: [(&str, u128); 9] = [
+        ("Ki", 1024),
+        ("Mi", 1024 * 1024),
+        ("Gi", 1024 * 1024 * 1024),
+        ("Ti", 1024 * 1024 * 1024 * 1024),
+        ("k", 1_000),
+        ("M", 1_000_000),
+        ("G", 1_000_000_000),
+        ("T", 1_000_000_000_000),
+        ("m", 1), // millicores: already thousandths
+    ];
+    for (suffix, scale) in SUFFIXES {
+        if let Some(number) = amount.strip_suffix(suffix) {
+            let scale = if suffix == "m" { scale } else { scale * 1000 };
+            return number.parse::<u128>().ok()?.checked_mul(scale);
+        }
+    }
+    amount.parse::<u128>().ok()?.checked_mul(1000)
+}
+
 /// Whether a review came back allowed.
 ///
 /// An absent or unparseable field reads as "no". The question is whether permission
@@ -340,6 +413,69 @@ mod tests {
         ] {
             assert!(!allowed(&unreadable), "{unreadable}");
         }
+    }
+
+    /// Occupancy clears when a Terminating pod finishes; a request larger than the
+    /// quota itself never fits. Telling them apart is what lets the gateway wait out
+    /// the first without ever waiting on the second.
+    #[test]
+    fn a_quota_refusal_is_hopeless_only_when_the_request_alone_exceeds_the_limit() {
+        // The cold-start overlap (#94): one pod over, because a closed session's pod
+        // is still Terminating. Clears within its termination grace — transient.
+        assert!(!quota_never_fits(
+            "exceeded quota: duckfleet, requested: count/pods=1, used: count/pods=24, \
+             limited: count/pods=24"
+        ));
+        // The harness's deliberate ceiling probe: 64 CPUs against a 24-CPU limit can
+        // never fit however empty the namespace is — hopeless, refuse at once.
+        assert!(quota_never_fits(
+            "exceeded quota: duckfleet, requested: limits.cpu=64,limits.memory=512Gi, \
+             used: limits.cpu=14,limits.memory=18Gi, limited: limits.cpu=24,limits.memory=32Gi"
+        ));
+        // Millicores and binary quantities normalize before comparing.
+        assert!(!quota_never_fits(
+            "exceeded quota: duckfleet, requested: requests.cpu=500m, \
+             used: requests.cpu=16, limited: requests.cpu=16"
+        ));
+        assert!(quota_never_fits(
+            "exceeded quota: duckfleet, requested: requests.memory=48Gi, \
+             used: requests.memory=0, limited: requests.memory=32Gi"
+        ));
+        // Anything unparseable reads as transient: the wait is bounded, and giving
+        // up on a request that would fit is the costlier mistake.
+        assert!(!quota_never_fits("exceeded quota: duckfleet"));
+        assert!(!quota_never_fits(
+            "exceeded quota: duckfleet, requested: cpu=1.5, used: cpu=0, limited: cpu=1"
+        ));
+    }
+
+    #[test]
+    fn only_a_quota_forbidden_carries_a_quota_message() {
+        let quota = Kube::expect_success(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"message":
+                "exceeded quota: duckfleet, requested: count/pods=1, used: count/pods=24, \
+                 limited: count/pods=24"}),
+            "creating a session pod",
+        )
+        .unwrap_err();
+        assert!(quota_message(&quota).is_some_and(|m| m.contains("exceeded quota")));
+        // An admission webhook's 403 is a verdict, not occupancy.
+        let webhook = Kube::expect_success(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"message": "admission webhook \"deny-all\" denied the request"}),
+            "creating a session pod",
+        )
+        .unwrap_err();
+        assert!(quota_message(&webhook).is_none());
+        // And a 500 mentioning quota text is still not a refusal.
+        let broken = Kube::expect_success(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"message": "exceeded quota: etcd timeout"}),
+            "creating a session pod",
+        )
+        .unwrap_err();
+        assert!(quota_message(&broken).is_none());
     }
 
     #[test]

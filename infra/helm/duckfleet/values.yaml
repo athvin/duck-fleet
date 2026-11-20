@@ -105,22 +105,15 @@ exposure:
   controllerNamespace: ""
   annotations: {}
 
-# The other half of not pinning the DuckFleet node pool, and inseparable from it.
-#
-# The shared pool is capped to m6i/m6a `large` — 2 vCPU, about 1780m allocatable — while
-# a 2-CPU worker pod claims 2050m once daemonset overhead is counted. Karpenter answers
-# "no instance type has enough resources", so it cannot even provision a node. The cgroup
-# quota the worker asserts comes from the CPU *limit*, so lowering only the request brings
-# the claim to about 1050m: satisfiable by a fresh `large`, the same path worker-small
-# takes, while the pod still receives a true 2-CPU cgroup and the full 2Gi.
-#
-# Two costs, accepted deliberately for a development lane until the boundary is applied.
-# The pod is Burstable rather than Guaranteed, the shape the gateway already uses. And its
-# 2-CPU limit exceeds what one `large` can deliver, so DuckDB's two threads can be
-# throttled — correct, but not a basis for performance measurement, which is why #18
-# needs the DuckFleet pool. Remove this entry in the same change that pins it.
-workerCpuRequests:
-  medium: 1
+# How many workers of each class to run. One by default — the topology every
+# existing deployment already has, byte for byte. Raising a count adds siblings
+# (worker-small-1, identity small-1, its own Service) that the gateway's discovery
+# ranks least-loaded first and fails over to when one refuses with a condition that
+# provably ran nothing. Each sibling is its own single-replica Recreate Deployment
+# because a worker identity must have at most one live process, and must recur after
+# a restart for history reconciliation and reservation recovery to find its rows.
+workerReplicas:
+  small: 1
 
 # Where cluster DNS may be reached, by address, because it cannot be selected by pod
 # on every topology. Deliberately the service and VPC ranges rather than 0.0.0.0/0:
@@ -163,6 +156,14 @@ isolatedCompute:
   # (see scripts/aws/deploy_values.py): without the wait the gateway deletes the pod
   # before Karpenter can provision for it, and no isolated session places (#90).
   provisioningSeconds: 0
+  # How long a pod create refused by the namespace quota is retried before the refusal
+  # is relayed. Separate from provisioningSeconds, which is a node-model property and
+  # deliberately zero on fixed nodes: quota occupancy is transient on every cluster,
+  # because a closed session's pod counts against count/pods while it is Terminating,
+  # so back-to-back isolated opens hit a full quota that clears within the pod's
+  # termination grace (#94). The default covers that grace; a request the quota could
+  # never fit, even empty, is still refused at once. Zero restores relay-immediately.
+  quotaWaitSeconds: 90
   # Where the Kubernetes API server may be reached, and on which port. Both required
   # when enabled: defaulting them would mean opening egress to reach an address nobody
   # declared.

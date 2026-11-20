@@ -1,0 +1,12 @@
+# Points dbt at the DuckFleet gateway over HTTP/Arrow, exactly like the platform's
+# own fixture. Identity is the platform credential; compute is chosen per model.
+duckfleet:
+  target: local
+  outputs:
+    local:
+      type: duckfleet
+      endpoint: '{{ env_var("DUCKFLEET_URL", "http://server:8080") }}'
+      token: '{{ env_var("DUCKFLEET_TOKEN") }}'
+      database: lake
+      schema: retail
+      threads: 2

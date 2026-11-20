@@ -632,6 +632,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-cast",
  "arrow-ipc",
  "arrow-schema",
  "axum",

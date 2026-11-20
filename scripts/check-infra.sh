@@ -25,17 +25,34 @@ PY
 helm lint infra/helm/duckfleet --namespace duckfleet-dev -f "$values"
 helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" > "$rendered"
 python3 scripts/check-chart.py "$rendered"
-# A CPU request may sit below its limit so a class fits constrained capacity, but a
-# request above the limit would schedule a worker onto a node that cannot honour the
-# limit its cgroup assertion depends on. Prove that is rejected, not merely rendered.
-overcommitted="$validation_dir/overcommitted.yaml"
-if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
-     --set-json 'workerCpuRequests={"medium":4}' > "$overcommitted" 2>/dev/null \
-   && python3 scripts/check-chart.py "$overcommitted" > /dev/null 2>&1; then
-  echo 'A worker CPU request above its limit must fail the chart check' >&2
+# The chart is a self-hosted warehouse for any single organization, so it must install
+# for an account that is not this one. A foreign registry, bucket, and region must pass
+# schema validation (the values schema pins shape — a digest-pinned image, a legal
+# bucket, a real region — not this account's identity). The dev lane's own values stay
+# pinned at the deploy, single-sourced in scripts/aws/target.env.
+foreign="$validation_dir/foreign.yaml"
+python3 - <<'PY' > "$validation_dir/foreign-values.json"
+import json
+reg = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/acme-analytics"
+print(json.dumps({
+    "workerImage": f"{reg}/worker@sha256:" + "b" * 64,
+    "dbtImage": f"{reg}/dbt@sha256:" + "b" * 64,
+    "bucket": "acme-ducklake-eu-west-1",
+    "region": "eu-west-1",
+    "secretName": "acme-duckfleet",
+}))
+PY
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-team-a \
+  -f "$validation_dir/foreign-values.json" > "$foreign"
+python3 scripts/check-chart.py "$foreign" > /dev/null
+# A mutable tag instead of a digest must still be refused: that is the one image
+# property the schema keeps, because a warehouse must pin what it runs.
+if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev \
+     --set workerImage=acme/worker:latest --set dbtImage=acme/dbt:latest > /dev/null 2>&1; then
+  echo 'A mutable image tag must fail schema validation' >&2
   exit 1
 fi
-echo 'PASS: a CPU request above its limit is rejected'
+echo 'PASS: the chart installs for a foreign account and still refuses an unpinned image'
 # The DuckFleet node pool is tainted, so the selector and the toleration only work
 # together: the pin without the toleration is a fleet that never schedules, and the
 # toleration without the pin lets a pod onto a neighbour's node. Both halves are
@@ -61,7 +78,7 @@ echo 'PASS: the node pool pin and its toleration are rejected unless they agree'
 # And the paired state renders, so the gate is not simply refusing everything.
 paired="$validation_dir/paired.yaml"
 helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
-  --set-json "$PINNED" --set-json "$TOLERATED" --set-json 'workerCpuRequests=null' > "$paired"
+  --set-json "$PINNED" --set-json "$TOLERATED" > "$paired"
 python3 scripts/check-chart.py "$paired" > /dev/null
 echo 'PASS: pinning the node pool and tolerating its taint together is accepted'
 # Isolated compute is off by default, so the assertions covering it only run against
@@ -157,6 +174,42 @@ helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$valu
   --set pgwire.enabled=true > "$wire"
 python3 scripts/check-chart.py "$wire" > /dev/null
 echo 'PASS: the wire front renders only when asked for'
+# Scale-out within a class: a second small worker renders as its own Deployment and
+# Service with its own recurring identity, the gateway's endpoint list names every
+# replica, and the legacy objects keep the exact names and selectors an existing
+# deployment already has — a Deployment selector is immutable, so index 0 changing
+# it would fail every in-place upgrade.
+scaled="$validation_dir/scaled.yaml"
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set workerReplicas.small=2 > "$scaled"
+python3 scripts/check-chart.py "$scaled" > /dev/null
+python3 - "$scaled" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+workers = {d['metadata']['name']: d for d in docs
+           if d['kind'] == 'Deployment' and d['metadata']['name'].startswith('worker-')}
+assert set(workers) == {'worker-small', 'worker-small-1'}, sorted(workers)
+identities = []
+for deployment in workers.values():
+    env = {e['name']: e.get('value') for e in
+           deployment['spec']['template']['spec']['containers'][0]['env']}
+    identities.append(env['DUCKFLEET_WORKER_ID'])
+assert len(set(identities)) == len(identities), f'worker identities collide: {identities}'
+assert workers['worker-small']['spec']['selector']['matchLabels'] == \
+    {'app': 'duckfleet-worker', 'size': 'small'}, 'index 0 selector changed: upgrades break'
+assert workers['worker-small-1']['spec']['selector']['matchLabels'].get('worker-index') == '1'
+gateway = next(d for d in docs if d['kind'] == 'Deployment' and d['metadata']['name'] == 'server')
+env = {e['name']: e.get('value') for e in
+       gateway['spec']['template']['spec']['containers'][0]['env']}
+urls = env['DUCKFLEET_WORKER_URLS'].split(',')
+assert sorted(urls) == ['http://worker-small-1:8080', 'http://worker-small:8080'], urls
+services = {d['metadata']['name']: d['spec']['selector'] for d in docs
+            if d['kind'] == 'Service' and d['metadata']['name'].startswith('worker-')}
+assert all('worker-index' in selector for selector in services.values()), \
+    'a worker Service without worker-index balances across siblings mid-session'
+assert services['worker-small-1']['worker-index'] == '1', services['worker-small-1']
+PY
+echo 'PASS: a second same-size worker renders its own identity, Service, and endpoint entry'
 # The #39 flip, as the AWS deploy computes it: isolated compute on, workers pinned to
 # the DuckFleet pool with the toleration its taint needs, the medium worker at its
 # full 2-CPU request. Chart defaults stay unpinned — the flip is a deploy-time overlay
@@ -179,15 +232,15 @@ python3 scripts/check-chart.py "$flip" > /dev/null
 python3 - "$flip" <<'PY'
 import sys, yaml
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
-med = next(d for d in docs if d['kind'] == 'Deployment'
-           and d['metadata']['name'] == 'worker-medium')['spec']['template']['spec']
-assert str(med['containers'][0]['resources']['requests']['cpu']) == '2', 'medium not at 2 CPU'
-assert med['nodeSelector'].get('karpenter.sh/nodepool') == 'duckfleet', 'medium not pinned'
+worker = next(d for d in docs if d['kind'] == 'Deployment'
+              and d['metadata']['name'] == 'worker-small')['spec']['template']['spec']
+assert str(worker['containers'][0]['resources']['requests']['cpu']) == '1', 'worker not at 1 CPU'
+assert worker['nodeSelector'].get('karpenter.sh/nodepool') == 'duckfleet', 'worker not pinned'
 # The Auto Mode compute-type label must NOT ride along with the pool pin: it is added
 # at node bootstrap, so Karpenter would not provision a new custom-pool node for a pod
 # requiring it (the isolated session pod never scheduled until this was dropped).
-assert 'eks.amazonaws.com/compute-type' not in med['nodeSelector'], 'compute-type blocks Karpenter'
-assert any(t['key'] == 'duckfleet.io/dedicated' for t in med['tolerations']), 'taint not tolerated'
+assert 'eks.amazonaws.com/compute-type' not in worker['nodeSelector'], 'compute-type blocks Karpenter'
+assert any(t['key'] == 'duckfleet.io/dedicated' for t in worker['tolerations']), 'taint not tolerated'
 # The isolated session pod is the object #90 was actually about: the gateway creates it
 # from this template, and it carried `compute-type: null` — an impossible label match
 # Karpenter will not provision for — until the placement helper learned to drop
@@ -202,7 +255,7 @@ assert all(v is not None for v in iso['nodeSelector'].values()), \
     f"isolated pod has a null selector value, an impossible match (#90): {iso['nodeSelector']}"
 assert iso['nodeSelector'].get('karpenter.sh/nodepool') == 'duckfleet', 'isolated pod not pinned'
 PY
-echo 'PASS: the AWS flip render — isolated on, pinned, medium at its full 2 CPU — is valid'
+echo 'PASS: the AWS flip render — isolated on, pinned, the persistent worker at 1 CPU — is valid'
 # And deploy_values builds exactly that overlay from the CIDRs and ports the
 # boundary recorded, which is what makes the egress rule name the endpoints rather
 # than the ClusterIP a rewritten rule would miss.
@@ -227,8 +280,7 @@ assert o['nodeSelector']['karpenter.sh/nodepool'] == 'duckfleet'
 # which the flip render above confirms is gone from the rendered pod.
 assert o['nodeSelector']['eks.amazonaws.com/compute-type'] is None, 'compute-type must be null-deleted'
 assert o['tolerations'][0]['key'] == 'duckfleet.io/dedicated'
-assert o['workerCpuRequests'] == {'medium': 2}
-print('deploy_values overlay: enabled, pinned, tolerated, medium at 2')
+print('deploy_values overlay: enabled, pinned, tolerated')
 PY
 echo 'PASS: deploy_values builds the flip overlay from the recorded egress CIDRs'
 for script in scripts/*.sh scripts/aws/*.sh scripts/ci/*.sh; do bash -n "$script"; done

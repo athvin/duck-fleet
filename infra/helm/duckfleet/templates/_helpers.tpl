@@ -49,14 +49,20 @@ and leave the gateway routing to a Service that was never rendered.
 */}}
 {{/* Consumers must coerce the size with `int`: Helm parses this through JSON, so a
      number arrives as a float and `printf "%d"` on it renders invalid YAML. */}}
+{{- /* The fleet is a single persistent tier at the default size (1 CPU / 1Gi);
+       sizing above it is served by isolated pods, not a second class. `small` is
+       kept as the identity so an in-place upgrade from the two-class chart keeps
+       the existing worker-small Deployment, Service, and history/reservation keys. */}}
 {{- define "duckfleet.workerClasses" -}}
 small: 1
-medium: 2
 {{- end -}}
 {{- define "duckfleet.workerUrls" -}}
 {{- $urls := list -}}
 {{- range $size, $cpu := include "duckfleet.workerClasses" . | fromYaml -}}
-{{- $urls = append $urls (printf "http://worker-%s:8080" $size) -}}
+{{- range $index := until (int (dig $size 1 ($.Values.workerReplicas | default dict))) -}}
+{{- $id := ternary $size (printf "%s-%d" $size $index) (eq $index 0) -}}
+{{- $urls = append $urls (printf "http://worker-%s:8080" $id) -}}
+{{- end -}}
 {{- end -}}
 {{- join "," $urls -}}
 {{- end -}}
@@ -78,6 +84,10 @@ template and the code that patches it from drifting silently.
 # container it actually got disagrees.
 - {name: DUCKFLEET_WORKER_CPU, value: {{ .cpu | quote }}}
 - {name: DUCKFLEET_WORKER_MEMORY, value: {{ .memory | quote }}}
+# Disk is declared-only (no cgroup to check against), so the worker trusts this to
+# match the ephemeral-storage request/limit above. The gateway overwrites it, with
+# cpu and memory, in the isolated pod template before creating a sized session.
+- {name: DUCKFLEET_WORKER_DISK, value: {{ .disk | quote }}}
 - {name: S3_AUTH_MODE, value: pod_identity}
 - {name: DUCKFLEET_PROFILING, value: {{ $.Values.profiling | quote }}}
 - {name: DUCKFLEET_CATALOG_WAIT_SECONDS, value: {{ $.Values.catalogWaitSeconds | quote }}}
@@ -141,7 +151,7 @@ spec:
         requests: {cpu: "1", memory: 1Gi, ephemeral-storage: 2Gi}
         limits: {cpu: "1", memory: 1Gi, ephemeral-storage: 3Gi}
       env:
-        {{- include "duckfleet.workerEnv" (dict "root" . "id" "replaced-per-session" "cpu" "1" "memory" "1Gi") | nindent 8 }}
+        {{- include "duckfleet.workerEnv" (dict "root" . "id" "replaced-per-session" "cpu" "1" "memory" "1Gi" "disk" "2Gi") | nindent 8 }}
         # Declares that this process is a pod created for one session. The worker
         # admits exactly one isolated session and refuses shared ones, and reports
         # the mode to history from this rather than from the request, so a caller

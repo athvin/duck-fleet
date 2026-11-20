@@ -1,28 +1,46 @@
 {{- range $size, $declared := include "duckfleet.workerClasses" . | fromYaml }}
 {{- /* fromYaml routes through JSON, so a class size arrives as a float. */}}
 {{- $cpu := int $declared }}
+{{- range $index := until (int (dig $size 1 ($.Values.workerReplicas | default dict))) }}
+{{- /* Index 0 keeps the legacy name and worker identity, so raising a class's count
+       never strands the history rows and held reservations keyed to the identity an
+       existing deployment already has. Each further replica is its own Deployment
+       and Service with its own recurring identity — identity has to recur for
+       startup reconciliation and reservation recovery to work, which is what rules
+       out one Deployment with N replicas and pod-name identities. */}}
+{{- $id := ternary $size (printf "%s-%d" $size $index) (eq $index 0) }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: worker-{{ $size }}
+  name: worker-{{ $id }}
 spec:
-  selector: {app: duckfleet-worker, size: {{ $size }}}
+  # worker-index pins the Service to exactly one replica's pod. Sessions are pinned
+  # by endpoint, so a Service balancing across siblings would move a session's
+  # statements between engines mid-transaction.
+  selector: {app: duckfleet-worker, size: {{ $size }}, worker-index: {{ $index | quote }}}
   ports: [{port: 8080, targetPort: 8080}]
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: worker-{{ $size }}
+  name: worker-{{ $id }}
 spec:
   # No concurrent writers with the same worker identity during upgrades.
   replicas: {{ ternary 0 1 $.Values.suspended }}
   strategy: {type: Recreate}
   selector:
+    {{- if eq $index 0 }}
+    {{- /* The legacy selector, verbatim: a Deployment's selector is immutable, so
+           adding worker-index here would fail every in-place upgrade. Siblings carry
+           controller references, so the looser match adopts nothing of theirs. */}}
     matchLabels: {app: duckfleet-worker, size: {{ $size }}}
+    {{- else }}
+    matchLabels: {app: duckfleet-worker, size: {{ $size }}, worker-index: {{ $index | quote }}}
+    {{- end }}
   template:
     metadata:
-      labels: {app: duckfleet-worker, size: {{ $size }}}
+      labels: {app: duckfleet-worker, size: {{ $size }}, worker-index: {{ $index | quote }}}
     spec:
       {{- include "duckfleet.termination" . | nindent 6 }}
       serviceAccountName: duckfleet-worker
@@ -39,14 +57,15 @@ spec:
             # limit is always the exact class size. The request may sit lower to fit
             # constrained capacity; memory stays requests == limits because memory is
             # not compressible.
-            requests: {cpu: {{ dig $size $cpu ($.Values.workerCpuRequests | default dict) | quote }}, memory: {{ printf "%dGi" $cpu }}, ephemeral-storage: 2Gi}
+            requests: {cpu: {{ $cpu | quote }}, memory: {{ printf "%dGi" $cpu }}, ephemeral-storage: 2Gi}
             limits: {cpu: {{ $cpu | quote }}, memory: {{ printf "%dGi" $cpu }}, ephemeral-storage: 3Gi}
           env:
-            {{- include "duckfleet.workerEnv" (dict "root" $ "id" $size "cpu" $cpu "memory" (printf "%dGi" $cpu)) | nindent 12 }}
+            {{- include "duckfleet.workerEnv" (dict "root" $ "id" $id "cpu" $cpu "memory" (printf "%dGi" $cpu) "disk" "2Gi") | nindent 12 }}
           {{- include "duckfleet.health" . | nindent 10 }}
           volumeMounts:
             - {name: tmp, mountPath: /tmp}
       volumes:
         - name: tmp
           emptyDir: {sizeLimit: 2Gi}
+{{- end }}
 {{- end }}

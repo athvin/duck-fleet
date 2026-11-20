@@ -26,13 +26,14 @@ const LABEL: &str = "duckfleet-compute=isolated";
 /// worker's, whose funds are recovered by the worker itself when it restarts.
 pub(crate) const PREFIX: &str = "duckfleet-session-";
 
-/// The three template values the gateway replaces per session. Named here so a
+/// The template environment values the gateway replaces per session. Named here so a
 /// template that stops carrying one fails at startup rather than running a pod that
 /// claims another session's identity or a size nobody asked for.
-const PATCHED: [&str; 3] = [
+const PATCHED: [&str; 4] = [
     "DUCKFLEET_WORKER_ID",
     "DUCKFLEET_WORKER_CPU",
     "DUCKFLEET_WORKER_MEMORY",
+    "DUCKFLEET_WORKER_DISK",
 ];
 
 pub(crate) struct Isolation {
@@ -52,6 +53,17 @@ pub(crate) struct Isolation {
     /// provision for it, which is why no isolated session ever placed there
     /// (duck-fleet#90).
     provisioning: Duration,
+    /// How long a create refused by the namespace quota is retried before the refusal
+    /// is relayed.
+    ///
+    /// Its own knob, not `provisioning`: that one is a property of the cluster's node
+    /// model and is deliberately zero on fixed nodes, while quota occupancy is
+    /// transient on every cluster — a closed session's pod counts against `count/pods`
+    /// for as long as it is Terminating, so back-to-back isolated opens routinely hit
+    /// a quota that clears within the pod's termination grace (duck-fleet#94). The
+    /// default covers that grace. A refusal no emptiness could cure — the request
+    /// alone exceeds the limit — is never waited on.
+    quota_wait: Duration,
 }
 
 /// A running session pod.
@@ -97,8 +109,9 @@ impl Isolation {
             kube: Kube::from_service_account()?,
             template,
             owner,
-            ready: env_seconds("DUCKFLEET_ISOLATED_READY_SECONDS", 120),
-            provisioning: env_seconds("DUCKFLEET_ISOLATED_PROVISIONING_SECONDS", 0),
+            ready: env_seconds("DUCKFLEET_ISOLATED_READY_SECONDS", 120)?,
+            provisioning: env_seconds("DUCKFLEET_ISOLATED_PROVISIONING_SECONDS", 0)?,
+            quota_wait: env_seconds("DUCKFLEET_ISOLATED_QUOTA_WAIT_SECONDS", 90)?,
         }))
     }
 
@@ -127,22 +140,61 @@ impl Isolation {
             tracing::error!(%error, "could not build a session pod from the template");
             ApiError::internal()
         })?;
-        self.kube.create_pod(&spec).await.map_err(|error| {
+        self.create_waiting_out_quota(&spec).await?;
+        match self.await_ready(&name).await {
+            Ok(endpoint) => Ok(Pod { name, endpoint }),
+            Err(error) => {
+                // The pod exists and is not usable. It does not outlive this call.
+                self.stop(&name).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Creates the pod, retrying a quota refusal the cluster can cure by itself.
+    ///
+    /// A closed session's pod still counts against the namespace quota while it is
+    /// Terminating, so back-to-back isolated opens hit a full quota that clears
+    /// within the pod's termination grace (duck-fleet#94). That is the cluster
+    /// needing a moment to make room — the same shape as the provisioning grace
+    /// (#93), absorbed server-side so every client benefits. A refusal no emptiness
+    /// could cure is relayed at once: `quota_never_fits` proves the request alone
+    /// exceeds the limit, and waiting on it would only delay the honest answer.
+    async fn create_waiting_out_quota(&self, spec: &serde_json::Value) -> Result<(), ApiError> {
+        const POLL: Duration = Duration::from_secs(2);
+        let started = Instant::now();
+        // The ready budget bounds everything, as it does for the provisioning grace.
+        let deadline = started + self.quota_wait.min(self.ready);
+        loop {
+            let error = match self.kube.create_pod(spec).await {
+                Ok(_) => return Ok(()),
+                Err(error) => error,
+            };
+            let transient_quota = crate::kube::quota_message(&error)
+                .is_some_and(|message| !crate::kube::quota_never_fits(message));
+            if transient_quota && Instant::now() + POLL <= deadline {
+                tokio::time::sleep(POLL).await;
+                continue;
+            }
             tracing::error!(
                 error = format!("{error:#}"),
                 "creating a session pod failed"
             );
-            if crate::kube::declined(&error) {
+            return Err(if crate::kube::declined(&error) {
                 // The API server refused before the pod existed — the namespace quota
                 // or an admission webhook — so this provably left nothing behind and a
                 // smaller request may succeed. Same answer as an unschedulable pod,
                 // reached without creating one, and carrying the refusal's own words so
                 // the ceiling that was hit is named rather than guessed.
+                let waited = match started.elapsed().as_secs() {
+                    0 => String::new(),
+                    seconds => format!("; waited {seconds}s for the namespace quota to free"),
+                };
                 ApiError::new(
                     failure::NOT_PLACEABLE,
                     format!(
-                        "this session could not be placed: {error:#}. No statement ran and \
-                         the request was not downgraded to a shared worker"
+                        "this session could not be placed: {error:#}{waited}. No statement \
+                         ran and the request was not downgraded to a shared worker"
                     ),
                 )
             } else {
@@ -152,15 +204,7 @@ impl Isolation {
                     failure::UNAVAILABLE,
                     format!("could not create a pod for this session; no statement ran: {error:#}"),
                 )
-            }
-        })?;
-        match self.await_ready(&name).await {
-            Ok(endpoint) => Ok(Pod { name, endpoint }),
-            Err(error) => {
-                // The pod exists and is not usable. It does not outlive this call.
-                self.stop(&name).await;
-                Err(error)
-            }
+            });
         }
     }
 
@@ -278,15 +322,24 @@ impl Isolation {
     }
 }
 
-/// A duration from an environment variable, falling back to `default` seconds when it
-/// is unset or unparseable. The two session-timing budgets are read the same way.
-fn env_seconds(name: &str, default: u64) -> Duration {
-    Duration::from_secs(
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default),
-    )
+/// A duration from an environment variable: `default` seconds when unset, but a
+/// hard error when set to something that is not a number.
+///
+/// Silently falling back on an unparseable value is how a typo in
+/// PROVISIONING_SECONDS would quietly restore the zero-grace behaviour that kept
+/// every isolated session from placing on EKS (#90) — with no log line to find it
+/// by. A gateway that was handed a nonsense budget refuses to start instead, the
+/// same way a worker refuses a cgroup it cannot read.
+fn env_seconds(name: &str, default: u64) -> anyhow::Result<Duration> {
+    match std::env::var(name) {
+        Err(_) => Ok(Duration::from_secs(default)),
+        Ok(value) => {
+            let seconds = value.parse::<u64>().map_err(|_| {
+                anyhow::anyhow!("{name} must be a whole number of seconds, not {value:?}")
+            })?;
+            Ok(Duration::from_secs(seconds))
+        }
+    }
 }
 
 fn owner(name: &str, uid: &str) -> Value {
@@ -320,6 +373,7 @@ fn specify(
         (PATCHED[0], name.to_owned()),
         (PATCHED[1], wanted.cpu.to_string()),
         (PATCHED[2], wanted.memory()),
+        (PATCHED[3], wanted.disk()),
     ];
     let environment = pod["spec"]["containers"][0]["env"]
         .as_array_mut()
@@ -331,12 +385,24 @@ fn specify(
             }
         }
     }
-    // Only cpu and memory are replaced; anything else the release asked for, such as
-    // ephemeral storage, is left exactly as it was rendered.
+    // cpu, memory and disk are all sized per session; requests equal limits because a
+    // dedicated pod has no neighbour to borrow headroom from. Anything else the
+    // release asked for is left exactly as it was rendered.
     let quantities = &mut pod["spec"]["containers"][0]["resources"];
     for side in ["requests", "limits"] {
         quantities[side]["cpu"] = json!(wanted.cpu.to_string());
         quantities[side]["memory"] = json!(wanted.memory());
+        quantities[side]["ephemeral-storage"] = json!(wanted.disk());
+    }
+    // The spill volume holds the same disk the pod was sized for, since that is where
+    // a query spills; its cap must track the ephemeral-storage limit above or the two
+    // would disagree about how much disk the session actually has.
+    if let Some(volumes) = pod["spec"]["volumes"].as_array_mut() {
+        for volume in volumes.iter_mut() {
+            if volume["name"] == json!("tmp") {
+                volume["emptyDir"]["sizeLimit"] = json!(wanted.disk());
+            }
+        }
     }
     Ok(pod)
 }
@@ -443,15 +509,17 @@ mod tests {
                     "name": "worker",
                     "resources": {
                         "requests": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "2Gi"},
-                        "limits": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "3Gi"},
+                        "limits": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "2Gi"},
                     },
                     "env": [
                         {"name": "DUCKFLEET_WORKER_ID", "value": "replaced-per-session"},
                         {"name": "DUCKFLEET_WORKER_CPU", "value": "1"},
                         {"name": "DUCKFLEET_WORKER_MEMORY", "value": "1Gi"},
+                        {"name": "DUCKFLEET_WORKER_DISK", "value": "2Gi"},
                         {"name": "CATALOG_DSN", "valueFrom": {"secretKeyRef": {"name": "s", "key": "CATALOG_DSN"}}},
                     ],
                 }],
+                "volumes": [{"name": "tmp", "emptyDir": {"sizeLimit": "2Gi"}}],
             },
         })
     }
@@ -482,44 +550,71 @@ mod tests {
 
     /// The ticket's first requirement. Requests below limits would let the scheduler
     /// place a pod the node cannot sustain, which is the opposite of a dedicated
-    /// worker, so both sides carry the size that was asked for.
+    /// worker, so all three dimensions carry the size that was asked for.
     #[test]
     fn a_session_pod_requests_exactly_what_was_asked_for() {
         let pod = specified(Resources {
             cpu: 4,
             memory_bytes: 8 * GIB,
+            disk_bytes: 40 * GIB,
         });
         let quantities = &pod["spec"]["containers"][0]["resources"];
         for side in ["requests", "limits"] {
             assert_eq!(quantities[side]["cpu"], json!("4"), "{side}");
             assert_eq!(quantities[side]["memory"], json!("8Gi"), "{side}");
+            assert_eq!(
+                quantities[side]["ephemeral-storage"],
+                json!("40Gi"),
+                "{side}"
+            );
         }
     }
 
-    /// Sizes the old two classes never covered, which is the point of resolving a
-    /// request to resources rather than to a name.
+    /// Sizes no prestarted worker covers, which is the point of resolving a request to
+    /// resources rather than to a name — including the new disk dimension.
     #[test]
     fn any_resolvable_size_can_be_asked_for() {
-        for (cpu, memory_bytes, expected) in [
-            (1, 512 * 1024 * 1024, "512Mi"),
-            (3, 6 * GIB, "6Gi"),
-            (16, 64 * GIB, "64Gi"),
+        for (cpu, memory_bytes, mem_text, disk_bytes, disk_text) in [
+            (1, 512 * 1024 * 1024, "512Mi", 2 * GIB, "2Gi"),
+            (3, 6 * GIB, "6Gi", 30 * GIB, "30Gi"),
+            (16, 64 * GIB, "64Gi", 500 * GIB, "500Gi"),
         ] {
-            let pod = specified(Resources { cpu, memory_bytes });
+            let pod = specified(Resources {
+                cpu,
+                memory_bytes,
+                disk_bytes,
+            });
             let quantities = &pod["spec"]["containers"][0]["resources"];
             assert_eq!(quantities["limits"]["cpu"], json!(cpu.to_string()));
-            assert_eq!(quantities["limits"]["memory"], json!(expected));
-            assert_eq!(environment(&pod)["DUCKFLEET_WORKER_MEMORY"], expected);
+            assert_eq!(quantities["limits"]["memory"], json!(mem_text));
+            assert_eq!(quantities["limits"]["ephemeral-storage"], json!(disk_text));
+            let env = environment(&pod);
+            assert_eq!(env["DUCKFLEET_WORKER_MEMORY"], mem_text);
+            assert_eq!(env["DUCKFLEET_WORKER_DISK"], disk_text);
+            // The spill volume is sized to the same disk.
+            assert_eq!(
+                pod["spec"]["volumes"][0]["emptyDir"]["sizeLimit"],
+                json!(disk_text)
+            );
         }
     }
 
-    /// Whatever else the release asked for survives being sized.
+    /// Disk sizes ephemeral storage and the spill volume together; whatever else the
+    /// release asked for survives being sized.
     #[test]
-    fn sizing_leaves_the_rest_of_the_release_alone() {
-        let pod = specified(Resources::default());
+    fn sizing_sets_disk_and_leaves_the_rest_of_the_release_alone() {
+        let pod = specified(Resources {
+            cpu: 1,
+            memory_bytes: GIB,
+            disk_bytes: 25 * GIB,
+        });
         let quantities = &pod["spec"]["containers"][0]["resources"];
-        assert_eq!(quantities["requests"]["ephemeral-storage"], json!("2Gi"));
-        assert_eq!(quantities["limits"]["ephemeral-storage"], json!("3Gi"));
+        assert_eq!(quantities["requests"]["ephemeral-storage"], json!("25Gi"));
+        assert_eq!(quantities["limits"]["ephemeral-storage"], json!("25Gi"));
+        assert_eq!(
+            pod["spec"]["volumes"][0]["emptyDir"]["sizeLimit"],
+            json!("25Gi")
+        );
         assert_eq!(pod["spec"]["restartPolicy"], json!("Never"));
         assert_eq!(pod["spec"]["activeDeadlineSeconds"], json!(1800));
         // An isolated pod runs user SQL and must not inherit the gateway's ability to
@@ -545,6 +640,7 @@ mod tests {
         let pod = specified(Resources {
             cpu: 2,
             memory_bytes: 2 * GIB,
+            disk_bytes: 10 * GIB,
         });
         let env = environment(&pod);
         assert_eq!(env["DUCKFLEET_WORKER_ID"], "duckfleet-session-abc");
@@ -553,6 +649,10 @@ mod tests {
         assert_eq!(
             env["DUCKFLEET_WORKER_MEMORY"],
             limits["memory"].as_str().unwrap()
+        );
+        assert_eq!(
+            env["DUCKFLEET_WORKER_DISK"],
+            limits["ephemeral-storage"].as_str().unwrap()
         );
     }
 
@@ -621,6 +721,23 @@ mod tests {
         let mut empty = template();
         empty["spec"]["containers"] = json!([]);
         assert!(patchable(&empty).is_err());
+    }
+
+    #[test]
+    fn env_seconds_defaults_when_unset_but_refuses_nonsense() {
+        let name = format!("DUCKFLEET_TEST_SECONDS_{}", uuid::Uuid::new_v4().simple());
+        // Unset: the default stands.
+        assert_eq!(env_seconds(&name, 42).unwrap(), Duration::from_secs(42));
+        // SAFETY: a uniquely named variable, set and removed around its only reads.
+        unsafe { std::env::set_var(&name, "7") };
+        assert_eq!(env_seconds(&name, 42).unwrap(), Duration::from_secs(7));
+        // A typo fails startup rather than silently restoring the default — which for
+        // PROVISIONING_SECONDS would quietly bring back the #90 zero-grace behaviour.
+        unsafe { std::env::set_var(&name, "soon") };
+        let error = format!("{:#}", env_seconds(&name, 42).unwrap_err());
+        unsafe { std::env::remove_var(&name) };
+        assert!(error.contains(&name), "{error}");
+        assert!(error.contains("soon"), "{error}");
     }
 
     #[test]

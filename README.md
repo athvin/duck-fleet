@@ -26,8 +26,8 @@ Compute comes in two tiers: prestarted persistent workers for everyday queries,
 and an isolated per-session pod with exactly the requested CPU and memory for
 jobs that need more. The namespace boundary is per team or environment, each
 running its own DuckLake; the trust model is teams within one organization, not
-hostile tenants. Clients speak HTTP with Arrow IPC results natively — a Python
-client, CLI, and dbt adapter exist — and an opt-in
+hostile tenants. Clients speak HTTP with Arrow IPC results natively — a built-in
+CLI and a dbt adapter exist — and an opt-in
 [Postgres wire-protocol front](#the-postgres-wire-front) lets `psql` and
 simple-protocol drivers connect directly.
 
@@ -94,7 +94,7 @@ This deletes the catalog, history, and object-store volumes.
 - Data and query history survive worker and gateway restarts; tiny fixture tables
   explicitly disable DuckLake data inlining so the test verifies real Parquet
   objects, rather than only catalog rows.
-- Overlapping transactions from two workers against one catalog resolve as
+- Overlapping transactions from two sessions against one catalog resolve as
   documented in [Concurrent writes and retry safety](#concurrent-writes-and-retry-safety):
   compatible writes both commit, and a losing commit is discarded whole and
   reported as retry-safe.
@@ -103,59 +103,54 @@ This deletes the catalog, history, and object-store volumes.
   rejects edits to recorded usage.
 
 The dbt project runs with two threads. Each worker executes its own statements
-serially, and dependent models read the preceding worker's committed DuckLake
+serially, and dependent models read the preceding model's committed DuckLake
 results. Test artifacts and the last 500 query records are written under
 `artifacts/`.
 
-## Request a worker size per model
+## Size a model's compute
 
 ```sql
 {{ config(meta={
-  'platform': {'compute': 'persistent', 'cpu': 2, 'memory': '2Gi'}
+  'platform': {'cpu': 2, 'memory': '2Gi', 'disk': '20Gi'}
 }) }}
 select * from {{ ref('stg_orders') }}
 ```
 
-Defaults can also be set under `models.<project>.+meta.platform` in
-`dbt_project.yml`. The adapter receives dbt's resolved model config before its
-first SQL statement. Both `cpu` and `memory` must be supplied together; omitting
-both requests 1 CPU and `1Gi`. Use `meta.platform.tags` for workload
-attribution. Other platform keys are rejected rather than ignored.
+Naming any of `cpu`, `memory`, or `disk` under `meta.platform` asks for an
+**isolated pod** of exactly that size — used by this model alone and removed when
+it finishes. A model that names none runs on the shared **persistent** tier, the
+default and the only mode Compose serves. The mode is *derived* from what you ask
+for; there is no separate `compute` key. Defaults can be set under
+`models.<project>.+meta.platform` in `dbt_project.yml`, and the adapter receives
+dbt's resolved config before its first SQL statement. Use `meta.platform.tags` for
+workload attribution — tags never size compute — and other platform keys are
+rejected rather than ignored.
 
-Any CPU and memory pair may be requested. There is no fixed menu of sizes: a
-worker reports the resources it actually has, read from its own cgroup, and the
-gateway routes a request to a worker providing exactly that. Running a new size
-is running a worker with those limits and listing its endpoint in
-`DUCKFLEET_WORKER_URLS`, not teaching the platform a new name.
+`cpu` is an integer; `memory` and `disk` are binary quantities such as `2Gi` or
+`512Mi`. Memory is the container cap, and DuckDB-managed memory is held to half of
+it, leaving room for extensions, networking, and Arrow results. `disk` is the
+pod's ephemeral-storage limit, enforced by the kubelet. The CPU quota the worker
+asserts comes from its limit, always the exact size requested. The local harness
+runs one persistent worker out of the box:
 
-The local harness runs two workers, so these resolve out of the box:
-
-| Requested CPU / memory | Worker | DuckDB threads | DuckDB memory limit |
+| Tier | CPU / memory | DuckDB threads | DuckDB memory limit |
 | --- | --- | --- | --- |
-| 1 / `1Gi` | `small` | 1 | 512 MiB |
-| 2 / `2Gi` | `medium` | 2 | 1 GiB |
+| persistent (`small`) | 1 / `1Gi` | 1 | 512 MiB |
+| isolated (per model) | as requested | = CPU | half of memory |
 
-Memory in the request is the **container cap**, given as a binary quantity such
-as `2Gi` or `512Mi`. DuckDB-managed memory is limited to half that cap, leaving
-room for extensions, networking, and Arrow results. Docker CPU quotas are hard
-limits on CPU time, not dedicated CPU cores.
+Docker CPU quotas are hard limits on CPU time, not dedicated cores.
 
-A request no worker provides is refused with `503`, naming the sizes the
-deployment does run. It is never served by a different size, and an unreachable
-worker is reported separately from a size that was never provisioned. A model's
-entire lifecycle stays on one worker/session; it cannot resize in the middle of a
-transaction. Unsupported sizes return an error, and an unavailable worker never
-falls back to a smaller one.
+A model's entire lifecycle stays on one session; it cannot resize in the middle of
+a transaction. The persistent tier is a prestarted worker shared across sessions;
+an isolated pod serves its one session alone, with requests equal to limits, and is
+removed afterwards — nothing else is admitted to it, before or after.
 
-A request carries a mode as well as a size. `persistent` selects an exact
-matching, prestarted worker, shared with other sessions of the same size.
-`isolated` creates a pod for that session alone, with requests equal to limits,
-and removes it afterwards; nothing else is admitted to that pod, before or after.
-An isolated request that cannot be served is refused with the refusing component's
-own reason — the namespace quota's, when the size is beyond what the namespace may
-hold at all, or the scheduler's, when no node can hold it — and is never downgraded
-to a shared worker. Both are retry-safe: no statement ran, and a smaller request
-may succeed.
+An isolated request the fleet cannot serve is refused, never downgraded to the
+persistent tier. Where isolation is off (Compose) a named size is refused `501
+compute_unavailable`; where it is on but no placement fits, it is `503` carrying the
+refusing component's own reason — the namespace quota's when the size is beyond what
+the namespace may hold, or the scheduler's when no node can hold it. Both are
+retry-safe: no statement ran, and a smaller request may succeed.
 
 A pod of one's own is not free, and the routing choice turns on how much it costs.
 The harness measures three opens — a persistent session, a cold isolated session
@@ -182,10 +177,22 @@ without the grant is inert rather than broken — the same refusal, and no state
 runs — and removing the `RoleBinding` is a supported way to turn the feature off.
 `duck-fleet#39` tracks switching it on for the shared development namespace.
 
-The harness builds `fct_orders` on medium and `customer_totals` on small, checks
-resource settings inside the materialized results, then rebuilds `fct_orders` on
-small and medium again by changing config. It verifies Docker's actual CPU/memory
-settings, the workers' kernel cgroup limits, and history for hooks through commit.
+A cold isolated open can take as long as `readySeconds` (420s on the AWS lane,
+to pay node scale-up), which is longer than a gateway's drain budget. A gateway
+rollout that lands during one therefore abandons the open — but retry-safe: no
+statement ran, and the client's bounded new-session wait rides through the
+replacement gap and reopens. The drain budget is deliberately **not** stretched
+to cover the full node-provisioning window; doing so would make every rollout
+block for minutes even with nothing in flight, on a single-replica deployment
+where a rollout is already a brief outage. A pod already serving statements
+drains normally within the grace period.
+
+The default lifecycle builds the fixture on the persistent tier with hooks, tests,
+and docs, and rebuilds it idempotently. It verifies Docker's actual CPU/memory
+limits, the worker's kernel cgroup limits, and history for hooks through commit. On
+Kubernetes the `--dbt-isolated` stage additionally runs a model whose
+`meta.platform` names a size, proving the adapter carries the derived mode through
+to a dedicated pod.
 Evidence is saved in `artifacts/model-placement.json`, `worker-resources.json`,
 and `docker-worker-limits.jsonl`.
 
@@ -201,28 +208,29 @@ docker compose run --rm dbt dbt run --select fct_orders --full-refresh \
 ## Layout
 
 ```text
-server/                 Rust gateway, resource classes, workers, query history
-clients/duckfleet-python/  HTTP/Arrow client and CLI; no dbt dependency
-adapters/dbt-duckfleet/  Python dbt adapter, which depends on that client
-compose.yaml            PostgreSQL, RustFS, gateway, sized workers, dbt and API runners
+server/                 Rust gateway, workers, query history, and the cli + harness roles
+server/src/client.rs    HTTP/Arrow client the cli role and harness speak to the gateway with
+server/src/harness.rs   The dbt + HTTP + Postgres + S3 integration gate (the harness role)
+compose.yaml            PostgreSQL, RustFS, gateway, the persistent worker, dbt and CLI runners
 docker/                 Images and initial PostgreSQL databases
 scripts/                Build and harness helpers
 tests/dbt/              Representative seed, view, table, incremental model, tests
-tests/harness.py         Protocol, dbt, and restart assertions
-tests/api_workflow.py    The same warehouse workflow with dbt absent
-tests/concurrency.py     Overlapping DuckLake transactions and retry classification
-tests/metering.py        Usage ledger, pricing, and budget enforcement
 ```
+
+The dbt adapter itself is not in this repo: it is a first-class `AdapterType::DuckFleet`
+in a fork of dbt-core v2 (`athvin/dbt`), whose compiled `dbt` binary this repo downloads
+by pinned release. A model's `meta.platform` (cpu/memory/disk) is what asks for a pod.
 
 ## Use it without dbt
 
 dbt is an option, not a dependency. Everything the platform does is reachable from
-the HTTP API, and the client that speaks it is its own package:
+the HTTP API, and the same `duckfleet-server` binary speaks it as its `cli` role —
+no separate package, and no dbt in the image at all:
 
 ```sh
-pip install ./clients/duckfleet-python
 export DUCKFLEET_URL=http://localhost:18080
 export DUCKFLEET_TOKEN=duckfleet-local-development-token
+alias duckfleet='docker compose run --rm api'   # the cli role; dbt is not installed here
 
 duckfleet sql 'create or replace table analytics.events (id integer, region varchar)' \
               "insert into analytics.events values (1, 'eu')"
@@ -230,39 +238,27 @@ duckfleet sql 'select region, count(*) from analytics.events group by region'
 duckfleet sql 'select * from analytics.events where region = ?' --param eu --format json
 ```
 
-`duckfleet` depends on `pyarrow` and the standard library. It does **not** depend on
-dbt-core, and the dbt adapter depends on *it*, so both speak one wire protocol rather
-than two that can drift apart.
+The `cli` role and the dbt adapter are two front-ends over one wire protocol — the
+Arrow-IPC client in `server/src/client.rs` — so neither can drift from the other.
 
 Statements given to one `sql` invocation share a session, which is what pins a load
-and the query that checks it to the same worker. Compute is selectable per invocation,
-the same choice a dbt model expresses through `meta.platform`:
+and the query that checks it to the same worker. Compute is selectable per invocation:
+naming any of `--cpu`/`--memory`/`--disk` asks for a pod of that size, the same derived
+trigger a dbt model expresses through `meta.platform`; naming none runs on the shared
+persistent tier.
 
 ```sh
-duckfleet sql 'select current_setting("threads")' --cpu 2 --memory 2Gi --placement
-duckfleet sql 'select 1' --isolated --cpu 4 --memory 8Gi   # a pod of its own
+duckfleet sql 'select current_setting("threads")' --cpu 2 --memory 2Gi
+duckfleet sql 'select 1' --cpu 4 --memory 8Gi --disk 20Gi   # a pod of its own
 ```
 
 `duckfleet history`, `query <id>`, `usage`, `budget` and `workers` cover inspection.
 A refusal exits non-zero and prints the server's own classification and `retry_safe`,
 so a shell script can tell "ask differently" from "ask later" without parsing prose.
 
-From Python, the same surface is a DB-API-shaped client:
-
-```python
-from duckfleet import RemoteConnection
-
-connection = RemoteConnection(URL, TOKEN, compute={"cpu": 2, "memory": "2Gi"})
-rows = connection.cursor().execute("select * from analytics.events where region = ?",
-                                   ["eu"]).fetchall()
-connection.close()   # rolls back anything uncommitted
-```
-
-`tests/api_workflow.py` runs this whole path — create, load with bound parameters,
-query, read history and usage, then the same workflow through the CLI — in
-`docker/cli.Dockerfile`, an image where dbt is **not installed**. Its first assertion
-is that `import dbt` fails, because running it anywhere dbt happened to be present
-would show that the API works rather than that it works without dbt.
+The `api` compose service runs this `cli` role from `docker/cli.Dockerfile`, an image
+built without the `dbt` binary. That is what proves the whole create → load → query →
+inspect path works with no dbt present rather than merely where dbt happens to be absent.
 
 ## Local execution API
 
@@ -308,10 +304,18 @@ Revocation takes effect immediately on the gateway that processed it. Unknown,
 revoked, and expired tokens are all refused with the same `401 unauthorized`,
 so a probing caller learns nothing about which it was.
 
-Credentials authenticate and attribute; they do not yet authorize differently.
-Every principal reaches the same full SQL surface and the same platform
-endpoints apart from credential management — per-principal SQL or budget
-scoping is explicitly not built.
+Credentials authenticate and attribute, and they scope the platform's levers —
+not its SQL. Every principal reaches the same full SQL surface; per-principal
+SQL scoping is explicitly not built. On the platform API the mutations are
+owned: credential management, lake maintenance, and budget **writes** are
+bootstrap-only (a spend ceiling writable by the spenders it constrains would be
+an accident log, not a control), and a session answers only to the principal
+that opened it — another credential's query, cancel, or close is refused `403
+forbidden`, while the bootstrap may act on any session because interrupting a
+runaway statement is the operator's job. Reads stay org-global by design:
+budget position, query history, and usage — including SQL text — are visible to
+every credential, because debugging a teammate's run and seeing the one shared
+bill are what a single-organization warehouse is for.
 
 ## The Postgres wire front
 
@@ -487,8 +491,9 @@ DuckLake detects a write conflict when a transaction **commits**, not while its
 statements run. The first transaction to commit wins, and a losing transaction is
 discarded whole rather than partly applied. Everything in this section was measured
 against DuckDB 1.5.4 with a DuckLake PostgreSQL catalog and is re-verified on every
-run by `tests/concurrency.py`, which interleaves two real worker sessions so the
-conflict window is exact instead of a race. Evidence is saved to
+run by the harness `--concurrency` stage (`server/src/harness/concurrency.rs`), which
+interleaves two sessions on the persistent worker so the conflict window is exact
+instead of a race. Evidence is saved to
 `artifacts/write-conflicts.json`.
 
 | Overlapping writes | Outcome |
@@ -560,7 +565,8 @@ cleanup of the data files a losing transaction already wrote to object storage.
 Every accepted execution is metered. Admission reserves funds before any SQL runs,
 settlement records exactly one usage event, and the reservation is released at the
 same time — for successes, SQL errors, timeouts, and lost commit races alike.
-`tests/metering.py` gates that on every run and saves `artifacts/metering.json`.
+The harness `--metering` stage (`server/src/harness/metering.rs`) gates that on every
+run and saves `artifacts/metering.json`.
 
 The ledger is deliberately separate from query history. Diagnostics get rewritten
 as a query progresses; a billable record must not. `usage_events` is append-only
@@ -623,7 +629,7 @@ Budgets are enforced two ways:
   are metered, and neither is retry-safe because an interrupted commit may still
   have committed.
 
-Two workers cannot both spend the last of the balance: admission locks the budget
+Two sessions cannot both spend the last of the balance: admission locks the budget
 row, so reservations serialize across workers.
 
 If settlement itself fails, the reservation stays held and the execution stays
@@ -775,9 +781,9 @@ gateway killed without grace. A request severed in transport fails as
 `transport_failure`, never retry-safe — its true outcome is read back from
 `/v1/queries` by `request_id`, because the worker finishes what it was running
 whether or not the gateway survives. A lost session answers `unknown_session`
-with instructions, its uncommitted work can only be rolled back, and the Python
-client rides new-session opens through a rollout's `draining` window and the
-replacement gap on a bounded wait. Statements are never replayed by the client,
+with instructions, its uncommitted work can only be rolled back, and the client
+rides new-session opens through a rollout's `draining` window and the replacement
+gap on a bounded wait. Statements are never replayed by the client,
 under any classification.
 
 ## Design and upstream contracts

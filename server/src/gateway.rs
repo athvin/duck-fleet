@@ -32,6 +32,10 @@ use uuid::Uuid;
 struct Route {
     endpoint: String,
     touched: Instant,
+    /// Who opened this session. Session IDs appear in history, which every
+    /// credential can read, so possession of an ID proves nothing — only the
+    /// opener (or the bootstrap) may run, cancel, or close the session.
+    principal: Arc<str>,
     /// The session pod to remove when this route goes away, for an isolated session.
     /// `None` for a persistent worker, which outlives every session it serves.
     pod: Option<String>,
@@ -65,6 +69,42 @@ struct Fleet {
     discovered: Instant,
 }
 
+/// How an attempt to open a persistent session ended: on a worker, or with the last
+/// candidate's refusal, already shaped for relaying to the caller unchanged.
+enum OpenOutcome {
+    Opened {
+        endpoint: String,
+        upstream: reqwest::Response,
+    },
+    Refused(Response),
+}
+
+/// Whether a worker's refusal of an open is safe grounds to try its sibling: the
+/// worker classified it, promised nothing ran, and named a condition that is about
+/// this worker rather than the request — full, draining, or still starting. Not
+/// every retry-safe kind qualifies: `budget_exhausted` is about the deployment's
+/// funds and would refuse identically everywhere.
+fn failover_worthy(status: StatusCode, refusal: &Value) -> bool {
+    !status.is_success()
+        && refusal["retry_safe"] == json!(true)
+        && matches!(
+            refusal["failure_kind"].as_str(),
+            Some("capacity" | "draining" | "starting")
+        )
+}
+
+/// Every worker providing the size, least-loaded first; the configured order breaks
+/// ties, so a deployment with one worker per size behaves exactly as before.
+fn ranked_endpoints(
+    workers: &[WorkerInfo],
+    wanted: Resources,
+    census: &HashMap<String, usize>,
+) -> Vec<String> {
+    let mut matches: Vec<&WorkerInfo> = workers.iter().filter(|w| w.serves(wanted)).collect();
+    matches.sort_by_key(|w| census.get(&w.endpoint).copied().unwrap_or(0));
+    matches.iter().map(|w| w.endpoint.clone()).collect()
+}
+
 /// Who a request authenticated as, attached by `authenticate` so handlers read a
 /// fact the middleware established rather than re-deriving it.
 #[derive(Clone)]
@@ -80,6 +120,12 @@ impl Principal {
             Self::Bootstrap => credentials::BOOTSTRAP_PRINCIPAL,
             Self::Named(name) => name,
         }
+    }
+    /// Whether this caller may act on a session `owner` opened. The bootstrap may
+    /// act on anyone's — it is the operator, and cancelling a runaway statement is
+    /// its job — while a named principal is confined to its own.
+    fn may_act_on(&self, owner: &str) -> bool {
+        matches!(self, Self::Bootstrap) || self.name() == owner
     }
 }
 
@@ -109,7 +155,7 @@ impl Authn {
     }
 
     async fn principal(&self, token: &str) -> Result<Principal, ApiError> {
-        if token == self.bootstrap.as_ref() {
+        if credentials::tokens_match(token, &self.bootstrap) {
             return Ok(Principal::Bootstrap);
         }
         let hashed = credentials::digest(token);
@@ -201,6 +247,9 @@ struct Gateway {
     /// grant itself RBAC, so the workers are the only available authority.
     endpoints: Arc<Vec<String>>,
     fleet: Arc<Mutex<Option<Fleet>>>,
+    /// Held for the duration of one `discover`, so concurrent cache misses collapse
+    /// into a single fleet probe instead of each running the sequential scan.
+    discovering: Arc<Mutex<()>>,
     routes: Arc<Mutex<HashMap<Uuid, Route>>>,
     capacity: Arc<Semaphore>,
     history: crate::history::Reader,
@@ -301,23 +350,56 @@ impl Gateway {
     /// the catalog wait removed. A miss refreshes once, so a worker that was still
     /// starting when the table was built is not reported as a class that does not
     /// exist.
-    async fn endpoint_for(&self, wanted: Resources) -> Result<String, ApiError> {
+    ///
+    /// Every worker providing the size is returned, least-loaded first, so running a
+    /// second worker with the same resources adds capacity rather than dead weight —
+    /// which is the fleet's whole scaling claim. The load measure is this gateway's
+    /// own routed-session census; sessions opened outside the route table (platform
+    /// statements, pgwire) are short-lived and uncounted, an approximation that
+    /// self-corrects as counted sessions close.
+    async fn endpoints_for(&self, wanted: Resources) -> Result<Vec<String>, ApiError> {
         const FRESH: Duration = Duration::from_secs(30);
-        let cached = {
-            let fleet = self.fleet.lock().await;
-            fleet
-                .clone()
-                .filter(|f| f.discovered.elapsed() < FRESH && f.unreachable.is_empty())
+        let census: HashMap<String, usize> = {
+            let routes = self.routes.lock().await;
+            let mut census = HashMap::new();
+            for route in routes.values() {
+                *census.entry(route.endpoint.clone()).or_insert(0) += 1;
+            }
+            census
         };
-        if let Some(fleet) = cached
-            && let Some(worker) = fleet.workers.iter().find(|w| w.serves(wanted))
-        {
-            return Ok(worker.endpoint.clone());
+        // The cache is usable whether or not some endpoints were unreachable when it
+        // was built: a worker being down does not make the workers that answered
+        // stale. The old `unreachable.is_empty()` gate meant one down worker forced
+        // every request to re-probe the whole fleet at 5s per endpoint — so a partial
+        // outage became a gateway-wide slowdown. A size the cache cannot serve still
+        // refreshes below, which re-probes the down endpoint lazily.
+        let fresh =
+            |fleet: &Option<Fleet>| fleet.clone().filter(|f| f.discovered.elapsed() < FRESH);
+        if let Some(fleet) = fresh(&*self.fleet.lock().await) {
+            let candidates = ranked_endpoints(&fleet.workers, wanted, &census);
+            if !candidates.is_empty() {
+                return Ok(candidates);
+            }
         }
-        let fleet = self.discover().await;
-        *self.fleet.lock().await = Some(fleet.clone());
-        if let Some(worker) = fleet.workers.iter().find(|w| w.serves(wanted)) {
-            return Ok(worker.endpoint.clone());
+        // Single-flight: hold the discovery lock, then re-check the cache a concurrent
+        // discovery may have just filled. Without this, N simultaneous misses each run
+        // the full sequential probe; with it, the first probes and the rest read its
+        // result. The request path never holds this across anything but one discover.
+        let fleet = {
+            let _flight = self.discovering.lock().await;
+            if let Some(fleet) = fresh(&*self.fleet.lock().await)
+                && !ranked_endpoints(&fleet.workers, wanted, &census).is_empty()
+            {
+                fleet
+            } else {
+                let discovered = self.discover().await;
+                *self.fleet.lock().await = Some(discovered.clone());
+                discovered
+            }
+        };
+        let candidates = ranked_endpoints(&fleet.workers, wanted, &census);
+        if !candidates.is_empty() {
+            return Ok(candidates);
         }
         // Never falls back to a different size. Which failure it is matters: a
         // degraded fleet is worth retrying, a missing class is not.
@@ -346,6 +428,74 @@ impl Gateway {
             )
         })
     }
+
+    /// Opens a session on the least-loaded worker providing the size, failing over
+    /// to the next when the current one provably ran nothing: its own classified
+    /// `retry_safe` refusal (full, draining, or still-starting), or a connection
+    /// that never established — a stale cache entry for a worker that is gone sends
+    /// no bytes, so no session was created. A transport error *after* connecting is
+    /// never failed over: the open may have been received, and opening a second
+    /// would leak the first.
+    async fn open_persistent(
+        &self,
+        wanted: Resources,
+        body: Vec<u8>,
+        principal: &str,
+    ) -> Result<OpenOutcome, ApiError> {
+        let candidates = self.endpoints_for(wanted).await?;
+        let total = candidates.len();
+        for (position, endpoint) in candidates.into_iter().enumerate() {
+            let last = position + 1 == total;
+            let upstream = match self
+                .client
+                .request(Method::POST, format!("{endpoint}/v1/sessions"))
+                .bearer_auth(&self.token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(credentials::PRINCIPAL_HEADER, principal)
+                .body(body.clone())
+                .send()
+                .await
+            {
+                Ok(upstream) => upstream,
+                // `is_connect` is the connection-never-established case: nothing was
+                // sent, so a worker that has gone away under a stale cache entry is
+                // safe to skip for its sibling. Anything else may have been received.
+                Err(error) if error.is_connect() && !last => {
+                    tracing::info!(
+                        endpoint,
+                        "a worker was unreachable at connect; trying its sibling"
+                    );
+                    continue;
+                }
+                Err(_) => return Err(ApiError::internal()),
+            };
+            if upstream.status().is_success() {
+                return Ok(OpenOutcome::Opened { endpoint, upstream });
+            }
+            let status = upstream.status();
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(value) = upstream.headers().get(header::CONTENT_TYPE) {
+                headers.insert(header::CONTENT_TYPE, value.clone());
+            }
+            let bytes = upstream.bytes().await.map_err(|_| ApiError::internal())?;
+            let refusal: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            if !last && failover_worthy(status, &refusal) {
+                tracing::info!(
+                    endpoint,
+                    kind = refusal["failure_kind"].as_str().unwrap_or(""),
+                    "a worker refused an open it provably did not start; trying its sibling"
+                );
+                continue;
+            }
+            // The last worker's own words, relayed unchanged: it says why it
+            // refused, and a gateway paraphrase would lose the only useful detail.
+            return Ok(OpenOutcome::Refused(
+                (status, headers, bytes).into_response(),
+            ));
+        }
+        // `endpoints_for` never returns an empty list.
+        Err(ApiError::internal())
+    }
     async fn send(
         &self,
         endpoint: &str,
@@ -362,12 +512,21 @@ impl Gateway {
             .await
             .map_err(|_| ApiError::internal())
     }
-    async fn route(&self, id: Uuid) -> Result<String, ApiError> {
+    async fn route(&self, id: Uuid, caller: &Principal) -> Result<String, ApiError> {
         self.expire().await;
         let mut routes = self.routes.lock().await;
         let route = routes
             .get_mut(&id)
             .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
+        // A 403 rather than a masked 404: the caller is a colleague, not an
+        // adversary, and naming the refusal is this API's idiom. Checked before the
+        // touch so a probing caller cannot keep someone else's session alive.
+        if !caller.may_act_on(&route.principal) {
+            return Err(ApiError::new(
+                failure::FORBIDDEN,
+                "this session belongs to another principal",
+            ));
+        }
         route.touched = Instant::now();
         Ok(route.endpoint.clone())
     }
@@ -393,9 +552,14 @@ impl Gateway {
             });
             expired
         };
+        // Released off the request path: each release is a kube DELETE plus a ledger
+        // settle, up to ~18s, and awaiting them here made the next unrelated request
+        // wait out every expired pod in turn. A spawned release that dies mid-flight
+        // is backstopped by the startup sweep, so nothing is lost by not awaiting.
         for pod in expired {
             tracing::warn!(pod, "releasing the pod of a session nobody closed");
-            self.release(Some(pod)).await;
+            let gateway = self.clone();
+            tokio::spawn(async move { gateway.release(Some(pod)).await });
         }
     }
 
@@ -437,14 +601,26 @@ async fn response(upstream: reqwest::Response) -> Result<Response, ApiError> {
 async fn open(
     State(app): State<Gateway>,
     Extension(principal): Extension<Principal>,
-    request: Option<Json<SessionRequest>>,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     // Only new sessions are refused. Requests on sessions already open continue,
     // which is the drain: the grace period bounds how long that can take.
     if app.draining.load(Ordering::Acquire) {
         return Err(draining_refusal());
     }
-    let mut request = request.map(|Json(r)| r).unwrap_or_default();
+    // An empty body is the default (persistent) request; a present-but-malformed
+    // body is a client error in the gateway's own {error,failure_kind,retry_safe}
+    // shape, not axum's raw 422 that bypasses the contract.
+    let mut request: SessionRequest = if body.is_empty() {
+        SessionRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            ApiError::new(
+                failure::INVALID_REQUEST,
+                format!("invalid session request: {e}"),
+            )
+        })?
+    };
     let placement = request.validate()?;
     // Carries the mode as well as the size, so an isolated session is recorded as
     // isolated rather than as whatever the pod would have assumed.
@@ -455,48 +631,59 @@ async fn open(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::new(failure::CAPACITY, "gateway session limit reached"))?;
-    // An isolated session gets a pod of its own; a persistent one gets whichever
-    // worker already reports these resources. Neither substitutes for the other.
-    let (endpoint, pod) = match placement.mode {
-        Mode::Persistent => (app.endpoint_for(placement.resources).await?, None),
+    // The principal rides the internal hop as a header the worker records at open:
+    // trusted because the hop requires the internal token, and set here rather than
+    // taken from the body so a caller cannot name someone else.
+    let body = serde_json::to_vec(&request).map_err(|_| ApiError::internal())?;
+    // An isolated session gets a pod of its own; a persistent one gets the
+    // least-loaded worker already reporting these resources, with a full or draining
+    // worker failed over to its sibling. Neither mode substitutes for the other.
+    let (endpoint, pod, upstream) = match placement.mode {
+        Mode::Persistent => {
+            match app
+                .open_persistent(placement.resources, body, principal.name())
+                .await?
+            {
+                OpenOutcome::Opened { endpoint, upstream } => (endpoint, None, upstream),
+                OpenOutcome::Refused(relay) => return Ok(relay),
+            }
+        }
         Mode::Isolated => {
             let isolation = app
                 .isolation
                 .as_ref()
                 .ok_or_else(crate::compute::unavailable)?;
             let started = isolation.start(placement.resources).await?;
-            (started.endpoint, Some(started.name))
+            // From here a session pod exists, so every exit below releases it. The
+            // worker's own response is still relayed unchanged on the way out: it
+            // says why it refused, and replacing that with a gateway error would
+            // lose the only useful detail.
+            let pod = Some(started.name);
+            let upstream = match app
+                .client
+                .request(Method::POST, format!("{}/v1/sessions", started.endpoint))
+                .bearer_auth(&app.token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(credentials::PRINCIPAL_HEADER, principal.name())
+                .body(body)
+                .send()
+                .await
+                .map_err(|_| ApiError::internal())
+            {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    app.release(pod).await;
+                    return Err(error);
+                }
+            };
+            if !upstream.status().is_success() {
+                let refused = response(upstream).await;
+                app.release(pod).await;
+                return refused;
+            }
+            (started.endpoint, pod, upstream)
         }
     };
-    // From here a session pod exists, so every exit below releases it. The worker's
-    // own response is still relayed unchanged on the way out: it says why it refused,
-    // and replacing that with a gateway error would lose the only useful detail.
-    // The principal rides the internal hop as a header the worker records at open:
-    // trusted because the hop requires the internal token, and set here rather than
-    // taken from the body so a caller cannot name someone else.
-    let body = serde_json::to_vec(&request).map_err(|_| ApiError::internal())?;
-    let upstream = match app
-        .client
-        .request(Method::POST, format!("{endpoint}/v1/sessions"))
-        .bearer_auth(&app.token)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(credentials::PRINCIPAL_HEADER, principal.name())
-        .body(body)
-        .send()
-        .await
-        .map_err(|_| ApiError::internal())
-    {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            app.release(pod).await;
-            return Err(error);
-        }
-    };
-    if !upstream.status().is_success() {
-        let refused = response(upstream).await;
-        app.release(pod).await;
-        return refused;
-    }
     let opened = upstream.json::<Value>().await.ok().and_then(|info| {
         let id = info
             .get("session_id")
@@ -513,6 +700,7 @@ async fn open(
         Route {
             endpoint,
             touched: Instant::now(),
+            principal: principal.name().into(),
             pod,
             _permit: permit,
         },
@@ -521,10 +709,11 @@ async fn open(
 }
 async fn query(
     State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<Uuid>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let endpoint = app.route(id).await?;
+    let endpoint = app.route(id, &principal).await?;
     response(
         app.send(
             &endpoint,
@@ -536,8 +725,12 @@ async fn query(
     )
     .await
 }
-async fn cancel(State(app): State<Gateway>, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
-    let endpoint = app.route(id).await?;
+async fn cancel(
+    State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let endpoint = app.route(id, &principal).await?;
     response(
         app.send(
             &endpoint,
@@ -549,8 +742,12 @@ async fn cancel(State(app): State<Gateway>, Path(id): Path<Uuid>) -> Result<Resp
     )
     .await
 }
-async fn close(State(app): State<Gateway>, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
-    let endpoint = app.route(id).await?;
+async fn close(
+    State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let endpoint = app.route(id, &principal).await?;
     let upstream = app
         .send(
             &endpoint,
@@ -591,8 +788,12 @@ async fn budget(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
 }
 async fn set_budget(
     State(app): State<Gateway>,
+    Extension(principal): Extension<Principal>,
     Json(update): Json<crate::usage::BudgetUpdate>,
 ) -> Result<Json<Value>, ApiError> {
+    // Reading the balance stays open to every credential — it is how a caller
+    // sizes a request — but the ceiling belongs to whoever answers for the bill.
+    admin_only(&principal, "set budget limits")?;
     app.usage.set_budget(update).await.map(Json)
 }
 /// Runs one platform-owned statement through the ordinary execution machinery: a
@@ -609,20 +810,16 @@ async fn platform_statement(
     if app.draining.load(Ordering::Acquire) {
         return Err(draining_refusal());
     }
-    let endpoint = app.endpoint_for(Resources::default()).await?;
-    let open = app
-        .client
-        .request(Method::POST, format!("{endpoint}/v1/sessions"))
-        .bearer_auth(&app.token)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(credentials::PRINCIPAL_HEADER, principal.name())
-        .body(json!({"compute": {}, "context": {"operation": operation}}).to_string())
-        .send()
-        .await
-        .map_err(|_| ApiError::internal())?;
-    if !open.status().is_success() {
-        return response(open).await;
-    }
+    let body = json!({"compute": {}, "context": {"operation": operation}})
+        .to_string()
+        .into_bytes();
+    let (endpoint, open) = match app
+        .open_persistent(Resources::default(), body, principal.name())
+        .await?
+    {
+        OpenOutcome::Opened { endpoint, upstream } => (endpoint, upstream),
+        OpenOutcome::Refused(relay) => return Ok(relay),
+    };
     let session = open
         .json::<Value>()
         .await
@@ -690,26 +887,18 @@ impl crate::pgwire::Platform for PgPlatform {
     }
 
     async fn open_session(&self, principal: String) -> anyhow::Result<crate::pgwire::Session> {
-        let endpoint = self
+        let body = json!({"compute": {}, "context": {"operation": "pgwire"}})
+            .to_string()
+            .into_bytes();
+        let (endpoint, opened) = match self
             .0
-            .endpoint_for(Resources::default())
+            .open_persistent(Resources::default(), body, &principal)
             .await
-            .map_err(|refusal| anyhow::anyhow!("{}", refusal.1))?;
-        let opened = self
-            .0
-            .client
-            .request(Method::POST, format!("{endpoint}/v1/sessions"))
-            .bearer_auth(&self.0.token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(credentials::PRINCIPAL_HEADER, &principal)
-            .body(json!({"compute": {}, "context": {"operation": "pgwire"}}).to_string())
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("the worker did not answer"))?;
-        anyhow::ensure!(
-            opened.status().is_success(),
-            "the worker refused the session"
-        );
+            .map_err(|refusal| anyhow::anyhow!("{}", refusal.1))?
+        {
+            OpenOutcome::Opened { endpoint, upstream } => (endpoint, upstream),
+            OpenOutcome::Refused(_) => anyhow::bail!("the worker refused the session"),
+        };
         let session_id = opened
             .json::<Value>()
             .await
@@ -728,6 +917,11 @@ impl crate::pgwire::Platform for PgPlatform {
         sql: String,
     ) -> crate::pgwire::QueryOutcome {
         use crate::pgwire::QueryOutcome;
+        // Counted into the same in-flight tally the HTTP handlers use, so the
+        // gateway's drain waits for a pgwire statement already running. The pgwire
+        // listener sits outside the axum router that carries `track_inflight`, so
+        // without this a rollout would close under a live wire-protocol query.
+        let _inflight = InFlight::enter(&self.0.inflight);
         let sent = self
             .0
             .send(
@@ -814,7 +1008,7 @@ async fn lake_maintenance(
     Extension(principal): Extension<Principal>,
     Json(request): Json<MaintenanceRequest>,
 ) -> Result<Response, ApiError> {
-    admin_only(&principal)?;
+    admin_only(&principal, "run lake maintenance")?;
     if request.expire_older_than_days.is_none() && !request.compact && !request.cleanup {
         return Err(ApiError::bad(
             "ask for at least one of expire_older_than_days, compact, or cleanup",
@@ -856,14 +1050,16 @@ struct MintRequest {
     expires_seconds: Option<i64>,
 }
 
-/// Credential management is the bootstrap's alone. A named credential that could
-/// mint credentials could quietly become every principal at once.
-fn admin_only(principal: &Principal) -> Result<(), ApiError> {
+/// Operator-only actions. Credential management because a named credential that
+/// could mint could quietly become every principal at once; budget writes because a
+/// spend ceiling writable by the spenders it constrains is not a control; lake
+/// maintenance because expiry and cleanup destroy what they tidy.
+fn admin_only(principal: &Principal, what: &str) -> Result<(), ApiError> {
     match principal {
         Principal::Bootstrap => Ok(()),
         Principal::Named(_) => Err(ApiError::new(
             failure::FORBIDDEN,
-            "only the bootstrap credential manages credentials",
+            format!("only the bootstrap credential may {what}"),
         )),
     }
 }
@@ -875,7 +1071,7 @@ async fn mint_credential(
     Extension(principal): Extension<Principal>,
     Json(request): Json<MintRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    admin_only(&principal)?;
+    admin_only(&principal, "manage credentials")?;
     // Validated here so a bad request is the caller's 400, not a swallowed
     // internal error from the issuing transaction.
     if !credentials::valid_principal(&request.principal) {
@@ -904,7 +1100,7 @@ async fn list_credentials(
     State(app): State<Gateway>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Value>, ApiError> {
-    admin_only(&principal)?;
+    admin_only(&principal, "manage credentials")?;
     Ok(Json(app.authn.with_db(false, credentials::list).await?))
 }
 
@@ -913,7 +1109,7 @@ async fn revoke_credential(
     Extension(principal): Extension<Principal>,
     Path(credential_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    admin_only(&principal)?;
+    admin_only(&principal, "manage credentials")?;
     let revoked = app
         .authn
         .with_db(true, move |client| {
@@ -969,20 +1165,35 @@ async fn health(State(app): State<Gateway>) -> Response {
 
 async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
     async fn info(app: &Gateway, endpoint: &str) -> Result<Value, ApiError> {
-        app.send(endpoint, Method::GET, "/v1/worker", Bytes::new())
-            .await?
-            .error_for_status()
-            .map_err(|_| ApiError::internal())?
-            .json()
-            .await
-            .map_err(|_| ApiError::internal())
+        // The 5s bound discovery uses, not the client's 75s statement timeout: one
+        // hung worker must not hold this report for over a minute, let alone that
+        // per endpoint, which is what sequential un-timed probing did.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            app.send(endpoint, Method::GET, "/v1/worker", Bytes::new()),
+        )
+        .await
+        .map_err(|_| ApiError::internal())??
+        .error_for_status()
+        .map_err(|_| ApiError::internal())?
+        .json()
+        .await
+        .map_err(|_| ApiError::internal())
     }
     // Every configured worker must answer: this endpoint reports the fleet, and a
-    // silently short list would read as a deployment that is smaller than it is.
-    let mut reported = Vec::with_capacity(app.endpoints.len());
-    for endpoint in app.endpoints.iter() {
-        reported.push(info(&app, endpoint).await?);
+    // silently short list would read as a deployment that is smaller than it is. Asked
+    // concurrently so the report takes one slow worker's time, not the sum of all.
+    let mut probes = tokio::task::JoinSet::new();
+    for (index, endpoint) in app.endpoints.iter().cloned().enumerate() {
+        let app = app.clone();
+        probes.spawn(async move { (index, info(&app, &endpoint).await) });
     }
+    let mut ordered: Vec<Option<Value>> = vec![None; app.endpoints.len()];
+    while let Some(joined) = probes.join_next().await {
+        let (index, result) = joined.map_err(|_| ApiError::internal())?;
+        ordered[index] = Some(result?);
+    }
+    let reported: Vec<Value> = ordered.into_iter().flatten().collect();
     // Reported rather than left to be discovered by being refused. Whether this
     // deployment can create pods is a property of the deployment, and a caller
     // deciding whether to ask for isolation should not have to learn it from a 501.
@@ -1043,6 +1254,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         token,
         endpoints: Arc::new(worker_endpoints()?),
         fleet: Arc::new(Mutex::new(None)),
+        discovering: Arc::new(Mutex::new(())),
         routes: Arc::new(Mutex::new(HashMap::new())),
         capacity: Arc::new(Semaphore::new(64)),
         history: crate::history::Reader::new(std::env::var("PLATFORM_DSN")?),
@@ -1085,6 +1297,20 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
                     "settled reservations left by a gateway that is gone"
                 );
             }
+        }
+        // After the sweep, so every session-pod identity is provably dead. Tolerant
+        // for the same reason as the held read above: on a first boot the history
+        // table does not exist yet, and there is nothing to repair in it either.
+        match app
+            .usage
+            .reconcile_isolated_history(crate::isolated::PREFIX)
+            .await
+        {
+            Ok(0) | Err(_) => {}
+            Ok(repaired) => tracing::warn!(
+                repaired,
+                "marked interrupted the running records of session pods that are gone"
+            ),
         }
         tracing::info!("isolated compute is available");
     }
@@ -1188,11 +1414,114 @@ mod tests {
 
     #[test]
     fn only_the_bootstrap_may_manage_credentials() {
-        assert!(admin_only(&Principal::Bootstrap).is_ok());
-        let refused = admin_only(&Principal::Named("analyst".into())).unwrap_err();
+        assert!(admin_only(&Principal::Bootstrap, "manage credentials").is_ok());
+        let refused =
+            admin_only(&Principal::Named("analyst".into()), "set budget limits").unwrap_err();
         assert_eq!(refused.0.kind, "forbidden");
         assert!(!refused.0.retry_safe);
         assert_eq!(refused.0.http, StatusCode::FORBIDDEN);
+        // The refusal names the action, so a caller knows which lever was refused.
+        assert!(refused.1.contains("set budget limits"), "{}", refused.1);
+    }
+
+    #[test]
+    fn failover_is_earned_only_by_a_worker_condition_that_ran_nothing() {
+        // The three conditions that are about the worker, not the request.
+        for kind in ["capacity", "draining", "starting"] {
+            let refusal = json!({"failure_kind": kind, "retry_safe": true});
+            assert!(
+                failover_worthy(StatusCode::SERVICE_UNAVAILABLE, &refusal),
+                "{kind}"
+            );
+        }
+        // Retry-safe but about the deployment, not this worker: every sibling would
+        // refuse identically, so trying one is noise.
+        assert!(!failover_worthy(
+            StatusCode::PAYMENT_REQUIRED,
+            &json!({"failure_kind": "budget_exhausted", "retry_safe": true})
+        ));
+        // Not retry-safe, unclassified, and success are never failover grounds.
+        assert!(!failover_worthy(
+            StatusCode::BAD_REQUEST,
+            &json!({"failure_kind": "invalid_request", "retry_safe": false})
+        ));
+        assert!(!failover_worthy(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({})
+        ));
+        assert!(!failover_worthy(
+            StatusCode::OK,
+            &json!({"failure_kind": "capacity", "retry_safe": true})
+        ));
+    }
+
+    #[test]
+    fn same_size_workers_rank_least_loaded_first_and_other_sizes_never_appear() {
+        let small = Resources {
+            cpu: 1,
+            memory_bytes: 1024 * 1024 * 1024,
+            disk_bytes: 2 * 1024 * 1024 * 1024,
+        };
+        let workers = vec![
+            WorkerInfo {
+                endpoint: "http://worker-small:8080".into(),
+                cpu: 1,
+                memory_bytes: small.memory_bytes,
+            },
+            WorkerInfo {
+                endpoint: "http://worker-small-b:8080".into(),
+                cpu: 1,
+                memory_bytes: small.memory_bytes,
+            },
+            WorkerInfo {
+                endpoint: "http://worker-medium:8080".into(),
+                cpu: 2,
+                memory_bytes: 2 * small.memory_bytes,
+            },
+        ];
+        // Empty census: the configured order breaks the tie, so a one-worker-per-size
+        // deployment routes exactly as it always has.
+        let ranked = ranked_endpoints(&workers, small, &HashMap::new());
+        assert_eq!(
+            ranked,
+            ["http://worker-small:8080", "http://worker-small-b:8080"]
+        );
+        // Three sessions on the first worker, one on the second: the sibling leads.
+        let census = HashMap::from([
+            ("http://worker-small:8080".to_owned(), 3),
+            ("http://worker-small-b:8080".to_owned(), 1),
+        ]);
+        let ranked = ranked_endpoints(&workers, small, &census);
+        assert_eq!(
+            ranked,
+            ["http://worker-small-b:8080", "http://worker-small:8080"]
+        );
+        // A size nobody provides ranks nobody.
+        assert!(
+            ranked_endpoints(
+                &workers,
+                Resources {
+                    cpu: 4,
+                    memory_bytes: 8 * small.memory_bytes,
+                    disk_bytes: small.disk_bytes,
+                },
+                &census
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_session_answers_only_to_its_owner_and_the_bootstrap() {
+        let owner = Principal::Named("analyst".into());
+        let intruder = Principal::Named("intruder".into());
+        assert!(owner.may_act_on("analyst"));
+        assert!(!intruder.may_act_on("analyst"));
+        // The operator can cancel or close anyone's runaway session.
+        assert!(Principal::Bootstrap.may_act_on("analyst"));
+        // And nobody impersonates the bootstrap by name: minting refuses the name,
+        // so a route owned by it can only have been opened with the real token.
+        assert!(!owner.may_act_on(credentials::BOOTSTRAP_PRINCIPAL));
     }
 
     #[test]

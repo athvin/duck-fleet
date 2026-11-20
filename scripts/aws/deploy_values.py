@@ -9,7 +9,7 @@ which has the admin access to read them, records them in a ConfigMap here that t
 deploy can read. That is where the flip the ownership boundary unblocks (#39)
 comes from, merged over the image digests already in values.json: isolated compute
 on with those CIDRs and ports, the workers pinned to the DuckFleet node pool with
-the toleration its taint needs, and the medium worker at its full two CPUs.
+the toleration its taint needs.
 
 Until the boundary is (re-)applied the ConfigMap is absent, in which case isolated
 compute stays off and the deploy renders exactly as it did before — the flip waits
@@ -80,10 +80,6 @@ def overlay(cidrs, ports):
             "value": "true",
             "effect": "NoSchedule",
         }],
-        # The shared-pool shim requested one CPU so a 2-CPU pod would fit a 2-vCPU
-        # node; on the dedicated pool the medium worker requests the two it is sized
-        # for, matching its limit.
-        "workerCpuRequests": {"medium": 2},
     }
 
 
@@ -101,7 +97,7 @@ def main():
     values.update(overlay(cidrs, ports))
     path.write_text(json.dumps(values, indent=2) + "\n")
     print(f"deploy values: isolated compute on, API egress to {sorted(cidrs)} "
-          f"ports {sorted(ports)}, workers pinned to the duckfleet pool at a full 2-CPU request")
+          f"ports {sorted(ports)}, workers pinned to the duckfleet pool")
 
 
 if __name__ == "__main__":
