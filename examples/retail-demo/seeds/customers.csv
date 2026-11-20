@@ -1,0 +1,8 @@
+customer_id,name,region,tier
+10,Acme Corp,US,enterprise
+11,Globex,US,mid
+12,Initech,US,smb
+20,Umbrella,EU,enterprise
+21,Soylent,EU,mid
+30,Hooli,APAC,enterprise
+31,Pied Piper,APAC,smb

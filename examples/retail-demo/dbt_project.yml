@@ -1,0 +1,42 @@
+name: retail_demo
+version: '1.0.0'
+config-version: 2
+profile: duckfleet
+model-paths: [models]
+seed-paths: [seeds]
+test-paths: [tests]
+target-path: target
+# Placement must work even when dbt's query comments are off, exactly as the
+# platform's own harness runs.
+query-comment: null
+
+# Every model defaults to the small persistent class (1 CPU / 1Gi). The two heavier
+# marts below override to the medium class (2 CPU / 2Gi) through meta.platform — that
+# per-model override is the point of the demo, and the gateway routes each model to a
+# worker reporting exactly those resources.
+models:
+  retail_demo:
+    +meta:
+      platform:
+        compute: persistent
+        cpu: 1
+        memory: 1Gi
+        tags:
+          team: retail
+
+seeds:
+  retail_demo:
+    customers:
+      +column_types:
+        customer_id: bigint
+        name: varchar
+        region: varchar
+        tier: varchar
+    orders:
+      +column_types:
+        order_id: bigint
+        customer_id: bigint
+        product: varchar
+        amount: decimal(18,2)
+        status: varchar
+        ordered_at: timestamp

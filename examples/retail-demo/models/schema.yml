@@ -1,0 +1,33 @@
+version: 2
+models:
+  - name: stg_customers
+    columns:
+      - name: customer_id
+        data_tests: [not_null, unique]
+  - name: stg_orders
+    columns:
+      - name: order_id
+        data_tests: [not_null, unique]
+  - name: fct_orders
+    columns:
+      - name: order_id
+        data_tests: [not_null, unique]
+      - name: customer_id
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('stg_customers')
+                field: customer_id
+  - name: customer_ltv
+    columns:
+      - name: customer_id
+        data_tests: [not_null, unique]
+  - name: revenue_by_region
+    columns:
+      - name: region
+        data_tests:
+          - not_null
+          - unique
+          - accepted_values:
+              arguments:
+                values: ['US', 'EU', 'APAC']
