@@ -33,7 +33,7 @@ def main():
     args = parser.parse_args()
 
     fleet = json.loads(call(args.port, args.token, "GET", "/v1/workers"))
-    assert {w["worker_id"] for w in fleet["workers"]} == {"small", "medium"}, fleet
+    assert {w["worker_id"] for w in fleet["workers"]} == {"small"}, fleet
     minted = json.loads(call(args.port, args.token, "POST", "/v1/credentials",
                              {"principal": "team-b-analyst"}))
     call(args.port, args.token, "DELETE", "/v1/credentials/" + minted["credential_id"])

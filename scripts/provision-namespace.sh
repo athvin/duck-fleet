@@ -44,7 +44,7 @@ helm template duckfleet infra/helm/duckfleet --namespace "$ns" \
   | sh -c "$transform" \
   | "${kube[@]}" apply -f -
 for workload in statefulset/duckfleet-postgres deployment/worker-small \
-                deployment/worker-medium deployment/server; do
+                deployment/server; do
   "${kube[@]}" rollout status "$workload" --timeout=420s
 done
 echo "provisioned $ns: its own boundary, catalog, credentials, and lake prefix $ns/lake"

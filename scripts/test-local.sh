@@ -31,8 +31,8 @@ if docker compose run --rm --no-deps -T -e DUCKFLEET_WORKER_CPU=4 \
   exit 1
 fi
 grep -q 'do not match the configured' artifacts/worker-misconfigured.log
-grep -q 'cpu: 1' artifacts/worker-misconfigured.log
-grep -q 'cpu: 4' artifacts/worker-misconfigured.log
+grep -q 'cpu=1' artifacts/worker-misconfigured.log
+grep -q 'cpu=4' artifacts/worker-misconfigured.log
 grep -q 'attaching the DuckLake catalog' artifacts/worker-boot-failure.log
 grep -q 'still unreachable' artifacts/worker-boot-failure.log
 grep -q 'catalog-does-not-resolve' artifacts/worker-boot-failure.log

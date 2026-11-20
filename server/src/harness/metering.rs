@@ -8,13 +8,6 @@ use serde_json::{Value, json};
 use super::{Ctx, request_json, require, rows_eq, sql};
 use crate::client::Client;
 
-fn small() -> Value {
-    json!({"cpu": 1, "memory": "1Gi"})
-}
-fn medium() -> Value {
-    json!({"cpu": 2, "memory": "2Gi"})
-}
-
 async fn budget(client: &Client) -> anyhow::Result<Value> {
     Ok(request_json(client, Method::GET, "/v1/budget", None).await?)
 }
@@ -46,7 +39,7 @@ async fn history_for(client: &Client, query_id: &str) -> anyhow::Result<Value> {
 
 async fn one_statement_is_metered_once(ctx: &Ctx, client: &Client) -> anyhow::Result<()> {
     let position = budget(client).await?;
-    let mut connection = ctx.open_named("metering", Some(medium())).await?;
+    let mut connection = ctx.open_named("metering", None).await?;
     let (query_id, _) = connection
         .execute_tracked("select sum(i) from range(200000) t(i)", Vec::new())
         .await?;
@@ -64,8 +57,8 @@ async fn one_statement_is_metered_once(ctx: &Ctx, client: &Client) -> anyhow::Re
         format!("{}", record["status"]),
     )?;
     require(event["meter_name"] == json!("compute"), format!("{event}"))?;
-    require(event["worker_id"] == json!("medium"), format!("{event}"))?;
-    require(event["resource_units"] == json!(2), format!("{event}"))?;
+    require(event["worker_id"] == json!("small"), format!("{event}"))?;
+    require(event["resource_units"] == json!(1), format!("{event}"))?;
     require(
         event["quantity"] == record["elapsed_ms"],
         format!("{event}"),
@@ -88,7 +81,7 @@ async fn one_statement_is_metered_once(ctx: &Ctx, client: &Client) -> anyhow::Re
 
 async fn an_exhausted_balance_refuses_admission(ctx: &Ctx, client: &Client) -> anyhow::Result<()> {
     let position = budget(client).await?;
-    let mut connection = ctx.open_named("metering-exhausted", Some(small())).await?;
+    let mut connection = ctx.open_named("metering-exhausted", None).await?;
     set_budget(client, json!({"prepaid_micro_usd": 0})).await?;
     let exhausted = budget(client).await?;
     require(

@@ -22,9 +22,9 @@ workers = [p for p in pods
            if p['metadata'].get('labels', {}).get('app') == 'duckfleet-worker'
            and 'duckfleet-compute' not in p['metadata'].get('labels', {})
            and not p['metadata'].get('deletionTimestamp')]
-assert len(workers) == 2, 'Expected exactly two persistent worker pods'
-assert {p['metadata']['labels']['size'] for p in workers} == {'small', 'medium'}
-assert {w['worker_id'] for w in evidence['workers']} == {'small', 'medium'}
+assert len(workers) == 1, 'Expected exactly one persistent worker pod'
+assert {p['metadata']['labels']['size'] for p in workers} == {'small'}
+assert {w['worker_id'] for w in evidence['workers']} == {'small'}
 for pod in workers:
     current = next(p for p in after if p['metadata']['uid'] == pod['metadata']['uid'])
     assert not current['metadata'].get('deletionTimestamp'), 'Worker was replaced during the test'

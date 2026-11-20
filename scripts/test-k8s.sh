@@ -122,7 +122,7 @@ render --no-hooks \
 "${KUBE[@]}" rollout status statefulset/duckfleet-postgres --timeout=300s
 # Workers come up alongside PostgreSQL rather than after it, so reaching ready here
 # also exercises the catalog wait: without it they would exit and crash-loop.
-for deployment in worker-small worker-medium server; do
+for deployment in worker-small server; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
 
@@ -156,7 +156,7 @@ harness() { # harness <job-name> <command> [timeout]
 
 harness duckfleet-harness 'duckfleet-server'
 grep -q 'PASS: protocol checks and dbt lifecycle' artifacts/kind/duckfleet-harness.log
-grep -q 'PASS: model config selected small and medium workers' artifacts/kind/duckfleet-harness.log
+grep -q 'PASS: resource/sizing routing refuses what it cannot serve' artifacts/kind/duckfleet-harness.log
 
 # On-demand compute. The harness asserts what the API reports; these assert the
 # cluster facts it cannot see, which is the half that matters for a leak.
@@ -320,7 +320,7 @@ echo "deleting worker-$victim while it is executing"
 "${KUBE[@]}" delete pod -l "app=duckfleet-worker,size=$victim" --wait=false
 wait "$evicted"
 grep -q 'PASS: a statement whose worker was deleted mid-run' artifacts/kind/duckfleet-evicted.log
-for deployment in worker-small worker-medium; do
+for deployment in worker-small; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
 
@@ -349,7 +349,7 @@ echo "killing worker-$victim outright while it is executing"
 "${KUBE[@]}" delete pod -l "app=duckfleet-worker,size=$victim" --grace-period=0 --force --wait=false
 wait "$evicted_hard"
 grep -q 'PASS: a statement whose worker was deleted mid-run' artifacts/kind/duckfleet-evicted-hard.log
-for deployment in worker-small worker-medium; do
+for deployment in worker-small; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
 
@@ -406,7 +406,7 @@ echo 'PASS: the kube backup produced restorable archives for both databases'
 # the catalog rather than from anything the old pod held.
 "${KUBE[@]}" delete pod -l app=duckfleet-worker
 "${KUBE[@]}" delete pod -l app=duckfleet-gateway
-for deployment in worker-small worker-medium server; do
+for deployment in worker-small server; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
 harness duckfleet-harness-replaced 'duckfleet-server --after-restart' 600
@@ -439,10 +439,10 @@ render --no-hooks \
 # apply does not prune, so the bundled instance is removed by name — exactly what
 # an operator migrating to an external catalog does after restoring into it.
 "${KUBE[@]}" delete statefulset/duckfleet-postgres service/postgres configmap/duckfleet-postgres-init
-for deployment in worker-small worker-medium server; do
+for deployment in worker-small server; do
   "${KUBE[@]}" rollout restart "deployment/$deployment"
 done
-for deployment in worker-small worker-medium server; do
+for deployment in worker-small server; do
   "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
 done
 # Two probes against the fresh external catalog: overlapping DuckLake writes from

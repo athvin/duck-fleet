@@ -405,21 +405,32 @@ async fn resource_checks(connection: &RemoteConnection) -> anyhow::Result<()> {
             format!("{compute}: {refused}"),
         )?;
     }
-    // A well-formed size nothing runs must be refused explicitly, never downgraded.
-    let absent = expect_status(
-        request_json(
-            client,
-            Method::POST,
-            "/v1/sessions",
-            Some(&json!({"compute": {"cpu": 32, "memory": "128Gi"}})),
-        )
-        .await,
-        503,
-    )?;
-    require(
-        absent.message.contains("cpu=32") || absent.message.contains("128Gi"),
-        format!("{absent}"),
-    )?;
+    // A well-formed size the fleet cannot serve must be refused explicitly, never
+    // downgraded to the persistent tier. Where isolation exists (Kubernetes) an
+    // impossibly large size is a placement refusal that names the size; where it does
+    // not (Compose) every named size is refused as unavailable — the same contract
+    // routing_contract_checks states, asserted here on the default lifecycle path.
+    let available = workers["isolated_compute"].as_bool().unwrap_or(false);
+    let big = json!({"compute": {"cpu": 32, "memory": "128Gi"}});
+    if available {
+        let absent = expect_status(
+            request_json(client, Method::POST, "/v1/sessions", Some(&big)).await,
+            503,
+        )?;
+        require(
+            absent.message.contains("cpu=32") || absent.message.contains("128Gi"),
+            format!("{absent}"),
+        )?;
+    } else {
+        let absent = expect_status(
+            request_json(client, Method::POST, "/v1/sessions", Some(&big)).await,
+            501,
+        )?;
+        require(
+            absent.failure_kind.as_deref() == Some("compute_unavailable"),
+            format!("{absent}"),
+        )?;
+    }
     println!("PASS: resource/sizing routing refuses what it cannot serve");
     Ok(())
 }
@@ -586,7 +597,7 @@ async fn drain_inflight(ctx: &Ctx, marker_name: &str, drained: &str) -> anyhow::
     let marker = format!("{ARTIFACTS}/{marker_name}");
     let _ = std::fs::remove_file(&marker);
     let connection = ctx
-        .open_named("harness-drain", Some(json!({"cpu": 1, "memory": "1Gi"})))
+        .open_named("harness-drain", None)
         .await?;
     let client = connection.client().clone();
     let path = connection.path();
@@ -630,7 +641,7 @@ async fn drain_inflight(ctx: &Ctx, marker_name: &str, drained: &str) -> anyhow::
 
 async fn gateway_replaced(ctx: &Ctx) -> anyhow::Result<()> {
     let mut setup = ctx
-        .open_named("harness-gwr", Some(json!({"cpu": 1, "memory": "1Gi"})))
+        .open_named("harness-gwr", None)
         .await?;
     sql(&setup, "create schema if not exists api_demo").await?;
     sql(
@@ -641,7 +652,7 @@ async fn gateway_replaced(ctx: &Ctx) -> anyhow::Result<()> {
     setup.close().await?;
 
     let connection = ctx
-        .open_named("harness-gwr2", Some(json!({"cpu": 1, "memory": "1Gi"})))
+        .open_named("harness-gwr2", None)
         .await?;
     let client = connection.client().clone();
     let path = connection.path();
@@ -677,7 +688,7 @@ async fn gateway_replaced(ctx: &Ctx) -> anyhow::Result<()> {
     println!("PASS: the in-flight request failed classified, not as a raw socket error");
 
     let reopened = ctx
-        .open_named("harness-gwr3", Some(json!({"cpu": 1, "memory": "1Gi"})))
+        .open_named("harness-gwr3", None)
         .await?;
     // The lost session refuses further use with guidance.
     let lost = match connection.execute("select 1", Vec::new()).await {
@@ -722,7 +733,7 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
         "api_demo.evicted"
     };
     let mut setup = ctx
-        .open_named("harness-evict", Some(json!({"cpu": 1, "memory": "1Gi"})))
+        .open_named("harness-evict", None)
         .await?;
     sql(&setup, "create schema if not exists api_demo").await?;
     sql(
@@ -733,7 +744,7 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
     setup.close().await?;
 
     let connection = ctx
-        .open_named("harness-evict2", Some(json!({"cpu": 1, "memory": "1Gi"})))
+        .open_named("harness-evict2", None)
         .await?;
     let client = connection.client().clone();
     let path = connection.path();
@@ -765,7 +776,7 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
         )?;
     }
     let reader = ctx
-        .open_named("harness-evict3", Some(json!({"cpu": 1, "memory": "1Gi"})))
+        .open_named("harness-evict3", None)
         .await?;
     let rows = sql(&reader, &format!("select count(*) from {table}")).await?;
     let count = rows

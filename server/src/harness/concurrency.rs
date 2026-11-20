@@ -2,17 +2,8 @@
 //! Statements serialize inside a worker, so overlapping transactions are built by
 //! interleaving requests across two sessions rather than racing threads.
 
-use serde_json::{Value, json};
-
 use super::{Ctx, require, rows_eq, sql};
 use crate::client::{RemoteConnection, RemoteError};
-
-fn small() -> Value {
-    json!({"cpu": 1, "memory": "1Gi"})
-}
-fn medium() -> Value {
-    json!({"cpu": 2, "memory": "2Gi"})
-}
 
 /// Asserts a statement lost a commit race and said so usefully.
 async fn expect_conflict(
@@ -41,7 +32,7 @@ async fn expect_conflict(
 }
 
 async fn reset(ctx: &Ctx, rows: Option<&str>) -> anyhow::Result<()> {
-    let mut connection = ctx.open_named("concurrency-admin", Some(small())).await?;
+    let mut connection = ctx.open_named("concurrency-admin", None).await?;
     sql(&connection, "create schema if not exists concurrency").await?;
     sql(&connection, "drop table if exists concurrency.target").await?;
     sql(
@@ -61,7 +52,7 @@ async fn reset(ctx: &Ctx, rows: Option<&str>) -> anyhow::Result<()> {
 }
 
 async fn read_target(ctx: &Ctx) -> anyhow::Result<Vec<Vec<Option<String>>>> {
-    let mut connection = ctx.open_named("concurrency-admin", Some(small())).await?;
+    let mut connection = ctx.open_named("concurrency-admin", None).await?;
     let rows = sql(
         &connection,
         "select id,amount from concurrency.target order by id",
@@ -73,8 +64,8 @@ async fn read_target(ctx: &Ctx) -> anyhow::Result<Vec<Vec<Option<String>>>> {
 
 async fn appends_never_conflict(ctx: &Ctx) -> anyhow::Result<()> {
     reset(ctx, None).await?;
-    let mut first = ctx.open_named("append-first", Some(small())).await?;
-    let mut second = ctx.open_named("append-second", Some(medium())).await?;
+    let mut first = ctx.open_named("append-first", None).await?;
+    let mut second = ctx.open_named("append-second", None).await?;
     sql(&first, "begin").await?;
     sql(&second, "begin").await?;
     sql(&first, "insert into concurrency.target values (1,10)").await?;
@@ -94,8 +85,8 @@ async fn appends_never_conflict(ctx: &Ctx) -> anyhow::Result<()> {
 
 async fn delete_insert_conflicts_atomically(ctx: &Ctx) -> anyhow::Result<()> {
     reset(ctx, Some("(1,10),(2,20),(3,30)")).await?;
-    let mut first = ctx.open_named("di-first", Some(small())).await?;
-    let mut second = ctx.open_named("di-second", Some(medium())).await?;
+    let mut first = ctx.open_named("di-first", None).await?;
+    let mut second = ctx.open_named("di-second", None).await?;
     sql(&first, "begin").await?;
     sql(&second, "begin").await?;
     sql(&first, "delete from concurrency.target where id = 1").await?;
@@ -120,7 +111,7 @@ async fn delete_insert_conflicts_atomically(ctx: &Ctx) -> anyhow::Result<()> {
 }
 
 async fn ordinary_sql_errors_stay_unsafe(ctx: &Ctx) -> anyhow::Result<()> {
-    let mut connection = ctx.open_named("concurrency-admin", Some(small())).await?;
+    let mut connection = ctx.open_named("concurrency-admin", None).await?;
     for (statement, kind) in [
         ("select * from concurrency.does_not_exist", "sql_error"),
         ("select missing_column", "sql_error"),
@@ -152,7 +143,7 @@ pub(super) async fn checks(ctx: &Ctx) -> anyhow::Result<()> {
     appends_never_conflict(ctx).await?;
     delete_insert_conflicts_atomically(ctx).await?;
     ordinary_sql_errors_stay_unsafe(ctx).await?;
-    let mut connection = ctx.open_named("concurrency-admin", Some(small())).await?;
+    let mut connection = ctx.open_named("concurrency-admin", None).await?;
     sql(&connection, "drop table if exists concurrency.target").await?;
     connection.close().await?;
     println!("PASS: concurrent-write cases match the documented DuckLake semantics");
