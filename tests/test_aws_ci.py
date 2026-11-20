@@ -768,10 +768,14 @@ class OwnershipBoundaryTests(unittest.TestCase):
         self.assertNotIn('can-i create roles', deploy)
         self.assertNotIn('exec deployment/server', deploy)
         self.assertNotIn('Bearer $DUCKFLEET_TOKEN', deploy)
-        # The AWS harness, which runs in-cluster, asserts the feature is live.
-        aws_harness = (ROOT/'tests/aws_harness.py').read_text()
-        self.assertIn('isolated_compute', aws_harness)
+        # The AWS harness, which runs in-cluster as the `harness` role of the Rust
+        # server binary, asserts the feature is live: its entrypoint drives the
+        # cold-start (isolated) path, and the shared harness inspects the gateway's
+        # isolated_compute flag rather than the deploy doing it from outside.
+        aws_harness = (ROOT/'server/src/harness/aws_harness.rs').read_text()
         self.assertIn('cold_start_checks', aws_harness)
+        harness = (ROOT/'server/src/harness.rs').read_text()
+        self.assertIn('isolated_compute', harness)
 
     def test_the_boundary_is_applied_by_an_operator_and_never_by_ci(self):
         script = (ROOT/'scripts/aws/apply-boundary.sh').read_text()

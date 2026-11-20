@@ -1,10 +1,10 @@
 """Checks each worker's cgroup against its pod spec, from inside the container.
 
 The load-bearing property is that a worker's cgroup CPU quota comes from its
-CPU **limit**, which the chart always sets to the exact class size. The worker
-asserts this for itself at startup; this re-checks it from outside against the
-live cgroup, which Compose cannot do: it has no request/limit distinction, so a
-regression here would only ever surface on Kubernetes.
+CPU **limit**, not its request. The chart sets the limit to the exact class size;
+localize.py then lowers the request below it so this local node can seat the pod,
+and the cgroup still reports the full limit — which is the rule. Compose cannot
+test this at all: it has no request/limit distinction.
 
 Emits one JSON record per worker as evidence, matching the Compose harness.
 """
@@ -74,16 +74,16 @@ def main():
         check(quota == period * cpu, f"cpu.max {quota}/{period} is not {cpu} CPU")
         check(memory_max == cpu * GIB, f"memory.max {memory_max} is not {cpu}GiB")
         check(limit == cpu, f"CPU limit {limit} is not the class size {cpu}")
-        # The persistent tier runs request == limit, so the cgroup reporting the
-        # class size is the same statement as the limit driving the cgroup.
-        check(request == limit, f"CPU request {request} must equal the limit {limit}")
+        # This is the point of running in Kubernetes at all: localize.py lowers the
+        # request below the limit here, and the cgroup above still reports the limit.
+        check(request < limit, f"CPU request {request} must be below the limit to prove the rule")
         check(0 < request, f"CPU request {request} must be positive")
 
     if failures:
         print("\n".join(failures), file=sys.stderr)
         return 1
     print(
-        "PASS: worker cgroups match their configured CPU limits",
+        "PASS: worker cgroups match their CPU limits while requests sit lower",
         file=sys.stderr,
     )
     return 0

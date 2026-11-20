@@ -596,9 +596,7 @@ async fn dbt_isolated_checks(ctx: &Ctx) -> anyhow::Result<()> {
 async fn drain_inflight(ctx: &Ctx, marker_name: &str, drained: &str) -> anyhow::Result<()> {
     let marker = format!("{ARTIFACTS}/{marker_name}");
     let _ = std::fs::remove_file(&marker);
-    let connection = ctx
-        .open_named("harness-drain", None)
-        .await?;
+    let connection = ctx.open_named("harness-drain", None).await?;
     let client = connection.client().clone();
     let path = connection.path();
     let handle = tokio::spawn(async move {
@@ -640,9 +638,7 @@ async fn drain_inflight(ctx: &Ctx, marker_name: &str, drained: &str) -> anyhow::
 }
 
 async fn gateway_replaced(ctx: &Ctx) -> anyhow::Result<()> {
-    let mut setup = ctx
-        .open_named("harness-gwr", None)
-        .await?;
+    let mut setup = ctx.open_named("harness-gwr", None).await?;
     sql(&setup, "create schema if not exists api_demo").await?;
     sql(
         &setup,
@@ -651,9 +647,7 @@ async fn gateway_replaced(ctx: &Ctx) -> anyhow::Result<()> {
     .await?;
     setup.close().await?;
 
-    let connection = ctx
-        .open_named("harness-gwr2", None)
-        .await?;
+    let connection = ctx.open_named("harness-gwr2", None).await?;
     let client = connection.client().clone();
     let path = connection.path();
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -687,9 +681,7 @@ async fn gateway_replaced(ctx: &Ctx) -> anyhow::Result<()> {
     )?;
     println!("PASS: the in-flight request failed classified, not as a raw socket error");
 
-    let reopened = ctx
-        .open_named("harness-gwr3", None)
-        .await?;
+    let reopened = ctx.open_named("harness-gwr3", None).await?;
     // The lost session refuses further use with guidance.
     let lost = match connection.execute("select 1", Vec::new()).await {
         Ok(_) => anyhow::bail!("a session route survived a gateway replacement"),
@@ -732,9 +724,7 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
     } else {
         "api_demo.evicted"
     };
-    let mut setup = ctx
-        .open_named("harness-evict", None)
-        .await?;
+    let mut setup = ctx.open_named("harness-evict", None).await?;
     sql(&setup, "create schema if not exists api_demo").await?;
     sql(
         &setup,
@@ -743,9 +733,7 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
     .await?;
     setup.close().await?;
 
-    let connection = ctx
-        .open_named("harness-evict2", None)
-        .await?;
+    let connection = ctx.open_named("harness-evict2", None).await?;
     let client = connection.client().clone();
     let path = connection.path();
     let sql_text =
@@ -775,9 +763,7 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
             "the statement completed despite an immediate kill",
         )?;
     }
-    let reader = ctx
-        .open_named("harness-evict3", None)
-        .await?;
+    let reader = ctx.open_named("harness-evict3", None).await?;
     let rows = sql(&reader, &format!("select count(*) from {table}")).await?;
     let count = rows
         .first()
