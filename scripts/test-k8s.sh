@@ -449,7 +449,7 @@ done
 # both workers — commit races resolved through the catalog under test — and the
 # credential matrix, which exercises the platform database's whole surface.
 harness duckfleet-external 'duckfleet-server --concurrency' 600
-grep -q 'PASS: .* concurrent-write cases match the documented DuckLake semantics' \
+grep -q 'PASS: concurrent-write cases match the documented DuckLake semantics' \
   artifacts/kind/duckfleet-external.log
 harness duckfleet-external-credentials 'duckfleet-server --credentials' 600
 grep -q 'PASS: credentials are issued' artifacts/kind/duckfleet-external-credentials.log
