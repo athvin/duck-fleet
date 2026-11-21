@@ -1,0 +1,52 @@
+name: DuckDB engine qualification
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Baseline Git commit or ref
+        required: true
+        default: d30084c
+      candidate_ref:
+        description: Candidate Git commit or ref
+        required: true
+        default: HEAD
+      baseline_version:
+        required: true
+        default: v1.5.4
+      candidate_version:
+        required: true
+        default: v2.0.1
+permissions:
+  contents: read
+concurrency:
+  group: engine-qualification-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Build and compare isolated engine lanes
+        run: >-
+          python3 scripts/qualify-engine.py
+          --baseline-ref '${{ inputs.baseline_ref }}'
+          --candidate-ref '${{ inputs.candidate_ref }}'
+          --baseline-version '${{ inputs.baseline_version }}'
+          --candidate-version '${{ inputs.candidate_version }}'
+          --output artifacts/engine-upgrade/qualification
+      - name: Save qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: duckdb-engine-qualification-${{ github.run_id }}
+          path: artifacts/engine-upgrade/qualification/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Remove qualification projects
+        if: always()
+        run: >-
+          docker compose --project-name duckfleet-qualification-baseline down --volumes --remove-orphans;
+          docker compose --project-name duckfleet-qualification-candidate down --volumes --remove-orphans

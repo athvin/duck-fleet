@@ -71,7 +71,7 @@ services:
   # Explicit schema changes run once before compute, without DuckDB, S3, or a token.
   # After restoring/resetting platform, rerun: scripts/migrate-platform.sh compose
   platform-migrate:
-    image: duckfleet-worker:local
+    image: duckfleet-worker:${DUCKFLEET_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: docker/server.Dockerfile
@@ -98,7 +98,7 @@ services:
   worker-small:
     labels:
       duckfleet.io/platform-schema: "5"
-    image: duckfleet-worker:local
+    image: duckfleet-worker:${DUCKFLEET_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: docker/server.Dockerfile
@@ -148,7 +148,7 @@ services:
     labels:
       duckfleet.io/platform-schema: "5"
     profiles: [scale-out]
-    image: duckfleet-worker:local
+    image: duckfleet-worker:${DUCKFLEET_IMAGE_TAG:-local}
     environment:
       <<: *worker-environment
       DUCKFLEET_WORKER_ID: small-b
@@ -163,7 +163,7 @@ services:
   server:
     labels:
       duckfleet.io/platform-schema: "5"
-    image: duckfleet-worker:local
+    image: duckfleet-worker:${DUCKFLEET_IMAGE_TAG:-local}
     environment:
       <<: *result-environment
       DUCKFLEET_ROLE: gateway
@@ -205,7 +205,7 @@ services:
     labels:
       duckfleet.io/platform-schema: "5"
     profiles: [pools]
-    image: duckfleet-worker:local
+    image: duckfleet-worker:${DUCKFLEET_IMAGE_TAG:-local}
     environment:
       <<: *worker-environment
       DUCKFLEET_WORKER_ID: pool-interactive-0
@@ -227,7 +227,7 @@ services:
     labels:
       duckfleet.io/platform-schema: "5"
     profiles: [pools]
-    image: duckfleet-worker:local
+    image: duckfleet-worker:${DUCKFLEET_IMAGE_TAG:-local}
     environment:
       <<: *result-environment
       DUCKFLEET_ROLE: gateway
@@ -264,6 +264,7 @@ services:
 
   dbt:
     profiles: [test]
+    image: duckfleet-dbt:${DUCKFLEET_DBT_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: docker/dbt.Dockerfile
@@ -279,7 +280,7 @@ services:
       DUCKFLEET_MAINTAINER_TEST_DSN: host=postgres port=5432 dbname=platform user=duckfleet_maintainer password=local-platform-maintainer-password
       DUCKFLEET_CATALOG_TEST_DSN: host=postgres port=5432 dbname=lake user=duckfleet_catalog password=local-lake-catalog-password
     volumes:
-      - ./artifacts:/artifacts
+      - ${DUCKFLEET_ARTIFACTS_DIRECTORY:-./artifacts}:/artifacts
     depends_on:
       server:
         condition: service_healthy
@@ -289,6 +290,7 @@ services:
   # being demonstrated and it cannot be demonstrated from an image that has it.
   api:
     profiles: [test]
+    image: duckfleet-api:${DUCKFLEET_API_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: docker/cli.Dockerfile
@@ -296,7 +298,7 @@ services:
       DUCKFLEET_URL: http://server:8080
       DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
     volumes:
-      - ./artifacts:/artifacts
+      - ${DUCKFLEET_ARTIFACTS_DIRECTORY:-./artifacts}:/artifacts
     depends_on:
       server:
         condition: service_healthy

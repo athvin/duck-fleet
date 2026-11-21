@@ -544,7 +544,7 @@ impl Worker {
                 resources.spill_limit(),
             ),
         )?;
-        startup.run("loading extensions", " SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; LOAD httpfs; LOAD postgres; LOAD ducklake;")?;
+        startup.run("loading extensions", " SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; SET allow_extension_repositories='forbidden'; LOAD icu; LOAD httpfs; LOAD postgres; LOAD ducklake;")?;
         match std::env::var("S3_AUTH_MODE").as_deref().unwrap_or("local") {
             "local" => startup.run("creating the object store secret", &format!(
                 "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');",
@@ -2218,11 +2218,15 @@ DETAIL: Key (typname, typnamespace)=(ducklake_metadata, 2200) already exists."#;
         let captured = profile.capture(cleared);
         assert_eq!(captured.status, "captured");
         let value: Value = serde_json::from_str(captured.profile.as_deref().unwrap())?;
-        assert_eq!(value["query_name"], "SELECT sum(i) FROM range(100) t(i)");
+        assert_eq!(
+            value["query"]["sql"], "SELECT sum(i) FROM range(100) t(i)",
+            "{value}"
+        );
         let cleared = profile.clear();
         assert!(execute(&conn, "SELECT * FROM missing_profile_table", vec![]).is_err());
         let failed = profile.capture(cleared);
-        assert!(failed.profile.is_none());
+        assert_eq!(failed.status, "captured");
+        assert!(failed.profile.is_some());
         let other = Connection::open_in_memory()?;
         let disabled = crate::profiling::Profile::new(Uuid::new_v4(), false, &other)?;
         execute(&other, "SELECT 1", vec![])?;
