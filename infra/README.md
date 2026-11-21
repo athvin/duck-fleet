@@ -67,10 +67,41 @@ DUCKFLEET_KUBE_CONTEXT=$DUCKFLEET_KUBE_CONTEXT DUCKFLEET_NAMESPACE=duckfleet-dev
 
 Dumps both databases as custom-format archives. Restore with
 `scripts/restore-catalog.sh kube` into a freshly initialised PostgreSQL, with
-compute suspended around it; the README's "Backup and restore" section states the
+compute stopped around it; the README's "Backup and restore" section states the
 recovery-point semantics, which the Compose harness proves on every run. How often
 this runs, and how many directories are kept, is the operator's policy — nothing
 schedules it automatically.
+
+## Platform schema and maintenance
+
+The release runs a PostgreSQL-only migration Job before compute can become ready.
+Workers validate the schema and recover their own exclusive identities; global
+retention and budget reconciliation run through the existing gateway. See the
+root README's "Platform migrations and maintenance" section for their bounds,
+manual commands and operational tables. This is separate from DuckLake data
+compaction and snapshot expiry below.
+
+`platformMigration.runId` changes the migration Job identity independently of the
+image digest. Deploy and namespace-provisioning helpers supply a fresh run ID.
+After restoring or retargeting `PLATFORM_DSN`, explicitly rerun migration with
+`scripts/migrate-platform.sh kube` or a new run ID before restarting compute.
+The migration uses the `duckfleet-no-aws` service account, has no mounted API token,
+and receives no object-store credentials. Failed Jobs prevent rollout success;
+inspect their logs to diagnose the schema or database problem.
+
+For this recovery flow, stop compute by scaling its Deployments to zero while
+retaining the release's migration Job. Setting `suspended: true` removes that Job
+from the Helm release, so the manual recovery helper cannot reuse its template.
+
+Successful deployment helpers prune superseded successful migration Jobs and their
+completed Pods only after the current migration and workloads are ready. They
+preserve current references, unfinished and failed Jobs, and unrelated resources.
+Plain `wait-rollout.py` is read-only; cleanup requires `--prune-migrations`.
+Helm retains its ordinary lifecycle and may remove superseded failed Jobs on the
+next upgrade or uninstall, so export failure logs before retrying a Helm release.
+Template/apply installations require explicit cleanup of failed Jobs. The current
+release Job has no TTL because manual recovery reuses its template; ad-hoc Jobs
+created by `migrate-platform.sh` expire one day after completion or failure.
 
 ## Bounding the development lake
 

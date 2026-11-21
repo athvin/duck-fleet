@@ -41,6 +41,17 @@ profiling: true
 # is what finally replaces a pod whose catalog never appears.
 catalogWaitSeconds: 120
 
+# Workers and the gateway wait for an explicit migration to publish a compatible
+# platform schema; an isolated worker never performs shared migrations itself.
+platformWaitSeconds: 120
+platformMigration:
+  # Increment after a restore/reset or a PLATFORM_DSN retarget, even with the same
+  # image and Secret name. Deploy/provision scripts supply a fresh run identity.
+  runId: ""
+  timeoutSeconds: 240
+  prepaidMicroUsd: 10000000
+  maxJobMicroUsd: 1000000
+
 # What one normalized compute unit (max of vCPU and GiB/4) costs per hour, in whole
 # micro-USD, and the version stamped on every event priced with it. Cost attribution
 # in the operator's own numbers: the default is the development placeholder, and the
@@ -55,7 +66,7 @@ rateCard:
 # rows carry SQL text and profiles, so throwing them away is an operator's
 # decision, never a default's. The usage ledger has no retention at all: it is
 # billing evidence, and a pruned query's event remains the proof of what ran and
-# what it cost. Workers sweep at startup and hourly, in bounded batches.
+# what it cost. The gateway coordinates bounded maintenance; workers do not sweep.
 historyRetentionDays: 0
 
 # The bundled PostgreSQL is a development fixture: one replica, one PVC, no HA.

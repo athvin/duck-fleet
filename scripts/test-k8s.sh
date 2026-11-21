@@ -29,6 +29,7 @@ cleanup() {
     "${KUBE[@]}" get events --sort-by=.lastTimestamp > artifacts/kind/events.txt 2>&1 || true
     "${KUBE[@]}" logs -l app=duckfleet-worker --tail=200 --prefix > artifacts/kind/workers.log 2>&1 || true
     "${KUBE[@]}" logs -l app=duckfleet-gateway --tail=200 --prefix > artifacts/kind/gateway.log 2>&1 || true
+    "${KUBE[@]}" logs -l app=duckfleet-platform-migrate --tail=200 --prefix > artifacts/kind/migrations.log 2>&1 || true
     # A restarted container's death is only in its previous instance's log and its
     # recorded last state; without these a crash reads as a mystery restart.
     "${KUBE[@]}" logs -l app=duckfleet-worker --tail=200 --prefix --previous > artifacts/kind/workers-previous.log 2>&1 || true
@@ -126,12 +127,10 @@ render --no-hooks \
   > "$work/release.yaml"
 "${KUBE[@]}" apply -f "$work/release.yaml"
 
-"${KUBE[@]}" rollout status statefulset/duckfleet-postgres --timeout=300s
-# Workers come up alongside PostgreSQL rather than after it, so reaching ready here
-# also exercises the catalog wait: without it they would exit and crash-loop.
-for deployment in worker-small server; do
-  "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
-done
+# A fresh install creates PostgreSQL, the ordinary migration Job, and compute
+# together. Schema readiness gates compute; no Helm hook has to run after readiness.
+python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+echo 'PASS: a fresh release migrated platform before compute became ready'
 
 python3 scripts/kind/assert_limits.py --context "$CONTEXT" --namespace "$NS" \
   | tee artifacts/kind/worker-limits.jsonl
@@ -429,6 +428,10 @@ grep -q 'PASS: data and query history survived' artifacts/kind/duckfleet-harness
 # namespace's pods; the out-of-namespace egress render is proven in check-infra.
 "${KUBE[@]}" apply -f infra/kind/external-postgres.yaml
 "${KUBE[@]}" rollout status deployment/external-postgres --timeout=240s
+# Quiesce every engine before changing the target of the shared Secret. Existing
+# process environments otherwise keep writing the old database during the switch.
+"${KUBE[@]}" scale deployment/worker-small deployment/server --replicas=0
+"${KUBE[@]}" wait --for=delete pod -l 'app in (duckfleet-worker,duckfleet-gateway)' --timeout=180s
 password=$("${KUBE[@]}" get secret duckfleet-dev -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)
 python3 - "$password" <<'PY' | "${KUBE[@]}" patch secret duckfleet-dev --type merge --patch-file /dev/stdin
 import json, sys
@@ -438,6 +441,7 @@ print(json.dumps({'stringData': {'CATALOG_DSN': dsn + ' dbname=lake',
 PY
 render --no-hooks \
   --set postgres.bundled=false \
+  --set-string platformMigration.runId=external-empty-database \
   --set isolatedCompute.enabled=true \
   --set "isolatedCompute.apiServerCidrs[0]=$api_address/32" \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
@@ -449,12 +453,8 @@ render --no-hooks \
 # apply does not prune, so the bundled instance is removed by name — exactly what
 # an operator migrating to an external catalog does after restoring into it.
 "${KUBE[@]}" delete statefulset/duckfleet-postgres service/postgres configmap/duckfleet-postgres-init
-for deployment in worker-small server; do
-  "${KUBE[@]}" rollout restart "deployment/$deployment"
-done
-for deployment in worker-small server; do
-  "${KUBE[@]}" rollout status "deployment/$deployment" --timeout=420s
-done
+python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+echo 'PASS: unchanged worker image migrated a fresh external platform database'
 # Two probes against the fresh external catalog: overlapping DuckLake writes from
 # both workers — commit races resolved through the catalog under test — and the
 # credential matrix, which exercises the platform database's whole surface.

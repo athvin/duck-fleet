@@ -57,7 +57,8 @@ for size, cpu in [('small', 1)]:
     # the startup probe allows would have the pod replaced mid-wait, which is the
     # crash loop the wait exists to prevent.
     probe = container['startupProbe']
-    assert int(env['DUCKFLEET_CATALOG_WAIT_SECONDS']) <= probe['periodSeconds'] * probe['failureThreshold']
+    assert (int(env['DUCKFLEET_CATALOG_WAIT_SECONDS']) + int(env['DUCKFLEET_PLATFORM_WAIT_SECONDS'])
+            <= probe['periodSeconds'] * probe['failureThreshold'])
 placements = {}
 for o in objects:
     # The release contains only what the deploy identity may create. Roles,
@@ -157,6 +158,42 @@ if gateway_env.get('DUCKFLEET_PGWIRE') == 'true':
     assert 5432 in server_ports, 'pgwire is enabled but the Service does not carry 5432'
 else:
     assert 5432 not in server_ports, 'the Service advertises a wire front nothing listens for'
+# Migration is an ordinary, bounded, minimally privileged Job. Its desired name
+# is explicit on the gateway so a completed Job from an older image/database run
+# can never satisfy the rollout. Suspended releases do not start database work.
+server_deployment = by_name['Deployment', 'server']
+migration_name = server_deployment['metadata'].get('annotations', {}).get('duckfleet.io/migration-job')
+migrations = [o for o in objects if o['kind'] == 'Job'
+              and o['metadata'].get('labels', {}).get('app') == 'duckfleet-platform-migrate']
+if server_deployment['spec']['replicas'] == 0:
+    assert not migration_name and not migrations, 'a suspended release must not migrate'
+else:
+    assert len(migrations) == 1 and migrations[0]['metadata']['name'] == migration_name
+    migration = migrations[0]
+    assert 'helm.sh/hook' not in migration['metadata'].get('annotations', {}), 'migration hooks can deadlock fresh installs'
+    pod = migration['spec']['template']['spec']
+    assert pod['serviceAccountName'] == 'duckfleet-no-aws'
+    assert pod['automountServiceAccountToken'] is False
+    assert pod['restartPolicy'] == 'Never' and migration['spec']['backoffLimit'] == 0
+    migrate = pod['containers'][0]
+    assert migrate['image'] == gateway['image']
+    env = {item['name']: item.get('value') for item in migrate['env']}
+    assert set(env) == {'DUCKFLEET_ROLE', 'PLATFORM_DSN', 'DUCKFLEET_PLATFORM_WAIT_SECONDS',
+                        'DUCKFLEET_MIGRATION_TIMEOUT_SECONDS', 'DUCKFLEET_PREPAID_MICRO_USD',
+                        'DUCKFLEET_MAX_JOB_MICRO_USD'}, env
+    assert env['DUCKFLEET_ROLE'] == 'migrate'
+    assert migration['spec']['activeDeadlineSeconds'] >= (
+        int(env['DUCKFLEET_PLATFORM_WAIT_SECONDS']) + int(env['DUCKFLEET_MIGRATION_TIMEOUT_SECONDS']))
+    assert not {'startupProbe', 'readinessProbe', 'livenessProbe'} & set(migrate)
+assert 'DUCKFLEET_HISTORY_RETENTION_DAYS' in gateway_env
+for kind, name in by_name:
+    if kind == 'Deployment' and name.startswith('worker-'):
+        env = {item['name']: item.get('value') for item in
+               by_name[kind, name]['spec']['template']['spec']['containers'][0]['env']}
+        assert 'DUCKFLEET_HISTORY_RETENTION_DAYS' not in env, 'retention belongs to gateway maintenance'
+        assert env['DUCKFLEET_PLATFORM_WAIT_SECONDS'] == gateway_env['DUCKFLEET_PLATFORM_WAIT_SECONDS']
+        assert int(env['DUCKFLEET_PLATFORM_WAIT_SECONDS']) <= 600
+
 # The catalog is either bundled or the operator's, never a partial mix: a render
 # carrying the StatefulSet without its Service or init would start a database
 # nothing can reach or seed. Whether named external addresses reach the egress

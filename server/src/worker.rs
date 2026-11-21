@@ -185,10 +185,6 @@ pub(crate) struct Worker {
     /// reservation copies it, so recovery prices work at the card it was admitted
     /// under rather than whatever a later process runs with.
     rate: pricing::RateCard,
-    /// How long query history is kept, `None` meaning forever — the default. The
-    /// ledger has no retention at all: it is billing evidence, not diagnostics.
-    retention_days: Option<i32>,
-    last_prune: Instant,
     ledger: Ledger,
     sessions: HashMap<Uuid, Session>,
     active: ActiveSlot,
@@ -207,41 +203,6 @@ fn literal(value: &str) -> String {
 fn required(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("missing {name}"))
 }
-/// Reads an optional micro-USD setting. A budget of zero would refuse every
-/// execution, so a configured value must be positive rather than merely parseable.
-fn env_micro_usd(name: &str, default: i64) -> Result<i64> {
-    match std::env::var(name) {
-        Err(_) => Ok(default),
-        Ok(raw) => {
-            let value: i64 = raw
-                .trim()
-                .parse()
-                .with_context(|| format!("{name} must be a whole number of micro-USD"))?;
-            anyhow::ensure!(value > 0, "{name} must be greater than zero");
-            Ok(value)
-        }
-    }
-}
-
-/// Parses `DUCKFLEET_HISTORY_RETENTION_DAYS`. Absent or `0` keeps history forever,
-/// which is the default: throwing away records is a decision an operator makes,
-/// never one a default makes for them.
-fn retention_days_from(value: Option<String>) -> Result<Option<i32>> {
-    let Some(text) = value else { return Ok(None) };
-    let days: i64 = text
-        .trim()
-        .parse()
-        .ok()
-        .filter(|days| (0..=3650).contains(days))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "DUCKFLEET_HISTORY_RETENTION_DAYS must be a whole number of days, \
-                 0 (keep forever) to 3650 ({text:?})"
-            )
-        })?;
-    Ok((days > 0).then_some(days as i32))
-}
-
 /// How long startup waits for a catalog that is not reachable yet. Bounded so a
 /// catalog that never appears fails the container instead of leaving it not-ready
 /// forever, and configurable because the wait a rollout needs is environment
@@ -582,6 +543,15 @@ impl Worker {
         placement["cgroup_cpu_period"] = json!(observed.cpu_period);
         placement["worker_boot_id"] = json!(status.boot_id());
         let redactor = Redactor::from_env();
+        let platform_dsn = required("PLATFORM_DSN")?;
+        let platform_wait = crate::platform::schema_wait()?;
+        // Deployment owns schema creation. Reject incompatible schemas before
+        // loading the engine or waiting for the catalog/object store.
+        let mut ledger = redactor.guard(
+            "waiting for compatible platform schema",
+            crate::platform::wait_schema(&platform_dsn, platform_wait),
+        )?;
+        let rate = pricing::RateCard::from_env()?;
         let startup = Startup::new(Connection::open_in_memory()?, redactor.clone());
         startup.run(
             "applying engine limits",
@@ -646,71 +616,49 @@ impl Worker {
         // it instead of quietly disagreeing with the binary that is actually loaded.
         placement["duckdb_version"] =
             json!(root.query_row("SELECT version()", [], |r| r.get::<_, String>(0))?);
-        let platform_dsn = required("PLATFORM_DSN")?;
-        let mut ledger = retrying(
-            "platform database",
-            &crate::secrets::dsn_host(&platform_dsn),
-            wait,
-            || {
-                redactor.guard(
-                    "connecting to the platform database",
-                    Client::connect(&platform_dsn, NoTls),
-                )
-            },
-        )?;
+        // A replacement must wait for its predecessor's engine sessions to drop
+        // before recovering the shared stable identity. Never hold a global
+        // migration lock while waiting for this process-scoped ownership.
         let mut ownership =
-            crate::worker_ownership::Guard::acquire(&platform_dsn, &worker_id, wait)?;
+            crate::worker_ownership::Guard::acquire(&platform_dsn, &worker_id, platform_wait)?;
         let ownership_lost = Arc::new(AtomicBool::new(false));
         let loss_ready = ready.clone();
         let loss_active = active.clone();
         let loss_latch = ownership_lost.clone();
         ownership.on_loss(move || lose_ownership(&loss_ready, &loss_latch, &loss_active));
-        let mut transaction = ledger.transaction()?;
-        transaction.batch_execute("SELECT pg_advisory_xact_lock(4283121);
-            CREATE TABLE IF NOT EXISTS query_history (
-                query_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, sql TEXT NOT NULL,
-                context TEXT NOT NULL, status TEXT NOT NULL,
-                accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ,
-                elapsed_ms BIGINT, result_rows BIGINT, error TEXT
+        // The earlier schema connection may have gone stale during catalog
+        // attachment or predecessor drain. Refresh metadata access without ever
+        // replacing the lifetime ownership connection.
+        if ledger.check_connection().is_err() {
+            ledger = redactor.guard(
+                "refreshing platform connection before worker recovery",
+                crate::platform::wait_schema(&platform_dsn, platform_wait),
+            )?;
+        }
+        anyhow::ensure!(
+            ownership.check(),
+            "exclusive worker ownership was lost before startup recovery"
+        );
+        let mut recovered = crate::platform::worker_startup(&mut ledger, &worker_id, &rate);
+        if recovered.is_err() && ledger.is_closed() && ownership.check() {
+            // Local recovery is transactional/idempotent. Retry a closed metadata
+            // connection once, while the same lifetime owner remains valid.
+            ledger = redactor.guard(
+                "reconnecting for worker recovery",
+                crate::platform::wait_schema(&platform_dsn, platform_wait),
+            )?;
+            anyhow::ensure!(
+                ownership.check(),
+                "exclusive worker ownership was lost while reconnecting for recovery"
             );
-            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS worker_id TEXT NOT NULL DEFAULT 'legacy';
-            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS placement TEXT NOT NULL DEFAULT '{}';
-            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS history_id BIGSERIAL;
-            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS profile_status TEXT NOT NULL DEFAULT 'not_recorded';
-            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS profile TEXT;
-            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS metrics TEXT NOT NULL DEFAULT '{}';
-            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS failure_kind TEXT;
-            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS retry_safe BOOLEAN;
-            ALTER TABLE query_history ADD COLUMN IF NOT EXISTS principal TEXT NOT NULL DEFAULT 'direct';
-            CREATE UNIQUE INDEX IF NOT EXISTS query_history_order ON query_history(history_id DESC);
-            CREATE INDEX IF NOT EXISTS query_history_failure ON query_history(failure_kind,history_id DESC);
-            CREATE INDEX IF NOT EXISTS query_history_model ON query_history((context::jsonb #>> '{dbt,node_id}'),history_id DESC);
-            CREATE INDEX IF NOT EXISTS query_history_invocation ON query_history((context::jsonb #>> '{dbt,invocation_id}'),history_id DESC);
-            CREATE INDEX IF NOT EXISTS query_history_model_run ON query_history((context::jsonb ->> 'model_run_id'),history_id DESC);
-            CREATE INDEX IF NOT EXISTS query_history_running ON query_history(worker_id) WHERE status='running';")?;
-        crate::credentials::migrate(&mut transaction)?;
-        // The budget starts from configuration only the first time it is created; a
-        // restart must not refill a balance that has already been spent.
-        metering::migrate(
-            &mut transaction,
-            env_micro_usd("DUCKFLEET_PREPAID_MICRO_USD", 10_000_000)?,
-            env_micro_usd("DUCKFLEET_MAX_JOB_MICRO_USD", 1_000_000)?,
-        )?;
-        // The one-time legacy backfill needs both diagnostics and ledger tables.
-        // Recovery must see durable identities before it marks abandoned work.
-        requests::migrate(&mut transaction)?;
-        // Starting one worker must not terminate records owned by the other worker.
-        metering::interrupt_abandoned_history(&mut transaction, &worker_id)?;
-        // Funds this worker was holding when it stopped are settled against whatever
-        // its history row recorded, so nothing stays both unmetered and reserved.
-        let rate = pricing::RateCard::from_env()?;
-        let recovered = metering::recover(&mut transaction, &worker_id, &rate)?;
-        // After recovery, so the accumulators absorb what it just settled. This is
-        // the one remaining O(ledger) scan: once per worker start, never per query.
-        metering::reconcile(&mut transaction)?;
-        transaction.commit()?;
-        if recovered > 0 {
-            tracing::warn!(recovered, "settled reservations abandoned by a restart");
+            recovered = crate::platform::worker_startup(&mut ledger, &worker_id, &rate);
+        }
+        let recovered = redactor.guard("recovering this worker's platform state", recovered)?;
+        if recovered.recovered > 0 {
+            tracing::warn!(
+                recovered = recovered.recovered,
+                "settled reservations abandoned by a restart"
+            );
         }
         anyhow::ensure!(
             ownership.check(),
@@ -724,10 +672,6 @@ impl Worker {
             dedicated,
             served: 0,
             rate,
-            retention_days: retention_days_from(
-                std::env::var("DUCKFLEET_HISTORY_RETENTION_DAYS").ok(),
-            )?,
-            last_prune: Instant::now(),
             ledger: Ledger {
                 client: ledger,
                 dsn: platform_dsn,
@@ -763,11 +707,6 @@ impl Worker {
             self.ledger.ready.store(false, Ordering::Release);
             return;
         }
-        // Startup drains any backlog the hourly sweeps missed while this worker was
-        // down; afterwards one bounded batch per hour keeps up with new expiry
-        // without ever holding the engine's queue behind a long delete.
-        self.prune_history(1000);
-        self.last_prune = Instant::now();
         let mut last_housekeeping = Instant::now();
         loop {
             // This is still the sole DuckDB thread. Waiting through the runtime
@@ -800,10 +739,6 @@ impl Worker {
             self.sessions
                 .retain(|_, s| s.touched.elapsed() < SESSION_IDLE_TIMEOUT);
             self.status.set_sessions(self.sessions.len());
-            if self.last_prune.elapsed() >= Duration::from_secs(3600) {
-                self.prune_history(1);
-                self.last_prune = Instant::now();
-            }
             let response = self.handle(op);
             self.status.set_sessions(self.sessions.len());
             drop(query_guard);
@@ -865,60 +800,6 @@ impl Worker {
             retain_authorized_sessions(&mut self.sessions, &valid);
         }
         self.status.set_sessions(self.sessions.len());
-    }
-
-    /// Deletes history older than the configured retention, in bounded batches so a
-    /// sweep between two statements cannot stall the engine behind it. Only
-    /// `query_history` is touched — the ledger has no retention, so a pruned
-    /// query's usage event remains the proof of what ran, when, and at what cost.
-    /// A sweep that removed anything records itself in history under the
-    /// `platform` principal, making the operation as visible as what it removed.
-    fn prune_history(&mut self, max_batches: usize) {
-        let Some(days) = self.retention_days else {
-            return;
-        };
-        let mut pruned: u64 = 0;
-        for _ in 0..max_batches {
-            match self.ledger.execute(
-                "pruning expired history",
-                "DELETE FROM query_history WHERE ctid IN (
-                     SELECT ctid FROM query_history
-                     WHERE accepted_at < now() - ($1::int * interval '1 day')
-                       AND status <> 'running'
-                     LIMIT 5000)",
-                &[&days],
-            ) {
-                Ok(0) => break,
-                Ok(removed) => pruned += removed,
-                // Already reported by the ledger; the next sweep tries again.
-                Err(_) => break,
-            }
-        }
-        if pruned > 0 {
-            let audit = json!({
-                "operation": "history_retention",
-                "pruned": pruned,
-                "retention_days": days,
-            });
-            let _ = self.ledger.execute(
-                "recording a retention sweep",
-                "INSERT INTO query_history (query_id, session_id, sql, context, status,
-                     worker_id, placement, principal, finished_at, elapsed_ms, result_rows)
-                 VALUES ($1, 'platform', '-- history retention sweep', $2, 'succeeded',
-                     $3, '{}', 'platform', now(), 0, $4)",
-                &[
-                    &Uuid::new_v4().to_string(),
-                    &audit.to_string(),
-                    &self.worker_id,
-                    &i64::try_from(pruned).unwrap_or(i64::MAX),
-                ],
-            );
-            tracing::info!(
-                pruned,
-                retention_days = days,
-                "pruned expired query history"
-            );
-        }
     }
 
     fn handle(&mut self, op: Operation) -> Reply {
@@ -1501,21 +1382,6 @@ mod tests {
             "failed validation must close named sessions"
         );
         Ok(())
-    }
-
-    #[test]
-    fn retention_defaults_to_forever_and_rejects_what_it_cannot_keep() {
-        // Absent and explicit zero both mean "keep everything".
-        assert_eq!(retention_days_from(None).unwrap(), None);
-        assert_eq!(retention_days_from(Some("0".into())).unwrap(), None);
-        assert_eq!(retention_days_from(Some("365".into())).unwrap(), Some(365));
-        assert_eq!(retention_days_from(Some(" 90 ".into())).unwrap(), Some(90));
-        for bad in ["-1", "3651", "0.5", "forever", ""] {
-            assert!(
-                retention_days_from(Some(bad.into())).is_err(),
-                "accepted {bad:?}"
-            );
-        }
     }
 
     #[test]

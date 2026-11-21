@@ -1,0 +1,42 @@
+{{- if not .Values.suspended }}
+# An ordinary Job can wait for bundled PostgreSQL while compute waits for schema.
+# A pre-install hook cannot reach the not-yet-created database; a post-install hook
+# can deadlock helm --wait behind compute that requires this migration to finish.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "duckfleet.migrationJob" . }}
+  labels:
+    app: duckfleet-platform-migrate
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ add .Values.platformWaitSeconds .Values.platformMigration.timeoutSeconds 30 }}
+  template:
+    metadata:
+      labels:
+        app: duckfleet-platform-migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: duckfleet-no-aws
+      automountServiceAccountToken: false
+      {{- include "duckfleet.placement" . | nindent 6 }}
+      securityContext:
+        {{- include "duckfleet.podSecurity" . | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ required "workerImage is required" .Values.workerImage | quote }}
+          securityContext:
+            {{- include "duckfleet.containerSecurity" . | nindent 12 }}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          env:
+            - {name: DUCKFLEET_ROLE, value: migrate}
+            - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ .Values.platformWaitSeconds | quote }}}
+            - {name: DUCKFLEET_MIGRATION_TIMEOUT_SECONDS, value: {{ .Values.platformMigration.timeoutSeconds | quote }}}
+            - {name: DUCKFLEET_PREPAID_MICRO_USD, value: {{ .Values.platformMigration.prepaidMicroUsd | quote }}}
+            - {name: DUCKFLEET_MAX_JOB_MICRO_USD, value: {{ .Values.platformMigration.maxJobMicroUsd | quote }}}
+            - name: PLATFORM_DSN
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.secretName }}, key: PLATFORM_DSN}
+{{- end }}

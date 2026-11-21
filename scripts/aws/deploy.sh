@@ -32,9 +32,11 @@ fi
 # Helm applies the release; convergence is waited for separately. `helm --wait` only
 # ever reports "context deadline exceeded", which says nothing about which pod failed
 # or why, and spends the whole timeout before saying even that.
+migration_run=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 helm upgrade --install duckfleet infra/helm/duckfleet --kube-context "$KUBE_CONTEXT" \
-  --namespace "$NAMESPACE" -f artifacts/aws/values.json --set suspended=false --timeout 5m
-python3 scripts/aws/wait-rollout.py --namespace "$NAMESPACE" --context "$KUBE_CONTEXT"
+  --namespace "$NAMESPACE" -f artifacts/aws/values.json --set suspended=false \
+  --set-string "platformMigration.runId=$migration_run" --timeout 5m
+python3 scripts/aws/wait-rollout.py --namespace "$NAMESPACE" --context "$KUBE_CONTEXT" --prune-migrations
 
 # Whether the gateway holds the pod grant is asked and answered by the harness, not
 # here: it runs in-cluster and reaches the gateway directly, where it reads

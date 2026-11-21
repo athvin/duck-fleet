@@ -39,12 +39,10 @@ print(json.dumps({'apiVersion': 'v1', 'kind': 'Secret',
                                  'PLATFORM_DSN': dsn + ' dbname=platform'}}))
 PY
 fi
+migration_run=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 helm template duckfleet infra/helm/duckfleet --namespace "$ns" \
-  --set "lakePrefix=$ns/lake" "$@" \
+  --set "lakePrefix=$ns/lake" --set-string "platformMigration.runId=$migration_run" "$@" \
   | sh -c "$transform" \
   | "${kube[@]}" apply -f -
-for workload in statefulset/duckfleet-postgres deployment/worker-small \
-                deployment/server; do
-  "${kube[@]}" rollout status "$workload" --timeout=420s
-done
+python3 scripts/aws/wait-rollout.py --context "$context" --namespace "$ns" --prune-migrations
 echo "provisioned $ns: its own boundary, catalog, credentials, and lake prefix $ns/lake"

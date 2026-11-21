@@ -592,15 +592,99 @@ authorization boundary. A `running` record means the worker accepted and began
 the request; queued operations are not yet durable history records.
 
 History retention is configurable and off by default: `historyRetentionDays: 0`
-keeps everything, because discarding records is an operator's decision, never a
-default's. With a window set, workers sweep expired rows — SQL text and profiles
-with them — at startup and hourly, in bounded batches that never hold the engine
-behind a long delete, and each sweep that removed anything records itself in
-history under the `platform` principal. The usage ledger has **no** retention:
-it is billing evidence, so a pruned query's `usage_events` row remains the proof
-of what ran, when, for how long, at which rate — everything except the SQL
-itself. The harness ages rows past the window and proves the sweep removes them,
-spares everything inside it, and leaves the ledger untouched to the row.
+keeps everything. With a window set, the gateway coordinates hourly cleanup in
+batches of at most 5,000 rows, with two batches per pass. A backlog makes the
+next bounded pass due sooner. Running requests, held reservations, and rows
+without a durable terminal identity remain protected. Request identities and
+append-only usage events have no diagnostic retention policy. SQL and profiles
+are deleted together with eligible history; their separate policies are tracked
+in #109.
+
+## Platform migrations and maintenance
+
+Workers validate the platform schema and recover only their own stable identity.
+They do not create global tables, aggregate the lifetime usage ledger, or prune
+history. Startup logs report the metadata recovery duration separately from
+DuckDB/catalog initialization. Both workers and the gateway wait up to
+`DUCKFLEET_PLATFORM_WAIT_SECONDS` (default 120) for a missing schema and reject
+unsupported versions with an actionable error.
+
+Deployment runs `DUCKFLEET_ROLE=migrate` using the same binary and `PLATFORM_DSN`.
+This PostgreSQL-only command supports a fresh database and the preceding
+unversioned installation. It adopts existing credentials, request identities,
+reservations and usage without refilling the budget. Migrations commit their
+version atomically; repeats skip the baseline scans. Quiesce older writers for
+an upgrade and preserve the `platform` database along with the DuckLake catalog.
+
+Compose gates workers on the successful `platform-migrate` service. Kubernetes
+uses an ordinary migration Job so bundled PostgreSQL can start before migration
+and compute can wait for a compatible schema. Deployment helpers check that the
+desired Job completed, including when old pods are still healthy. A failed Job
+prevents rollout success; inspect its logs before retrying. Suspended releases do
+not launch migrations.
+
+After restoring or retargeting a database, explicitly rerun migration even when
+the image has not changed:
+
+```sh
+bash scripts/migrate-platform.sh compose
+# Kubernetes: set DUCKFLEET_KUBE_CONTEXT and DUCKFLEET_NAMESPACE first.
+bash scripts/migrate-platform.sh kube
+```
+
+A direct Helm deployment can instead change `platformMigration.runId`. The restore
+helper stops compute, restores both databases, and migrates before reporting
+success; it leaves compute stopped for an explicit restart. A failed restore or
+migration never restarts compute against partial state.
+
+The existing gateway attempts due maintenance every minute. PostgreSQL owns a
+30-second lease with a fencing generation; each work transaction locks and
+validates it. Defaults allow 10 seconds to start work, three seconds per SQL
+statement and 250 ms for lock acquisition, followed by bounded result bookkeeping.
+Lost transactions have an idle timeout, and a successor marks unfinished runs
+interrupted after lease expiry. Retention and six-hour budget reconciliation
+have independent schedules; the oldest due task runs first so a retention backlog
+cannot keep reconciliation waiting. A failed task retries after a minute. Reconciliation
+locks the budget before calculating totals so concurrent settlement deltas are
+preserved. Maintenance never infers worker death from a request's age.
+
+No additional always-on service is required. With gateways stopped, an operator
+can run one bounded pass independently of execution workers:
+
+```sh
+docker compose run --rm --no-deps -e DUCKFLEET_ROLE=platform-maintain server
+```
+
+A standalone binary needs only `PLATFORM_DSN` and that role. The command returns
+JSON describing whether it acquired ownership and each task's outcome. For a
+large deliberate repair, `DUCKFLEET_MAINTENANCE_STATEMENT_SECONDS`,
+`DUCKFLEET_MAINTENANCE_PASS_SECONDS` and `DUCKFLEET_MAINTENANCE_LEASE_SECONDS`
+can raise the bounds; lease duration must exceed the pass budget, which must be
+at least the statement timeout. Keep recurring defaults small to protect query
+admission. Operators can inspect PostgreSQL directly:
+
+```sql
+SELECT task, next_due_at, last_success_at, last_failure_at, last_error
+FROM platform_maintenance_tasks;
+SELECT task, started_at, finished_at, status, rows_pruned,
+       backlog_remaining, oldest_eligible_at, error
+FROM platform_maintenance_runs ORDER BY started_at DESC LIMIT 20;
+```
+
+The integration fixture verifies failed-migration rollback, supported adoption,
+future-version refusal, competing owners, server-driven abandoned-transaction
+rollback, retention backlog and concurrent accounting. It measures nine metadata
+startup samples before and after adding 50,000 history rows and 50,000 usage rows,
+with the global budget locked during the larger case. Results are written to
+`artifacts/platform-startup-volume.json`; this measures schema validation and
+worker-local recovery, excluding DuckDB/catalog attachment, and is not a universal
+startup latency promise.
+
+A local Docker Desktop Linux/aarch64 run with PostgreSQL 17.6 measured a median
+of 1.00 ms for the small fixture and 1.70 ms after those additional rows, across
+nine samples per case. The larger case completed while another connection held
+the budget row lock. These are measurements of the metadata phase on that
+fixture, not end-to-end cold-start timings or a hardware-independent target.
 
 The integration gate verifies filtering and pagination, observes/cancels a running
 query without waiting behind it, rejects stale profiles after SQL failure, checks
@@ -789,15 +873,15 @@ dumps both databases — `lake` (the DuckLake catalog) and `platform` (query
 history, usage ledger, budget) — as custom-format archives, and
 `scripts/restore-catalog.sh` restores them into a freshly initialised PostgreSQL,
 refusing to run without `DUCKFLEET_CONFIRM_RESTORE=yes`. Stop workers and the
-gateway around a restore; their startup migrations are idempotent against the
-restored schema.
+gateway around a restore. The restore helper runs the explicit platform
+migration against the restored schema before compute can be restarted.
 
-The harness proves the whole cycle, not just the dump: it backs up, commits more
-work, destroys the PostgreSQL volume outright, restores, and asserts that
-pre-backup data reads through the restored catalog from the bucket, that work
-committed after the backup is gone, that history and the ledger are back, and
-that a fresh write commits cleanly against the restored snapshot chain. The kind
-harness additionally exercises the `kube` mode an operator would actually run.
+The Kubernetes gate inspects both backup archives and verifies data after worker
+replacement. Restore command sequencing and failure behavior have operator-script
+fixtures; the full fresh-host restore-and-write drill is tracked in #108. The
+restore helper requires fresh, empty databases. On Kubernetes it reuses the
+existing release's migration Job template, so keep that Job until recovery is
+complete.
 
 The recovery point is the age of the newest backup you kept — scheduling and
 retention are the operator's policy, and the honest statement of loss is:

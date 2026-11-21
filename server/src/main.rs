@@ -13,6 +13,7 @@ mod isolated;
 mod kube;
 mod metering;
 mod pgwire;
+mod platform;
 mod pricing;
 mod profiling;
 mod requests;
@@ -422,6 +423,11 @@ async fn main() -> anyhow::Result<()> {
     if std::env::var("DUCKFLEET_ROLE").as_deref() == Ok("harness") {
         let args: Vec<String> = std::env::args().skip(1).collect();
         std::process::exit(harness::run(args).await);
+    }
+    match std::env::var("DUCKFLEET_ROLE").as_deref() {
+        Ok("migrate") => return platform::migrate_command().await,
+        Ok("platform-maintain") => return platform::maintain_command().await,
+        _ => {}
     }
     let token = std::env::var("DUCKFLEET_TOKEN")?;
     anyhow::ensure!(

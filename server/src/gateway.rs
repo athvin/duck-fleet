@@ -1523,6 +1523,15 @@ fn worker_endpoints() -> anyhow::Result<Vec<String>> {
 }
 
 pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
+    let platform_dsn = std::env::var("PLATFORM_DSN")?;
+    let maintenance_config = crate::platform::MaintenanceConfig::from_env()?;
+    let schema_wait = crate::platform::schema_wait()?;
+    let schema_dsn = platform_dsn.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        drop(crate::platform::wait_schema(&schema_dsn, schema_wait)?);
+        Ok(())
+    })
+    .await??;
     // Configured and permitted are different questions, and only the API server can
     // answer the second: the Role that allows pod creation is applied outside this
     // release by an operator. Resolved here, once, so `isolated_compute` below reports
@@ -1578,12 +1587,8 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             .held_isolated(crate::isolated::PREFIX)
             .await
             .unwrap_or_else(|error| {
-                // Expected on a first boot, where the ledger tables do not exist yet:
-                // a worker creates them, and the gateway does not wait for one. Not
-                // fatal in any case — the pods below are still removed, and unread
-                // funds stay held rather than being lost, so serving is the more
-                // useful outcome. A warning, because an error here on every first
-                // boot would teach an operator to ignore the real thing.
+                // Schema was validated before startup. A later metadata outage
+                // must preserve unread holds for a subsequent safe recovery.
                 tracing::warn!(
                     ?error,
                     "could not read which session pods hold funds; continuing without settling"
@@ -1602,9 +1607,8 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
                 );
             }
         }
-        // After the sweep, so every session-pod identity is provably dead. Tolerant
-        // for the same reason as the held read above: on a first boot the history
-        // table does not exist yet, and there is nothing to repair in it either.
+        // After the sweep, so every session-pod identity is provably dead.
+        // Metadata failures retain evidence for a later recovery pass.
         match app
             .usage
             .reconcile_isolated_history(crate::isolated::PREFIX)
@@ -1673,8 +1677,9 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .merge(api)
         .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(app);
+    let maintenance = crate::platform::spawn_maintenance(platform_dsn, maintenance_config);
     tracing::info!("DuckFleet gateway ready");
-    axum::serve(tokio::net::TcpListener::bind("0.0.0.0:8080").await?, router)
+    let served = axum::serve(tokio::net::TcpListener::bind("0.0.0.0:8080").await?, router)
         .with_graceful_shutdown(async move {
             crate::terminating().await;
             // Marked first, and the server deliberately keeps serving afterwards —
@@ -1690,7 +1695,9 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             crate::drain_until_idle(move || inflight.load(Ordering::Acquire) > 0).await;
             tracing::info!("drain complete; shutting down");
         })
-        .await?;
+        .await;
+    maintenance.abort();
+    served?;
     Ok(())
 }
 

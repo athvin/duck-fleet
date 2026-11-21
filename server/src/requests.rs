@@ -146,9 +146,24 @@ fn backfill(transaction: &mut Transaction<'_>, request_id: Option<&str>) -> anyh
     Ok(())
 }
 
-/// Called after metering migration and before recovery, under the worker's
-/// existing migration advisory lock. The marker and backfill commit together,
-/// so a failed upgrade retries, and subsequent worker starts do no full scans.
+/// The platform baseline calls this once for history written after the previous
+/// request-backfill marker, including old synthetic retention audit records.
+/// Existing ownership, fingerprints and outcomes are never overwritten. This is
+/// deployment migration work, not a worker-startup or maintenance-loop scan.
+pub(crate) fn backfill_missing_history(transaction: &mut Transaction<'_>) -> anyhow::Result<u64> {
+    Ok(transaction.execute(
+        &format!(
+            "{HISTORY_BACKFILL} WHERE NOT EXISTS (
+            SELECT 1 FROM requests r WHERE r.request_id=h.query_id)
+            ON CONFLICT DO NOTHING"
+        ),
+        &[],
+    )?)
+}
+
+/// Called after metering migration and before recovery, under the platform's
+/// migration advisory lock. The marker and backfill commit together,
+/// so a failed upgrade retries, and later migration invocations skip full scans.
 pub(crate) fn migrate(transaction: &mut Transaction<'_>) -> anyhow::Result<()> {
     transaction.batch_execute(
         "CREATE TABLE IF NOT EXISTS requests (

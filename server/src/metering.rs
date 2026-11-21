@@ -16,9 +16,10 @@
 //! The budget row carries `spent_micro_usd` and `held_micro_usd` accumulators so
 //! admission never has to sum a ledger that, by rule 2, only ever grows. They are a
 //! derived cache, not a second ledger: every writer updates them in the same
-//! transaction as its ledger write, and each worker start recomputes them from the
-//! true sums under the budget lock — so the one O(ledger) scan left runs per boot,
-//! not per admission, and a delta missed by an older binary heals at the next start.
+//! transaction as its ledger write. Deployment migration and the bounded platform
+//! maintenance coordinator can recompute them from true sums under the budget
+//! lock. Worker startup performs only identity-local recovery; it never scans the
+//! lifetime ledger or waits on reconciliation when it has no holds to release.
 use crate::{ApiError, failure, pricing};
 use anyhow::Result;
 use postgres::{Client, Transaction};
@@ -128,8 +129,9 @@ pub(crate) fn migrate(transaction: &mut Transaction, prepaid: i64, max_job: i64)
 }
 
 /// Recomputes the budget accumulators from the ledger's true sums, under the budget
-/// lock. Run once per worker start: taking the row lock *before* reading the sums
-/// means any concurrent settle is either already visible to this snapshot or blocked
+/// lock. Run only from deployment migration or bounded platform maintenance:
+/// taking the row lock *before* reading the sums means any concurrent settle is
+/// either already visible to this snapshot or blocked
 /// until after the overwrite, when it applies its own delta — no update is lost in
 /// either order. This is also what heals a delta an older binary never applied.
 pub(crate) fn reconcile(transaction: &mut Transaction) -> Result<()> {
