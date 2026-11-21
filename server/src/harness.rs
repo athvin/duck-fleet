@@ -1072,6 +1072,10 @@ async fn scale_checks(ctx: &Ctx) -> anyhow::Result<()> {
         "scale",
         &[
             "build",
+            // This is a model-count acceptance sweep on the single-worker tier.
+            // Parallel admission is covered by the dedicated concurrency stages.
+            "--threads",
+            "1",
             "--project-dir",
             project,
             "--profiles-dir",
