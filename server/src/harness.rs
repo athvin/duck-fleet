@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use crate::client::{self, Client, RemoteConnection, RemoteError};
 
 mod api_workflow;
+mod authentication;
 mod aws_harness;
 mod concurrency;
 mod metering;
@@ -64,6 +65,10 @@ pub async fn run(args: Vec<String>) -> i32 {
         gateway_replaced(&ctx).await
     } else if has("--credentials") {
         credentials_checks(&ctx).await
+    } else if has("--auth-continuity") {
+        authentication::checks(&ctx).await
+    } else if has("--auth-isolated") {
+        authentication::isolated_cleanup(&ctx).await
     } else if has("--dbt-isolated") {
         dbt_isolated_checks(&ctx).await
     } else if has("--cold-start") {

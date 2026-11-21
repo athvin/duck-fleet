@@ -66,11 +66,11 @@ struct Envelope {
     query_guard: Option<worker_status::QueryGuard>,
 }
 enum Operation {
-    /// The string is the principal the gateway authenticated, or `direct` for a
-    /// worker addressed without one.
-    Open(SessionRequest, String),
+    /// Request identity travels on the authenticated internal hop, independently
+    /// of the caller's SQL context and the credential that opened a session.
+    Open(SessionRequest, credentials::Identity),
     Close(Uuid),
-    Query(Uuid, QueryRequest),
+    Query(Uuid, QueryRequest, credentials::Identity),
 }
 enum Output {
     Json(Value),
@@ -286,16 +286,47 @@ async fn open(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Reply 
         })?
     };
     request.validate()?;
-    // The gateway names who it authenticated; reaching this worker at all already
-    // required the internal token, which is what makes the header trustworthy.
-    // Addressed directly, there is no authenticated principal to name.
+    let identity = worker_identity(&headers)?;
+    dispatch(app, Operation::Open(request, identity)).await
+}
+
+/// Only the shared internal token can reach this handler. A named identity must
+/// carry an issued credential ID, which the worker rechecks after dequeue; an
+/// incomplete named identity must never silently become operator authority.
+fn worker_identity(headers: &HeaderMap) -> Result<credentials::Identity, ApiError> {
+    let denied = || {
+        ApiError::new(
+            failure::UNAUTHORIZED,
+            "invalid internal credential identity",
+        )
+    };
     let principal = headers
         .get(credentials::PRINCIPAL_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|principal| !principal.is_empty() && principal.len() <= 64)
-        .unwrap_or("direct")
-        .to_owned();
-    dispatch(app, Operation::Open(request, principal)).await
+        .map(|value| value.to_str().map_err(|_| denied()))
+        .transpose()?;
+    let credential_id = headers
+        .get(credentials::CREDENTIAL_HEADER)
+        .map(|value| value.to_str().map_err(|_| denied()))
+        .transpose()?;
+    match (principal, credential_id) {
+        (None, None) | (Some("direct"), None) => Ok(credentials::Identity {
+            principal: "direct".into(),
+            credential_id: None,
+            expires_at: None,
+        }),
+        (Some(credentials::BOOTSTRAP_PRINCIPAL), None) => Ok(credentials::Identity::bootstrap()),
+        (Some(principal), Some(id))
+            if credentials::valid_principal(principal) && Uuid::parse_str(id).is_ok() =>
+        {
+            Ok(credentials::Identity {
+                principal: principal.into(),
+                credential_id: Some(id.into()),
+                // The database supplies authoritative expiry at admission.
+                expires_at: None,
+            })
+        }
+        _ => Err(denied()),
+    }
 }
 async fn info(State(app): State<App>) -> Reply {
     Ok(Output::Json(app.status.snapshot()))
@@ -312,6 +343,7 @@ async fn query_detail(State(app): State<App>, Path(id): Path<Uuid>) -> Reply {
 async fn query(
     State(app): State<App>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(req): Json<QueryRequest>,
 ) -> Reply {
     if req.sql.trim().is_empty()
@@ -330,7 +362,8 @@ async fn query(
             "too many parameters or context exceeds 8192 bytes",
         ));
     }
-    dispatch(app, Operation::Query(id, req)).await
+    let identity = worker_identity(&headers)?;
+    dispatch(app, Operation::Query(id, req, identity)).await
 }
 async fn usage_events(State(app): State<App>, Query(filter): Query<usage::Filter>) -> Reply {
     app.usage.events(filter).await.map(Output::Json)
@@ -496,6 +529,46 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    #[test]
+    fn internal_identity_requires_a_complete_named_credential() {
+        let id = Uuid::new_v4().to_string();
+        for (principal, credential) in [
+            (Some("analyst"), None),
+            (None, Some(id.as_str())),
+            (Some("analyst"), Some("not-a-uuid")),
+            (Some(""), None),
+            (Some("bootstrap-admin"), Some(id.as_str())),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = principal {
+                headers.insert(credentials::PRINCIPAL_HEADER, value.parse().unwrap());
+            }
+            if let Some(value) = credential {
+                headers.insert(credentials::CREDENTIAL_HEADER, value.parse().unwrap());
+            }
+            assert!(
+                worker_identity(&headers).is_err(),
+                "{principal:?} {credential:?}"
+            );
+        }
+        assert_eq!(
+            worker_identity(&HeaderMap::new()).unwrap().principal,
+            "direct"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            credentials::PRINCIPAL_HEADER,
+            "bootstrap-admin".parse().unwrap(),
+        );
+        assert!(worker_identity(&headers).unwrap().is_bootstrap());
+        headers.insert(credentials::PRINCIPAL_HEADER, "analyst".parse().unwrap());
+        headers.insert(credentials::CREDENTIAL_HEADER, id.parse().unwrap());
+        let identity = worker_identity(&headers).unwrap();
+        assert_eq!(identity.principal, "analyst");
+        assert_eq!(identity.credential_id.as_deref(), Some(id.as_str()));
+        assert!(identity.expires_at.is_none());
+    }
+
     fn status_test_app() -> (App, mpsc::Receiver<Envelope>) {
         let (sender, receiver) = mpsc::channel(1);
         let ready = Arc::new(AtomicBool::new(true));
@@ -527,6 +600,7 @@ mod tests {
                 context: json!({}),
                 timeout_seconds: 30,
             },
+            credentials::Identity::bootstrap(),
         )
     }
 

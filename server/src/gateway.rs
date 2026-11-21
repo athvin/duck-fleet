@@ -2,7 +2,8 @@
 use crate::{
     ApiError,
     compute::{Mode, Resources, SessionRequest},
-    credentials, failure,
+    credentials::{self, Identity},
+    failure,
     isolated::Isolation,
 };
 use axum::{
@@ -36,6 +37,10 @@ struct Route {
     /// credential can read, so possession of an ID proves nothing — only the
     /// opener (or the bootstrap) may run, cancel, or close the session.
     principal: Arc<str>,
+    /// The last authorized request may rotate credentials without changing owner.
+    identity: Identity,
+    active: Arc<AtomicUsize>,
+    closing: bool,
     /// The session pod to remove when this route goes away, for an isolated session.
     /// `None` for a persistent worker, which outlives every session it serves.
     pod: Option<String>,
@@ -137,6 +142,13 @@ enum Principal {
     Named(Arc<str>),
 }
 impl Principal {
+    fn from_identity(identity: &Identity) -> Self {
+        if identity.is_bootstrap() {
+            Self::Bootstrap
+        } else {
+            Self::Named(identity.principal.clone().into())
+        }
+    }
     fn name(&self) -> &str {
         match self {
             Self::Bootstrap => credentials::BOOTSTRAP_PRINCIPAL,
@@ -151,15 +163,77 @@ impl Principal {
     }
 }
 
+#[derive(Default)]
+struct AuthCache {
+    generation: u64,
+    identities: HashMap<String, (Identity, Instant)>,
+    digests: HashMap<String, String>,
+}
+
+impl AuthCache {
+    fn get(&self, id: &str) -> Option<Identity> {
+        self.identities.get(id).and_then(|(identity, resolved)| {
+            (resolved.elapsed() < Authn::FRESH && !identity.expired()).then(|| identity.clone())
+        })
+    }
+
+    /// Generation and publication share the same mutex. A lookup started before
+    /// revocation cannot refill the cache after the revocation has cleared it.
+    fn publish(
+        &mut self,
+        generation: u64,
+        identity: Identity,
+        started: Instant,
+        digest: Option<String>,
+    ) -> bool {
+        if generation != self.generation || identity.expired() {
+            return false;
+        }
+        let Some(id) = identity.credential_id.clone() else {
+            return false;
+        };
+        self.identities
+            .retain(|_, (identity, at)| at.elapsed() < Authn::FRESH && !identity.expired());
+        if self.identities.len() >= 512
+            && !self.identities.contains_key(&id)
+            && let Some(oldest) = self
+                .identities
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(id, _)| id.clone())
+        {
+            self.identities.remove(&oldest);
+        }
+        self.digests
+            .retain(|_, id| self.identities.contains_key(id));
+        self.identities.insert(id.clone(), (identity, started));
+        if let Some(digest) = digest {
+            self.digests.insert(digest, id);
+        }
+        true
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.identities.clear();
+        self.digests.clear();
+    }
+}
+
+#[derive(Clone)]
+enum AuthLookup {
+    Digest(String),
+    Id(String),
+}
+
 /// Resolves bearer tokens: the bootstrap by comparison, issued credentials by
 /// digest lookup against the platform database, behind a short positive cache.
 struct Authn {
     bootstrap: Arc<str>,
     dsn: String,
-    /// digest → (principal, resolved at). Positive entries only, and cleared
-    /// whole on any revocation, so on this gateway a revocation bites at once and
-    /// `FRESH` only bounds how long a *deleted-underneath* database row lingers.
-    cache: Mutex<HashMap<String, (Arc<str>, Instant)>>,
+    /// Positive entries share credential identity across HTTP and pgwire checks.
+    /// The generation also invalidates database lookups racing a revocation.
+    cache: Mutex<AuthCache>,
     /// Admission for lookups and credential management, separate from the history
     /// readers' pool so an auth storm cannot starve history or vice versa.
     lookups: Arc<Semaphore>,
@@ -171,38 +245,80 @@ impl Authn {
         Arc::new(Self {
             bootstrap,
             dsn,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(AuthCache::default()),
             lookups: Arc::new(Semaphore::new(8)),
         })
     }
 
-    async fn principal(&self, token: &str) -> Result<Principal, ApiError> {
+    async fn authenticate(&self, token: &str) -> Result<Identity, ApiError> {
         if credentials::tokens_match(token, &self.bootstrap) {
-            return Ok(Principal::Bootstrap);
+            return Ok(Identity::bootstrap());
         }
-        let hashed = credentials::digest(token);
-        if let Some((name, resolved)) = self.cache.lock().await.get(&hashed)
-            && resolved.elapsed() < Self::FRESH
-        {
-            return Ok(Principal::Named(name.clone()));
+        self.resolve(AuthLookup::Digest(credentials::digest(token)))
+            .await
+    }
+
+    async fn revalidate(&self, identity: &Identity) -> Result<(), ApiError> {
+        if identity.is_bootstrap() {
+            return Ok(());
         }
-        let lookup = hashed.clone();
-        let resolved = self
-            .with_db(false, move |client| credentials::resolve(client, &lookup))
-            .await?;
-        match resolved {
-            Some(principal) => {
-                let name: Arc<str> = principal.into();
-                self.cache
-                    .lock()
-                    .await
-                    .insert(hashed, (name.clone(), Instant::now()));
-                Ok(Principal::Named(name))
+        let id = identity
+            .credential_id
+            .as_ref()
+            .ok_or_else(invalid_credential)?;
+        if identity.expired() {
+            return Err(invalid_credential());
+        }
+        let current = self.resolve(AuthLookup::Id(id.clone())).await?;
+        if current.principal != identity.principal || current.expired() {
+            return Err(invalid_credential());
+        }
+        Ok(())
+    }
+
+    async fn resolve(&self, lookup: AuthLookup) -> Result<Identity, ApiError> {
+        // A burst of operator changes may invalidate a lookup repeatedly. Refuse
+        // rather than return a stale result or wait without a bound.
+        for _ in 0..3 {
+            let started = Instant::now();
+            let generation = {
+                let cache = self.cache.lock().await;
+                let id = match &lookup {
+                    AuthLookup::Digest(digest) => cache.digests.get(digest),
+                    AuthLookup::Id(id) => Some(id),
+                };
+                if let Some(identity) = id.and_then(|id| cache.get(id)) {
+                    return Ok(identity);
+                }
+                cache.generation
+            };
+            let query = lookup.clone();
+            let resolved = self
+                .with_db(false, move |client| match query {
+                    AuthLookup::Digest(digest) => credentials::resolve(client, &digest),
+                    AuthLookup::Id(id) => credentials::resolve_id(client, &id),
+                })
+                .await?;
+            let mut cache = self.cache.lock().await;
+            if cache.generation != generation {
+                continue;
             }
-            // Unknown, revoked and expired answer alike: a probe learns nothing
-            // about which it was, and none of them is worth a distinct code path.
-            None => Err(ApiError::new(failure::UNAUTHORIZED, "invalid bearer token")),
+            let identity = resolved
+                .filter(|identity| !identity.expired())
+                .ok_or_else(invalid_credential)?;
+            let digest = match &lookup {
+                AuthLookup::Digest(digest) => Some(digest.clone()),
+                AuthLookup::Id(_) => None,
+            };
+            if cache.publish(generation, identity.clone(), started, digest) {
+                return Ok(identity);
+            }
+            return Err(invalid_credential());
         }
+        Err(ApiError::new(
+            failure::CAPACITY,
+            "credential state is changing; retry authentication",
+        ))
     }
 
     /// One blocking connection per call, like the history readers: credential
@@ -235,6 +351,21 @@ impl Authn {
     }
 }
 
+fn invalid_credential() -> ApiError {
+    ApiError::new(failure::UNAUTHORIZED, "invalid platform credential")
+}
+
+fn authenticated_request(
+    request: reqwest::RequestBuilder,
+    identity: &Identity,
+) -> reqwest::RequestBuilder {
+    let request = request.header(credentials::PRINCIPAL_HEADER, &identity.principal);
+    match &identity.credential_id {
+        Some(id) => request.header(credentials::CREDENTIAL_HEADER, id),
+        None => request,
+    }
+}
+
 /// Authenticates every `/v1` request and attaches the principal.
 async fn authenticate(
     State(authn): State<Arc<Authn>>,
@@ -250,9 +381,12 @@ async fn authenticate(
     let Some(token) = presented else {
         return ApiError::new(failure::UNAUTHORIZED, "invalid bearer token").into_response();
     };
-    match authn.principal(&token).await {
-        Ok(principal) => {
-            request.extensions_mut().insert(principal);
+    match authn.authenticate(&token).await {
+        Ok(identity) => {
+            request
+                .extensions_mut()
+                .insert(Principal::from_identity(&identity));
+            request.extensions_mut().insert(identity);
             next.run(request).await
         }
         Err(refused) => refused.into_response(),
@@ -502,22 +636,20 @@ impl Gateway {
         &self,
         wanted: Resources,
         body: Vec<u8>,
-        principal: &str,
+        identity: &Identity,
     ) -> Result<OpenOutcome, ApiError> {
         let candidates = self.endpoints_for(wanted).await?;
         let total = candidates.len();
         for (position, endpoint) in candidates.into_iter().enumerate() {
             let last = position + 1 == total;
-            let upstream = match self
+            self.authn.revalidate(identity).await?;
+            let request = self
                 .client
                 .request(Method::POST, format!("{endpoint}/v1/sessions"))
                 .bearer_auth(&self.token)
                 .header(header::CONTENT_TYPE, "application/json")
-                .header(credentials::PRINCIPAL_HEADER, principal)
-                .body(body.clone())
-                .send()
-                .await
-            {
+                .body(body.clone());
+            let upstream = match authenticated_request(request, identity).send().await {
                 Ok(upstream) => upstream,
                 // `is_connect` is the connection-never-established case: nothing was
                 // sent, so a worker that has gone away under a stale cache entry is
@@ -582,8 +714,31 @@ impl Gateway {
             .await
             .map_err(|_| ApiError::internal())
     }
+
+    async fn send_as(
+        &self,
+        endpoint: &str,
+        method: Method,
+        path: &str,
+        body: Bytes,
+        identity: &Identity,
+    ) -> Result<reqwest::Response, ApiError> {
+        // Middleware ran before body extraction and route/provisioning waits.
+        // Recheck here; the worker also checks at dequeue, before any SQL runs.
+        self.authn.revalidate(identity).await?;
+        authenticated_request(
+            self.client
+                .request(method, format!("{endpoint}{path}"))
+                .bearer_auth(&self.token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body),
+            identity,
+        )
+        .send()
+        .await
+        .map_err(|_| ApiError::internal())
+    }
     async fn route(&self, id: Uuid, caller: &Principal) -> Result<String, ApiError> {
-        self.expire().await;
         let mut routes = self.routes.lock().await;
         let route = routes
             .get_mut(&id)
@@ -601,36 +756,106 @@ impl Gateway {
         Ok(route.endpoint.clone())
     }
 
-    /// Drops routes nothing has touched recently, releasing any session pod that
-    /// went with them.
-    ///
-    /// Expiry used to be a plain `retain`, which is correct for a persistent worker
-    /// because forgetting a route costs nothing. An isolated session owns a pod, so
-    /// forgetting its route without releasing it would leave that pod billing until
-    /// its deadline — a leak with a half-hour fuse rather than an unbounded one, but
-    /// a leak nobody would see.
-    async fn expire(&self) {
-        let expired: Vec<String> = {
-            let mut routes = self.routes.lock().await;
-            let mut expired = Vec::new();
-            routes.retain(|_, route| {
-                if route.touched.elapsed() < Duration::from_secs(300) {
-                    return true;
-                }
-                expired.extend(route.pod.take());
-                false
-            });
-            expired
-        };
-        // Released off the request path: each release is a kube DELETE plus a ledger
-        // settle, up to ~18s, and awaiting them here made the next unrelated request
-        // wait out every expired pod in turn. A spawned release that dies mid-flight
-        // is backstopped by the startup sweep, so nothing is lost by not awaiting.
-        for pod in expired {
-            tracing::warn!(pod, "releasing the pod of a session nobody closed");
-            let gateway = self.clone();
-            tokio::spawn(async move { gateway.release(Some(pod)).await });
+    async fn query_route(
+        &self,
+        id: Uuid,
+        identity: &Identity,
+    ) -> Result<(String, InFlight), ApiError> {
+        self.authn.revalidate(identity).await?;
+        let mut routes = self.routes.lock().await;
+        let route = routes
+            .get_mut(&id)
+            .filter(|route| !route.closing)
+            .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
+        if !Principal::from_identity(identity).may_act_on(&route.principal) {
+            return Err(ApiError::new(
+                failure::FORBIDDEN,
+                "this session belongs to another principal",
+            ));
         }
+        route.touched = Instant::now();
+        if identity.principal == route.principal.as_ref() {
+            route.identity = identity.clone();
+        }
+        Ok((route.endpoint.clone(), InFlight::enter(&route.active)))
+    }
+
+    /// Periodic, independent of new client traffic. Close on the worker before
+    /// deleting an isolated pod, so cleanup never interrupts accepted active SQL.
+    async fn expire(&self) {
+        let candidates: Vec<_> = self
+            .routes
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, route)| route.active.load(Ordering::Acquire) == 0)
+            .map(|(id, route)| (*id, route.identity.clone(), route.touched, route.closing))
+            .collect();
+        let ids: Vec<String> = candidates
+            .iter()
+            .filter_map(|(_, identity, _, _)| identity.credential_id.clone())
+            .collect();
+        let current = if ids.is_empty() {
+            Ok(Vec::new())
+        } else {
+            self.authn
+                .with_db(false, move |client| credentials::resolve_ids(client, &ids))
+                .await
+        };
+        let mut retire = Vec::new();
+        {
+            let mut routes = self.routes.lock().await;
+            for (id, identity, touched, closing) in candidates {
+                // Failure to establish continuing authority closes named idle
+                // sessions; it does not interrupt active statements.
+                let invalid = identity.expired()
+                    || (identity.credential_id.is_some()
+                        && !current
+                            .as_ref()
+                            .is_ok_and(|valid| valid.iter().any(|item| item == &identity)));
+                if !(closing || invalid || touched.elapsed() >= Duration::from_secs(300)) {
+                    continue;
+                }
+                if let Some(route) = routes.get_mut(&id)
+                    && route.identity == identity
+                    && route.touched == touched
+                    && route.active.load(Ordering::Acquire) == 0
+                {
+                    route.closing = true;
+                    retire.push((id, route.endpoint.clone()));
+                }
+            }
+        }
+        let mut closes = tokio::task::JoinSet::new();
+        for (id, endpoint) in retire {
+            let app = self.clone();
+            closes.spawn(async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    app.send(
+                        &endpoint,
+                        Method::DELETE,
+                        &format!("/v1/sessions/{id}"),
+                        Bytes::new(),
+                    ),
+                )
+                .await;
+                // Retain failed closes for the next pass. Only an acknowledged
+                // close proves that deleting this pod cannot cancel active SQL.
+                if matches!(result, Ok(Ok(ref response)) if response.status().is_success()) {
+                    let pod = app
+                        .routes
+                        .lock()
+                        .await
+                        .remove(&id)
+                        .and_then(|route| route.pod);
+                    // Pod deletion/settlement is bounded independently and cannot
+                    // delay the next credential cleanup pass.
+                    tokio::spawn(async move { app.release(pod).await });
+                }
+            });
+        }
+        while closes.join_next().await.is_some() {}
     }
 
     /// Removes a session pod and settles whatever it was holding.
@@ -670,7 +895,7 @@ async fn response(upstream: reqwest::Response) -> Result<Response, ApiError> {
 }
 async fn open(
     State(app): State<Gateway>,
-    Extension(principal): Extension<Principal>,
+    Extension(identity): Extension<Identity>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     // Only new sessions are refused. Requests on sessions already open continue,
@@ -692,10 +917,12 @@ async fn open(
         })?
     };
     let placement = request.validate()?;
+    // Body extraction may have outlived authentication. Refuse before spending
+    // resources on isolated provisioning, then check again before worker open.
+    app.authn.revalidate(&identity).await?;
     // Carries the mode as well as the size, so an isolated session is recorded as
     // isolated rather than as whatever the pod would have assumed.
     request.compute = placement.request();
-    app.expire().await;
     let permit = app
         .capacity
         .clone()
@@ -711,7 +938,7 @@ async fn open(
     let (endpoint, pod, upstream) = match placement.mode {
         Mode::Persistent => {
             match app
-                .open_persistent(placement.resources, body, principal.name())
+                .open_persistent(placement.resources, body, &identity)
                 .await?
             {
                 OpenOutcome::Opened { endpoint, upstream } => (endpoint, None, upstream),
@@ -730,15 +957,14 @@ async fn open(
             // lose the only useful detail.
             let pod = Some(started.name);
             let upstream = match app
-                .client
-                .request(Method::POST, format!("{}/v1/sessions", started.endpoint))
-                .bearer_auth(&app.token)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(credentials::PRINCIPAL_HEADER, principal.name())
-                .body(body)
-                .send()
+                .send_as(
+                    &started.endpoint,
+                    Method::POST,
+                    "/v1/sessions",
+                    body.into(),
+                    &identity,
+                )
                 .await
-                .map_err(|_| ApiError::internal())
             {
                 Ok(upstream) => upstream,
                 Err(error) => {
@@ -770,7 +996,10 @@ async fn open(
         Route {
             endpoint,
             touched: Instant::now(),
-            principal: principal.name().into(),
+            principal: identity.principal.clone().into(),
+            identity,
+            active: Arc::new(AtomicUsize::new(0)),
+            closing: false,
             pod,
             _permit: permit,
         },
@@ -779,21 +1008,30 @@ async fn open(
 }
 async fn query(
     State(app): State<Gateway>,
-    Extension(principal): Extension<Principal>,
+    Extension(identity): Extension<Identity>,
     Path(id): Path<Uuid>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let endpoint = app.route(id, &principal).await?;
-    response(
-        app.send(
-            &endpoint,
-            Method::POST,
-            &format!("/v1/sessions/{id}/queries"),
-            body,
+    let (endpoint, guard) = app.query_route(id, &identity).await?;
+    let inflight = InFlight::enter(&app.inflight);
+    // A disconnected caller does not establish that the accepted work ended.
+    tokio::spawn(async move {
+        let _guard = guard;
+        let _inflight = inflight;
+        response(
+            app.send_as(
+                &endpoint,
+                Method::POST,
+                &format!("/v1/sessions/{id}/queries"),
+                body,
+                &identity,
+            )
+            .await?,
         )
-        .await?,
-    )
+        .await
+    })
     .await
+    .map_err(|_| ApiError::internal())?
 }
 async fn cancel(
     State(app): State<Gateway>,
@@ -873,7 +1111,7 @@ async fn set_budget(
 /// race is classified `transaction_conflict`, retry-safe, like anyone else's.
 async fn platform_statement(
     app: &Gateway,
-    principal: &Principal,
+    identity: &Identity,
     operation: &str,
     sql: String,
 ) -> Result<Response, ApiError> {
@@ -884,7 +1122,7 @@ async fn platform_statement(
         .to_string()
         .into_bytes();
     let (endpoint, open) = match app
-        .open_persistent(Resources::default(), body, principal.name())
+        .open_persistent(Resources::default(), body, identity)
         .await?
     {
         OpenOutcome::Opened { endpoint, upstream } => (endpoint, upstream),
@@ -897,7 +1135,7 @@ async fn platform_statement(
         .and_then(|info| info["session_id"].as_str().map(str::to_owned))
         .ok_or_else(ApiError::internal)?;
     let result = app
-        .send(
+        .send_as(
             &endpoint,
             Method::POST,
             &format!("/v1/sessions/{session}/queries"),
@@ -909,6 +1147,7 @@ async fn platform_statement(
             })
             .to_string()
             .into(),
+            identity,
         )
         .await;
     // Closed on every path: the session was this handler's to clean up, and the
@@ -928,11 +1167,11 @@ async fn platform_statement(
 /// listing destroys nothing and is how a caller decides what expiry would cost.
 async fn lake_snapshots(
     State(app): State<Gateway>,
-    Extension(principal): Extension<Principal>,
+    Extension(identity): Extension<Identity>,
 ) -> Result<Response, ApiError> {
     platform_statement(
         &app,
-        &principal,
+        &identity,
         "lake_snapshots",
         "SELECT snapshot_id, snapshot_time, schema_version, changes \
          FROM ducklake_snapshots('lake') ORDER BY snapshot_id"
@@ -947,34 +1186,40 @@ async fn lake_snapshots(
 /// compatibility layer over machinery that neither knows nor cares it exists.
 struct PgPlatform(Gateway);
 impl crate::pgwire::Platform for PgPlatform {
-    async fn authenticate(&self, token: String) -> Option<String> {
-        self.0
-            .authn
-            .principal(&token)
-            .await
-            .ok()
-            .map(|principal| principal.name().to_owned())
+    async fn authenticate(&self, token: String) -> Result<Identity, ApiError> {
+        self.0.authn.authenticate(&token).await
     }
 
-    async fn open_session(&self, principal: String) -> anyhow::Result<crate::pgwire::Session> {
+    async fn revalidate(&self, identity: &Identity) -> Result<(), ApiError> {
+        self.0.authn.revalidate(identity).await
+    }
+
+    async fn open_session(&self, identity: &Identity) -> Result<crate::pgwire::Session, ApiError> {
         let body = json!({"compute": {}, "context": {"operation": "pgwire"}})
             .to_string()
             .into_bytes();
         let (endpoint, opened) = match self
             .0
-            .open_persistent(Resources::default(), body, &principal)
-            .await
-            .map_err(|refusal| anyhow::anyhow!("{}", refusal.1))?
+            .open_persistent(Resources::default(), body, identity)
+            .await?
         {
             OpenOutcome::Opened { endpoint, upstream } => (endpoint, upstream),
-            OpenOutcome::Refused(_) => anyhow::bail!("the worker refused the session"),
+            OpenOutcome::Refused(reply) => {
+                return Err(match reply.status() {
+                    StatusCode::UNAUTHORIZED => invalid_credential(),
+                    StatusCode::FORBIDDEN => {
+                        ApiError::new(failure::FORBIDDEN, "session access refused")
+                    }
+                    _ => ApiError::new(failure::UNAVAILABLE, "the worker refused the session"),
+                });
+            }
         };
         let session_id = opened
             .json::<Value>()
             .await
             .ok()
             .and_then(|info| info["session_id"].as_str().map(str::to_owned))
-            .ok_or_else(|| anyhow::anyhow!("the worker's answer had no session id"))?;
+            .ok_or_else(ApiError::internal)?;
         Ok(crate::pgwire::Session {
             endpoint,
             session_id,
@@ -983,6 +1228,7 @@ impl crate::pgwire::Platform for PgPlatform {
 
     async fn query(
         &self,
+        identity: &Identity,
         session: &crate::pgwire::Session,
         sql: String,
     ) -> crate::pgwire::QueryOutcome {
@@ -994,7 +1240,7 @@ impl crate::pgwire::Platform for PgPlatform {
         let _inflight = InFlight::enter(&self.0.inflight);
         let sent = self
             .0
-            .send(
+            .send_as(
                 &session.endpoint,
                 Method::POST,
                 &format!("/v1/sessions/{}/queries", session.session_id),
@@ -1006,6 +1252,7 @@ impl crate::pgwire::Platform for PgPlatform {
                 })
                 .to_string()
                 .into(),
+                identity,
             )
             .await;
         let upstream = match sent {
@@ -1041,15 +1288,18 @@ impl crate::pgwire::Platform for PgPlatform {
     }
 
     async fn close_session(&self, session: crate::pgwire::Session) {
-        let _ = self
-            .0
-            .send(
+        // Do not let a busy unrelated worker keep a revoked socket alive. The
+        // enqueued close and worker's periodic cleanup are the backstops.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.0.send(
                 &session.endpoint,
                 Method::DELETE,
                 &format!("/v1/sessions/{}", session.session_id),
                 Bytes::new(),
-            )
-            .await;
+            ),
+        )
+        .await;
     }
 
     fn draining(&self) -> bool {
@@ -1076,6 +1326,7 @@ struct MaintenanceRequest {
 async fn lake_maintenance(
     State(app): State<Gateway>,
     Extension(principal): Extension<Principal>,
+    Extension(identity): Extension<Identity>,
     Json(request): Json<MaintenanceRequest>,
 ) -> Result<Response, ApiError> {
     admin_only(&principal, "run lake maintenance")?;
@@ -1109,7 +1360,7 @@ async fn lake_maintenance(
             _ => "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)".to_owned(),
         });
     }
-    platform_statement(&app, &principal, "lake_maintenance", statements.join(";\n")).await
+    platform_statement(&app, &identity, "lake_maintenance", statements.join(";\n")).await
 }
 
 #[derive(Deserialize)]
@@ -1195,7 +1446,7 @@ async fn revoke_credential(
     // The whole cache rather than one entry: revocation is rare, the cache is
     // small, and clearing it makes a revocation bite this gateway immediately
     // instead of after the cache window.
-    app.authn.cache.lock().await.clear();
+    app.authn.cache.lock().await.invalidate();
     Ok(Json(json!({"revoked": true})))
 }
 
@@ -1392,6 +1643,15 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             listener,
         ));
     }
+    let cleanup = app.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            cleanup.expire().await;
+        }
+    });
     let draining = app.draining.clone();
     let inflight = app.inflight.clone();
     let router = Router::new()
@@ -1429,6 +1689,8 @@ mod tests {
         reply: Arc<Mutex<(StatusCode, Value)>>,
         requests: Arc<AtomicUsize>,
         opens: Arc<AtomicUsize>,
+        closes: Arc<AtomicUsize>,
+        close_status: Arc<Mutex<StatusCode>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -1442,9 +1704,13 @@ mod tests {
         let reply = Arc::new(Mutex::new((StatusCode::OK, value)));
         let requests = Arc::new(AtomicUsize::new(0));
         let opens = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let close_status = Arc::new(Mutex::new(StatusCode::OK));
         let handler_reply = reply.clone();
         let handler_requests = requests.clone();
         let handler_opens = opens.clone();
+        let handler_closes = closes.clone();
+        let handler_close_status = close_status.clone();
         let router = Router::new()
             .route(
                 "/v1/worker",
@@ -1467,6 +1733,17 @@ mod tests {
                         Json(json!({"session_id": Uuid::new_v4()}))
                     }
                 }),
+            )
+            .route(
+                "/v1/sessions/{id}",
+                axum::routing::delete(move || {
+                    let closes = handler_closes.clone();
+                    let status = handler_close_status.clone();
+                    async move {
+                        closes.fetch_add(1, Ordering::SeqCst);
+                        *status.lock().await
+                    }
+                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1478,6 +1755,8 @@ mod tests {
             reply,
             requests,
             opens,
+            closes,
+            close_status,
             task,
         }
     }
@@ -1529,6 +1808,185 @@ mod tests {
             draining: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn issued_identity() -> Identity {
+        Identity {
+            principal: "analyst".into(),
+            credential_id: Some(Uuid::new_v4().to_string()),
+            expires_at: Some(SystemTime::now() + Duration::from_secs(300)),
+        }
+    }
+
+    #[test]
+    fn revocation_prevents_a_previously_started_lookup_from_refilling_the_cache() {
+        let mut cache = AuthCache::default();
+        let identity = issued_identity();
+        let lookup_generation = cache.generation;
+        cache.invalidate();
+        assert!(!cache.publish(
+            lookup_generation,
+            identity.clone(),
+            Instant::now(),
+            Some("old-digest".into())
+        ));
+        assert!(
+            cache
+                .get(identity.credential_id.as_ref().unwrap())
+                .is_none()
+        );
+        assert!(cache.digests.is_empty());
+        let replacement = issued_identity();
+        assert!(cache.publish(
+            cache.generation,
+            replacement.clone(),
+            Instant::now(),
+            Some("new-digest".into())
+        ));
+        assert_eq!(
+            cache.get(replacement.credential_id.as_ref().unwrap()),
+            Some(replacement)
+        );
+        assert!(
+            cache
+                .get(identity.credential_id.as_ref().unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn auth_cache_never_extends_credential_expiry_or_the_lookup_freshness_window() {
+        let mut cache = AuthCache::default();
+        let mut identity = issued_identity();
+        identity.expires_at = Some(SystemTime::now() - Duration::from_secs(1));
+        assert!(!cache.publish(cache.generation, identity.clone(), Instant::now(), None));
+        // Even a fresh positive entry must obey the credential's own deadline.
+        let id = identity.credential_id.clone().unwrap();
+        cache
+            .identities
+            .insert(id.clone(), (identity, Instant::now()));
+        assert!(cache.get(&id).is_none());
+        let valid = issued_identity();
+        let id = valid.credential_id.clone().unwrap();
+        assert!(cache.publish(cache.generation, valid, Instant::now() - Authn::FRESH, None));
+        assert!(
+            cache.get(&id).is_none(),
+            "finishing a lookup restarted its cache window"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_credentials_are_refused_before_an_internal_request_is_sent() {
+        let server = status_server(status("ready")).await;
+        let app = test_gateway(vec![server.endpoint.clone()]);
+        let mut expired = issued_identity();
+        expired.expires_at = Some(SystemTime::now() - Duration::from_secs(1));
+        let refused = app
+            .send_as(
+                &server.endpoint,
+                Method::POST,
+                "/v1/sessions",
+                Bytes::from_static(b"{}"),
+                &expired,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.0.kind, "unauthorized");
+        assert_eq!(server.opens.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn internal_identity_headers_come_from_authentication_not_query_context() {
+        let app = test_gateway(Vec::new());
+        let identity = issued_identity();
+        let request = authenticated_request(app.client.post("http://localhost/v1/sessions/s/queries")
+            .json(&json!({"context": {"principal": "bootstrap-admin", "credential_id": "forged"}})), &identity)
+            .build().unwrap();
+        assert_eq!(request.headers()[credentials::PRINCIPAL_HEADER], "analyst");
+        assert_eq!(
+            request.headers()[credentials::CREDENTIAL_HEADER],
+            identity.credential_id.unwrap()
+        );
+        let bootstrap = authenticated_request(
+            app.client.post("http://localhost/v1/sessions"),
+            &Identity::bootstrap(),
+        )
+        .build()
+        .unwrap();
+        assert!(
+            !bootstrap
+                .headers()
+                .contains_key(credentials::CREDENTIAL_HEADER)
+        );
+    }
+
+    async fn insert_test_route(
+        app: &Gateway,
+        endpoint: String,
+        identity: Identity,
+        touched: Instant,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        app.routes.lock().await.insert(
+            id,
+            Route {
+                endpoint,
+                principal: identity.principal.clone().into(),
+                identity,
+                touched,
+                active: Arc::new(AtomicUsize::new(0)),
+                closing: false,
+                pod: None,
+                _permit: app.capacity.clone().try_acquire_owned().unwrap(),
+            },
+        );
+        id
+    }
+
+    #[tokio::test]
+    async fn cleanup_waits_for_active_requests_and_a_successful_worker_close() {
+        let server = status_server(status("ready")).await;
+        let app = test_gateway(vec![server.endpoint.clone()]);
+        let id = insert_test_route(
+            &app,
+            server.endpoint.clone(),
+            Identity::bootstrap(),
+            Instant::now() - Duration::from_secs(301),
+        )
+        .await;
+        let active = app.routes.lock().await[&id].active.clone();
+        let guard = InFlight::enter(&active);
+        app.expire().await;
+        assert_eq!(server.closes.load(Ordering::SeqCst), 0);
+        drop(guard);
+        *server.close_status.lock().await = StatusCode::SERVICE_UNAVAILABLE;
+        app.expire().await;
+        assert!(app.routes.lock().await[&id].closing);
+        assert_eq!(app.capacity.available_permits(), 63);
+        assert!(app.query_route(id, &Identity::bootstrap()).await.is_err());
+        *server.close_status.lock().await = StatusCode::OK;
+        app.expire().await;
+        assert!(!app.routes.lock().await.contains_key(&id));
+        assert_eq!(app.capacity.available_permits(), 64);
+        assert_eq!(server.closes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_credential_preserves_principal_ownership_and_claims_cleanup() {
+        let app = test_gateway(Vec::new());
+        let old = issued_identity();
+        let replacement = issued_identity();
+        let id = insert_test_route(&app, "http://unused".into(), old, Instant::now()).await;
+        {
+            let mut cache = app.authn.cache.lock().await;
+            let generation = cache.generation;
+            assert!(cache.publish(generation, replacement.clone(), Instant::now(), None));
+        }
+        let (_, guard) = app.query_route(id, &replacement).await.unwrap();
+        assert_eq!(app.routes.lock().await[&id].identity, replacement);
+        app.expire().await;
+        assert!(!app.routes.lock().await[&id].closing);
+        drop(guard);
     }
 
     #[tokio::test]
@@ -1690,7 +2148,7 @@ mod tests {
         let mut placements = Vec::new();
         for _ in 0..4 {
             match app
-                .open_persistent(Resources::default(), b"{}".to_vec(), "analyst")
+                .open_persistent(Resources::default(), b"{}".to_vec(), &Identity::bootstrap())
                 .await
                 .unwrap()
             {
@@ -1935,9 +2393,9 @@ mod tests {
         let resolved = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(authn.principal("the-bootstrap-token"))
+            .block_on(authn.authenticate("the-bootstrap-token"))
             .unwrap();
-        assert_eq!(resolved.name(), credentials::BOOTSTRAP_PRINCIPAL);
+        assert!(resolved.is_bootstrap());
     }
 
     /// A caller that disconnects has its handler future dropped mid-await. The drain

@@ -9,6 +9,7 @@
 use anyhow::Result;
 use postgres::{Client, Transaction};
 use serde_json::{Value, json};
+use std::time::SystemTime;
 use uuid::Uuid;
 
 /// The header the gateway sets on the internal hop to a worker, naming the
@@ -16,8 +17,37 @@ use uuid::Uuid;
 /// shared internal token; a caller-supplied value never reaches it — the gateway
 /// overwrites, and a worker addressed directly records `direct`.
 pub(crate) const PRINCIPAL_HEADER: &str = "x-duckfleet-principal";
+/// Issued credential authenticated for this operation, never taken from SQL
+/// context. Workers resolve this identifier again immediately before execution.
+pub(crate) const CREDENTIAL_HEADER: &str = "x-duckfleet-credential-id";
 /// What the bootstrap credential authenticates as.
 pub(crate) const BOOTSTRAP_PRINCIPAL: &str = "bootstrap-admin";
+
+/// Authenticated identity without the bearer token or its digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Identity {
+    pub principal: String,
+    pub credential_id: Option<String>,
+    pub expires_at: Option<SystemTime>,
+}
+
+impl Identity {
+    pub fn bootstrap() -> Self {
+        Self {
+            principal: BOOTSTRAP_PRINCIPAL.into(),
+            credential_id: None,
+            expires_at: None,
+        }
+    }
+
+    pub fn is_bootstrap(&self) -> bool {
+        self.credential_id.is_none() && self.principal == BOOTSTRAP_PRINCIPAL
+    }
+
+    pub fn expired(&self) -> bool {
+        self.expires_at.is_some_and(|at| at <= SystemTime::now())
+    }
+}
 
 /// A credential at mint time. The only moment `token` exists in plaintext
 /// anywhere but the caller's hands.
@@ -156,15 +186,63 @@ pub(crate) fn list(client: &mut Client) -> Result<Value> {
 
 /// The principal a presented token authenticates, or None: unknown, revoked and
 /// expired all answer alike, so a probe learns nothing about which it was.
-pub(crate) fn resolve(client: &mut Client, token_sha256: &str) -> Result<Option<String>> {
-    Ok(client
-        .query_opt(
-            "SELECT principal FROM credentials
+pub(crate) fn resolve(client: &mut Client, token_sha256: &str) -> Result<Option<Identity>> {
+    Ok(read_identities(
+        client,
+        "SELECT credential_id, principal, expires_at FROM credentials
              WHERE token_sha256 = $1 AND revoked_at IS NULL
-               AND (expires_at IS NULL OR expires_at > now())",
-            &[&token_sha256],
-        )?
-        .map(|row| row.get(0)))
+               AND (expires_at IS NULL OR expires_at > clock_timestamp())",
+        &[&token_sha256],
+    )?
+    .into_iter()
+    .next())
+}
+
+/// Authoritative admission check for an already authenticated connection/request.
+pub(crate) fn resolve_id(client: &mut Client, credential_id: &str) -> Result<Option<Identity>> {
+    Ok(read_identities(
+        client,
+        "SELECT credential_id, principal, expires_at FROM credentials
+             WHERE credential_id = $1 AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > clock_timestamp())",
+        &[&credential_id],
+    )?
+    .into_iter()
+    .next())
+}
+
+/// One bounded query checks the lifecycle credentials of a worker's idle sessions.
+pub(crate) fn resolve_ids(client: &mut Client, credential_ids: &[String]) -> Result<Vec<Identity>> {
+    read_identities(
+        client,
+        "SELECT credential_id, principal, expires_at FROM credentials
+             WHERE credential_id = ANY($1) AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > clock_timestamp())",
+        &[&credential_ids],
+    )
+}
+
+fn read_identities(
+    client: &mut Client,
+    sql: &str,
+    parameters: &[&(dyn postgres::types::ToSql + Sync)],
+) -> Result<Vec<Identity>> {
+    // Workers reuse the ledger connection: scope the auth timeout/read-only mode
+    // to this transaction, so lock contention cannot stall admission indefinitely
+    // and subsequent ledger writes retain their original configuration.
+    let mut transaction = client.build_transaction().read_only(true).start()?;
+    transaction.batch_execute("SET LOCAL statement_timeout = 3000")?;
+    let rows = transaction.query(sql, parameters)?;
+    transaction.commit()?;
+    Ok(rows.into_iter().map(identity).collect())
+}
+
+fn identity(row: postgres::Row) -> Identity {
+    Identity {
+        credential_id: Some(row.get(0)),
+        principal: row.get(1),
+        expires_at: row.get(2),
+    }
 }
 
 #[cfg(test)]
