@@ -1571,7 +1571,7 @@ pub(crate) fn finish_open(
     let mut tx = client.transaction()?;
     bounded(&mut tx)?;
     tx.execute("UPDATE session_events SET session_id=COALESCE($2,session_id),
-        provisioning_ms=CASE WHEN provisioning_started_at IS NOT NULL THEN $3 ELSE NULL END,
+        provisioning_ms=CASE WHEN provisioning_started_at IS NOT NULL THEN $3::BIGINT ELSE NULL END,
         finished_at=CASE WHEN provisioning_started_at IS NOT NULL THEN clock_timestamp() ELSE NULL END,
         error=$4 WHERE open_span_id=$1",&[&span.to_string(),&session.map(|id|id.to_string()),&elapsed_ms,&error])?;
     tx.commit()?;

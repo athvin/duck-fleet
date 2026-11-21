@@ -371,6 +371,7 @@ fn fixtures(
             max_queued_bytes: 16 * 1024 * 1024,
         },
     )?;
+    open_timing(worker, gateway, &epoch, &alice)?;
     let sa = session(worker, &epoch, &alice)?;
     let sb = session(worker, &epoch, &bob)?;
     let qa = query();
@@ -506,6 +507,74 @@ fn fixtures(
     anyhow::ensure!(
         report.tasks.iter().all(|task| task.status == "succeeded"),
         "actual maintainer role cannot maintain platform"
+    );
+    Ok(())
+}
+
+fn open_timing(
+    worker: &mut Client,
+    gateway: &mut Client,
+    epoch: &WorkerEpoch,
+    actor: &Identity,
+) -> Result<()> {
+    // Worker registration can succeed even if gateway begin_open was unavailable.
+    let missing_start = session(worker, epoch, actor)?;
+    queue::finish_open(
+        gateway,
+        missing_start.open_span_id,
+        Some(missing_start.session_id),
+        999,
+        Some("unavailable"),
+    )?;
+    let row=gateway.query_one("SELECT provisioning_started_at IS NULL,provisioning_ms IS NULL,finished_at IS NULL,opened_at IS NOT NULL,error FROM session_events WHERE open_span_id=$1", &[&missing_start.open_span_id.to_string()])?;
+    anyhow::ensure!(
+        row.get::<_, bool>(0)
+            && row.get::<_, bool>(1)
+            && row.get::<_, bool>(2)
+            && row.get::<_, bool>(3)
+            && row.get::<_, String>(4) == "unavailable",
+        "missing gateway start fabricated provisioning time or lost backend observation"
+    );
+
+    let mut opened = missing_start.clone();
+    opened.session_id = Uuid::new_v4();
+    opened.open_span_id = Uuid::new_v4();
+    queue::begin_open(
+        gateway,
+        opened.open_span_id,
+        &actor.principal,
+        &opened.scope,
+    )?;
+    api(queue::register_session(worker, &opened))?;
+    queue::finish_open(
+        gateway,
+        opened.open_span_id,
+        Some(opened.session_id),
+        37,
+        None,
+    )?;
+    let row=gateway.query_one("SELECT session_id,provisioning_started_at IS NOT NULL,provisioning_ms,finished_at IS NOT NULL,opened_at IS NOT NULL,error IS NULL FROM session_events WHERE open_span_id=$1", &[&opened.open_span_id.to_string()])?;
+    anyhow::ensure!(
+        row.get::<_, String>(0) == opened.session_id.to_string()
+            && row.get::<_, bool>(1)
+            && row.get::<_, i64>(2) == 37
+            && row.get::<_, bool>(3)
+            && row.get::<_, bool>(4)
+            && row.get::<_, bool>(5),
+        "actual gateway role did not persist successful provisioning duration"
+    );
+
+    let refused = Uuid::new_v4();
+    queue::begin_open(gateway, refused, &actor.principal, &opened.scope)?;
+    queue::finish_open(gateway, refused, None, 0, Some("unavailable"))?;
+    let row=gateway.query_one("SELECT session_id IS NULL,provisioning_ms,finished_at IS NOT NULL,opened_at IS NULL,error FROM session_events WHERE open_span_id=$1", &[&refused.to_string()])?;
+    anyhow::ensure!(
+        row.get::<_, bool>(0)
+            && row.get::<_, i64>(1) == 0
+            && row.get::<_, bool>(2)
+            && row.get::<_, bool>(3)
+            && row.get::<_, String>(4) == "unavailable",
+        "failed open lost zero elapsed timing or fabricated a backend session"
     );
     Ok(())
 }
