@@ -54,6 +54,8 @@ pub async fn run(args: Vec<String>) -> i32 {
 
     let result: anyhow::Result<()> = if has("--engine-qualification") {
         engine_qualification::checks(&ctx).await
+    } else if has("--extension-security") {
+        engine_qualification::security(&ctx).await
     } else if has("--jobs-storage") {
         jobs_storage::checks().await
     } else if has("--jobs-long") {

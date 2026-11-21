@@ -24,8 +24,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=du
 FROM python:3.12.12-slim-bookworm AS aws-credentials-check
 RUN pip install --no-cache-dir duckdb==2.0.1
 COPY --from=build /opt/duckdb /opt/duckdb
+COPY tests/extension_bundle.py /app/extension_bundle.py
+RUN --network=none python /app/extension_bundle.py
 COPY tests/aws_credentials.py /app/aws_credentials.py
-RUN python /app/aws_credentials.py
+COPY tests/s3_secret_scope.py /app/s3_secret_scope.py
+RUN python /app/aws_credentials.py && python /app/s3_secret_scope.py
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 && rm -rf /var/lib/apt/lists/* && useradd -m -u 10001 duckfleet
