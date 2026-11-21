@@ -244,8 +244,9 @@ duckfleet sql 'select region, count(*) from analytics.events group by region'
 duckfleet sql 'select * from analytics.events where region = ?' --param eu --format json
 ```
 
-The `cli` role and the dbt adapter are two front-ends over one wire protocol — the
-Arrow-IPC client in `server/src/client.rs` — so neither can drift from the other.
+The CLI uses the HTTP/Arrow client in `server/src/client.rs`. The external dbt
+adapter speaks the same API; its supported selection fields depend on the pinned
+adapter release described above.
 
 Statements given to one `sql` invocation share a session, which is what pins a load
 and the query that checks it to the same worker. Compute is selectable per invocation:
