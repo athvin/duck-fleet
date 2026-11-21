@@ -28,6 +28,13 @@ def main():
         help="persist /artifacts on this claim instead of an emptyDir, so a later "
         "run can read what an earlier one wrote",
     )
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="add or replace a plain environment variable on the dbt container",
+    )
     args = parser.parse_args()
 
     documents = [doc for doc in yaml.safe_load_all(sys.stdin.read()) if doc is not None]
@@ -51,6 +58,18 @@ def main():
     if dbt is None:
         raise SystemExit("the harness Job no longer has a container named 'dbt'")
     dbt["command"] = shlex.split(args.command)
+
+    for item in args.env:
+        name, sep, value = item.partition("=")
+        if not sep or not name:
+            raise SystemExit(f"--env expects NAME=VALUE, got {item!r}")
+        env = dbt.setdefault("env", [])
+        entry = next((e for e in env if e.get("name") == name), None)
+        if entry is None:
+            env.append({"name": name, "value": value})
+        else:
+            entry.pop("valueFrom", None)
+            entry["value"] = value
 
     if args.artifacts_claim:
         # The restart assertions read a query id an earlier run wrote. An emptyDir
