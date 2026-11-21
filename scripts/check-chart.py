@@ -182,6 +182,12 @@ else:
                         'DUCKFLEET_MIGRATION_TIMEOUT_SECONDS', 'DUCKFLEET_PREPAID_MICRO_USD',
                         'DUCKFLEET_MAX_JOB_MICRO_USD'}, env
     assert env['DUCKFLEET_ROLE'] == 'migrate'
+    # Helm may stringify large numeric YAML values in scientific notation.
+    # Migrations parse whole micro-USD, and the Kind YAML round trip must retain
+    # string-valued Kubernetes environment entries rather than numbers.
+    for name in ('DUCKFLEET_PREPAID_MICRO_USD', 'DUCKFLEET_MAX_JOB_MICRO_USD'):
+        assert isinstance(env[name], str) and env[name].isascii() and env[name].isdigit(), env
+        assert int(env[name]) > 0, f'{name} must be a positive whole number'
     assert migration['spec']['activeDeadlineSeconds'] >= (
         int(env['DUCKFLEET_PLATFORM_WAIT_SECONDS']) + int(env['DUCKFLEET_MIGRATION_TIMEOUT_SECONDS']))
     assert not {'startupProbe', 'readinessProbe', 'livenessProbe'} & set(migrate)
