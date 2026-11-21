@@ -237,10 +237,10 @@ pub struct RemoteConnection {
 }
 
 impl RemoteConnection {
-    /// Opens a session. `compute` is `None` (or an empty map) for the shared
-    /// persistent tier; naming any of cpu/memory/disk asks for a dedicated pod of
-    /// that size — the gateway derives the mode from presence, so there is no mode
-    /// flag. The open is retried only while a refusal is one a new session may
+    /// Opens a session. `compute` is `None` (or an empty map) for the default
+    /// persistent pool. Resource fields alone request a dedicated pod; explicit
+    /// `mode` and `pool` select persistent resources or isolated compute. Selection
+    /// is fixed for the session. The open is retried only while a refusal is one a new session may
     /// wait out, bounded by `open_retry_seconds` wall-clock.
     pub async fn open(
         endpoint: &str,

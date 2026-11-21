@@ -564,6 +564,114 @@ class PlatformPackagingTests(unittest.TestCase):
         self.assertFalse(any(item['kind'] == 'StatefulSet' for item in objects))
 
 
+class NamedPoolPackagingTests(unittest.TestCase):
+    POOLS = {
+        'small': {'cpu': 1, 'memory': '1Gi', 'disk': '2Gi', 'workers': 2},
+        'interactive': {'cpu': 2, 'memory': '3Gi', 'disk': '4Gi', 'workers': 2,
+                        'maxSessionsPerWorker': 7},
+        'small-1': {'cpu': 1, 'memory': '512Mi', 'disk': '1536Mi', 'workers': 1},
+    }
+
+    def render(self, pools=None, *extra):
+        text = chart(['--set-json', 'persistentPools='+json.dumps(self.POOLS if pools is None else pools),
+                      *extra])
+        objects = [item for item in yaml.safe_load_all(text) if item]
+        # Exercise the same resource-boundary validator used on every deployment.
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml') as handle:
+            handle.write(text); handle.flush()
+            subprocess.run(['python3', str(ROOT/'scripts/check-chart.py'), handle.name],
+                           check=True, capture_output=True, text=True)
+        return {(item['kind'], item['metadata']['name']): item for item in objects}
+
+    def test_independent_allocations_and_generated_identities_agree_with_registry(self):
+        objects = self.render()
+        config = json.loads(objects['ConfigMap', 'duckfleet-pools']['data']['pools.json'])
+        self.assertEqual(config['pools']['interactive'], {
+            'cpu': 2, 'memory': '3Gi', 'disk': '4Gi', 'max_sessions_per_worker': 7,
+            'endpoints': ['http://worker-pool-interactive-0:8080',
+                          'http://worker-pool-interactive-1:8080']})
+        self.assertIn(('Deployment', 'worker-small-1'), objects)
+        self.assertIn(('Deployment', 'worker-pool-small-1-0'), objects,
+                      'a pool called small-1 must not collide with legacy small replica1')
+        interactive = objects['Deployment', 'worker-pool-interactive-0']['spec']['template']['spec']
+        resource = interactive['containers'][0]['resources']
+        self.assertEqual(resource['requests'], {'cpu': '2', 'memory': '3Gi', 'ephemeral-storage': '4Gi'})
+        self.assertEqual(resource['limits']['ephemeral-storage'], '5Gi')
+        self.assertEqual(interactive['volumes'][0]['emptyDir']['sizeLimit'], '4Gi')
+        fractional = objects['Deployment', 'worker-pool-small-1-0']['spec']['template']['spec']['containers'][0]
+        self.assertEqual(fractional['resources']['limits']['ephemeral-storage'], '2560Mi')
+
+    def test_named_small_preserves_legacy_immutable_selectors(self):
+        named = self.render()
+        legacy = {(item['kind'], item['metadata']['name']): item
+                  for item in yaml.safe_load_all(chart(['--set', 'workerReplicas.small=2'])) if item}
+        for name in ('worker-small', 'worker-small-1'):
+            self.assertEqual(named['Deployment', name]['spec']['selector'],
+                             legacy['Deployment', name]['spec']['selector'])
+            self.assertEqual(named['Service', name]['spec']['selector'],
+                             legacy['Service', name]['spec']['selector'])
+
+    def test_configuration_reload_does_not_change_gateway_pod_template(self):
+        initial = self.render()
+        updated = self.render(None, '--set', 'defaultPool=interactive')
+        self.assertEqual(initial['Deployment', 'server']['spec']['template'],
+                         updated['Deployment', 'server']['spec']['template'])
+        self.assertNotEqual(initial['ConfigMap', 'duckfleet-pools']['data'],
+                            updated['ConfigMap', 'duckfleet-pools']['data'])
+        gateway = initial['Deployment', 'server']['spec']['template']['spec']['containers'][0]
+        mounts = {mount['name']: mount for mount in gateway['volumeMounts']}
+        self.assertNotIn('subPath', mounts['persistent-pools'])
+        env = {item['name']: item.get('value') for item in gateway['env']}
+        self.assertNotIn('DUCKFLEET_WORKER_URLS', env)
+
+    def test_empty_pool_and_non_small_default_remain_configured(self):
+        objects = self.render({'etl': {'cpu': 4, 'memory': '8Gi', 'disk': '20Gi', 'workers': 0}},
+                              '--set', 'defaultPool=etl')
+        self.assertFalse(any(kind == 'Deployment' and name.startswith('worker-') for kind, name in objects))
+        config = json.loads(objects['ConfigMap', 'duckfleet-pools']['data']['pools.json'])
+        self.assertEqual(config['default_pool'], 'etl')
+        self.assertEqual(config['pools']['etl']['endpoints'], [])
+
+    def test_invalid_pool_configuration_is_rejected_at_render(self):
+        for args in [
+            ['--set', 'defaultPool=missing'],
+            ['--set', 'workerReplicas.small=1'],
+            ['--set', 'persistentPools.interactive.memory=128Mi'],
+            ['--set', 'persistentPools.interactive.disk=512Mi'],
+            ['--set', 'persistentPools.interactive.maxSessionsPerWorker=1025'],
+            ['--set', 'gatewayMaxSessions=4097'],
+            ['--set', 'workerQueueCapacity=0'],
+        ]:
+            with self.subTest(args=args), self.assertRaises(subprocess.CalledProcessError):
+                self.render(None, *args)
+        for name in ['Upper', 'trailing-', '-leading', 'a'*41]:
+            with self.subTest(name=name), self.assertRaises(subprocess.CalledProcessError):
+                self.render({name: {'cpu': 1, 'memory': '1Gi', 'disk': '2Gi'}},
+                            '--set', 'defaultPool='+name)
+
+    def test_clearing_inherited_replica_values_allows_named_pool_adoption(self):
+        self.render(None, '--set', 'workerReplicas.small=2', '--set', 'workerReplicas=null')
+
+    def test_named_pools_work_without_isolated_compute(self):
+        self.render(None, '--set', 'isolatedCompute.enabled=false')
+
+    def test_compose_pool_profile_is_optional_and_reload_uses_a_directory(self):
+        compose = yaml.safe_load((ROOT/'compose.yaml').read_text())['services']
+        config = json.loads((ROOT/'examples/pools/compose.json').read_text())
+        worker = compose['worker-pool-interactive-0']
+        self.assertEqual(worker['profiles'], ['pools'])
+        self.assertEqual(worker['environment']['DUCKFLEET_POOL'], 'interactive')
+        self.assertEqual(worker['cpus'], config['pools']['interactive']['cpu'])
+        self.assertEqual(worker['environment']['DUCKFLEET_WORKER_MEMORY'], '3Gi')
+        self.assertEqual(worker['mem_limit'], '3g')
+        gateway = compose['server-pools']
+        self.assertEqual(gateway['profiles'], ['pools'])
+        self.assertNotIn('DUCKFLEET_WORKER_URLS', gateway['environment'])
+        self.assertTrue(any('/etc/duckfleet/pools:ro' in mount for mount in gateway['volumes']))
+        self.assertNotIn('profiles', compose['server'])
+        self.assertNotIn('DUCKFLEET_POOLS_FILE', compose['server']['environment'])
+
+
 class PlatformOperatorScriptsTests(unittest.TestCase):
     def test_restore_stops_compute_and_migrates_only_after_both_restores_succeed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -742,6 +850,39 @@ class WorkerResourceRuleTests(unittest.TestCase):
             wrong[kind]['memory'] = '1Gi'
             with self.assertRaises(AssertionError):
                 resources.assert_worker_resources(wrong, 2, 'test')
+
+    def test_cpu_and_memory_are_independent_declared_dimensions(self):
+        resources.assert_worker_resources(self.spec(2, memory='3Gi'), 2, 'test', memory='3Gi')
+        resources.assert_worker_resources(self.spec(4, memory='512Mi'), 4, 'test', memory='512Mi')
+        with self.assertRaises(AssertionError):
+            resources.assert_worker_resources(self.spec(2, memory='3Gi'), 2, 'test', memory='4Gi')
+
+    def test_kind_cgroup_probe_uses_independent_memory_and_all_workers(self):
+        limits = load('kind_assert_limits', 'scripts/kind/assert_limits.py')
+        pods = []
+        for name, cpu, memory in [('small', 1, '1Gi'), ('interactive', 2, '3Gi')]:
+            pods.append({'metadata': {'name': name, 'labels': {'app': 'duckfleet-worker'}},
+                         'spec': {'containers': [{'name': 'worker', 'env': [
+                             {'name': 'DUCKFLEET_WORKER_ID', 'value': name},
+                             {'name': 'DUCKFLEET_POOL', 'value': name},
+                             {'name': 'DUCKFLEET_WORKER_CPU', 'value': str(cpu)},
+                             {'name': 'DUCKFLEET_WORKER_MEMORY', 'value': memory},
+                             {'name': 'DUCKFLEET_WORKER_DISK', 'value': '2Gi'}],
+                             'resources': {'requests': {'cpu': '50m', 'memory': memory,
+                                                        'ephemeral-storage': '2Gi'},
+                                           'limits': {'cpu': str(cpu), 'memory': memory,
+                                                      'ephemeral-storage': '3Gi'}}}]}})
+        observed = {'small': '100000 100000 1073741824',
+                    'interactive': '200000 100000 3221225472'}
+        def kube(args, context, namespace):
+            return json.dumps({'items': pods}) if args[0] == 'get' else observed[args[1]]
+        with mock.patch.object(limits, 'kubectl', side_effect=kube) as calls, \
+                mock.patch.object(limits.sys, 'argv', ['assert_limits.py', '--context', 'fixture',
+                                                     '--namespace', 'duckfleet-fixture']):
+            self.assertEqual(limits.main(), 0)
+            self.assertEqual(calls.call_count, 3)
+            observed['interactive'] = '200000 100000 2147483648'
+            self.assertEqual(limits.main(), 1, 'a mismatched memory cgroup must fail')
 
     def test_both_callers_use_the_shared_rule(self):
         # Built in pieces so this does not match its own source.

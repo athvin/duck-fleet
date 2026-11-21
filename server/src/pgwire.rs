@@ -22,8 +22,9 @@ use tokio::sync::Semaphore;
 
 use crate::{ApiError, credentials::Identity};
 
-/// Concurrent pgwire connections this listener will hold, mirroring the gateway's
-/// own 64-session cap. A bound at all is the point: without one, every accepted
+/// Separate bound on wire sockets, including unauthenticated and idle clients.
+/// Backend sessions also acquire the gateway's shared HTTP/pgwire/platform permit.
+/// Without a socket bound, every accepted
 /// socket spawned an unbounded task, so a client that connected and sent nothing
 /// parked a task forever.
 const MAX_CONNECTIONS: usize = 64;
@@ -178,6 +179,17 @@ async fn established<P: Platform>(
 ) -> Result<()> {
     let mut user = String::new();
     for pair in startup.split(|b| *b == 0).collect::<Vec<_>>().chunks(2) {
+        if let [key, _] = pair
+            && matches!(*key, b"pool" | b"duckfleet_pool")
+        {
+            error_response(
+                stream,
+                "0A000",
+                "pgwire uses the configured default pool; explicit pool selection is unsupported",
+            )
+            .await?;
+            return Ok(());
+        }
         if let [key, value] = pair
             && *key == b"user"
         {
@@ -908,6 +920,33 @@ mod tests {
         flush(&mut client).await.unwrap();
         successful_response(&mut client).await;
         (client, task)
+    }
+
+    #[tokio::test]
+    async fn explicit_startup_pool_selection_is_refused_before_backend_open() {
+        for key in ["pool", "duckfleet_pool"] {
+            let platform = Arc::new(TestPlatform::default());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let task = tokio::spawn(connection(platform.clone(), server));
+            let mut client = BufStream::new(client);
+            let startup = format!("user\0test-user\0{key}\0interactive\0\0");
+            client
+                .write_i32(i32::try_from(startup.len() + 8).unwrap())
+                .await
+                .unwrap();
+            client.write_i32(PROTOCOL_V3).await.unwrap();
+            client.write_all(startup.as_bytes()).await.unwrap();
+            flush(&mut client).await.unwrap();
+            refusal(&mut client, "0A000").await;
+            client.shutdown().await.unwrap();
+            finished(task).await;
+            assert_eq!(platform.opened.load(Ordering::SeqCst), 0);
+            assert!(platform.statements.lock().unwrap().is_empty());
+        }
     }
 
     async fn response(client: &mut BufStream<TcpStream>) -> (u8, Vec<u8>) {

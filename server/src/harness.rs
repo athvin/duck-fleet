@@ -25,6 +25,7 @@ mod concurrency;
 mod metering;
 mod observability;
 mod platform;
+mod pools;
 mod request_identity;
 mod request_upgrade;
 
@@ -42,7 +43,9 @@ pub async fn run(args: Vec<String>) -> i32 {
     let ctx = Ctx { url, token };
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
-    let result: anyhow::Result<()> = if has("--platform-maintenance") {
+    let result: anyhow::Result<()> = if has("--pools") || has("--pools-isolated") {
+        pools::checks(&ctx, has("--pools-isolated")).await
+    } else if has("--platform-maintenance") {
         platform::checks().await
     } else if has("--spread") {
         spread_checks(&ctx).await

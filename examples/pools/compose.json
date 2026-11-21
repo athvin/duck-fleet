@@ -1,0 +1,23 @@
+{
+  "default_pool": "small",
+  "pools": {
+    "small": {
+      "cpu": 1,
+      "memory": "1Gi",
+      "disk": "2Gi",
+      "endpoints": [
+        "http://worker-small:8080"
+      ],
+      "max_sessions_per_worker": 32
+    },
+    "interactive": {
+      "cpu": 2,
+      "memory": "3Gi",
+      "disk": "4Gi",
+      "endpoints": [
+        "http://worker-pool-interactive-0:8080"
+      ],
+      "max_sessions_per_worker": 32
+    }
+  }
+}

@@ -20,6 +20,7 @@ struct Inner {
     worker_id: String,
     boot_id: Uuid,
     placement: OnceLock<Value>,
+    configured: Value,
     ready: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     counts: Mutex<Counts>,
@@ -43,11 +44,17 @@ enum Stage {
 }
 
 impl Status {
-    pub fn new(worker_id: String, ready: Arc<AtomicBool>, draining: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        worker_id: String,
+        ready: Arc<AtomicBool>,
+        draining: Arc<AtomicBool>,
+        configured: Value,
+    ) -> Self {
         Self(Arc::new(Inner {
             worker_id,
             boot_id: Uuid::new_v4(),
             placement: OnceLock::new(),
+            configured,
             ready,
             draining,
             counts: Mutex::new(Counts::default()),
@@ -94,9 +101,12 @@ impl Status {
     }
 
     pub fn snapshot(&self) -> Value {
-        let mut value = self.0.placement.get().cloned().unwrap_or_else(
-            || json!({"worker_id": self.0.worker_id, "worker_boot_id": self.0.boot_id}),
-        );
+        let mut value = self.0.placement.get().cloned().unwrap_or_else(|| {
+            let mut value = self.0.configured.clone();
+            value["worker_id"] = json!(self.0.worker_id);
+            value["worker_boot_id"] = json!(self.0.boot_id);
+            value
+        });
         let counts = self.0.counts.lock().unwrap_or_else(|e| e.into_inner());
         let draining = self.0.draining.load(Ordering::Acquire);
         let initialized = self.0.placement.get().is_some();
@@ -175,10 +185,18 @@ mod tests {
     fn lifecycle_preserves_placement_and_boot_identity() {
         let ready = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
-        let status = Status::new("small".into(), ready.clone(), draining.clone());
+        let status = Status::new(
+            "small".into(),
+            ready.clone(),
+            draining.clone(),
+            json!({"pool":"interactive","max_sessions":16,"queue_capacity":8}),
+        );
         let starting = status.snapshot();
         assert_eq!(starting["state"], "starting");
         assert_eq!(starting["ready"], false);
+        assert_eq!(starting["pool"], "interactive");
+        assert_eq!(starting["max_sessions"], 16);
+        assert_eq!(starting["queue_capacity"], 8);
         status.initialize(json!({"worker_id":"small", "cpu":2, "worker_boot_id":status.boot_id()}));
         ready.store(true, Ordering::Release);
         assert_eq!(status.snapshot()["state"], "ready");
@@ -199,7 +217,7 @@ mod tests {
         drop(query);
         assert!(!status.has_queries());
         assert_ne!(
-            Status::new("small".into(), ready, draining).boot_id(),
+            Status::new("small".into(), ready, draining, json!({})).boot_id(),
             status.boot_id()
         );
     }
@@ -210,6 +228,7 @@ mod tests {
             "small".into(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
+            json!({}),
         );
         let first = status.enqueue();
         let second = status.enqueue();

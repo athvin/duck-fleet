@@ -1,18 +1,7 @@
-//! What a caller may ask for, and what that resolves to.
-//!
-//! The contract is deliberately small: a request that names no resources runs on the
-//! shared persistent tier at the default size, and a request that names *any* of cpu,
-//! memory, or disk gets a pod of its own, sized to the ask. There is no mode to pick —
-//! asking for something other than the default *is* the request for isolation. A dbt
-//! model that sets nothing under `meta.platform` shares the prestarted workers; one
-//! that sets a resource there triggers a dedicated pod.
-//!
-//! Resources are carried as values rather than named classes. Adding a size is running
-//! a pod with those limits rather than teaching the platform a new name.
-//!
-//! A worker still declares what it is meant to be and checks its cgroup against that
-//! declaration, so a container that did not get the limits it was created with refuses
-//! to start instead of quietly serving a different size.
+//! Requested compute policy, resolved allocations, and worker-side validation.
+//! Resource-only requests retain historical isolation; named persistent pools
+//! select an allocation independently of its size. Observed placement is always
+//! authored by the worker and never accepted as a client assertion.
 use crate::ApiError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,7 +21,8 @@ const DISK_HEADROOM: u64 = 512 * MIB;
 
 /// Where a statement runs. Derived from the request rather than chosen by the caller:
 /// a request that names resources is a request for a pod of its own.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Mode {
     /// A prestarted worker, shared with other sessions. What a request with no
     /// resource ask resolves to.
@@ -55,7 +45,8 @@ impl Mode {
 
 /// A compute size. Memory is the **container cap**, not the engine's share. Disk is
 /// the pod's ephemeral-storage limit, which also bounds how far a query may spill.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Resources {
     pub cpu: u16,
     pub memory_bytes: u64,
@@ -94,7 +85,7 @@ impl Resources {
         Ok(resources)
     }
     /// Rejects a size too small to run an engine, whoever asked for it.
-    fn usable(self) -> Result<(), String> {
+    pub fn usable(self) -> Result<(), String> {
         if self.cpu == 0 {
             return Err("cpu must be at least 1".into());
         }
@@ -145,8 +136,12 @@ impl Resources {
 fn quantity(bytes: u64) -> String {
     if bytes.is_multiple_of(GIB) {
         format!("{}Gi", bytes / GIB)
-    } else {
+    } else if bytes.is_multiple_of(MIB) {
         format!("{}Mi", bytes / MIB)
+    } else {
+        // Accepted quantities are integral KiB. Preserve that precision when
+        // forwarding allocations into pod resources and worker declarations.
+        format!("{}Ki", bytes / 1024)
     }
 }
 
@@ -163,53 +158,205 @@ fn parse_quantity(text: &str) -> Option<u64> {
     None
 }
 
-/// What a caller asks for. Every field is optional, and which ones are present is the
-/// whole contract: none means the shared default, any means a pod sized to the ask
-/// with the rest filled from the default.
+/// Original caller intent. Serialization deliberately omits absent fields;
+/// durable fingerprint versions implement their own historical projections.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ComputeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<String>,
 }
 
-/// Where a resolved request will run. Both halves are reported to the caller and
-/// recorded in history, so a placement can be compared against what was asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Requirements {
+    pub cpu: Option<u16>,
+    pub memory_bytes: Option<u64>,
+    pub disk_bytes: Option<u64>,
+}
+impl Requirements {
+    pub fn satisfied_by(self, resources: Resources) -> bool {
+        self.cpu.is_none_or(|minimum| resources.cpu >= minimum)
+            && self
+                .memory_bytes
+                .is_none_or(|minimum| resources.memory_bytes >= minimum)
+            && self
+                .disk_bytes
+                .is_none_or(|minimum| resources.disk_bytes >= minimum)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Selection {
+    Persistent {
+        pool: Option<String>,
+        minimum: Requirements,
+    },
+    Isolated(Resources),
+}
+
+/// A resolved policy. Resources are the allocation actually selected and billed,
+/// not the optional minimum requirements in the original request.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Placement {
     pub mode: Mode,
+    pub pool: Option<String>,
     pub resources: Resources,
 }
 
+pub(crate) fn valid_pool_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 40
+        && bytes[0].is_ascii_lowercase()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
 impl ComputeRequest {
-    /// Resolves a request to a placement, or refuses it.
-    ///
-    /// No resource named is the shared default. Any named is a pod of its own, with
-    /// the unspecified dimensions filled from the default so a caller can tune a
-    /// single axis — `cpu` alone keeps the default memory and disk.
-    ///
-    /// Only the request itself is judged here. Whether this deployment can create a
-    /// pod at all is the router's question, and answering it here would turn a
-    /// deployment without isolated compute into a malformed request.
-    pub fn resolve(&self) -> Result<Placement, ApiError> {
-        if self.cpu.is_none() && self.memory.is_none() && self.disk.is_none() {
-            return Ok(Placement {
-                mode: Mode::Persistent,
-                resources: Resources::default(),
-            });
+    /// Syntax-only validation: this does not require a configured pool registry.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        self.selection().map(|_| ())
+    }
+
+    /// Fixed semantic policy input for fingerprint v2. Original textual intent
+    /// remains in diagnostics, while equivalent binary quantities hash alike.
+    pub fn canonical_intent(&self) -> Result<Value, ApiError> {
+        let minimum = match self.selection()? {
+            Selection::Persistent { minimum, .. } => minimum,
+            Selection::Isolated(resources) => Requirements {
+                cpu: self.cpu,
+                memory_bytes: self.memory.as_ref().map(|_| resources.memory_bytes),
+                disk_bytes: self.disk.as_ref().map(|_| resources.disk_bytes),
+            },
+        };
+        Ok(json!({"mode":self.mode.map(Mode::name),"pool":self.pool,
+            "cpu":minimum.cpu,"memory_bytes":minimum.memory_bytes,"disk_bytes":minimum.disk_bytes}))
+    }
+
+    pub fn selection(&self) -> Result<Selection, ApiError> {
+        if self
+            .pool
+            .as_deref()
+            .is_some_and(|pool| !valid_pool_name(pool))
+        {
+            return Err(ApiError::bad(
+                "pool must be a lowercase DNS label starting with a letter, at most 40 characters",
+            ));
         }
-        let base = Resources::default();
-        let resources = Resources::parse(
-            &self.cpu.unwrap_or(base.cpu).to_string(),
-            &self.memory.clone().unwrap_or_else(|| base.memory()),
-            &self.disk.clone().unwrap_or_else(|| base.disk()),
-        )
-        .map_err(ApiError::bad)?;
-        Ok(Placement {
-            mode: Mode::Isolated,
-            resources,
+        if self.mode == Some(Mode::Isolated) && self.pool.is_some() {
+            return Err(ApiError::bad(
+                "isolated compute cannot select a persistent pool",
+            ));
+        }
+        let has_resources = self.cpu.is_some() || self.memory.is_some() || self.disk.is_some();
+        let mode = self
+            .mode
+            .unwrap_or(if self.pool.is_some() || !has_resources {
+                Mode::Persistent
+            } else {
+                Mode::Isolated
+            });
+        if mode == Mode::Isolated {
+            let base = Resources::default();
+            return Ok(Selection::Isolated(
+                Resources::parse(
+                    &self.cpu.unwrap_or(base.cpu).to_string(),
+                    self.memory.as_deref().unwrap_or("1Gi"),
+                    self.disk.as_deref().unwrap_or("2Gi"),
+                )
+                .map_err(ApiError::bad)?,
+            ));
+        }
+        if self.cpu == Some(0) {
+            return Err(ApiError::bad("cpu must be at least 1"));
+        }
+        let bytes = |value: &Option<String>, dimension: &str| -> Result<Option<u64>, ApiError> {
+            value
+                .as_deref()
+                .map(|text| {
+                    parse_quantity(text.trim())
+                        .filter(|bytes| *bytes > 0)
+                        .ok_or_else(|| {
+                            ApiError::bad(format!(
+                                "{dimension} must be a positive binary quantity such as 2Gi"
+                            ))
+                        })
+                })
+                .transpose()
+        };
+        Ok(Selection::Persistent {
+            pool: self.pool.clone(),
+            minimum: Requirements {
+                cpu: self.cpu,
+                memory_bytes: bytes(&self.memory, "memory")?,
+                disk_bytes: bytes(&self.disk, "disk")?,
+            },
         })
+    }
+
+    pub fn validate_resolved(&self, resolved: &Placement) -> Result<(), ApiError> {
+        resolved.resources.usable().map_err(ApiError::bad)?;
+        let matches = match self.selection()? {
+            Selection::Persistent { pool, minimum } => {
+                resolved.mode == Mode::Persistent
+                    && resolved.pool.as_deref().is_some_and(valid_pool_name)
+                    && pool
+                        .as_ref()
+                        .is_none_or(|name| resolved.pool.as_ref() == Some(name))
+                    && minimum.satisfied_by(resolved.resources)
+            }
+            Selection::Isolated(resources) => {
+                resolved.mode == Mode::Isolated
+                    && resolved.pool.is_none()
+                    && resolved.resources == resources
+            }
+        };
+        if !matches {
+            return Err(ApiError::bad(
+                "resolved compute does not satisfy the original request",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Direct worker callers can choose only this worker's pool/allocation.
+    /// A dedicated worker is represented by pool=None and cannot serve persistent work.
+    pub fn resolve_local(
+        &self,
+        pool: Option<&str>,
+        resources: Resources,
+    ) -> Result<Placement, ApiError> {
+        let resolved = match self.selection()? {
+            Selection::Persistent { .. } => Placement {
+                mode: Mode::Persistent,
+                pool: Some(
+                    pool.ok_or_else(|| {
+                        ApiError::bad("this dedicated worker cannot serve persistent sessions")
+                    })?
+                    .to_owned(),
+                ),
+                resources,
+            },
+            Selection::Isolated(resources) => Placement {
+                mode: Mode::Isolated,
+                pool: None,
+                resources,
+            },
+        };
+        self.validate_resolved(&resolved)?;
+        resolved.validate_worker(pool, resources)?;
+        Ok(resolved)
     }
 }
 
@@ -227,37 +374,37 @@ pub(crate) fn unavailable() -> ApiError {
 }
 
 impl Placement {
-    /// Billable size comes from what the caller requested, not from the worker it
-    /// landed on. A persistent worker is shared by many sessions, so charging for the
-    /// provision would bill each one for the whole worker.
-    pub fn units(self) -> i64 {
+    pub fn units(&self) -> i64 {
         self.resources.units()
     }
-    /// The request the gateway forwards to the worker.
-    ///
-    /// A persistent placement forwards nothing, so the worker re-derives the shared
-    /// default exactly as a direct caller would; an isolated placement forwards the
-    /// fully resolved size, so the pod re-derives isolation from the same presence
-    /// rule and records the mode it actually served. The derivation is identical on
-    /// both hops, which is what keeps the gateway and the worker from disagreeing
-    /// about what a request meant.
-    pub fn request(self) -> ComputeRequest {
-        match self.mode {
-            Mode::Persistent => ComputeRequest::default(),
-            Mode::Isolated => ComputeRequest {
-                cpu: Some(self.resources.cpu),
-                memory: Some(self.resources.memory()),
-                disk: Some(self.resources.disk()),
-            },
+
+    pub fn validate_worker(
+        &self,
+        pool: Option<&str>,
+        resources: Resources,
+    ) -> Result<(), ApiError> {
+        if self.mode == Mode::Isolated && pool.is_some() {
+            return Err(unavailable());
         }
+        let mode = if pool.is_some() {
+            Mode::Persistent
+        } else {
+            Mode::Isolated
+        };
+        if self.mode != mode || self.pool.as_deref() != pool || self.resources != resources {
+            return Err(ApiError::bad(
+                "resolved compute does not match this worker's pool and resources",
+            ));
+        }
+        self.resources.usable().map_err(ApiError::bad)
     }
-    /// `worker_id` is the worker's own identity, passed in rather than derived from
-    /// its size: reservation recovery keys on it, so it must stay stable even if the
-    /// worker is given different resources.
-    pub fn describe(self, worker_id: &str) -> Value {
+
+    /// Existing flattened observed-placement fields stay compatible with clients.
+    pub fn describe(&self, worker_id: &str) -> Value {
         let mut value = self.resources.describe();
         value["worker_id"] = json!(worker_id);
         value["compute"] = json!(self.mode.name());
+        value["pool"] = json!(self.pool);
         value
     }
 }
@@ -277,14 +424,41 @@ impl Default for SessionRequest {
     }
 }
 impl SessionRequest {
-    pub fn validate(&self) -> Result<Placement, ApiError> {
+    pub fn validate(&self) -> Result<(), ApiError> {
         if !self.context.is_object() || self.context.to_string().len() > 8192 {
             return Err(ApiError::bad(
                 "session context must be an object of at most 8192 bytes",
             ));
         }
-        self.compute.resolve()
+        self.compute.validate()
     }
+}
+
+/// Accepted only on the authenticated internal worker hop. Public gateways parse
+/// SessionRequest instead and reject this envelope's authoritative fields.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ForwardedSessionRequest {
+    pub version: u8,
+    pub request: SessionRequest,
+    pub resolved: Placement,
+    pub registry_revision: String,
+}
+impl ForwardedSessionRequest {
+    pub fn validate_version(&self) -> Result<(), ApiError> {
+        if self.version != 1 {
+            return Err(ApiError::bad("unsupported worker forwarding version"));
+        }
+        self.request.validate()?;
+        self.request.compute.validate_resolved(&self.resolved)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum WorkerSessionRequest {
+    Direct(SessionRequest),
+    Forwarded(ForwardedSessionRequest),
 }
 
 #[cfg(test)]
@@ -294,14 +468,20 @@ mod tests {
         serde_json::from_value(value).expect("should deserialize")
     }
     fn placement(value: Value) -> Placement {
-        request(value).resolve().unwrap()
+        let request = request(value);
+        match request.selection().unwrap() {
+            Selection::Persistent { .. } => request
+                .resolve_local(Some("small"), Resources::default())
+                .unwrap(),
+            Selection::Isolated(resources) => request.resolve_local(None, resources).unwrap(),
+        }
     }
 
     /// The whole contract in one test: nothing named is the shared default, anything
     /// named is a pod of its own.
     #[test]
     fn no_resources_is_shared_and_any_resource_is_isolated() {
-        let shared = SessionRequest::default().validate().unwrap();
+        let shared = placement(json!({}));
         assert_eq!(shared.mode, Mode::Persistent);
         assert_eq!(shared.resources, Resources::default());
         // An empty compute object is still the default.
@@ -370,7 +550,7 @@ mod tests {
             json!({"memory": "1024"}),
             json!({"disk": "lots"}),
         ] {
-            assert!(request(value.clone()).resolve().is_err(), "{value}");
+            assert!(request(value.clone()).validate().is_err(), "{value}");
         }
         // The old mode string and any unknown dimension are rejected at the wire.
         assert!(serde_json::from_value::<ComputeRequest>(json!({"compute": "isolated"})).is_err());
@@ -413,6 +593,17 @@ mod tests {
     }
 
     #[test]
+    fn resource_rendering_preserves_accepted_kibibytes_without_downgrading() {
+        let resources = Resources::parse("2", "262148Ki", "2097156Ki").unwrap();
+        assert_eq!(resources.memory(), "262148Ki");
+        assert_eq!(resources.disk(), "2097156Ki");
+        assert_eq!(
+            Resources::parse("2", &resources.memory(), &resources.disk()).unwrap(),
+            resources
+        );
+    }
+
+    #[test]
     fn the_engine_gets_half_the_container_cap() {
         assert_eq!(Resources::default().engine_memory(), "512MiB");
         assert_eq!(
@@ -451,30 +642,77 @@ mod tests {
         );
     }
 
-    /// A persistent placement forwards nothing so the worker re-derives the default;
-    /// an isolated one forwards its full size so the pod re-derives isolation.
     #[test]
-    fn a_placement_round_trips_through_the_request_it_forwards() {
-        let persistent = Placement {
-            mode: Mode::Persistent,
-            resources: Resources::default(),
-        };
-        let forwarded = persistent.request();
-        assert_eq!(forwarded.cpu, None);
-        assert_eq!(forwarded.memory, None);
-        assert_eq!(forwarded.disk, None);
-        assert_eq!(forwarded.resolve().unwrap(), persistent);
-
-        let isolated = Placement {
-            mode: Mode::Isolated,
-            resources: Resources {
-                cpu: 4,
-                memory_bytes: 6 * GIB,
-                disk_bytes: 40 * GIB,
+    fn forwarding_preserves_original_requirements_and_rejects_spoofed_resolution() {
+        let requested = request(json!({"pool":"interactive", "cpu":2}));
+        let resources = Resources::parse("4", "16Gi", "20Gi").unwrap();
+        let resolved = requested
+            .resolve_local(Some("interactive"), resources)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&requested).unwrap(),
+            json!({"pool":"interactive", "cpu":2})
+        );
+        let forwarded = ForwardedSessionRequest {
+            version: 1,
+            request: SessionRequest {
+                compute: requested.clone(),
+                context: json!({}),
             },
+            resolved: resolved.clone(),
+            registry_revision: "test".into(),
         };
-        let resolved = isolated.request().resolve().unwrap();
-        assert_eq!(resolved, isolated);
+        assert!(forwarded.validate_version().is_ok());
+        assert!(serde_json::from_value::<SessionRequest>(json!(forwarded)).is_err());
+        let mut wrong = resolved.clone();
+        wrong.pool = Some("another".into());
+        assert!(requested.validate_resolved(&wrong).is_err());
+        wrong = resolved;
+        wrong.resources.disk_bytes /= 2;
+        assert!(
+            wrong
+                .validate_worker(Some("interactive"), resources)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn persistent_minima_are_independent_and_isolated_defaults_remain_historical() {
+        let resources = Resources::parse("2", "512Mi", "1Gi").unwrap();
+        assert!(
+            request(json!({"mode":"persistent","cpu":2}))
+                .resolve_local(Some("tiny"), resources)
+                .is_ok()
+        );
+        assert!(
+            request(json!({"pool":"tiny","memory":"128Mi"}))
+                .resolve_local(Some("tiny"), resources)
+                .is_ok()
+        );
+        assert!(
+            request(json!({"pool":"tiny","disk":"2Gi"}))
+                .resolve_local(Some("tiny"), resources)
+                .is_err()
+        );
+        assert!(
+            request(json!({"mode":"isolated","pool":"tiny"}))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            request(json!({"pool":"other"}))
+                .resolve_local(Some("tiny"), resources)
+                .is_err()
+        );
+        assert!(
+            request(json!({"cpu":2}))
+                .resolve_local(Some("tiny"), resources)
+                .is_err()
+        );
+        assert_eq!(
+            placement(json!({"mode":"isolated"})).resources,
+            Resources::default()
+        );
     }
 
     /// Isolation is a guarantee, so where it cannot be provided the request is
@@ -498,10 +736,7 @@ mod tests {
         assert_eq!(described["memory_bytes"], json!(2 * GIB));
         assert_eq!(described["disk_bytes"], json!(10 * GIB));
         // The shared default reports persistent and the default size.
-        let default = SessionRequest::default()
-            .validate()
-            .unwrap()
-            .describe("small");
+        let default = placement(json!({})).describe("small");
         assert_eq!(default["compute"], json!("persistent"));
     }
 

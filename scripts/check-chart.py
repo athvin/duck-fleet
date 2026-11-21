@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from worker_resources import assert_worker_resources
+from worker_resources import assert_worker_resources, quantity_bytes
 
 # Read from the server rather than restated here: this is the number the drain has to
 # outlast, and a copy of it would be one more thing to keep in step.
@@ -18,22 +18,32 @@ MAX_STATEMENT_SECONDS = int(re.search(
 
 objects = list(yaml.safe_load_all(open(sys.argv[1])))
 by_name = {(o['kind'], o['metadata']['name']): o for o in objects}
-for size, cpu in [('small', 1)]:
-    worker = by_name['Deployment', f'worker-{size}']
+persistent_workers = {name: value for (kind, name), value in by_name.items()
+                      if kind == 'Deployment' and name.startswith('worker-')}
+for name, worker in persistent_workers.items():
     assert worker['spec']['strategy']['type'] == 'Recreate'
     pod = worker['spec']['template']['spec']
     assert pod['serviceAccountName'] == 'duckfleet-worker'
     container = pod['containers'][0]
     # The same rule the deploy verification applies to live pods, so the rendered
     # release and what actually runs cannot disagree about what is legal.
-    assert_worker_resources(container['resources'], cpu, f'rendered worker-{size}')
+    declared = {e['name']: e.get('value') for e in container['env']}
+    cpu = int(declared['DUCKFLEET_WORKER_CPU'])
+    assert_worker_resources(container['resources'], cpu, f'rendered {name}',
+                            memory=declared['DUCKFLEET_WORKER_MEMORY'],
+                            disk=declared['DUCKFLEET_WORKER_DISK'])
+    assert name == 'worker-' + declared['DUCKFLEET_WORKER_ID']
+    assert declared['DUCKFLEET_POOL'] == worker['spec']['template']['metadata']['labels']['duckfleet-pool']
+    assert 1 <= int(declared['DUCKFLEET_WORKER_MAX_SESSIONS']) <= 1024
+    assert 1 <= int(declared['DUCKFLEET_WORKER_QUEUE_CAPACITY']) <= 4096
+    tmp = next(volume['emptyDir'] for volume in pod['volumes'] if volume['name'] == 'tmp')
+    assert quantity_bytes(tmp['sizeLimit']) == quantity_bytes(declared['DUCKFLEET_WORKER_DISK'])
     # The worker checks its cgroup against this declaration and refuses to start on a
     # mismatch, so the declaration must match the limits the chart actually renders.
     # Checked here too, because a drift between them would fail at deploy time rather
     # than at render time.
     declared = {e['name']: e.get('value') for e in container['env']}
     assert declared['DUCKFLEET_WORKER_CPU'] == str(cpu), declared['DUCKFLEET_WORKER_CPU']
-    assert declared['DUCKFLEET_WORKER_MEMORY'] == f'{cpu}Gi', declared['DUCKFLEET_WORKER_MEMORY']
     assert declared['DUCKFLEET_WORKER_CPU'] == container['resources']['limits']['cpu']
     assert declared['DUCKFLEET_WORKER_MEMORY'] == container['resources']['limits']['memory']
     # Disk is declared-only (no cgroup to check), so it must match the ephemeral-storage
@@ -51,7 +61,7 @@ for size, cpu in [('small', 1)]:
     # second half could never finish however well the drain was written. The two are
     # coupled, so changing either must fail here rather than quietly truncate drains.
     assert pod['terminationGracePeriodSeconds'] > MAX_STATEMENT_SECONDS, (
-        f"worker-{size} drains in {pod['terminationGracePeriodSeconds']}s, which is "
+        f"{name} drains in {pod['terminationGracePeriodSeconds']}s, which is "
         f"not longer than the {MAX_STATEMENT_SECONDS}s a statement may run")
     # A worker reports not-ready while it waits for the catalog. Waiting longer than
     # the startup probe allows would have the pod replaced mid-wait, which is the
@@ -121,15 +131,39 @@ assert by_name['Deployment', 'server']['spec']['template']['spec'][
 # worker class at request time rather than a packaging mistake at render time.
 gateway = next(c for c in by_name['Deployment', 'server']['spec']['template']['spec']['containers']
                if c['name'] == 'gateway')
-worker_urls = {e['name']: e.get('value') for e in gateway['env']}['DUCKFLEET_WORKER_URLS']
+gateway_env = {entry['name']: entry.get('value') for entry in gateway['env']}
+assert 1 <= int(gateway_env['DUCKFLEET_GATEWAY_MAX_SESSIONS']) <= 4096
+pool_config = by_name.get(('ConfigMap', 'duckfleet-pools'))
+if pool_config:
+    assert 'DUCKFLEET_WORKER_URLS' not in gateway_env
+    assert gateway_env.get('DUCKFLEET_POOLS_FILE') == '/etc/duckfleet-pools/pools.json'
+    config = json.loads(pool_config['data']['pools.json'])
+    assert config['default_pool'] in config['pools']
+    worker_urls = []
+    for pool_name, pool in config['pools'].items():
+        for url in pool['endpoints']:
+            host = url.removeprefix('http://').split(':')[0]
+            assert host in persistent_workers, f'pool {pool_name} points at missing worker {host}'
+            container = persistent_workers[host]['spec']['template']['spec']['containers'][0]
+            declared = {entry['name']: entry.get('value') for entry in container['env']}
+            assert declared['DUCKFLEET_POOL'] == pool_name
+            assert int(declared['DUCKFLEET_WORKER_CPU']) == pool['cpu']
+            assert quantity_bytes(declared['DUCKFLEET_WORKER_MEMORY']) == quantity_bytes(pool['memory'])
+            assert quantity_bytes(declared['DUCKFLEET_WORKER_DISK']) == quantity_bytes(pool['disk'])
+            assert int(declared['DUCKFLEET_WORKER_MAX_SESSIONS']) == pool['max_sessions_per_worker']
+            worker_urls.append(url)
+    mounts = {mount['name']: mount for mount in gateway['volumeMounts']}
+    assert mounts['persistent-pools']['readOnly'] and 'subPath' not in mounts['persistent-pools']
+else:
+    assert 'DUCKFLEET_POOLS_FILE' not in gateway_env
+    worker_urls = gateway_env['DUCKFLEET_WORKER_URLS'].split(',')
+    assert worker_urls and all(worker_urls), 'the legacy gateway must be given worker endpoints'
 services = {name for kind, name in by_name if kind == 'Service'}
-assert worker_urls, 'the gateway must be given worker endpoints'
-for url in worker_urls.split(','):
+for url in worker_urls:
     host = url.removeprefix('http://').split(':')[0]
     assert host in services, f'gateway points at {host}, which this release does not render'
     assert ('Deployment', host) in by_name, f'no Deployment backs {host}'
-assert len(worker_urls.split(',')) == len([n for k, n in by_name
-                                           if k == 'Deployment' and n.startswith('worker-')])
+assert len(set(worker_urls)) == len(worker_urls) == len(persistent_workers)
 # One rate card per deployment. Every container that prices or reports work must
 # carry the same pair, or admission and the budget position would disagree about
 # what a unit-hour costs.
@@ -290,7 +324,7 @@ if not present:
     # cannot reach the API server whatever RBAC exists, and `compute: isolated` is
     # refused rather than served from a shared worker.
     assert gateway_pod['serviceAccountName'] == 'duckfleet-no-aws'
-    assert not gateway_pod.get('volumes'), gateway_pod.get('volumes')
+    assert {volume['name'] for volume in gateway_pod.get('volumes', [])} <= {'persistent-pools'}
 else:
     assert gateway_pod['serviceAccountName'] == 'duckfleet-gateway'
 
@@ -317,7 +351,8 @@ else:
     # same image under the same security rules, differing only in how it is sized and
     # how long it lives.
     template = json.loads(by_name['ConfigMap', 'duckfleet-isolated-pod']['data']['pod.json'])
-    persistent = by_name['Deployment', 'worker-small']['spec']['template']['spec']
+    persistent = (next(iter(persistent_workers.values())) if persistent_workers else
+                  by_name['Deployment', 'server'])['spec']['template']['spec']
     isolated, container = template['spec'], template['spec']['containers'][0]
     assert isolated['securityContext'] == persistent['securityContext']
     assert container['securityContext'] == persistent['containers'][0]['securityContext']
@@ -355,6 +390,8 @@ else:
     # Without this the pod would admit shared sessions and report an isolated
     # placement as persistent in history.
     assert declared['DUCKFLEET_ISOLATED'] == 'true', declared.get('DUCKFLEET_ISOLATED')
+    assert 'DUCKFLEET_POOL' not in declared, 'isolated pods cannot inherit a persistent pool'
+    assert declared['DUCKFLEET_WORKER_MAX_SESSIONS'] == '1'
     # Rendered from the shared helper, so a session pod reaches the same catalog and
     # bucket as a persistent worker rather than a separately maintained guess.
     assert declared['S3_AUTH_MODE'] == 'pod_identity'

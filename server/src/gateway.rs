@@ -1,10 +1,11 @@
 //! Pins each session to one configured worker. It never retries or reroutes SQL.
 use crate::{
     ApiError,
-    compute::{Mode, Resources, SessionRequest},
+    compute::{ForwardedSessionRequest, Mode, Placement, Resources, SessionRequest},
     credentials::{self, Identity},
     failure,
     isolated::Isolation,
+    pools::PoolRegistry,
 };
 use axum::{
     Extension, Json, Router,
@@ -21,8 +22,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -54,14 +56,25 @@ struct WorkerInfo {
     endpoint: String,
     cpu: u16,
     memory_bytes: u64,
+    disk_bytes: Option<u64>,
+    pool: Option<String>,
+    max_sessions: Option<u64>,
     ready: bool,
     active_queries: u64,
     queued_queries: u64,
     open_sessions: u64,
 }
 impl WorkerInfo {
-    fn serves(&self, wanted: Resources) -> bool {
-        self.cpu == wanted.cpu && self.memory_bytes == wanted.memory_bytes
+    fn serves(&self, wanted: Resources, pool: &str, legacy: bool) -> bool {
+        self.cpu == wanted.cpu
+            && self.memory_bytes == wanted.memory_bytes
+            && self.disk_bytes == Some(wanted.disk_bytes)
+            && (self.pool.as_deref() == Some(pool) || (legacy && self.pool.is_none()))
+    }
+
+    fn session_limit(&self, configured: usize, legacy: bool) -> Option<u64> {
+        let reported = self.max_sessions.or(legacy.then_some(32))?;
+        (reported > 0 && (legacy || reported == configured as u64)).then_some(reported)
     }
 }
 
@@ -73,10 +86,20 @@ impl WorkerInfo {
 /// class every time a pod restarted.
 #[derive(Clone, Debug)]
 struct Fleet {
+    revision: String,
     workers: Vec<WorkerInfo>,
     unreachable: Vec<String>,
     discovered: Instant,
     reported: Vec<Value>,
+}
+
+enum SessionOutcome {
+    Opened {
+        endpoint: String,
+        id: Uuid,
+        info: Value,
+    },
+    Refused(Response),
 }
 
 /// How an attempt to open a persistent session ended: on a worker, or with the last
@@ -106,10 +129,23 @@ fn failover_worthy(status: StatusCode, refusal: &Value) -> bool {
 /// Prefer the least execution pressure, then fewer open sessions. Stable sorting
 /// preserves configured order on ties. Counts come from workers, so pgwire and
 /// platform operations have exactly the same weight as HTTP clients.
-fn ranked_endpoints(workers: &[WorkerInfo], wanted: Resources) -> Vec<String> {
+fn ranked_endpoints(
+    workers: &[WorkerInfo],
+    wanted: Resources,
+    pool: &str,
+    endpoints: &[String],
+    max_sessions: usize,
+    legacy: bool,
+) -> Vec<String> {
     let mut matches: Vec<&WorkerInfo> = workers
         .iter()
-        .filter(|w| w.ready && w.serves(wanted))
+        .filter(|w| {
+            w.ready
+                && endpoints.contains(&w.endpoint)
+                && w.serves(wanted, pool, legacy)
+                && w.session_limit(max_sessions, legacy)
+                    .is_some_and(|limit| w.open_sessions < limit)
+        })
         .collect();
     matches.sort_by_key(|w| {
         (
@@ -401,7 +437,9 @@ struct Gateway {
     /// it cannot list pods: both service accounts set
     /// `automountServiceAccountToken: false` and the deploy asserts DuckFleet cannot
     /// grant itself RBAC, so the workers are the only available authority.
-    endpoints: Arc<Vec<String>>,
+    pools: Arc<RwLock<Arc<PoolRegistry>>>,
+    pools_file: Option<Arc<PathBuf>>,
+    max_sessions: usize,
     fleet: Arc<Mutex<Option<Fleet>>>,
     /// Last successful observations remain available for diagnosis, never routing.
     observations: Arc<Mutex<HashMap<String, Value>>>,
@@ -458,6 +496,10 @@ fn draining_refusal() -> ApiError {
     )
 }
 impl Gateway {
+    fn registry(&self) -> Arc<PoolRegistry> {
+        self.pools.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     async fn worker_info(&self, endpoint: &str) -> Result<Value, ApiError> {
         // Bound the entire response, including decoding: headers alone are not a
         // successful observation when a broken worker stalls its response body.
@@ -474,16 +516,21 @@ impl Gateway {
         .map_err(|_| ApiError::internal())?
     }
 
-    async fn discover(&self) -> Fleet {
+    async fn discover(&self, registry: &PoolRegistry) -> Fleet {
+        let endpoints: Vec<String> = registry
+            .pools
+            .values()
+            .flat_map(|pool| pool.endpoints.iter().cloned())
+            .collect();
         let mut probes = tokio::task::JoinSet::new();
-        for (index, endpoint) in self.endpoints.iter().cloned().enumerate() {
+        for (index, endpoint) in endpoints.iter().cloned().enumerate() {
             let app = self.clone();
             probes.spawn(async move {
                 let result = app.worker_info(&endpoint).await;
                 (index, result, observed_at())
             });
         }
-        let mut ordered: Vec<Option<(Value, u64)>> = vec![None; self.endpoints.len()];
+        let mut ordered: Vec<Option<(Value, u64)>> = vec![None; endpoints.len()];
         while let Some(joined) = probes.join_next().await {
             if let Ok((index, Ok(value), observed)) = joined {
                 // A starting worker has no observed cgroup placement yet. It is
@@ -497,7 +544,8 @@ impl Gateway {
         let mut unreachable = Vec::new();
         let mut reported = Vec::new();
         let mut observations = self.observations.lock().await;
-        for (endpoint, value) in self.endpoints.iter().zip(ordered) {
+        observations.retain(|endpoint, _| endpoints.contains(endpoint));
+        for (endpoint, value) in endpoints.iter().zip(ordered) {
             match value {
                 Some((mut value, observed)) => {
                     value["endpoint"] = json!(endpoint);
@@ -508,6 +556,9 @@ impl Gateway {
                             endpoint: endpoint.clone(),
                             cpu,
                             memory_bytes,
+                            disk_bytes: value["disk_bytes"].as_u64(),
+                            pool: value["pool"].as_str().map(str::to_owned),
+                            max_sessions: value["max_sessions"].as_u64(),
                             ready: value["ready"] == true
                                 && value["draining"] == false
                                 && matches!(value["state"].as_str(), Some("ready" | "busy"))
@@ -539,6 +590,7 @@ impl Gateway {
             tracing::warn!(?unreachable, "some workers did not report their resources");
         }
         Fleet {
+            revision: registry.revision.clone(),
             workers,
             unreachable,
             reported,
@@ -548,11 +600,11 @@ impl Gateway {
 
     /// Shared by placement and inspection, with short-lived load observations.
     /// Unreachable workers do not discard healthy siblings' observations.
-    async fn fleet_snapshot(&self) -> Fleet {
+    async fn fleet_snapshot(&self, registry: &PoolRegistry) -> Fleet {
         let fresh = |fleet: &Option<Fleet>| {
             fleet
                 .clone()
-                .filter(|f| f.discovered.elapsed() < FLEET_FRESH)
+                .filter(|f| f.revision == registry.revision && f.discovered.elapsed() < FLEET_FRESH)
         };
         if let Some(fleet) = fresh(&*self.fleet.lock().await) {
             return fleet;
@@ -561,69 +613,78 @@ impl Gateway {
         if let Some(fleet) = fresh(&*self.fleet.lock().await) {
             return fleet;
         }
-        let discovered = self.discover().await;
+        let discovered = self.discover(registry).await;
         *self.fleet.lock().await = Some(discovered.clone());
         discovered
     }
 
     /// New sessions use worker-observed pressure from every protocol. Existing
     /// sessions remain pinned even if another worker subsequently becomes idle.
-    async fn endpoints_for(&self, wanted: Resources) -> Result<Vec<String>, ApiError> {
-        let fleet = self.fleet_snapshot().await;
-        let candidates = ranked_endpoints(&fleet.workers, wanted);
+    async fn endpoints_for(
+        &self,
+        registry: &PoolRegistry,
+        placement: &Placement,
+    ) -> Result<Vec<String>, ApiError> {
+        let name = placement.pool.as_deref().ok_or_else(ApiError::internal)?;
+        let pool = registry.pools.get(name).ok_or_else(ApiError::internal)?;
+        let fleet = self.fleet_snapshot(registry).await;
+        let candidates = ranked_endpoints(
+            &fleet.workers,
+            placement.resources,
+            name,
+            &pool.endpoints,
+            pool.max_sessions_per_worker,
+            registry.legacy,
+        );
         if !candidates.is_empty() {
             return Ok(candidates);
         }
-        // Excluding a worker from placement must preserve the classified open
-        // refusal clients wait out during a rollout. No open was forwarded here.
+        // A different pool's starting or failed worker cannot determine this
+        // selection's error. An endpoint is never borrowed from another pool.
         for report in &fleet.reported {
-            let matching = report["cpu"].as_u64() == Some(u64::from(wanted.cpu))
-                && report["memory_bytes"].as_u64() == Some(wanted.memory_bytes);
+            if !report["endpoint"].as_str().is_some_and(|endpoint| {
+                pool.endpoints.iter().any(|candidate| candidate == endpoint)
+            }) {
+                continue;
+            }
+            let matching = report["pool"].as_str() == Some(name)
+                || (registry.legacy && report["pool"].is_null());
+            let resources = report["cpu"].as_u64() == Some(u64::from(placement.resources.cpu))
+                && report["memory_bytes"].as_u64() == Some(placement.resources.memory_bytes)
+                && report["disk_bytes"].as_u64() == Some(placement.resources.disk_bytes);
             let refusal = match report["state"].as_str() {
-                Some("draining") if matching => Some(failure::DRAINING),
-                Some("unavailable") if matching => Some(failure::NO_READY_WORKER),
-                Some("starting") if matching || report.get("cpu").is_none() => {
-                    Some(failure::STARTING)
-                }
+                Some("draining") if matching && resources => Some(failure::DRAINING),
+                Some("starting") if matching => Some(failure::STARTING),
                 _ => None,
             };
             if let Some(refusal) = refusal {
                 return Err(ApiError::new(
                     refusal,
                     format!(
-                        "a worker serving the requested resources is {}; no session was opened and no statement ran",
+                        "a worker in pool {name} is {}; no session was opened and no statement ran",
                         refusal.kind
                     ),
                 ));
             }
         }
-        Err(if fleet.unreachable.is_empty() {
-            ApiError::new(
-                failure::UNAVAILABLE,
-                format!(
-                    "no ready worker provides cpu={}, memory={}; this deployment reports {:?}",
-                    wanted.cpu,
-                    wanted.memory(),
-                    fleet
-                        .workers
-                        .iter()
-                        .map(|w| format!(
-                            "cpu={} memory_bytes={} ready={}",
-                            w.cpu, w.memory_bytes, w.ready
-                        ))
-                        .collect::<Vec<_>>()
-                ),
-            )
-        } else {
-            ApiError::new(
-                failure::NO_READY_WORKER,
-                format!(
-                    "no reachable worker serves cpu={}, memory={}; no session was opened and no statement ran",
-                    wanted.cpu,
-                    wanted.memory()
-                ),
-            )
-        })
+        let full = fleet.workers.iter().any(|worker| {
+            worker.ready
+                && pool.endpoints.contains(&worker.endpoint)
+                && worker.serves(placement.resources, name, registry.legacy)
+                && worker
+                    .session_limit(pool.max_sessions_per_worker, registry.legacy)
+                    .is_some()
+        });
+        Err(ApiError::new(
+            if full {
+                failure::CAPACITY
+            } else {
+                failure::NO_READY_WORKER
+            },
+            format!(
+                "no eligible worker is available in pool {name}; no session was opened and no statement ran"
+            ),
+        ))
     }
 
     /// Opens a session on the least-loaded worker providing the size, failing over
@@ -635,11 +696,12 @@ impl Gateway {
     /// would leak the first.
     async fn open_persistent(
         &self,
-        wanted: Resources,
+        registry: &PoolRegistry,
+        placement: &Placement,
         body: Vec<u8>,
         identity: &Identity,
     ) -> Result<OpenOutcome, ApiError> {
-        let candidates = self.endpoints_for(wanted).await?;
+        let candidates = self.endpoints_for(registry, placement).await?;
         let total = candidates.len();
         for (position, endpoint) in candidates.into_iter().enumerate() {
             let last = position + 1 == total;
@@ -781,6 +843,38 @@ impl Gateway {
         Ok((route.endpoint.clone(), InFlight::enter(&route.active)))
     }
 
+    /// Protocol-owned sessions use the same route and capacity permit as HTTP.
+    /// A failed close stays tracked for the periodic cleanup to retry.
+    async fn close_internal(&self, id: Uuid) {
+        let endpoint = {
+            let mut routes = self.routes.lock().await;
+            let Some(route) = routes.get_mut(&id) else {
+                return;
+            };
+            route.closing = true;
+            route.endpoint.clone()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.send(
+                &endpoint,
+                Method::DELETE,
+                &format!("/v1/sessions/{id}"),
+                Bytes::new(),
+            ),
+        )
+        .await;
+        if matches!(result, Ok(Ok(ref upstream)) if upstream.status().is_success()) {
+            let pod = self
+                .routes
+                .lock()
+                .await
+                .remove(&id)
+                .and_then(|route| route.pod);
+            self.release(pod).await;
+        }
+    }
+
     /// Periodic, independent of new client traffic. Close on the worker before
     /// deleting an isolated pod, so cleanup never interrupts accepted active SQL.
     async fn expire(&self) {
@@ -894,118 +988,129 @@ async fn response(upstream: reqwest::Response) -> Result<Response, ApiError> {
     let body = upstream.bytes().await.map_err(|_| ApiError::internal())?;
     Ok((status, headers, body).into_response())
 }
+impl Gateway {
+    async fn open_session(
+        &self,
+        request: SessionRequest,
+        identity: &Identity,
+    ) -> Result<SessionOutcome, ApiError> {
+        if self.draining.load(Ordering::Acquire) {
+            return Err(draining_refusal());
+        }
+        request.validate()?;
+        // One immutable snapshot governs selection, discovery, and forwarding even
+        // if the operator reloads the registry while this open is awaiting a worker.
+        let registry = self.registry();
+        let placement = registry.resolve(&request.compute)?;
+        // Body extraction may have outlived authentication. Refuse before spending
+        // resources on isolated provisioning, then check again before worker open.
+        self.authn.revalidate(identity).await?;
+        let permit = self
+            .capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::new(failure::CAPACITY, "gateway session limit reached"))?;
+        // The principal rides the internal hop as a header the worker records at open:
+        // trusted because the hop requires the internal token, and set here rather than
+        // taken from the body so a caller cannot name someone else.
+        let body = serde_json::to_vec(&ForwardedSessionRequest {
+            version: 1,
+            request,
+            resolved: placement.clone(),
+            registry_revision: registry.revision.clone(),
+        })
+        .map_err(|_| ApiError::internal())?;
+        // An isolated session gets a pod of its own; a persistent one gets the
+        // least-loaded worker already reporting these resources, with a full or draining
+        // worker failed over to its sibling. Neither mode substitutes for the other.
+        let (endpoint, pod, upstream) = match placement.mode {
+            Mode::Persistent => {
+                match self
+                    .open_persistent(&registry, &placement, body, identity)
+                    .await?
+                {
+                    OpenOutcome::Opened { endpoint, upstream } => (endpoint, None, upstream),
+                    OpenOutcome::Refused(relay) => return Ok(SessionOutcome::Refused(relay)),
+                }
+            }
+            Mode::Isolated => {
+                let isolation = self
+                    .isolation
+                    .as_ref()
+                    .ok_or_else(crate::compute::unavailable)?;
+                let started = isolation.start(placement.resources).await?;
+                // From here a session pod exists, so every exit below releases it. The
+                // worker's own response is still relayed unchanged on the way out: it
+                // says why it refused, and replacing that with a gateway error would
+                // lose the only useful detail.
+                let pod = Some(started.name);
+                let upstream = match self
+                    .send_as(
+                        &started.endpoint,
+                        Method::POST,
+                        "/v1/sessions",
+                        body.into(),
+                        identity,
+                    )
+                    .await
+                {
+                    Ok(upstream) => upstream,
+                    Err(error) => {
+                        self.release(pod).await;
+                        return Err(error);
+                    }
+                };
+                if !upstream.status().is_success() {
+                    let refused = response(upstream).await;
+                    self.release(pod).await;
+                    return refused.map(SessionOutcome::Refused);
+                }
+                (started.endpoint, pod, upstream)
+            }
+        };
+        let opened = upstream.json::<Value>().await.ok().and_then(|info| {
+            let id = info
+                .get("session_id")
+                .and_then(Value::as_str)
+                .and_then(|s| Uuid::parse_str(s).ok())?;
+            Some((id, info))
+        });
+        let Some((id, info)) = opened else {
+            self.release(pod).await;
+            return Err(ApiError::internal());
+        };
+        self.routes.lock().await.insert(
+            id,
+            Route {
+                endpoint: endpoint.clone(),
+                touched: Instant::now(),
+                principal: identity.principal.clone().into(),
+                identity: identity.clone(),
+                active: Arc::new(AtomicUsize::new(0)),
+                closing: false,
+                pod,
+                _permit: permit,
+            },
+        );
+        Ok(SessionOutcome::Opened { endpoint, id, info })
+    }
+}
+
 async fn open(
     State(app): State<Gateway>,
     Extension(identity): Extension<Identity>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    // Only new sessions are refused. Requests on sessions already open continue,
-    // which is the drain: the grace period bounds how long that can take.
-    if app.draining.load(Ordering::Acquire) {
-        return Err(draining_refusal());
-    }
-    // An empty body is the default (persistent) request; a present-but-malformed
-    // body is a client error in the gateway's own {error,failure_kind,retry_safe}
-    // shape, not axum's raw 422 that bypasses the contract.
-    let mut request: SessionRequest = if body.is_empty() {
+    let request = if body.is_empty() {
         SessionRequest::default()
     } else {
-        serde_json::from_slice(&body).map_err(|e| {
-            ApiError::new(
-                failure::INVALID_REQUEST,
-                format!("invalid session request: {e}"),
-            )
-        })?
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad(format!("invalid session request: {e}")))?
     };
-    let placement = request.validate()?;
-    // Body extraction may have outlived authentication. Refuse before spending
-    // resources on isolated provisioning, then check again before worker open.
-    app.authn.revalidate(&identity).await?;
-    // Carries the mode as well as the size, so an isolated session is recorded as
-    // isolated rather than as whatever the pod would have assumed.
-    request.compute = placement.request();
-    let permit = app
-        .capacity
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::new(failure::CAPACITY, "gateway session limit reached"))?;
-    // The principal rides the internal hop as a header the worker records at open:
-    // trusted because the hop requires the internal token, and set here rather than
-    // taken from the body so a caller cannot name someone else.
-    let body = serde_json::to_vec(&request).map_err(|_| ApiError::internal())?;
-    // An isolated session gets a pod of its own; a persistent one gets the
-    // least-loaded worker already reporting these resources, with a full or draining
-    // worker failed over to its sibling. Neither mode substitutes for the other.
-    let (endpoint, pod, upstream) = match placement.mode {
-        Mode::Persistent => {
-            match app
-                .open_persistent(placement.resources, body, &identity)
-                .await?
-            {
-                OpenOutcome::Opened { endpoint, upstream } => (endpoint, None, upstream),
-                OpenOutcome::Refused(relay) => return Ok(relay),
-            }
-        }
-        Mode::Isolated => {
-            let isolation = app
-                .isolation
-                .as_ref()
-                .ok_or_else(crate::compute::unavailable)?;
-            let started = isolation.start(placement.resources).await?;
-            // From here a session pod exists, so every exit below releases it. The
-            // worker's own response is still relayed unchanged on the way out: it
-            // says why it refused, and replacing that with a gateway error would
-            // lose the only useful detail.
-            let pod = Some(started.name);
-            let upstream = match app
-                .send_as(
-                    &started.endpoint,
-                    Method::POST,
-                    "/v1/sessions",
-                    body.into(),
-                    &identity,
-                )
-                .await
-            {
-                Ok(upstream) => upstream,
-                Err(error) => {
-                    app.release(pod).await;
-                    return Err(error);
-                }
-            };
-            if !upstream.status().is_success() {
-                let refused = response(upstream).await;
-                app.release(pod).await;
-                return refused;
-            }
-            (started.endpoint, pod, upstream)
-        }
-    };
-    let opened = upstream.json::<Value>().await.ok().and_then(|info| {
-        let id = info
-            .get("session_id")
-            .and_then(Value::as_str)
-            .and_then(|s| Uuid::parse_str(s).ok())?;
-        Some((id, info))
-    });
-    let Some((id, info)) = opened else {
-        app.release(pod).await;
-        return Err(ApiError::internal());
-    };
-    app.routes.lock().await.insert(
-        id,
-        Route {
-            endpoint,
-            touched: Instant::now(),
-            principal: identity.principal.clone().into(),
-            identity,
-            active: Arc::new(AtomicUsize::new(0)),
-            closing: false,
-            pod,
-            _permit: permit,
-        },
-    );
-    Ok(Json(info).into_response())
+    match app.open_session(request, &identity).await? {
+        SessionOutcome::Opened { info, .. } => Ok(Json(info).into_response()),
+        SessionOutcome::Refused(response) => Ok(response),
+    }
 }
 async fn query(
     State(app): State<Gateway>,
@@ -1127,25 +1232,21 @@ async fn platform_statement(
     operation: &str,
     sql: String,
 ) -> Result<Response, ApiError> {
-    if app.draining.load(Ordering::Acquire) {
-        return Err(draining_refusal());
-    }
-    let body = json!({"compute": {}, "context": {"operation": operation}})
-        .to_string()
-        .into_bytes();
-    let (endpoint, open) = match app
-        .open_persistent(Resources::default(), body, identity)
-        .await?
-    {
-        OpenOutcome::Opened { endpoint, upstream } => (endpoint, upstream),
-        OpenOutcome::Refused(relay) => return Ok(relay),
+    let request = SessionRequest {
+        context: json!({"operation": operation}),
+        ..SessionRequest::default()
     };
-    let session = open
-        .json::<Value>()
-        .await
-        .ok()
-        .and_then(|info| info["session_id"].as_str().map(str::to_owned))
-        .ok_or_else(ApiError::internal)?;
+    let (endpoint, session) = match app.open_session(request, identity).await? {
+        SessionOutcome::Opened { endpoint, id, .. } => (endpoint, id),
+        SessionOutcome::Refused(response) => return Ok(response),
+    };
+    let guard = match app.query_route(session, identity).await {
+        Ok((_, guard)) => guard,
+        Err(error) => {
+            app.close_internal(session).await;
+            return Err(error);
+        }
+    };
     let result = app
         .send_as(
             &endpoint,
@@ -1162,16 +1263,8 @@ async fn platform_statement(
             identity,
         )
         .await;
-    // Closed on every path: the session was this handler's to clean up, and the
-    // worker rolls back anything a failed statement left open.
-    let _ = app
-        .send(
-            &endpoint,
-            Method::DELETE,
-            &format!("/v1/sessions/{session}"),
-            Bytes::new(),
-        )
-        .await;
+    drop(guard);
+    app.close_internal(session).await;
     response(result?).await
 }
 
@@ -1207,35 +1300,26 @@ impl crate::pgwire::Platform for PgPlatform {
     }
 
     async fn open_session(&self, identity: &Identity) -> Result<crate::pgwire::Session, ApiError> {
-        let body = json!({"compute": {}, "context": {"operation": "pgwire"}})
-            .to_string()
-            .into_bytes();
-        let (endpoint, opened) = match self
-            .0
-            .open_persistent(Resources::default(), body, identity)
-            .await?
-        {
-            OpenOutcome::Opened { endpoint, upstream } => (endpoint, upstream),
-            OpenOutcome::Refused(reply) => {
-                return Err(match reply.status() {
-                    StatusCode::UNAUTHORIZED => invalid_credential(),
-                    StatusCode::FORBIDDEN => {
-                        ApiError::new(failure::FORBIDDEN, "session access refused")
-                    }
-                    _ => ApiError::new(failure::UNAVAILABLE, "the worker refused the session"),
-                });
-            }
+        let request = SessionRequest {
+            context: json!({"operation": "pgwire"}),
+            ..SessionRequest::default()
         };
-        let session_id = opened
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|info| info["session_id"].as_str().map(str::to_owned))
-            .ok_or_else(ApiError::internal)?;
-        Ok(crate::pgwire::Session {
-            endpoint,
-            session_id,
-        })
+        match self.0.open_session(request, identity).await? {
+            SessionOutcome::Opened { endpoint, id, .. } => Ok(crate::pgwire::Session {
+                endpoint,
+                session_id: id.to_string(),
+            }),
+            SessionOutcome::Refused(reply) => Err(match reply.status() {
+                StatusCode::UNAUTHORIZED => invalid_credential(),
+                StatusCode::FORBIDDEN => {
+                    ApiError::new(failure::FORBIDDEN, "session access refused")
+                }
+                StatusCode::TOO_MANY_REQUESTS => {
+                    ApiError::new(failure::CAPACITY, "session capacity reached")
+                }
+                _ => ApiError::new(failure::UNAVAILABLE, "the worker refused the session"),
+            }),
+        }
     }
 
     async fn query(
@@ -1250,10 +1334,29 @@ impl crate::pgwire::Platform for PgPlatform {
         // listener sits outside the axum router that carries `track_inflight`, so
         // without this a rollout would close under a live wire-protocol query.
         let _inflight = InFlight::enter(&self.0.inflight);
+        let id = match Uuid::parse_str(&session.session_id) {
+            Ok(id) => id,
+            Err(_) => {
+                return QueryOutcome::Refused {
+                    kind: "unknown_session".into(),
+                    message: "invalid session identity".into(),
+                };
+            }
+        };
+        let (endpoint, _guard) = match self.0.query_route(id, identity).await {
+            Ok(route) => route,
+            Err(error) => {
+                return QueryOutcome::Refused {
+                    kind: error.0.kind.into(),
+                    message: error.1,
+                };
+            }
+        };
+        debug_assert_eq!(endpoint, session.endpoint);
         let sent = self
             .0
             .send_as(
-                &session.endpoint,
+                &endpoint,
                 Method::POST,
                 &format!("/v1/sessions/{}/queries", session.session_id),
                 json!({
@@ -1300,18 +1403,9 @@ impl crate::pgwire::Platform for PgPlatform {
     }
 
     async fn close_session(&self, session: crate::pgwire::Session) {
-        // Do not let a busy unrelated worker keep a revoked socket alive. The
-        // enqueued close and worker's periodic cleanup are the backstops.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.0.send(
-                &session.endpoint,
-                Method::DELETE,
-                &format!("/v1/sessions/{}", session.session_id),
-                Bytes::new(),
-            ),
-        )
-        .await;
+        if let Ok(id) = Uuid::parse_str(&session.session_id) {
+            self.0.close_internal(id).await;
+        }
     }
 
     fn draining(&self) -> bool {
@@ -1497,32 +1591,87 @@ async fn health(State(app): State<Gateway>) -> Response {
 }
 
 async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
-    let fleet = app.fleet_snapshot().await;
+    let registry = app.registry();
+    let fleet = app.fleet_snapshot(&registry).await;
     Ok(Json(json!({
         "workers": fleet.reported,
+        "unreachable": fleet.unreachable,
+        "registry_revision": registry.revision,
         "isolated_compute": app.isolation.is_some(),
         "observation_age_ms": u64::try_from(fleet.discovered.elapsed().as_millis()).unwrap_or(u64::MAX),
     })))
 }
 
-/// Worker endpoints, listed rather than named by class, so a deployment can run any
-/// set of sizes without the gateway being taught about them.
-fn worker_endpoints() -> anyhow::Result<Vec<String>> {
-    let configured = std::env::var("DUCKFLEET_WORKER_URLS")?;
-    let endpoints: Vec<String> = configured
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_owned)
-        .collect();
-    anyhow::ensure!(
-        !endpoints.is_empty(),
-        "DUCKFLEET_WORKER_URLS must list at least one worker endpoint"
-    );
-    Ok(endpoints)
+async fn pool_discovery(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
+    let registry = app.registry();
+    let fleet = app.fleet_snapshot(&registry).await;
+    let pools: Vec<Value> = registry.pools.iter().map(|(name, pool)| {
+        let eligible = ranked_endpoints(&fleet.workers, pool.resources, name,
+            &pool.endpoints, pool.max_sessions_per_worker, registry.legacy);
+        let sampled: Vec<&WorkerInfo> = fleet.workers.iter().filter(|worker| {
+            pool.endpoints.contains(&worker.endpoint)
+                && worker.serves(pool.resources, name, registry.legacy)
+        }).collect();
+        json!({
+            "name": name, "resources": pool.resources.describe(),
+            "configured_workers": pool.endpoints.len(), "eligible_workers": eligible.len(),
+            "sampled_workers": sampled.len(),
+            "sampled_open_sessions": sampled.iter().fold(0u64, |total, worker| total.saturating_add(worker.open_sessions)),
+            "unreachable_workers": fleet.unreachable.iter().filter(|endpoint| pool.endpoints.contains(endpoint)).count(),
+            "max_sessions_per_worker": if registry.legacy { None } else { Some(pool.max_sessions_per_worker) },
+            "worker_limits": sampled.iter().map(|worker| json!({
+                "endpoint": worker.endpoint,
+                "reported_max_sessions": worker.max_sessions,
+                "effective_max_sessions": worker.session_limit(pool.max_sessions_per_worker, registry.legacy),
+            })).collect::<Vec<_>>(),
+            "endpoints": pool.endpoints,
+        })
+    }).collect();
+    Ok(Json(json!({
+        "default_pool": registry.default_pool, "revision": registry.revision,
+        "reload_available": app.pools_file.is_some(), "pools": pools,
+        "gateway_max_sessions": app.max_sessions,
+        "gateway_open_sessions": app.max_sessions.saturating_sub(app.capacity.available_permits()),
+        "isolated_compute": app.isolation.is_some(),
+        "observation_age_ms": u64::try_from(fleet.discovered.elapsed().as_millis()).unwrap_or(u64::MAX),
+    })))
+}
+
+async fn reload_pools(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Json<Value>, ApiError> {
+    admin_only(
+        &Principal::from_identity(&identity),
+        "reload persistent pools",
+    )?;
+    app.authn.revalidate(&identity).await?;
+    let path = app.pools_file.clone().ok_or_else(|| ApiError::bad(
+        "pool reload requires DUCKFLEET_POOLS_FILE; inline and legacy configuration cannot reload"
+    ))?;
+    let candidate = tokio::task::spawn_blocking(move || -> anyhow::Result<PoolRegistry> {
+        anyhow::ensure!(
+            std::fs::metadata(path.as_ref())?.len() <= 1_048_576,
+            "pool configuration exceeds one MiB"
+        );
+        PoolRegistry::from_json(&std::fs::read_to_string(path.as_ref())?)
+    })
+    .await
+    .map_err(|_| ApiError::internal())?
+    .map_err(|_| {
+        ApiError::bad("invalid or unavailable pool configuration; previous registry retained")
+    })?;
+    let revision = candidate.revision.clone();
+    *app.pools.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(candidate);
+    // Existing routes retain their endpoint and session. A concurrent open retains
+    // its complete old snapshot; a fleet cache also carries its registry revision.
+    *app.fleet.lock().await = None;
+    Ok(Json(json!({"reloaded": true, "revision": revision})))
 }
 
 pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
+    let (registry, pools_file) = PoolRegistry::load()?;
+    let max_sessions = crate::configured_limit("DUCKFLEET_GATEWAY_MAX_SESSIONS", 64, 4096)?;
     let platform_dsn = std::env::var("PLATFORM_DSN")?;
     let maintenance_config = crate::platform::MaintenanceConfig::from_env()?;
     let schema_wait = crate::platform::schema_wait()?;
@@ -1563,12 +1712,14 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             .build()?,
         authn: Authn::new(token.clone(), std::env::var("PLATFORM_DSN")?),
         token,
-        endpoints: Arc::new(worker_endpoints()?),
+        pools: Arc::new(RwLock::new(Arc::new(registry))),
+        pools_file: pools_file.map(Arc::new),
+        max_sessions,
         fleet: Arc::new(Mutex::new(None)),
         observations: Arc::new(Mutex::new(HashMap::new())),
         discovering: Arc::new(Mutex::new(())),
         routes: Arc::new(Mutex::new(HashMap::new())),
-        capacity: Arc::new(Semaphore::new(64)),
+        capacity: Arc::new(Semaphore::new(max_sessions)),
         history: crate::history::Reader::new(std::env::var("PLATFORM_DSN")?),
         requests: crate::requests::Reader::new(std::env::var("PLATFORM_DSN")?),
         usage: crate::usage::Reader::new(
@@ -1633,6 +1784,8 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/usage", get(usage_events))
         .route("/v1/budget", get(budget).put(set_budget))
         .route("/v1/workers", get(workers))
+        .route("/v1/pools", get(pool_discovery))
+        .route("/v1/pools/reload", post(reload_pools))
         .route(
             "/v1/credentials",
             get(list_credentials).post(mint_credential),
@@ -1756,6 +1909,10 @@ mod tests {
                 }),
             )
             .route(
+                "/v1/sessions/{id}/queries",
+                post(|| async { Json(json!({"executed": true})) }),
+            )
+            .route(
                 "/v1/sessions/{id}",
                 axum::routing::delete(move || {
                     let closes = handler_closes.clone();
@@ -1792,6 +1949,9 @@ mod tests {
             "draining": state == "draining",
             "cpu": resources.cpu,
             "memory_bytes": resources.memory_bytes,
+            "disk_bytes": resources.disk_bytes,
+            "pool": "small",
+            "max_sessions": 32,
             "active_queries": 0,
             "queued_queries": 0,
             "open_sessions": 0,
@@ -1811,7 +1971,20 @@ mod tests {
                 .unwrap(),
             authn: Authn::new(token.clone(), dsn.into()),
             token,
-            endpoints: Arc::new(endpoints),
+            pools: Arc::new(RwLock::new(Arc::new(
+                PoolRegistry::from_json(
+                    &json!({
+                        "default_pool":"small", "pools":{"small":{
+                            "cpu":1,"memory":"1Gi","disk":"2Gi","endpoints":endpoints,
+                            "max_sessions_per_worker":32
+                        }}
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+            ))),
+            pools_file: None,
+            max_sessions: 64,
             fleet: Arc::new(Mutex::new(None)),
             observations: Arc::new(Mutex::new(HashMap::new())),
             discovering: Arc::new(Mutex::new(())),
@@ -1830,6 +2003,164 @@ mod tests {
             draining: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn placement(resources: Resources) -> Placement {
+        Placement {
+            mode: Mode::Persistent,
+            pool: Some("small".into()),
+            resources,
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_membership_disk_and_capacity_are_required_for_routing() {
+        let server = status_server(status("ready")).await;
+        let app = test_gateway(vec![server.endpoint.clone()]);
+        for (field, value, kind) in [
+            ("pool", json!("another-pool"), "no_ready_worker"),
+            (
+                "disk_bytes",
+                json!(Resources::default().disk_bytes * 2),
+                "no_ready_worker",
+            ),
+            ("max_sessions", json!(0), "no_ready_worker"),
+            ("max_sessions", json!(16), "no_ready_worker"),
+            ("open_sessions", json!(32), "capacity"),
+        ] {
+            let mut report = status("ready");
+            report[field] = value;
+            server.reply.lock().await.1 = report;
+            *app.fleet.lock().await = None;
+            let error = app
+                .endpoints_for(&app.registry(), &placement(Resources::default()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.0.kind, kind);
+            assert!(error.0.retry_safe);
+            assert_eq!(server.opens.load(Ordering::SeqCst), 0);
+        }
+        server.reply.lock().await.1 = status("ready");
+        *app.fleet.lock().await = None;
+        assert_eq!(
+            app.endpoints_for(&app.registry(), &placement(Resources::default()))
+                .await
+                .unwrap(),
+            std::slice::from_ref(&server.endpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn all_ingress_paths_share_the_backend_session_limit() {
+        use crate::pgwire::Platform;
+        let server = status_server(status("ready")).await;
+        let mut app = test_gateway(vec![server.endpoint.clone()]);
+        app.max_sessions = 1;
+        app.capacity = Arc::new(Semaphore::new(1));
+        let identity = Identity::bootstrap();
+        let response = open(
+            State(app.clone()),
+            Extension(identity.clone()),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let http_id = *app.routes.lock().await.keys().next().unwrap();
+        let pg = PgPlatform(app.clone());
+        let refused = pg.open_session(&identity).await.err().unwrap();
+        assert_eq!(refused.0.kind, "capacity");
+        let refused = platform_statement(&app, &identity, "fixture", "SELECT 1".into())
+            .await
+            .unwrap_err();
+        assert_eq!(refused.0.kind, "capacity");
+        assert_eq!(server.opens.load(Ordering::SeqCst), 1);
+        app.close_internal(http_id).await;
+        let session = pg.open_session(&identity).await.unwrap();
+        let refused = open(
+            State(app.clone()),
+            Extension(identity.clone()),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.0.kind, "capacity");
+        assert_eq!(app.routes.lock().await.len(), 1);
+        pg.close_session(session).await;
+        assert_eq!(app.capacity.available_permits(), 1);
+        let response = platform_statement(&app, &identity, "fixture", "SELECT 1".into())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(app.capacity.available_permits(), 1);
+        assert!(app.routes.lock().await.is_empty());
+        assert_eq!(server.opens.load(Ordering::SeqCst), 3);
+        assert_eq!(server.closes.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn reload_changes_new_opens_but_preserves_existing_routes_and_invalid_candidates() {
+        let first = status_server(status("ready")).await;
+        let mut named = status("ready");
+        named["pool"] = json!("interactive");
+        let second = status_server(named).await;
+        let mut app = test_gateway(vec![first.endpoint.clone()]);
+        let path = std::env::temp_dir().join(format!("duckfleet-pools-{}.json", Uuid::new_v4()));
+        app.pools_file = Some(Arc::new(path.clone()));
+        let identity = Identity::bootstrap();
+        let SessionOutcome::Opened { id: original, .. } = app
+            .open_session(SessionRequest::default(), &identity)
+            .await
+            .unwrap()
+        else {
+            panic!("initial open failed")
+        };
+        let previous = app.registry();
+        let candidate = json!({"default_pool":"interactive","pools":{"interactive":{
+            "cpu":1,"memory":"1Gi","disk":"2Gi","endpoints":[second.endpoint],"max_sessions_per_worker":32
+        }}});
+        std::fs::write(&path, candidate.to_string()).unwrap();
+        let denied = reload_pools(State(app.clone()), Extension(issued_identity()))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.0.kind, "forbidden");
+        assert_eq!(app.registry().revision, previous.revision);
+        let _ = reload_pools(State(app.clone()), Extension(identity.clone()))
+            .await
+            .unwrap();
+        assert_ne!(app.registry().revision, previous.revision);
+        let (endpoint, guard) = app.query_route(original, &identity).await.unwrap();
+        assert_eq!(endpoint, first.endpoint);
+        drop(guard);
+        let SessionOutcome::Opened {
+            endpoint, id: next, ..
+        } = app
+            .open_session(SessionRequest::default(), &identity)
+            .await
+            .unwrap()
+        else {
+            panic!("reloaded open failed")
+        };
+        assert_eq!(endpoint, second.endpoint);
+        // Even an open holding the old immutable snapshot can finish against its
+        // original pool after the current registry has removed that pool.
+        assert_eq!(
+            app.endpoints_for(&previous, &placement(Resources::default()))
+                .await
+                .unwrap(),
+            std::slice::from_ref(&first.endpoint)
+        );
+        let current = app.registry();
+        std::fs::write(&path, "{}").unwrap();
+        assert!(
+            reload_pools(State(app.clone()), Extension(identity))
+                .await
+                .is_err()
+        );
+        assert_eq!(app.registry().revision, current.revision);
+        app.close_internal(original).await;
+        app.close_internal(next).await;
+        std::fs::remove_file(path).unwrap();
     }
 
     fn issued_identity() -> Identity {
@@ -2016,7 +2347,7 @@ mod tests {
         let healthy = status_server(status("ready")).await;
         let failing = status_server(status("ready")).await;
         let app = test_gateway(vec![healthy.endpoint.clone(), failing.endpoint.clone()]);
-        let first = app.fleet_snapshot().await;
+        let first = app.fleet_snapshot(&app.registry()).await;
         let previous = first.reported[1].clone();
         assert!(previous["last_success_at"].as_u64().unwrap() > 0);
 
@@ -2031,14 +2362,16 @@ mod tests {
         assert_eq!(unavailable["last_success_at"], previous["last_success_at"]);
         assert_eq!(unavailable["last_observation"], previous);
         assert_eq!(
-            app.endpoints_for(Resources::default()).await.unwrap(),
+            app.endpoints_for(&app.registry(), &placement(Resources::default()))
+                .await
+                .unwrap(),
             std::slice::from_ref(&healthy.endpoint)
         );
 
         // Consecutive failures retain the successful observation, not a nested
         // history of earlier failures or counters eligible for placement.
         *app.fleet.lock().await = None;
-        let again = app.fleet_snapshot().await;
+        let again = app.fleet_snapshot(&app.registry()).await;
         assert_eq!(again.reported[1]["last_observation"], previous);
         assert_eq!(again.unreachable, std::slice::from_ref(&failing.endpoint));
 
@@ -2046,7 +2379,7 @@ mod tests {
         restarted["worker_boot_id"] = json!("second-boot");
         *failing.reply.lock().await = (StatusCode::OK, restarted);
         *app.fleet.lock().await = None;
-        let recovered = app.fleet_snapshot().await;
+        let recovered = app.fleet_snapshot(&app.registry()).await;
         assert!(recovered.unreachable.is_empty());
         assert_eq!(recovered.reported[1]["worker_boot_id"], "second-boot");
         assert_eq!(recovered.reported[1]["worker_id"], previous["worker_id"]);
@@ -2058,12 +2391,16 @@ mod tests {
         let failing = status_server(status("ready")).await;
         failing.reply.lock().await.0 = StatusCode::SERVICE_UNAVAILABLE;
         let app = test_gateway(vec![failing.endpoint.clone()]);
-        let initial = app.fleet_snapshot().await;
+        let initial = app.fleet_snapshot(&app.registry()).await;
         assert_eq!(initial.reported[0]["state"], "unreachable");
         assert!(initial.reported[0]["last_success_at"].is_null());
         assert!(initial.reported[0]["last_observation"].is_null());
         for _ in 0..3 {
-            assert!(app.endpoints_for(Resources::default()).await.is_err());
+            assert!(
+                app.endpoints_for(&app.registry(), &placement(Resources::default()))
+                    .await
+                    .is_err()
+            );
         }
         assert_eq!(failing.requests.load(Ordering::SeqCst), 1);
 
@@ -2074,7 +2411,11 @@ mod tests {
             ..Resources::default()
         };
         for _ in 0..3 {
-            assert!(app.endpoints_for(absent).await.is_err());
+            assert!(
+                app.endpoints_for(&app.registry(), &placement(absent))
+                    .await
+                    .is_err()
+            );
         }
         assert_eq!(healthy.requests.load(Ordering::SeqCst), 1);
     }
@@ -2095,12 +2436,14 @@ mod tests {
             draining.endpoint.clone(),
             healthy.endpoint.clone(),
         ]);
-        let snapshot = app.fleet_snapshot().await;
+        let snapshot = app.fleet_snapshot(&app.registry()).await;
         assert!(snapshot.unreachable.is_empty());
         assert_eq!(snapshot.reported[0]["state"], "starting");
         assert_eq!(snapshot.reported[1]["state"], "draining");
         assert_eq!(
-            app.endpoints_for(Resources::default()).await.unwrap(),
+            app.endpoints_for(&app.registry(), &placement(Resources::default()))
+                .await
+                .unwrap(),
             std::slice::from_ref(&healthy.endpoint)
         );
     }
@@ -2143,7 +2486,9 @@ mod tests {
             malformed.reply.lock().await.1 = value;
             *app.fleet.lock().await = None;
             assert_eq!(
-                app.endpoints_for(Resources::default()).await.unwrap(),
+                app.endpoints_for(&app.registry(), &placement(Resources::default()))
+                    .await
+                    .unwrap(),
                 std::slice::from_ref(&healthy.endpoint),
                 "{description} was treated as eligible idle capacity"
             );
@@ -2161,7 +2506,7 @@ mod tests {
             second.endpoint.clone(),
             failed.endpoint.clone(),
         ]);
-        let initial = app.fleet_snapshot().await;
+        let initial = app.fleet_snapshot(&app.registry()).await;
         assert_eq!(initial.unreachable, std::slice::from_ref(&failed.endpoint));
         // Keep this test within one cache generation independently of machine
         // scheduling. Discarding the cache after an open still triggers a probe.
@@ -2170,7 +2515,12 @@ mod tests {
         let mut placements = Vec::new();
         for _ in 0..4 {
             match app
-                .open_persistent(Resources::default(), b"{}".to_vec(), &Identity::bootstrap())
+                .open_persistent(
+                    &app.registry(),
+                    &placement(Resources::default()),
+                    b"{}".to_vec(),
+                    &Identity::bootstrap(),
+                )
                 .await
                 .unwrap()
             {
@@ -2205,7 +2555,10 @@ mod tests {
     async fn excluding_a_transient_worker_preserves_the_waitable_open_refusal() {
         let server = status_server(status("draining")).await;
         let app = test_gateway(vec![server.endpoint.clone()]);
-        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        let error = app
+            .endpoints_for(&app.registry(), &placement(Resources::default()))
+            .await
+            .unwrap_err();
         assert_eq!(error.0.kind, "draining");
         assert!(error.0.retry_safe);
         assert_eq!(server.opens.load(Ordering::SeqCst), 0);
@@ -2214,13 +2567,19 @@ mod tests {
         // draining process and its replacement. This is still pre-admission.
         server.reply.lock().await.0 = StatusCode::SERVICE_UNAVAILABLE;
         *app.fleet.lock().await = None;
-        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        let error = app
+            .endpoints_for(&app.registry(), &placement(Resources::default()))
+            .await
+            .unwrap_err();
         assert_eq!(error.0.kind, "no_ready_worker");
         assert!(error.0.retry_safe);
         assert_eq!(server.opens.load(Ordering::SeqCst), 0);
         *server.reply.lock().await = (StatusCode::OK, status("unavailable"));
         *app.fleet.lock().await = None;
-        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        let error = app
+            .endpoints_for(&app.registry(), &placement(Resources::default()))
+            .await
+            .unwrap_err();
         assert_eq!(error.0.kind, "no_ready_worker");
         assert!(error.0.retry_safe);
 
@@ -2229,7 +2588,10 @@ mod tests {
         starting.as_object_mut().unwrap().remove("memory_bytes");
         server.reply.lock().await.1 = starting;
         *app.fleet.lock().await = None;
-        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        let error = app
+            .endpoints_for(&app.registry(), &placement(Resources::default()))
+            .await
+            .unwrap_err();
         assert_eq!(error.0.kind, "starting");
         assert!(error.0.retry_safe);
         assert_eq!(server.opens.load(Ordering::SeqCst), 0);
@@ -2237,7 +2599,9 @@ mod tests {
         server.reply.lock().await.1 = status("ready");
         *app.fleet.lock().await = None;
         assert_eq!(
-            app.endpoints_for(Resources::default()).await.unwrap(),
+            app.endpoints_for(&app.registry(), &placement(Resources::default()))
+                .await
+                .unwrap(),
             std::slice::from_ref(&server.endpoint)
         );
         // Unknown outcomes after forwarding retain their conservative meaning.
@@ -2363,6 +2727,9 @@ mod tests {
             endpoint: endpoint.into(),
             cpu: small.cpu,
             memory_bytes: small.memory_bytes,
+            disk_bytes: Some(small.disk_bytes),
+            pool: Some("small".into()),
+            max_sessions: Some(32),
             ready: true,
             active_queries: 0,
             queued_queries: 0,
@@ -2374,24 +2741,40 @@ mod tests {
             make("other-size"),
             make("draining"),
         ];
+        let endpoints: Vec<_> = workers
+            .iter()
+            .map(|worker| worker.endpoint.clone())
+            .collect();
         workers[2].cpu = 4;
         workers[3].ready = false;
-        assert_eq!(ranked_endpoints(&workers, small), ["first", "second"]);
+        assert_eq!(
+            ranked_endpoints(&workers, small, "small", &endpoints, 32, false),
+            ["first", "second"]
+        );
         // An idle pool with many sessions beats a busy worker with one session.
         workers[0].active_queries = 1;
         workers[0].open_sessions = 1;
         workers[1].open_sessions = 20;
-        assert_eq!(ranked_endpoints(&workers, small), ["second", "first"]);
+        assert_eq!(
+            ranked_endpoints(&workers, small, "small", &endpoints, 32, false),
+            ["second", "first"]
+        );
         // Queued work counts even between statements; open sessions break ties.
         workers[0].active_queries = 0;
         workers[0].queued_queries = 2;
         workers[1].active_queries = 1;
-        assert_eq!(ranked_endpoints(&workers, small), ["second", "first"]);
+        assert_eq!(
+            ranked_endpoints(&workers, small, "small", &endpoints, 32, false),
+            ["second", "first"]
+        );
         workers[0].queued_queries = 1;
-        assert_eq!(ranked_endpoints(&workers, small), ["first", "second"]);
+        assert_eq!(
+            ranked_endpoints(&workers, small, "small", &endpoints, 32, false),
+            ["first", "second"]
+        );
         workers[0].ready = false;
         workers[1].ready = false;
-        assert!(ranked_endpoints(&workers, small).is_empty());
+        assert!(ranked_endpoints(&workers, small, "small", &endpoints, 32, false).is_empty());
     }
 
     #[test]

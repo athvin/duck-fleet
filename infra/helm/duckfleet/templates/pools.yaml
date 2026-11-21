@@ -1,0 +1,8 @@
+{{- if .Values.persistentPools }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duckfleet-pools
+data:
+  pools.json: {{ include "duckfleet.poolConfig" . | quote }}
+{{- end }}
