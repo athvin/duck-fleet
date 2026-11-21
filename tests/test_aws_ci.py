@@ -1445,6 +1445,8 @@ class DatabaseRolePackagingTests(unittest.TestCase):
         self.assertIn('host=external-postgres.duckfleet-dev.svc.cluster.local ', query)
         self.assertIn('user=' + roles.role_names('duckfleet-dev')['catalog'] + ' ', query)
         self.assertNotIn('user=duckfleet ', query)
+        self.assertIn(" connect_timeout=3'", query)
+        self.assertEqual(query.count('connect_timeout='), 1)
         with self.assertRaises(ValueError):
             probe.catalog_probe(dsn + ' host=obsolete', 'duckfleet-dev')
         with self.assertRaises(ValueError):
@@ -1457,6 +1459,7 @@ class DatabaseRolePackagingTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaises(AssertionError):
                 probe.verify_denial({'failure_kind': 'sql_error', 'error': message}, 'fixture-secret')
         probe.verify_denial({'failure_kind': 'sql_error', 'error': 'connection timed out'}, 'fixture-secret')
+        probe.verify_denial({'failure_kind': 'sql_error', 'error': 'connection to server failed: timeout expired'}, 'fixture-secret')
         probe.verify_denial({'failure_kind': 'timeout', 'error': 'query deadline elapsed'}, 'fixture-secret')
         with self.assertRaises(AssertionError):
             probe.verify_denial({'failure_kind': 'timeout', 'error': 'fixture-secret'}, 'fixture-secret')

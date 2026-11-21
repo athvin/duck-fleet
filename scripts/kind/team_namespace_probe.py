@@ -49,6 +49,10 @@ def catalog_probe(dsn, namespace):
     # when DuckDB embeds the complete statement in a connection error.
     if not all(re.fullmatch(r"[a-zA-Z0-9_.:-]+", value) for value in fields.values()):
         raise ValueError("catalog fixture DSN contains unsupported field characters")
+    # libpq otherwise waits indefinitely while connecting. DuckDB's statement
+    # interrupt need not stop that blocking call through dropped policy packets.
+    # Both controls use this same DSN and its per-address connection deadline.
+    fields["connect_timeout"] = "3"
     literal = "'" + " ".join(key + "=" + value for key, value in fields.items()) + "'"
     return ("SELECT COUNT(*) FROM postgres_scan(" + literal
             + ", 'public', 'ducklake_snapshot')")
