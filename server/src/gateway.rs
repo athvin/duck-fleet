@@ -959,6 +959,23 @@ impl Gateway {
         Ok((status, value))
     }
 
+    /// Retire a route only after the worker acknowledges the close. Pair the
+    /// cached increment on open with a decrement so rapid session churn cannot
+    /// exhaust the sampled capacity while the worker itself is idle.
+    async fn retire_route(&self, id: Uuid) -> Option<String> {
+        let route = self.routes.lock().await.remove(&id)?;
+        if route.pod.is_none()
+            && let Some(fleet) = self.fleet.lock().await.as_mut()
+            && let Some(worker) = fleet
+                .workers
+                .iter_mut()
+                .find(|w| w.endpoint == route.endpoint)
+        {
+            worker.open_sessions = worker.open_sessions.saturating_sub(1);
+        }
+        route.pod
+    }
+
     /// Protocol-owned sessions retain their capacity until the worker confirms
     /// connection closure and durable settlement, even after a transport timeout.
     async fn close_internal(&self, id: Uuid) {
@@ -975,12 +992,7 @@ impl Gateway {
             && status.is_success()
             && value["closed"] == true
         {
-            let pod = self
-                .routes
-                .lock()
-                .await
-                .remove(&id)
-                .and_then(|route| route.pod);
+            let pod = self.retire_route(id).await;
             self.release(pod).await;
         }
     }
@@ -1044,12 +1056,7 @@ impl Gateway {
             closes.spawn(async move {
                 match app.close_backend(id, &endpoint, reason.as_ref()).await {
                     Ok((status, value)) if status.is_success() && value["closed"] == true => {
-                        let pod = app
-                            .routes
-                            .lock()
-                            .await
-                            .remove(&id)
-                            .and_then(|route| route.pod);
+                        let pod = app.retire_route(id).await;
                         tokio::spawn(async move { app.release(pod).await });
                     }
                     Ok((status, value))
@@ -1440,12 +1447,7 @@ async fn close(
     }
     let (status, value) = app.close_backend(id, &endpoint, None).await?;
     if status.is_success() && value["closed"] == true {
-        let pod = app
-            .routes
-            .lock()
-            .await
-            .remove(&id)
-            .and_then(|route| route.pod);
+        let pod = app.retire_route(id).await;
         app.release(pod).await;
     }
     Ok((status, Json(value)).into_response())
@@ -2359,6 +2361,55 @@ mod tests {
                 .unwrap(),
             std::slice::from_ref(&server.endpoint)
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_closes_release_cached_worker_capacity_once() {
+        let server = status_server(status("ready")).await;
+        let app = test_gateway(vec![server.endpoint.clone()]);
+        let identity = Identity::bootstrap();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let SessionOutcome::Opened { id, .. } = app
+                .open_session(SessionRequest::default(), &identity)
+                .await
+                .unwrap()
+            else {
+                panic!("open failed")
+            };
+            ids.push(id);
+        }
+        assert_eq!(
+            app.fleet.lock().await.as_ref().unwrap().workers[0].open_sessions,
+            2
+        );
+        // A refusal must leave the route and its capacity counted.
+        *server.close_status.lock().await = StatusCode::SERVICE_UNAVAILABLE;
+        app.close_internal(ids[0]).await;
+        assert_eq!(
+            app.fleet.lock().await.as_ref().unwrap().workers[0].open_sessions,
+            2
+        );
+        *server.close_status.lock().await = StatusCode::OK;
+        app.close_internal(ids[0]).await;
+        app.close_internal(ids[0]).await;
+        assert_eq!(
+            app.fleet.lock().await.as_ref().unwrap().workers[0].open_sessions,
+            1
+        );
+        let response = close(
+            State(app.clone()),
+            Extension(Principal::from_identity(&identity)),
+            Path(ids[1]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            app.fleet.lock().await.as_ref().unwrap().workers[0].open_sessions,
+            0
+        );
+        assert_eq!(app.capacity.available_permits(), 64);
     }
 
     #[tokio::test]
