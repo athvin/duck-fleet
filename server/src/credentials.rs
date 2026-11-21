@@ -1,13 +1,15 @@
 //! Issued credentials: per-user and per-service bearer tokens, individually
 //! revocable, stored only as digests.
 //!
-//! The environment token (`DUCKFLEET_TOKEN`) does not go away — it becomes the
-//! **bootstrap credential**: the operator-held secret that mints, lists, and
-//! revokes everything else, and the only principal allowed to. A token is shown
-//! exactly once, in the response that issued it; the database holds its SHA-256,
-//! so neither a database read nor a backup discloses a usable secret.
+//! The public environment token (`DUCKFLEET_TOKEN`) remains a gateway-only
+//! bootstrap recovery credential. Named principals with credential-management
+//! permission can also issue/list/revoke credentials through audited operations.
+//! Workers receive a separate internal-service token. Issued bearer tokens are
+//! shown only once; PostgreSQL stores a SHA-256 digest, never the bearer itself.
+
 use anyhow::Result;
 use postgres::{Client, Transaction};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::SystemTime;
 use uuid::Uuid;
@@ -20,12 +22,31 @@ pub(crate) const PRINCIPAL_HEADER: &str = "x-duckfleet-principal";
 /// Issued credential authenticated for this operation, never taken from SQL
 /// context. Workers resolve this identifier again immediately before execution.
 pub(crate) const CREDENTIAL_HEADER: &str = "x-duckfleet-credential-id";
+pub(crate) const ACTOR_KIND_HEADER: &str = "x-duckfleet-actor-kind";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActorKind {
+    Named,
+    Bootstrap,
+    Internal,
+}
+impl ActorKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Named => "named",
+            Self::Bootstrap => "bootstrap",
+            Self::Internal => "internal",
+        }
+    }
+}
 /// What the bootstrap credential authenticates as.
 pub(crate) const BOOTSTRAP_PRINCIPAL: &str = "bootstrap-admin";
 
 /// Authenticated identity without the bearer token or its digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
+    pub kind: ActorKind,
     pub principal: String,
     pub credential_id: Option<String>,
     pub expires_at: Option<SystemTime>,
@@ -34,6 +55,7 @@ pub(crate) struct Identity {
 impl Identity {
     pub fn bootstrap() -> Self {
         Self {
+            kind: ActorKind::Bootstrap,
             principal: BOOTSTRAP_PRINCIPAL.into(),
             credential_id: None,
             expires_at: None,
@@ -41,7 +63,16 @@ impl Identity {
     }
 
     pub fn is_bootstrap(&self) -> bool {
-        self.credential_id.is_none() && self.principal == BOOTSTRAP_PRINCIPAL
+        self.kind == ActorKind::Bootstrap
+    }
+
+    pub fn internal(principal: impl Into<String>) -> Self {
+        Self {
+            kind: ActorKind::Internal,
+            principal: principal.into(),
+            credential_id: None,
+            expires_at: None,
+        }
     }
 
     pub fn expired(&self) -> bool {
@@ -127,6 +158,18 @@ pub(crate) fn issue(
     principal: &str,
     expires_seconds: Option<i64>,
 ) -> Result<Issued> {
+    let mut transaction = client.transaction()?;
+    crate::authz::bounded(&mut transaction)?;
+    let issued = issue_in(&mut transaction, principal, expires_seconds)?;
+    transaction.commit()?;
+    Ok(issued)
+}
+
+pub(crate) fn issue_in(
+    client: &mut Transaction<'_>,
+    principal: &str,
+    expires_seconds: Option<i64>,
+) -> Result<Issued> {
     anyhow::ensure!(
         valid_principal(principal),
         "principal must be 1-64 characters of [a-zA-Z0-9._@-], and not the bootstrap's own name"
@@ -139,49 +182,20 @@ pub(crate) fn issue(
         principal: principal.to_owned(),
         token: new_token(),
     };
+    let principal_id = crate::authz::ensure_principal_in(client, principal)?;
     client.execute(
-        "INSERT INTO credentials (credential_id, principal, token_sha256, expires_at)
+        "INSERT INTO credentials (credential_id, principal, token_sha256, expires_at, principal_id)
          VALUES ($1,$2,$3, CASE WHEN $4::bigint IS NULL THEN NULL
-                                ELSE now() + ($4::bigint * interval '1 second') END)",
+                                ELSE now() + ($4::bigint * interval '1 second') END,$5)",
         &[
             &issued.credential_id,
             &issued.principal,
             &digest(&issued.token),
             &expires_seconds,
+            &principal_id,
         ],
     )?;
     Ok(issued)
-}
-
-/// Marks a credential unusable. Idempotence is the caller's signal: false means
-/// it was already revoked or never existed, which for an operator cleaning up
-/// amounts to the same thing said honestly.
-pub(crate) fn revoke(client: &mut Client, credential_id: &str) -> Result<bool> {
-    let revoked = client.execute(
-        "UPDATE credentials SET revoked_at = now()
-         WHERE credential_id = $1 AND revoked_at IS NULL",
-        &[&credential_id],
-    )?;
-    Ok(revoked > 0)
-}
-
-/// Every credential, without a byte of secret material — not even the digest,
-/// which would let a listing be brute-forced offline.
-pub(crate) fn list(client: &mut Client) -> Result<Value> {
-    let rows = client.query(
-        "SELECT credential_id, principal, created_at::text, expires_at::text, revoked_at::text
-         FROM credentials ORDER BY created_at DESC",
-        &[],
-    )?;
-    Ok(json!({
-        "credentials": rows.iter().map(|row| json!({
-            "credential_id": row.get::<_, String>(0),
-            "principal": row.get::<_, String>(1),
-            "created_at": row.get::<_, String>(2),
-            "expires_at": row.get::<_, Option<String>>(3),
-            "revoked_at": row.get::<_, Option<String>>(4),
-        })).collect::<Vec<_>>()
-    }))
 }
 
 /// The principal a presented token authenticates, or None: unknown, revoked and
@@ -239,10 +253,120 @@ fn read_identities(
 
 fn identity(row: postgres::Row) -> Identity {
     Identity {
+        kind: ActorKind::Named,
         credential_id: Some(row.get(0)),
         principal: row.get(1),
         expires_at: row.get(2),
     }
+}
+
+fn api_error(_: impl std::fmt::Display) -> crate::ApiError {
+    crate::ApiError::new(
+        crate::failure::UNAVAILABLE,
+        "credential service unavailable",
+    )
+}
+pub(crate) fn issue_authorized(
+    client: &mut Client,
+    actor: &Identity,
+    principal: &str,
+    expires: Option<i64>,
+) -> Result<Issued, crate::ApiError> {
+    if !valid_principal(principal) || expires.is_some_and(|v| v < 1) {
+        return Err(crate::ApiError::bad(
+            "invalid credential principal or expiry",
+        ));
+    }
+    let mut tx = client.transaction().map_err(api_error)?;
+    crate::authz::bounded(&mut tx).map_err(api_error)?;
+    crate::authz::lock_actor_in(&mut tx, actor)?;
+    let access = crate::authz::resolve_in(&mut tx, actor)?;
+    if let Err(error) = crate::authz::require_in(
+        &mut tx,
+        &access,
+        crate::authz::Action::CredentialManage,
+        None,
+    ) {
+        tx.commit().map_err(api_error)?;
+        return Err(error);
+    }
+    let issued = issue_in(&mut tx, principal, expires).map_err(api_error)?;
+    crate::audit::append_in(
+        &mut tx,
+        &crate::audit::Event::new(
+            &access,
+            crate::authz::Action::CredentialManage,
+            "credential",
+            Some(&issued.credential_id),
+            "allowed",
+            "credential_issued",
+            None,
+        ),
+    )
+    .map_err(api_error)?;
+    tx.commit().map_err(api_error)?;
+    Ok(issued)
+}
+pub(crate) fn revoke_authorized(
+    client: &mut Client,
+    actor: &Identity,
+    id: &str,
+) -> Result<bool, crate::ApiError> {
+    let mut tx = client.transaction().map_err(api_error)?;
+    crate::authz::bounded(&mut tx).map_err(api_error)?;
+    crate::authz::lock_actor_in(&mut tx, actor)?;
+    let access = crate::authz::resolve_in(&mut tx, actor)?;
+    if let Err(error) = crate::authz::require_in(
+        &mut tx,
+        &access,
+        crate::authz::Action::CredentialManage,
+        None,
+    ) {
+        tx.commit().map_err(api_error)?;
+        return Err(error);
+    }
+    let changed=tx.execute("UPDATE credentials SET revoked_at=clock_timestamp() WHERE credential_id=$1 AND revoked_at IS NULL",&[&id]).map_err(api_error)?>0;
+    crate::audit::append_in(
+        &mut tx,
+        &crate::audit::Event::new(
+            &access,
+            crate::authz::Action::CredentialManage,
+            "credential",
+            Some(id),
+            "allowed",
+            "credential_revoked",
+            None,
+        ),
+    )
+    .map_err(api_error)?;
+    tx.commit().map_err(api_error)?;
+    Ok(changed)
+}
+pub(crate) fn list_authorized(
+    client: &mut Client,
+    actor: &Identity,
+    limit: i64,
+    after: Option<&str>,
+) -> Result<Value, crate::ApiError> {
+    crate::authz::validate_page(limit, after)?;
+    let mut tx = client.transaction().map_err(api_error)?;
+    crate::authz::bounded(&mut tx).map_err(api_error)?;
+    let access = crate::authz::resolve_in(&mut tx, actor)?;
+    if let Err(error) = crate::authz::require_in(
+        &mut tx,
+        &access,
+        crate::authz::Action::CredentialManage,
+        None,
+    ) {
+        tx.commit().map_err(api_error)?;
+        return Err(error);
+    }
+    let rows=tx.query("SELECT credential_id,principal,principal_id,created_at::text,expires_at::text,revoked_at::text FROM credentials WHERE ($1::text IS NULL OR credential_id>$1) ORDER BY credential_id LIMIT $2",&[&after,&(limit+1)]).map_err(api_error)?;
+    let more = rows.len() > limit as usize;
+    let page = &rows[..rows.len().min(limit as usize)];
+    let value = json!({"next_after":if more{page.last().map(|r|r.get::<_,String>(0))}else{None},"credentials":page.iter().map(|r|json!({"credential_id":r.get::<_,String>(0),"principal":r.get::<_,String>(1),"principal_id":r.get::<_,Option<String>>(2),"created_at":r.get::<_,String>(3),"expires_at":r.get::<_,Option<String>>(4),"revoked_at":r.get::<_,Option<String>>(5)})).collect::<Vec<_>>()});
+    tx.commit().map_err(api_error)?;
+    Ok(value)
 }
 
 #[cfg(test)]

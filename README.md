@@ -287,23 +287,26 @@ credential from the environment, or a credential it issued; see
 | GET | `/healthz` | Process health after startup initialization |
 | POST | `/v1/sessions` | Select compute, open a pinned connection; returns `session_id` and placement |
 | GET | `/v1/pools` | Configured persistent pools, allocations, capacity limits and current eligible-worker observations |
-| POST | `/v1/pools/reload` | Validate and reload the operator-configured pool file; bootstrap only |
+| POST | `/v1/pools/reload` | Validate and reload the operator-configured pool file; fleet management permission |
 | POST | `/v1/sessions/{id}/queries` | Durably admit SQL and await Arrow; reports request ID, status URL and acceptance |
 | DELETE | `/v1/sessions/{id}` | Close connection and roll back any open transaction |
 | POST | `/v1/sessions/{id}/cancel` | Interrupt this session's currently executing statement |
 | GET | `/v1/queries` | Filtered history with cursor pagination; defaults to 500 records |
 | GET | `/v1/queries/{query_id}` | One durable record, metrics, and raw DuckDB profile when available |
-| POST | `/v1/requests/{request_id}/cancel` | Durably request cancellation independently of engine availability; owner or bootstrap |
-| GET | `/v1/requests/{request_id}` | Owner-scoped durable identity, attempt lineage, outcome, and diagnostic availability; bootstrap can inspect all |
+| POST | `/v1/requests/{request_id}/cancel` | Durably request cancellation independently of engine availability; authorized own/all cancellation |
+| GET | `/v1/requests/{request_id}` | Authorized own/all durable identity, attempt lineage, outcome, and diagnostic availability |
 | GET | `/v1/workers` | Every configured worker's state and execution pressure, observed limits, and whether isolated compute is available |
 | GET | `/v1/usage` | Append-only usage events with cursor pagination |
 | GET | `/v1/budget` | Prepaid balance, held reservations, spend, caps, rate card |
 | PUT | `/v1/budget` | Set the prepaid balance and per-job cost cap |
 | GET | `/v1/lake/snapshots` | DuckLake snapshots, as an Arrow stream |
-| POST | `/v1/lake/maintenance` | Expire snapshots, compact small files, clean unreferenced files (bootstrap only) |
-| POST | `/v1/credentials` | Issue a credential for a principal; the token appears only in this response (bootstrap only) |
-| GET | `/v1/credentials` | List credentials without any secret material (bootstrap only) |
-| DELETE | `/v1/credentials/{id}` | Revoke one credential immediately (bootstrap only) |
+| POST | `/v1/lake/maintenance` | Validated snapshot expiry, compaction, and cleanup (maintenance and compute grants) |
+| POST | `/v1/credentials` | Issue a credential; token appears once (credential management permission) |
+| GET | `/v1/credentials` | List credentials without secret material (credential management permission) |
+| DELETE | `/v1/credentials/{id}` | Revoke one credential (credential management permission) |
+| GET | `/v1/principals` | Paginated stable principals (grant management permission) |
+| GET/PUT | `/v1/principals/{principal}/policy` | Inspect or atomically replace a principal policy |
+| GET | `/v1/audit` | Paginated append-only audit events (audit read permission) |
 
 `GET /v1/workers` remains available while SQL runs. Each reachable worker reports
 its `worker_id`, per-process `boot_id`, `state`, `ready`, `draining`,
@@ -420,76 +423,137 @@ abandons its routes and ends client sessions; it is not transaction recovery.
 
 ## Credentials
 
-The environment token (`DUCKFLEET_TOKEN`) is the **bootstrap credential**: the
-operator-held secret that issues, lists, and revokes everything else, and the
-only principal allowed to — a named credential that could mint could quietly
-become every principal at once, so management refusals are a classified `403
-forbidden`. Issue per-user and per-service credentials with
-`POST /v1/credentials` (`{"principal": "analyst", "expires_seconds": 86400}`,
-expiry optional); the token is shown exactly once, in that response, and the
-database stores only its SHA-256, so neither a listing, a history row, a log
-line, nor a database backup discloses a usable secret. Every query's history
-record names the `principal` the gateway authenticated — server-derived, so a
-caller's context cannot claim to be someone else; a worker addressed directly
-inside the cluster records `direct`.
+The gateway's `DUCKFLEET_TOKEN` is the operator-held bootstrap recovery credential.
+It can repair grants when named administrators lose access. Workers instead receive
+`DUCKFLEET_INTERNAL_TOKEN`; they reject the public bootstrap token. Keep both
+secrets distinct. Internal-worker endpoints are trusted service interfaces.
+
+Issue a named user or service credential with `POST /v1/credentials`
+(`{"principal":"analyst","expires_seconds":86400}`, expiry optional). Only
+credential administrators can issue, list, or revoke tokens. The token appears
+once in the response; PostgreSQL stores its SHA-256. Each principal has a stable
+ID in one persisted deployment namespace. Names cannot be renamed or reused;
+revoked credentials and disabled principals remain tombstones for attribution.
+Caller headers, pgwire usernames, SQL settings, and query context never supply
+roles, namespace, or authenticated actor identity.
+
+Permissions live in the existing platform database. Presets are additive, and
+explicit grants can add a specific capability without a policy service:
+
+| Preset | Execute | Cancel / close | History / usage | SQL text / raw profiles | Administration |
+| --- | --- | --- | --- | --- | --- |
+| `analyst` | Own sessions, granted compute | Own | Own | Own | None |
+| `viewer` | No | No | Own | Hidden | None |
+| `operator` | Fixed maintenance only, granted compute | All | All | Hidden | Fleet/budget reads and maintenance |
+| `admin` | Own sessions, granted compute | All | All | All | Credentials, grants, budgets, pool reload, audit |
+
+`own` means the immutable workload owner within this namespace. An operator's
+cancellation does not transfer ownership. Organization-wide history access does
+not let a named administrator execute SQL in someone else's session or claim
+their request ID or retry chain. Bootstrap recovery is a separate actor kind.
+
+Row visibility, SQL visibility, and profile visibility are separate decisions.
+SQL permission covers SQL text, arbitrary context/model tags, and raw error text.
+Full profiles require **both** `sql.read` and `profile.read`, because engine profiles
+can contain SQL and expressions. Metadata-only readers receive typed state,
+placement, timestamps, cost, and curated numeric metrics. Hidden payload fields
+are absent or null; filtering on a hidden sensitive field is refused. Invisible
+history/request IDs use the same not-found response as absent IDs. Row scopes
+are applied in PostgreSQL before pagination, and HTTP metadata remains available
+while execution workers are stopped. SQL system relations follow in #104.
+
+Manage a whole principal policy with
+`GET/PUT /v1/principals/{principal}/policy`. A PUT replaces its roles, explicit
+permissions, complete compute grants, and disabled state atomically. For example,
+this policy grants an organization observer metadata without SQL text or execution:
+
+```json
+{
+  "roles": ["viewer"],
+  "permissions": [
+    {"action":"history.read","scope":"all"},
+    {"action":"usage.read","scope":"all"}
+  ],
+  "compute": [],
+  "disabled": false
+}
+```
+
+The CLI supports `principals`, `credentials`, `policy <name>`,
+`policy <name> --file policy.json`, and `audit`. Listings accept `--limit` (1–500),
+with `--after` for principals/credentials and `--before` for audit; responses carry
+the next cursor. Create the principal by issuing its first credential, inspect its
+policy, then replace it deliberately. Giving a role does not silently grant every
+pool or isolated mode.
+
+A compute grant is one complete allocation envelope:
+`{"mode":"persistent","pool":"small","cpu":1,"memory_bytes":1073741824,"disk_bytes":2147483648}`.
+An isolated grant uses `"mode":"isolated","pool":null` plus all three ceilings.
+One grant must cover the resolved allocation; CPU from one grant cannot combine
+with memory from another. Checks run before provisioning, after provisioning
+waits, at durable submission/grant, and immediately before SQL. Operational queue,
+session, and budget caps apply independently. Fixed maintenance also needs a
+compute grant. API maintenance rebuilds validated server-owned SQL; setting
+`context.operation` cannot authorize arbitrary SQL.
 
 HTTP and pgwire retain the authenticated credential ID, principal, and expiry.
-Expiry has no cache grace period. Revocation invalidates the cache on the gateway
-handling the revoke request before its response returns; another gateway
-or a direct database revocation can leave a cached read authorized for at most
-15 seconds. An earlier lookup cannot repopulate the cache after invalidation.
-Workers independently check the credential against PostgreSQL when admitting
-each session or statement, after it leaves the execution queue and again after
-any wait for budget admission. The final check immediately before execution is
-the SQL authorization boundary: revoking a credential prevents queued and later
-work from starting, while a statement already admitted may finish within its
-existing deadline (at most 60 seconds). Revocation neither cancels nor replays
-that statement. Operators can still explicitly cancel it.
+Authentication uses a positive cache of at most 15 seconds, never past expiry;
+revocation invalidates that gateway's cache before returning. Authorization has
+no policy cache: each operation resolves the current credential, principal state,
+and complete policy snapshot. Workers repeat the check after queue and budget
+waits as the final metadata step before engine entry. Revoked credentials or
+grants prevent queued and subsequent SQL from starting. Already active SQL may
+finish within its existing deadline, at most 60 seconds, unless explicitly
+canceled. A grant change never replays SQL.
 
-Unknown, revoked, and expired tokens all return HTTP `401 unauthorized` or
-pgwire SQLSTATE `28P01`. Failed authentication-store lookups fail closed with
-HTTP `503 unavailable` or pgwire `57P01`; they do not count as successful
-authentication. Credential reads have a three-second database statement timeout.
-Pgwire revalidates before its lazy first session and every statement, and checks
-idle connections every five seconds. An authentication refusal ends that wire
-connection and closes its worker session. Protocol writes are bounded so a
-client that stops reading cannot keep the session alive indefinitely.
+Unknown, expired, revoked, and disabled credentials return `401 unauthorized`;
+missing permissions return `403 forbidden`. Database failures refuse new work.
+Pgwire checks before lazy session creation, every statement, and at five-second
+idle intervals. Idle-session cleanup rechecks current authority: a stale revoke
+observation cannot close a session after a regrant. Transient policy lookup failure
+leaves cleanup pending and execution unavailable, rather than proving revocation.
+Closing a session rolls back its uncommitted transaction.
 
-Workers sweep idle credentials every five seconds, including when no new
-request arrives. A running statement delays that sweep until it completes or
-reaches its deadline. Closing a session rolls back uncommitted transactions;
-an authentication-store failure also closes issued-credential sessions. The
-gateway periodically removes idle revoked or expired routes and releases their
-isolated pods, subject to Kubernetes deletion latency. These checks do not
-require a refused follow-up request to trigger cleanup. The ordinary five-minute
-session idle limit still applies to valid credentials.
+Rotate credentials by issuing another for the same principal, durably accepting
+work with it on each HTTP session, then revoking the old credential. Accepted work
+rotates cleanup authority immediately, even while queued; rejected requests do
+not. Cleanup compares the durable authority generation. Pgwire clients reconnect
+because their password is fixed for the connection. Principal-wide policy changes
+apply to both old and replacement credentials.
 
-Rotate a token by issuing another credential for the same principal, completing
-a statement with it on each existing HTTP session, then revoking the old
-credential. Session ownership
-stays with the principal; cleanup follows the last admitted credential. Tokens
-for other principals cannot claim that session. An idle session still held by
-the revoked token is closed, even if another token exists for its principal.
-Successful durable queue acceptance under the replacement token transfers cleanup
-authority immediately, even while SQL waits. Rejected requests do not rotate it.
-Cleanup compares the durable authority generation, so a stale old-token sweep
-cannot close newly accepted replacement-token work. If cleanup closes first, the
-new submission is refused. Execution still requires a fresh credential check.
-Pgwire clients reconnect with the replacement token because their password is
-fixed for the life of a connection.
+Credential, grant, budget, cancellation, and privileged-operation decisions append
+auditable events. External effects have a committed start event and a subsequent
+outcome event; an unavailable outcome write is reported without pretending the
+external effect rolled back. Audits exclude bearer tokens, SQL, arbitrary context,
+profiles, and raw errors. Privileged effects fail if their required start audit
+cannot persist. Denial still denies during an audit/database outage. Usage and
+reservations retain authenticated actor/credential IDs directly, separately from
+the workload owner, so pruning history does not erase attribution. Unknown legacy
+actors remain unknown. A denial under a revoked accepted credential uses its
+retained actor; audit `policy_version: 0` means current authorization could not be
+resolved, rather than inventing a current grant snapshot.
 
-Credentials authenticate and attribute, and they scope the platform's levers —
-not its SQL. Every principal reaches the same full SQL surface; per-principal
-SQL scoping is explicitly not built. On the platform API the mutations are
-owned: credential management, lake maintenance, and budget **writes** are
-bootstrap-only (a spend ceiling writable by the spenders it constrains would be
-an accident log, not a control), and a session answers only to the principal
-that opened it — another principal's query, cancel, or close is refused `403
-forbidden`, while the bootstrap may act on any session because interrupting a
-runaway statement is the operator's job. Reads stay org-global by design:
-budget position, query history, and usage — including SQL text — are visible to
-every credential, because debugging a teammate's run and seeing the one shared
-bill are what a single-organization warehouse is for.
+Schema 3 deliberately tightens upgrade defaults: existing named principals become
+analysts with own visibility and one bounded default persistent grant. The default
+is `small`, 1 CPU, 1 GiB memory, 2 GiB disk. Before migration, deployments with a
+different default pool must review `DUCKFLEET_AUTHZ_DEFAULT_POOL`, `_CPU`, `_MEMORY`,
+and `_DISK` (each has the `DUCKFLEET_AUTHZ_DEFAULT` prefix). Extra pools, isolated
+execution, and organization-wide debugging require explicit grants. Repeating
+migration does not restore revoked application grants. The configured
+`DUCKFLEET_NAMESPACE` must match the persisted deployment identity.
+
+Platform owner/migrator, gateway, worker, maintainer, and lake-catalog PostgreSQL
+credentials are separate. Runtime roles cannot update, delete, truncate, alter,
+or own audit/usage tables. Workers cannot read token hashes or manage credentials,
+grants, or budget limits. Worker pods receive neither the public bootstrap nor
+migration credentials. Compose provisions the roles; external PostgreSQL uses the
+explicit privileged provisioning procedure in [infra/README.md](infra/README.md).
+Startup rejects unsafe owner/superuser runtime DSNs.
+
+These permissions protect supported platform interfaces. SQL executors remain
+trusted with their worker's files, network access, catalog connection, and internal
+service authority until #106 separates execution authority. Platform roles alone
+are not table permissions, row policies, or a hostile-SQL sandbox.
 
 ## The Postgres wire front
 
@@ -586,19 +650,19 @@ array order and value types matter. It excludes attempt IDs, credential IDs,
 worker identity, boot identity and pool-registry revision. It does not fingerprint ambient session or
 database state, or establish semantic equivalence between different SQL text.
 
-`GET /v1/requests/<id>` exposes identity only to its authenticated principal or
-the bootstrap operator. A different principal receives the same 404 as an absent
-ID, including on duplicate submissions. Credential rotation preserves ownership.
-This protection applies to the request/deduplication API: the existing diagnostic
-history API remains organization-wide until platform RBAC is enabled, and trusted
-administrator SQL is not a data-isolation boundary.
+`GET /v1/requests/<id>` follows own/all history permissions. An invisible ID
+returns the same 404 as an absent ID. Duplicate submission and retry ownership
+remain restricted to the workload owner or bootstrap recovery; observation grants
+do not transfer them. Credential rotation preserves the immutable owner.
 
 After a `budget_exhausted` refusal, fund the budget and submit the same payload
 with a **new** `request_id` and `"retry_of": "<refused-attempt-id>"`. The response
 from the old ID stays a duplicate of its refusal. Both attempts retain the same
 `logical_request_id`, and only one child attempt may reference each refusal;
-retry a refused child by referring to that latest child. The lookup's `retry`
-object describes whether this controlled retry is allowed. Other kinds of
+retry a refused child by referring to that latest child. The lookup's `retry.allowed`
+describes retained outcome eligibility, not the reader's current permission to retry.
+New submission still checks immutable ownership, current grants, compute, and budget;
+all-history access does not grant execution. Other kinds of
 failure do not become permission to retry through this mechanism.
 
 Identity, diagnostic acceptance, bounded SQL payload and admission permits commit
@@ -765,9 +829,10 @@ DuckDB/catalog initialization. Both workers and the gateway wait up to
 `DUCKFLEET_PLATFORM_WAIT_SECONDS` (default 120) for a missing or known older schema and reject
 unsupported future versions with an actionable error.
 
-Deployment runs `DUCKFLEET_ROLE=migrate` using the same binary and `PLATFORM_DSN`.
+Deployment runs `DUCKFLEET_ROLE=migrate` using the same binary and its dedicated
+owner/migrator `PLATFORM_DSN`; runtime processes use their own restricted DSNs.
 This PostgreSQL-only command supports a fresh database, unversioned installations
-and the ordered schema-1 to schema-2 upgrade. It adopts existing credentials, request identities,
+and ordered schema-1 through schema-3 upgrades. It adopts existing credentials, request identities,
 reservations and usage without refilling the budget. Migrations commit their
 version atomically; repeats skip the baseline scans. Quiesce older writers for
 an upgrade and preserve the `platform` database along with the DuckLake catalog.
@@ -790,6 +855,8 @@ the image has not changed:
 
 ```sh
 bash scripts/migrate-platform.sh compose
+# Explicit privilege repair after restore or database-role changes:
+bash scripts/migrate-platform.sh compose platform-grants
 # Kubernetes: set DUCKFLEET_KUBE_CONTEXT and DUCKFLEET_NAMESPACE first.
 bash scripts/migrate-platform.sh kube
 ```
@@ -1082,7 +1149,7 @@ and `POST /v1/lake/maintenance` takes any combination of
 `{"expire_older_than_days": N, "compact": true, "cleanup": true}`: expire
 snapshots older than the window (`0` keeps only the current state, which is
 exactly as destructive as it sounds), merge adjacent small files, and delete
-files no snapshot references. Maintenance is **bootstrap-only** — expiry
+files no snapshot references. Maintenance requires the **maintenance permission and a compute grant** — expiry
 forfeits time travel and cleanup deletes files, which is the operator's call.
 
 The operations run through the ordinary execution machinery rather than a side
@@ -1113,19 +1180,19 @@ full dbt-free workflow against it.
 
 ## Scope and limitations
 
-This is a **trusted, single-tenant development environment** with known local
-credentials and plain HTTP inside Docker. Every credential — bootstrap or
-issued — controls access to an administrator SQL connection; credentials
-authenticate and attribute, they are not a SQL sandbox. Do not expose the API
-publicly or use customer data. Query history includes SQL text and errors.
-Logical model IDs and tags are caller-supplied correlation data, not
-authenticated billing data; the `principal` column is the authenticated part.
+This is a **trusted, single-organization deployment**. Platform roles control
+execution, observation, and administration through supported interfaces. Named
+executors still use a privileged DuckDB/catalog connection, and unrestricted SQL
+can reach worker files and network resources. SQL-process and reader/writer data
+authority separation is tracked in #106. Local Docker uses known development
+credentials and plain HTTP. Caller-supplied model IDs and tags are correlation
+data; durable actor IDs are authenticated attribution.
 
 Only SQL models are implemented. The Docker harness runs the two persistent
 compute classes; isolated per-session pods are implemented in the Kubernetes
 chart and exercised by the kind harness, and are refused with `501` wherever the
 pod grant is absent — which includes everywhere in Docker. There is no warm
-pool, durable job queue, multi-tenant authorization, production secret
+pool, durable asynchronous result storage, hostile-tenant isolation, production secret
 management, or automatic write retry.
 The usage ledger meters compute only, against a configurable rate card whose
 default is a placeholder, and nothing
@@ -1136,7 +1203,7 @@ external materializations, and dbt plugins are unsupported. Unchecked dbt
 materializations or version combinations are not part of the tested contract.
 
 Health reports process availability, not continuous dependency readiness. History
-uses separate, read-only PostgreSQL connections and remains available while
+uses separate bounded PostgreSQL connections and remains available while
 workers are busy or stopped. Each process admits at most eight concurrent history
 reads, with a three-second connection timeout and PostgreSQL statement timeout;
 excess requests return 429. A database outage returns 503. Cancellation bypasses

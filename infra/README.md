@@ -210,7 +210,7 @@ The migration uses the `duckfleet-no-aws` service account, has no mounted API to
 and receives no object-store credentials. Failed Jobs prevent rollout success;
 inspect their logs to diagnose the schema or database problem.
 
-Schema 2 requires a quiesced upgrade from schema 1: all old gateways, persistent
+Schema 3 requires a quiesced upgrade from schemas 1 or 2: all old gateways, persistent
 workers, isolated workers, and any separately managed direct workers must stop
 before migration. A per-Deployment Recreate rollout is not a fleet-wide barrier.
 The deploy/provision/manual migration helpers perform a read-only preflight and
@@ -235,17 +235,18 @@ Do not use
 `suspended:true` for this flow: suspension also stops bundled PostgreSQL and removes
 the migration Job.
 
-After the stop succeeds, apply the desired schema 2 chart/image with a fresh
+After the stop succeeds, apply the desired schema 3 chart/image with a fresh
 `platformMigration.runId` and wait for migration/rollout; new compute cannot become
-usable before schema 2 and its admission policy exist. For Compose, build/pull the
+usable before schema 3, its runtime grants, and its admission policy exist. For Compose, build/pull the
 desired image, run `scripts/migrate-platform.sh compose`, then explicitly start
 the desired services. Bare Helm/template-apply users must follow the same stop/apply
 sequence. Do not automatically roll back the binary after migration commits.
 
-Restore also uses this stop flow, restores both databases, runs a fresh migration,
-and leaves compute stopped for explicit restart. A schema 1 backup is upgraded to 2
-by the current image. `migrate-platform.sh kube` requires the current schema 2 Job
-template; cloning an old schema 1 image cannot perform this upgrade. Apply the
+Restore also uses this stop flow, restores both databases under their dedicated
+owners with backup ACLs discarded, runs a fresh migration and explicit
+`platform-grants` repair, and leaves compute stopped for explicit restart. A schema 1 or 2 backup is upgraded to 3
+by the current image. `migrate-platform.sh kube` requires the current schema 3 Job
+template; cloning an old schema 1/2 image cannot perform this upgrade. Apply the
 desired chart only after old compute has stopped. Same-image DB reset/retarget
 still requires a fresh Job/runId; prior completion does not prove the new database.
 
@@ -258,6 +259,127 @@ next upgrade or uninstall, so export failure logs before retrying a Helm release
 Template/apply installations require explicit cleanup of failed Jobs. The current
 release Job has no TTL because manual recovery reuses its template; ad-hoc Jobs
 created by `migrate-platform.sh` expire one day after completion or failure.
+
+## Database roles and platform RBAC
+
+Schema 3 uses separate PostgreSQL logins. Runtime startup checks actual privileges
+and refuses an owner, superuser, inherited elevated role, schema CREATE permission,
+or mutable audit/usage ledger. The application checks principal permissions and
+compute grants separately; service database roles are not end-user PostgreSQL RLS.
+
+| Component | Secret key mapped to `PLATFORM_DSN` | Other credentials |
+| --- | --- | --- |
+| Migration/grant-repair Job | `PLATFORM_MIGRATION_DSN` | None |
+| Gateway | `PLATFORM_GATEWAY_DSN` | `PLATFORM_MAINTENANCE_DSN` mapped to `DUCKFLEET_MAINTENANCE_DSN`; public `DUCKFLEET_TOKEN`; distinct `DUCKFLEET_INTERNAL_TOKEN` |
+| Persistent/isolated SQL worker | `PLATFORM_WORKER_DSN` | Dedicated nonsuperuser `CATALOG_DSN`; internal token only |
+| PostgreSQL-only maintenance | `PLATFORM_MAINTENANCE_DSN` | None |
+
+The migrator owns platform objects and does not have CREATEROLE. Workers cannot
+read credential hashes, manage credentials/grants, change budget limits, or
+update/delete/truncate audit and usage rows. Gateway and maintainer roles also
+cannot modify retained audit/usage rows or perform DDL. The catalog login owns
+only the dedicated lake database/schema, has no platform membership or CONNECT
+grant, and is distinct from every platform role. Public schema CREATE and default
+database CONNECT are revoked in the two dedicated databases.
+
+Compose automatically runs `platform-provision` before `platform-migrate`; only the
+provisioning task receives its development administrator credential. Its fixed
+local passwords are development fixtures. Fresh bundled Helm PostgreSQL runs the
+same reviewed SQL during initial creation. Helm runtime Pods mount individual
+Secret keys, never the complete Secret. A worker's service account has no Secret
+read permission. The PostgreSQL administrator and role password seeds appear only
+in the database Pod, not a migration or compute Pod.
+
+`databaseRoles` may explicitly name `migrator`, `gateway`, `worker`, `maintainer`,
+and `catalog`. Defaults derive distinct names from the release namespace plus a
+hash, permitting multiple deployments on one PostgreSQL cluster. The supplied
+Secret must match those names. `scripts/database_roles.py <namespace>` generates a
+fresh development Secret for piping directly to `kubectl create -f -`; do not save
+its output in build logs or artifacts. Production credentials belong in the
+operator's secret manager.
+
+For external PostgreSQL, provision first using the environment template in
+`examples/database-roles.env`, replacing every placeholder with a distinct secret:
+
+```sh
+# Export the reviewed variables through your secret manager or operator shell.
+scripts/provision-database.sh
+```
+
+This explicit administrator action creates constrained LOGIN roles and dedicated
+databases, grants connection access, and transfers only objects in each database's
+public schema. It never uses cluster-wide `REASSIGN OWNED`. Existing elevated
+component roles are refused for review. Existing databases with a different owner
+require `DUCKFLEET_ADOPT_DATABASE_OWNER=yes` after all compute is stopped. The
+administrator must be allowed to create roles/databases and transfer these objects;
+the application migrator is not silently elevated to obtain those rights.
+
+Create the chart Secret with the four platform DSNs from the table, `CATALOG_DSN`, separate
+public/internal tokens, and set `postgres.bundled=false`, reviewed external CIDRs,
+and `databaseRoles` to your chosen names. External database deployments do not need
+the administrator or `DATABASE_*_PASSWORD` seed keys in their chart Secret. Apply
+the chart after provisioning; the migration installs explicit table/column grants
+in the same transaction as schema 3. Ordinary current-version migration remains
+read-only. For an intentional grant repair after restoring or changing role names:
+
+```sh
+scripts/migrate-platform.sh compose platform-grants
+# Or, with DUCKFLEET_KUBE_CONTEXT and DUCKFLEET_NAMESPACE set:
+scripts/migrate-platform.sh kube platform-grants
+```
+
+The repair uses only the migration credential and never reseeds revoked principal
+grants. Runtime policies and credential mutations remain audited application
+operations. A grant repair changes database privileges and should run while compute
+is stopped when coupled to role/credential replacement.
+
+Before a schema 2 upgrade, review `authorization.defaultPersistentGrant` (default
+`{pool: small, cpu: 1, memory: 1Gi, disk: 2Gi}`). The chart requires this explicit
+envelope to cover its configured default pool; named custom defaults need a matching
+reviewed value. Migration adopts existing named principals as analysts with own
+visibility and this bounded persistent grant only. Other pools, isolation, operator
+visibility, and administration need explicit grants. Repeated migration never
+restores revoked grants. `DUCKFLEET_NAMESPACE` is the release namespace (Compose:
+`local`); runtime rejects a restored database with a different persisted label.
+
+For an existing Compose volume, stop compute, export the original PostgreSQL admin
+password (older development volumes used `local-catalog-password`), and explicitly
+adopt the old database ownership before migration:
+
+```sh
+scripts/stop-compute.sh compose
+export DUCKFLEET_POSTGRES_ADMIN_PASSWORD='<existing administrator password>'
+DUCKFLEET_ADOPT_DATABASE_OWNER=yes docker compose run --rm platform-provision
+scripts/migrate-platform.sh compose
+# Resume the desired services explicitly after successful migration.
+docker compose up -d --wait server
+```
+
+For an existing bundled Kubernetes PVC, stop compute first. Upgrade its Secret
+without rotating existing admin/bootstrap credentials, using the same namespace and
+Secret name as the deployment:
+
+```sh
+kubectl --context "$DUCKFLEET_KUBE_CONTEXT" -n "$DUCKFLEET_NAMESPACE" get secret duckfleet-dev -o json \
+  | python3 scripts/database_roles.py "$DUCKFLEET_NAMESPACE" --upgrade \
+  | kubectl --context "$DUCKFLEET_KUBE_CONTEXT" -n "$DUCKFLEET_NAMESPACE" apply -f -
+```
+
+Render/apply only `templates/postgres.yaml` from the desired chart with your existing
+values, and wait for its StatefulSet rollout. This mounts the reviewed provisioning
+SQL and role password seeds without starting compute or migration. An administrator
+then runs `env DUCKFLEET_ADOPT_DATABASE_OWNER=yes bash /docker-entrypoint-initdb.d/init.sh`
+inside the PostgreSQL Pod. Apply the complete desired chart with a fresh migration
+run ID only after provisioning succeeds. External PostgreSQL uses the explicit
+administrator helper instead. The normal deploy helper never invents permission
+to transfer an existing database or stop compute.
+
+This is platform-interface RBAC for trusted SQL executors. Until executor isolation
+in #106, SQL runs in a process holding its worker/catalog credentials and internal
+service token; file/environment access may expose that authority. Role separation
+protects append-only records from runtime edits but cannot prove that a stolen
+runtime credential did not forge an INSERT. It is not table RBAC, row masking, or
+hostile-SQL isolation.
 
 ## Bounding the development lake
 
@@ -292,8 +414,9 @@ database reachable only with a credential that no longer exists anywhere, then a
 the Secret, restarts the deployments (a Secret change does not reach a running pod's
 environment), and finally requires the fleet to answer before reporting success.
 
-Only the password changes. The DSNs are edited rather than rebuilt, so host, port,
-database and user survive exactly; `DUCKFLEET_TOKEN` is left alone because it is the
+Only `DATABASE_CATALOG_PASSWORD` and the password in `CATALOG_DSN` change.
+Platform runtime, migration, maintainer, and PostgreSQL administrator credentials
+remain unchanged. Host, port, database and user survive exactly; `DUCKFLEET_TOKEN` is left alone because it is the
 bootstrap credential, not a database credential, and rotating it here would log the
 operator out as a side effect of database maintenance. Humans and services should
 hold credentials issued through `POST /v1/credentials` (see the README's

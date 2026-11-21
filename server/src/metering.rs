@@ -22,7 +22,7 @@
 //! lifetime ledger or waits on reconciliation when it has no holds to release.
 use crate::{ApiError, failure, pricing};
 use anyhow::Result;
-use postgres::{Client, Transaction};
+use postgres::Transaction;
 use serde_json::{Value, json};
 
 /// This harness bills one tenant, so the budget is a single known row.
@@ -357,6 +357,21 @@ pub(crate) fn admit_in(
             "request_id already has a reservation; no SQL was executed",
         ));
     }
+    // Typed authority is copied from durable admission, never request context.
+    // The JSON read also supports the isolated pre-schema3 upgrade fixtures.
+    let attribution: Value = transaction
+        .query_one(
+            "SELECT to_jsonb(r)::text FROM requests r WHERE request_id=$1",
+            &[&execution_id],
+        )
+        .map_err(|_| ApiError::internal())
+        .and_then(|row| {
+            serde_json::from_str(row.get::<_, &str>(0)).map_err(|_| ApiError::internal())
+        })?;
+    if attribution["namespace_id"].is_string() {
+        transaction.execute("UPDATE reservations SET namespace_id=$2,owner_principal_id=$3,actor_principal_id=$4,actor_kind=$5,actor_principal=$6,actor_credential_id=$7 WHERE execution_id=$1",
+            &[&execution_id,&attribution["namespace_id"].as_str(),&attribution["owner_principal_id"].as_str(),&attribution["actor_principal_id"].as_str(),&attribution["actor_kind"].as_str(),&attribution["actor_principal"].as_str(),&attribution["actor_credential_id"].as_str()]).map_err(|_|ApiError::internal())?;
+    }
     apply_deltas(transaction, 0, reserved_micro_usd).map_err(|_| ApiError::internal())?;
     Ok(Admission {
         execution_id: execution_id.to_owned(),
@@ -379,28 +394,57 @@ fn record(
     context: &str,
     source: &str,
 ) -> Result<u64> {
-    // One event per execution per meter, keyed so a replayed settlement is a no-op.
-    // Returns the insert count so a caller can tell a first write from a replay.
-    let inserted = transaction.execute(
-        "INSERT INTO usage_events (event_id, execution_id, meter_name, quantity, unit,
-            resource_units, amount_micro_usd, rate_card_version, worker_id, context, source,
-            started_at, ended_at)
-         VALUES ($1,$2,$3,$4,'millisecond',$5,$6,$7,$8,$9,$10,
-                 now() - ($4::BIGINT * interval '1 millisecond'), now())
-         ON CONFLICT (event_id) DO NOTHING",
-        &[
-            &format!("{execution_id}:{METER}"),
-            &execution_id,
-            &METER,
-            &elapsed_ms,
-            &units,
-            &amount_micro_usd,
-            &rate_card_version,
-            &worker_id,
-            &context,
-            &source,
-        ],
-    )?;
+    // Retained reservation attribution survives diagnostic deletion and recovery.
+    // Old fixtures/legacy reservations have no namespace and stay explicitly unknown.
+    let attribution: Value = transaction
+        .query_opt(
+            "SELECT to_jsonb(r)::text FROM reservations r WHERE execution_id=$1",
+            &[&execution_id],
+        )?
+        .map(|row| serde_json::from_str(row.get::<_, &str>(0)))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    let actor_columns = if attribution["namespace_id"].is_string() {
+        ",namespace_id,owner_principal_id,actor_principal_id,actor_kind,actor_principal,actor_credential_id"
+    } else {
+        ""
+    };
+    let actor_values = if actor_columns.is_empty() {
+        ""
+    } else {
+        ",$11,$12,$13,$14,$15,$16"
+    };
+    let event_id = format!("{execution_id}:{METER}");
+    let namespace = attribution["namespace_id"].as_str();
+    let owner = attribution["owner_principal_id"].as_str();
+    let actor = attribution["actor_principal_id"].as_str();
+    let kind = attribution["actor_kind"].as_str();
+    let principal = attribution["actor_principal"].as_str();
+    let credential = attribution["actor_credential_id"].as_str();
+    let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+        &event_id,
+        &execution_id,
+        &METER,
+        &elapsed_ms,
+        &units,
+        &amount_micro_usd,
+        &rate_card_version,
+        &worker_id,
+        &context,
+        &source,
+    ];
+    if !actor_columns.is_empty() {
+        params.extend([
+            &namespace as &(dyn postgres::types::ToSql + Sync),
+            &owner,
+            &actor,
+            &kind,
+            &principal,
+            &credential,
+        ]);
+    }
+    let inserted=transaction.execute(&format!("INSERT INTO usage_events(event_id,execution_id,meter_name,quantity,unit,resource_units,amount_micro_usd,rate_card_version,worker_id,context,source,started_at,ended_at{actor_columns})
+        VALUES($1,$2,$3,$4,'millisecond',$5,$6,$7,$8,$9,$10,now()-($4::BIGINT*interval '1 millisecond'),now(){actor_values}) ON CONFLICT(event_id) DO NOTHING"),&params)?;
     Ok(inserted)
 }
 
@@ -490,7 +534,10 @@ pub(crate) fn settle_saved_in(
 
 /// Current budget position, for the operator view. The rate reported is the card
 /// this process prices *new* work with; recorded events carry their own.
-pub(crate) fn summary(client: &mut Client, rate: &pricing::RateCard) -> Result<Value, ApiError> {
+pub(crate) fn summary(
+    client: &mut impl postgres::GenericClient,
+    rate: &pricing::RateCard,
+) -> Result<Value, ApiError> {
     // The accumulators, not fresh SUMs: the operator reads exactly the position the
     // admission gate enforces, and the two can never disagree in a report.
     let limits = client

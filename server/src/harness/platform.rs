@@ -226,7 +226,38 @@ fn migration_failure(client: &mut Client) -> Result<()> {
 /// This generated-schema fixture reconstructs the real schema-1 surface before
 /// testing upgrades. Merely deleting version markers leaves schema-2 DDL behind
 /// and does not represent any supported historical installation.
+pub(super) fn remove_authz_fixture_schema(client: &mut Client) -> Result<()> {
+    for table in [
+        "requests",
+        "query_history",
+        "queue_sessions",
+        "reservations",
+        "usage_events",
+    ] {
+        for column in [
+            "namespace_id",
+            "owner_principal_id",
+            "actor_principal_id",
+            "actor_kind",
+            "actor_credential_id",
+        ] {
+            client.batch_execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"))?;
+        }
+        if table != "requests" {
+            client.batch_execute(&format!("ALTER TABLE {table} DROP COLUMN actor_principal"))?;
+        }
+    }
+    client.batch_execute("ALTER TABLE requests DROP COLUMN authorization_policy_version;
+        ALTER TABLE queue_sessions DROP COLUMN authority_kind,DROP COLUMN authority_principal_id,DROP COLUMN authority_policy_version,DROP COLUMN operation;
+        ALTER TABLE credentials DROP COLUMN principal_id;
+        DROP TABLE audit_events,authz_legacy_owners,principal_roles,permission_grants,compute_grants,principals,authz_defaults,platform_namespace;
+        DROP FUNCTION immutable_audit_event();
+        DELETE FROM platform_schema_migrations WHERE version=3;")?;
+    Ok(())
+}
+
 fn remove_queue_fixture_schema(client: &mut Client) -> Result<()> {
+    remove_authz_fixture_schema(client)?;
     client.batch_execute(
         "DROP TABLE admission_policies,admission_publication,admission_scopes,
         queue_workers,queue_sessions,query_payloads,query_controls,query_permits,
@@ -298,7 +329,7 @@ fn versioned_queue_upgrade(client: &mut Client) -> Result<()> {
     )?;
     let report = platform::migrate(client, &seed())?;
     require(
-        report.applied && report.version == 2,
+        report.applied && report.version == platform::SCHEMA_VERSION,
         "ordered queue migration missing",
     )?;
     require(
@@ -326,7 +357,7 @@ fn versioned_queue_upgrade(client: &mut Client) -> Result<()> {
         &[&before],
     )?;
     println!(
-        "PASS: schema1 upgrades to2 without repeating baseline scans or budget reconciliation"
+        "PASS: schema1 upgrades through queue and authorization without repeating baseline scans or budget reconciliation"
     );
     Ok(())
 }
@@ -334,7 +365,7 @@ fn versioned_queue_upgrade(client: &mut Client) -> Result<()> {
 fn adoption_and_future_schema(client: &mut Client, credential_id: &str) -> Result<()> {
     let credential: String = client
         .query_one(
-            "SELECT to_jsonb(c)::TEXT FROM credentials c WHERE credential_id=$1",
+            "SELECT (to_jsonb(c)-'principal_id')::TEXT FROM credentials c WHERE credential_id=$1",
             &[&credential_id],
         )?
         .get(0);
@@ -383,7 +414,7 @@ fn adoption_and_future_schema(client: &mut Client, credential_id: &str) -> Resul
     require(
         client
             .query_one(
-                "SELECT to_jsonb(c)::TEXT FROM credentials c WHERE credential_id=$1",
+                "SELECT (to_jsonb(c)-'principal_id')::TEXT FROM credentials c WHERE credential_id=$1",
                 &[&credential_id],
             )?
             .get::<_, String>(0)

@@ -1,17 +1,20 @@
 //! Read-only history requests use independent, bounded PostgreSQL connections.
 //! They never enter the DuckDB worker queue or acquire its execution lock.
-use crate::{ApiError, failure};
-use postgres::{Client, NoTls, Row};
+use crate::{
+    ApiError,
+    authz::{Action, MetadataAccess},
+    credentials::Identity,
+    failure,
+    metadata::{self, Relation, RelationPlan},
+};
+use postgres::{Row, Transaction};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
-use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub(crate) struct Reader {
-    dsn: Arc<str>,
-    capacity: Arc<Semaphore>,
+    reader: metadata::Reader,
 }
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -87,28 +90,31 @@ impl Filter {
     }
 }
 
-const COLUMNS: &str = "query_id,session_id,sql,context,status,accepted_at::text,finished_at::text,elapsed_ms,result_rows,error,placement,history_id,worker_id,profile_status,metrics,failure_kind,retry_safe,principal,to_jsonb(query_history)::text";
-fn record(row: &Row) -> Value {
-    fn json_column(row: &Row, column: usize) -> Value {
-        serde_json::from_str(row.get::<_, &str>(column)).unwrap_or(Value::Null)
-    }
+const OWNER: &str = "COALESCE(h.owner_principal_id,l.principal_id)";
+fn columns() -> String {
+    let sql = format!("($4 OR ($5 AND {OWNER}=$2))");
+    format!("h.query_id,h.session_id,CASE WHEN {sql} THEN h.sql ELSE NULL END,h.context,h.status,h.accepted_at::text,h.finished_at::text,h.elapsed_ms,h.result_rows,CASE WHEN {sql} THEN h.error ELSE NULL END,h.placement,h.history_id,h.worker_id,h.profile_status,h.metrics,h.failure_kind,h.retry_safe,h.principal,
+        jsonb_build_object('queued_at',h.queued_at,'selected_at',h.selected_at,'execution_granted_at',h.execution_granted_at,'engine_started_at',h.engine_started_at,'queue_deadline_at',h.queue_deadline_at,'session_sequence',h.session_sequence,'worker_boot_id',h.worker_boot_id,'pool_scope',h.pool_scope,'protocol',h.protocol,'open_span_id',h.open_span_id,'namespace_id',COALESCE(h.namespace_id,$1),'owner_principal_id',{OWNER},'actor_principal_id',h.actor_principal_id,'actor_kind',h.actor_kind,'actor_principal',h.actor_principal,'actor_credential_id',h.actor_credential_id)::text,{OWNER}").replace("h.context,",&format!("CASE WHEN {sql} THEN h.context ELSE 'null' END,"))
+}
+const FROM: &str = "FROM query_history h LEFT JOIN authz_legacy_owners l ON h.owner_principal_id IS NULL AND h.namespace_id IS NULL AND l.namespace_id=$1 AND l.legacy_name=h.principal";
+fn visible() -> String {
+    format!("COALESCE(h.namespace_id,$1)=$1 AND ($3 OR {OWNER}=$2)")
+}
+fn record(row: &Row, plan: &RelationPlan) -> Value {
+    let json_column =
+        |column| serde_json::from_str(row.get::<_, &str>(column)).unwrap_or(Value::Null);
+    let owner = row.get::<_, Option<&str>>(19);
+    let placement = json_column(10);
     let mut value = json!({
-        "query_id":row.get::<_, String>(0), "session_id":row.get::<_, String>(1),
-        "sql":row.get::<_, String>(2), "context":json_column(row,3),
-        "status":row.get::<_, String>(4), "accepted_at":row.get::<_, String>(5),
-        "finished_at":row.get::<_, Option<String>>(6), "elapsed_ms":row.get::<_, Option<i64>>(7),
-        "result_rows":row.get::<_, Option<i64>>(8), "error":row.get::<_, Option<String>>(9),
-        "placement":json_column(row,10), "history_id":row.get::<_, i64>(11),
-        "worker_id":row.get::<_, String>(12), "profile_status":row.get::<_, String>(13),
-        "metrics":json_column(row,14),
-        // Null on success, and on records written before this column existed.
-        "failure_kind":row.get::<_, Option<String>>(15),
-        "retry_safe":row.get::<_, Option<bool>>(16),
-        // Who the gateway authenticated for the session; `direct` for a worker
-        // addressed without one, and for records older than the column.
-        "principal":row.get::<_, String>(17)
+        "query_id":row.get::<_,String>(0),"session_id":row.get::<_,String>(1),"sql":row.get::<_,Option<String>>(2),
+        "context":json_column(3),"status":row.get::<_,String>(4),"accepted_at":row.get::<_,String>(5),
+        "finished_at":row.get::<_,Option<String>>(6),"elapsed_ms":row.get::<_,Option<i64>>(7),"result_rows":row.get::<_,Option<i64>>(8),
+        "error":row.get::<_,Option<String>>(9),"placement":if plan.sql_visible(owner){placement}else{metadata::safe_placement(&placement)},
+        "history_id":row.get::<_,i64>(11),"worker_id":row.get::<_,String>(12),"profile_status":row.get::<_,String>(13),
+        "metrics":metadata::numeric_metrics(&json_column(14)),"failure_kind":row.get::<_,Option<String>>(15),"retry_safe":row.get::<_,Option<bool>>(16),
+        "principal":row.get::<_,String>(17)
     });
-    queue_metadata(&mut value, &json_column(row, 18));
+    queue_metadata(&mut value, &json_column(18));
     value
 }
 fn queue_metadata(value: &mut Value, stored: &Value) {
@@ -125,99 +131,108 @@ fn queue_metadata(value: &mut Value, stored: &Value) {
         "pool_scope",
         "protocol",
         "open_span_id",
+        "namespace_id",
+        "owner_principal_id",
+        "actor_principal_id",
+        "actor_kind",
+        "actor_principal",
+        "actor_credential_id",
     ] {
         value[key] = stored.get(key).cloned().unwrap_or(Value::Null);
     }
 }
+pub(crate) fn list_in(
+    tx: &mut Transaction<'_>,
+    access: &MetadataAccess,
+    filter: Filter,
+) -> Result<Value, ApiError> {
+    filter.validate()?;
+    let plan = metadata::relation_plan(access, Relation::History)?;
+    if filter.model_id.is_some() || filter.invocation_id.is_some() || filter.model_run_id.is_some()
+    {
+        plan.sensitive_filter()?;
+    }
+    let rows = tx
+        .query(
+            &format!(
+                "SELECT {} {FROM} WHERE {} AND ($6::bigint IS NULL OR h.history_id<$6)
+        AND ($7::text IS NULL OR h.status=$7) AND ($8::text IS NULL OR h.worker_id=$8)
+        AND ($9::text IS NULL OR h.context::jsonb #>> '{{dbt,node_id}}'=$9)
+        AND ($10::text IS NULL OR h.context::jsonb #>> '{{dbt,invocation_id}}'=$10)
+        AND ($11::text IS NULL OR h.context::jsonb ->> 'model_run_id'=$11)
+        AND ($12::text IS NULL OR h.failure_kind=$12) ORDER BY h.history_id DESC LIMIT $13",
+                columns(),
+                visible()
+            ),
+            &[
+                &plan.namespace_id,
+                &plan.principal_id,
+                &plan.all,
+                &plan.sql_all,
+                &plan.sql_own,
+                &filter.before,
+                &filter.status,
+                &filter.worker_id,
+                &filter.model_id,
+                &filter.invocation_id,
+                &filter.model_run_id,
+                &filter.failure_kind,
+                &(filter.limit + 1),
+            ],
+        )
+        .map_err(|_| ApiError::internal())?;
+    let mut queries: Vec<Value> = rows.iter().map(|row| record(row, &plan)).collect();
+    let more = queries.len() > filter.limit as usize;
+    queries.truncate(filter.limit as usize);
+    let next = if more {
+        queries.last().map(|row| row["history_id"].clone())
+    } else {
+        None
+    };
+    Ok(json!({"queries":queries,"next_before":next}))
+}
+pub(crate) fn detail_in(
+    tx: &mut Transaction<'_>,
+    access: &MetadataAccess,
+    id: Uuid,
+) -> Result<Value, ApiError> {
+    let plan = metadata::relation_plan(access, Relation::History)?;
+    let row=tx.query_opt(&format!("SELECT {},CASE WHEN ($4 OR ($5 AND {OWNER}=$2)) AND ($6 OR ($7 AND {OWNER}=$2)) THEN h.profile ELSE NULL END {FROM} WHERE {} AND h.query_id=$8",columns(),visible()),
+        &[&plan.namespace_id,&plan.principal_id,&plan.all,&plan.sql_all,&plan.sql_own,&plan.profile_all,&plan.profile_own,&id.to_string()])
+        .map_err(|_|ApiError::internal())?.ok_or_else(||ApiError::new(failure::NOT_FOUND,"query not found"))?;
+    let mut value = record(&row, &plan);
+    value["profile"] = (if plan.profile_visible(row.get::<_, Option<&str>>(19)) {
+        row.get::<_, Option<&str>>(row.len() - 1)
+    } else {
+        None
+    })
+    .and_then(|raw| serde_json::from_str(raw).ok())
+    .unwrap_or(Value::Null);
+    Ok(value)
+}
 impl Reader {
     pub fn new(dsn: String) -> Self {
         Self {
-            dsn: dsn.into(),
-            capacity: Arc::new(Semaphore::new(8)),
+            reader: metadata::Reader::new(dsn),
         }
     }
-    async fn read<F>(&self, operation: F) -> Result<Value, ApiError>
-    where
-        F: FnOnce(&mut Client) -> Result<Value, ApiError> + Send + 'static,
-    {
-        let permit = self
-            .capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ApiError::new(failure::CAPACITY, "history reader capacity reached"))?;
-        let dsn = self.dsn.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut config: postgres::Config = dsn.parse().map_err(|_| ApiError::internal())?;
-            config.connect_timeout(Duration::from_secs(3));
-            config.options("-c default_transaction_read_only=on -c statement_timeout=3000");
-            let mut client = config.connect(NoTls).map_err(|_| ApiError::internal())?;
-            operation(&mut client)
-        })
-        .await
-        .map_err(|_| ApiError::internal())?
-    }
-    pub async fn list(&self, filter: Filter) -> Result<Value, ApiError> {
+    pub async fn list(&self, identity: Identity, filter: Filter) -> Result<Value, ApiError> {
         filter.validate()?;
-        self.read(move |client| {
-            let rows = client
-                .query(
-                    &format!(
-                        "SELECT {COLUMNS} FROM query_history
-                WHERE ($1::bigint IS NULL OR history_id < $1)
-                  AND ($2::text IS NULL OR status=$2)
-                  AND ($3::text IS NULL OR worker_id=$3)
-                  AND ($4::text IS NULL OR context::jsonb #>> '{{dbt,node_id}}'=$4)
-                  AND ($5::text IS NULL OR context::jsonb #>> '{{dbt,invocation_id}}'=$5)
-                  AND ($6::text IS NULL OR context::jsonb ->> 'model_run_id'=$6)
-                  AND ($7::text IS NULL OR failure_kind=$7)
-                ORDER BY history_id DESC LIMIT $8"
-                    ),
-                    &[
-                        &filter.before,
-                        &filter.status,
-                        &filter.worker_id,
-                        &filter.model_id,
-                        &filter.invocation_id,
-                        &filter.model_run_id,
-                        &filter.failure_kind,
-                        &(filter.limit + 1),
-                    ],
-                )
-                .map_err(|_| ApiError::internal())?;
-            let mut queries: Vec<Value> = rows.iter().map(record).collect();
-            let has_more = queries.len() > filter.limit as usize;
-            queries.truncate(filter.limit as usize);
-            let next_before = if has_more {
-                queries.last().map(|q| q["history_id"].clone())
-            } else {
-                None
-            };
-            Ok(json!({"queries":queries, "next_before":next_before}))
-        })
-        .await
+        self.reader
+            .run(identity, Action::HistoryRead, None, move |tx, access| {
+                list_in(tx, &access.metadata(), filter)
+            })
+            .await
     }
-    pub async fn detail(&self, id: Uuid) -> Result<Value, ApiError> {
-        self.read(move |client| {
-            let row = client
-                .query_opt(
-                    &format!("SELECT {COLUMNS},profile FROM query_history WHERE query_id=$1"),
-                    &[&id.to_string()],
-                )
-                .map_err(|_| ApiError::internal())?
-                .ok_or_else(|| ApiError::new(failure::NOT_FOUND, "query not found"))?;
-            let mut value = record(&row);
-            // Appended after COLUMNS above, so it is always the last column —
-            // counted from the end rather than hardcoded, which is how adding
-            // `principal` to COLUMNS once silently moved this to a column that
-            // happened to parse as null.
-            value["profile"] = row
-                .get::<_, Option<&str>>(row.len() - 1)
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or(Value::Null);
-            Ok(value)
-        })
-        .await
+    pub async fn detail(&self, identity: Identity, id: Uuid) -> Result<Value, ApiError> {
+        self.reader
+            .run(
+                identity,
+                Action::HistoryRead,
+                Some(id.to_string()),
+                move |tx, access| detail_in(tx, &access.metadata(), id),
+            )
+            .await
     }
 }
 

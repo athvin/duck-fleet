@@ -8,12 +8,14 @@ use anyhow::Result;
 use duckdb::Connection;
 
 /// Environment variables whose values must never be printed.
-const SECRET_VARS: [&str; 5] = [
+const SECRET_VARS: [&str; 7] = [
     "CATALOG_DSN",
     "PLATFORM_DSN",
     "S3_ACCESS_KEY",
     "S3_SECRET_KEY",
     "DUCKFLEET_TOKEN",
+    "DUCKFLEET_INTERNAL_TOKEN",
+    "DUCKFLEET_MAINTENANCE_DSN",
 ];
 const MASK: &str = "[redacted]";
 

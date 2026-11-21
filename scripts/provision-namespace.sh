@@ -30,18 +30,9 @@ python3 scripts/compute_lifecycle.py check kube --context "$context" --namespace
 
 python3 scripts/aws/render_boundary.py "$ns" | kubectl --context "$context" apply -f -
 if ! "${kube[@]}" get secret duckfleet-dev > /dev/null 2>&1; then
-  python3 - <<'PY' | "${kube[@]}" create -f -
-import json, secrets
-password = secrets.token_hex(32)
-dsn = f'host=postgres port=5432 user=duckfleet password={password}'
-print(json.dumps({'apiVersion': 'v1', 'kind': 'Secret',
-                  'metadata': {'name': 'duckfleet-dev'}, 'type': 'Opaque',
-                  'stringData': {'POSTGRES_PASSWORD': password,
-                                 'DUCKFLEET_TOKEN': secrets.token_hex(32),
-                                 'CATALOG_DSN': dsn + ' dbname=lake',
-                                 'PLATFORM_DSN': dsn + ' dbname=platform'}}))
-PY
+  python3 scripts/database_roles.py "$ns" | "${kube[@]}" create -f -
 fi
+"${kube[@]}" get secret duckfleet-dev -o json | python3 scripts/database_roles.py "$ns" --check
 migration_run=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 helm template duckfleet infra/helm/duckfleet --namespace "$ns" \
   --set "lakePrefix=$ns/lake" --set-string "platformMigration.runId=$migration_run" "$@" \

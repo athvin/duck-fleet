@@ -23,13 +23,9 @@ python3 scripts/aws/check-api-egress.py "$KUBE_CONTEXT"
   echo 'Expected Auto Mode gp3 storage class is unavailable' >&2; exit 1;
 }
 if [[ -z $("${KUBE[@]}" get secret duckfleet-dev --ignore-not-found -o name) ]]; then
-  python3 - <<'PY' | "${KUBE[@]}" create -f -
-import json,secrets
-password=secrets.token_hex(32)
-dsn=f'host=postgres port=5432 user=duckfleet password={password}'
-print(json.dumps({'apiVersion':'v1','kind':'Secret','metadata':{'name':'duckfleet-dev','namespace':'duckfleet-dev'},'type':'Opaque','stringData':{'POSTGRES_PASSWORD':password,'DUCKFLEET_TOKEN':secrets.token_hex(32),'CATALOG_DSN':dsn+' dbname=lake','PLATFORM_DSN':dsn+' dbname=platform'}}))
-PY
+  python3 scripts/database_roles.py "$NAMESPACE" | "${KUBE[@]}" create -f -
 fi
+"${KUBE[@]}" get secret duckfleet-dev -o json | python3 scripts/database_roles.py "$NAMESPACE" --check
 # Helm applies the release; convergence is waited for separately. `helm --wait` only
 # ever reports "context deadline exceeded", which says nothing about which pod failed
 # or why, and spends the whole timeout before saying even that.

@@ -52,11 +52,13 @@ rotated=$(DUCKFLEET_NEW_PASSWORD="$password" python3 scripts/aws/rotate_secret.p
 # hold the old password and are broken until the Secret catches up — but the inverse,
 # writing the Secret first, would leave the *database* reachable with a credential that
 # is no longer anywhere, which is harder to recover from.
-"${KUBE[@]}" exec statefulset/duckfleet-postgres -- \
-  env PGPASSWORD_NEW="$password" sh -c \
-  'psql -U duckfleet -d postgres -v ON_ERROR_STOP=1 -c "ALTER USER duckfleet PASSWORD '"'"'$PGPASSWORD_NEW'"'"'"' \
-  > /dev/null
-printf '%s\n' 'database password changed'
+"${KUBE[@]}" exec -i statefulset/duckfleet-postgres -- \
+  env PGPASSWORD_NEW="$password" psql -X -q -U duckfleet -d lake -v ON_ERROR_STOP=1 <<'SQL'
+\getenv password PGPASSWORD_NEW
+SELECT pg_get_userbyid(datdba) AS catalog_role FROM pg_database WHERE datname=current_database() \gset
+ALTER ROLE :"catalog_role" PASSWORD :'password';
+SQL
+printf '%s\n' 'catalog role password changed'
 
 printf '%s' "$rotated" | "${KUBE[@]}" apply -f - > /dev/null
 printf '%s\n' 'secret updated'
@@ -77,7 +79,7 @@ done
 printf '%s\n' 'PASS: the fleet came back with the rotated credential'
 cat <<'EOF'
 
-The previous password is now accepted by nothing. Anywhere it was recorded — a
+The previous catalog password is no longer accepted by the catalog role. Anywhere it was recorded — a
 password manager entry, a terminal scrollback, an old pod log export — can be
 discarded rather than cleaned.
 EOF

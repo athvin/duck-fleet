@@ -1,13 +1,14 @@
 //! PostgreSQL queue authority. No DuckDB connection or execution lives here.
 use crate::{
-    ApiError,
-    credentials::Identity,
+    ApiError, audit,
+    authz::{self, Action, TrustedOperation},
+    credentials::{ActorKind, Identity},
     failure, metering,
     pricing::RateCard,
     query::{AdmissionLimits, Protocol, QueryRequest, WorkerLimits},
     requests,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use postgres::{Client, GenericClient, Row, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -31,11 +32,15 @@ pub(crate) struct SessionRegistration {
     pub scope: String,
     pub protocol: Protocol,
     pub open_span_id: Uuid,
+    pub operation: TrustedOperation,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Actor {
     pub principal: String,
     pub credential_id: Option<String>,
+    pub kind: ActorKind,
+    pub namespace_id: String,
+    pub principal_id: Option<String>,
 }
 impl Actor {
     pub fn identity(&self) -> Identity {
@@ -43,6 +48,7 @@ impl Actor {
             principal: self.principal.clone(),
             credential_id: self.credential_id.clone(),
             expires_at: None,
+            kind: self.kind,
         }
     }
 }
@@ -58,6 +64,9 @@ pub(crate) struct Payload {
     pub scope: String,
     pub protocol: Protocol,
     pub sequence: i64,
+    pub namespace_id: String,
+    pub owner_principal_id: Option<String>,
+    pub operation: TrustedOperation,
 }
 #[derive(Debug)]
 pub(crate) enum SubmitResult {
@@ -91,7 +100,13 @@ pub(crate) enum GrantResult {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum CloseIntent {
-    Explicit,
+    Explicit {
+        actor: Identity,
+    },
+    Policy {
+        authority_generation: i64,
+        policy_version: i64,
+    },
     Credential {
         credential_id: Option<String>,
         authority_generation: i64,
@@ -109,6 +124,10 @@ pub(crate) struct SessionAuthority {
     pub touched_at: SystemTime,
     pub outstanding: Option<Uuid>,
     pub closing: bool,
+    pub owner_principal_id: Option<String>,
+    pub compute: Value,
+    pub operation: TrustedOperation,
+    pub authority_policy_version: i64,
 }
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct Counts {
@@ -263,26 +282,57 @@ pub(crate) fn register_worker(
     tx.commit()?;
     Ok(exists)
 }
-pub(crate) fn register_session(client: &mut Client, s: &SessionRegistration) -> Result<()> {
-    let mut tx = client.transaction()?;
-    bounded(&mut tx)?;
-    let worker = tx
-        .query_opt(
-            "SELECT scope FROM queue_workers WHERE worker_id=$1 AND boot_id=$2",
-            &[&s.epoch.worker_id, &s.epoch.boot_id.to_string()],
-        )?
-        .context("worker is not registered")?;
-    anyhow::ensure!(
-        worker.get::<_, String>(0) == s.scope,
-        "session pool differs from its worker"
-    );
-    tx.execute("INSERT INTO queue_sessions(session_id,worker_id,boot_id,principal,authority_principal,credential_id,context,compute,placement,scope,protocol,open_span_id)
+pub(crate) fn register_session(
+    client: &mut Client,
+    s: &SessionRegistration,
+) -> Result<(), ApiError> {
+    let mut tx = api(client.transaction())?;
+    api(bounded(&mut tx))?;
+    let canonical = authz::resolve_in(&mut tx, &s.authority)?;
+    let owner_id = canonical.actor.principal_id.clone();
+    let access = match authz::authorize_execution_for_owner_in(
+        &mut tx,
+        &s.authority,
+        owner_id.as_deref(),
+        &s.compute,
+        &s.operation,
+    ) {
+        Ok(access) => access,
+        Err(error) => {
+            api(audit::append_in(
+                &mut tx,
+                &audit::Event::new(
+                    &canonical,
+                    s.operation.action(),
+                    "session",
+                    Some(&s.session_id.to_string()),
+                    "denied",
+                    "permission_denied",
+                    None,
+                ),
+            ))?;
+            api(tx.commit())?;
+            return Err(error);
+        }
+    };
+    let worker = api(tx.query_opt(
+        "SELECT scope FROM queue_workers WHERE worker_id=$1 AND boot_id=$2",
+        &[&s.epoch.worker_id, &s.epoch.boot_id.to_string()],
+    ))?
+    .ok_or_else(ApiError::internal)?;
+    if worker.get::<_, String>(0) != s.scope {
+        return Err(ApiError::bad("session pool differs from its worker"));
+    }
+    api(tx.execute("INSERT INTO queue_sessions(session_id,worker_id,boot_id,principal,authority_principal,credential_id,context,compute,placement,scope,protocol,open_span_id)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
         &[&s.session_id.to_string(),&s.epoch.worker_id,&s.epoch.boot_id.to_string(),&s.principal,&s.authority.principal,&s.authority.credential_id,
-          &s.context.to_string(),&s.compute.to_string(),&s.placement.to_string(),&s.scope,&s.protocol.name(),&s.open_span_id.to_string()])?;
-    tx.execute("INSERT INTO session_events(open_span_id,session_id,principal,worker_id,boot_id,scope,opened_at) VALUES($1,$2,$3,$4,$5,$6,clock_timestamp()) ON CONFLICT(open_span_id) DO UPDATE SET session_id=EXCLUDED.session_id,worker_id=EXCLUDED.worker_id,boot_id=EXCLUDED.boot_id,opened_at=EXCLUDED.opened_at",
-        &[&s.open_span_id.to_string(),&s.session_id.to_string(),&s.principal,&s.epoch.worker_id,&s.epoch.boot_id.to_string(),&s.scope])?;
-    tx.commit()?;
+          &s.context.to_string(),&s.compute.to_string(),&s.placement.to_string(),&s.scope,&s.protocol.name(),&s.open_span_id.to_string()]))?;
+    api(tx.execute("UPDATE queue_sessions SET namespace_id=$2,owner_principal_id=$3,actor_principal_id=$4,actor_kind=$5,actor_principal=$6,actor_credential_id=$7,
+        authority_kind=$5,authority_principal_id=$4,authority_policy_version=$8,operation=$9 WHERE session_id=$1",
+        &[&s.session_id.to_string(),&access.actor.namespace_id,&owner_id,&access.actor.principal_id,&access.actor.kind.name(),&access.actor.principal,&access.actor.credential_id,&access.policy_version,&api(serde_json::to_string(&s.operation))?]))?;
+    api(tx.execute("INSERT INTO session_events(open_span_id,session_id,principal,worker_id,boot_id,scope,opened_at) VALUES($1,$2,$3,$4,$5,$6,clock_timestamp()) ON CONFLICT(open_span_id) DO UPDATE SET session_id=EXCLUDED.session_id,worker_id=EXCLUDED.worker_id,boot_id=EXCLUDED.boot_id,opened_at=EXCLUDED.opened_at",
+        &[&s.open_span_id.to_string(),&s.session_id.to_string(),&s.principal,&s.epoch.worker_id,&s.epoch.boot_id.to_string(),&s.scope]))?;
+    api(tx.commit())?;
     Ok(())
 }
 pub(crate) fn session_closed(client: &mut Client, id: Uuid, epoch: &WorkerEpoch) -> Result<()> {
@@ -310,25 +360,28 @@ fn api<T>(value: std::result::Result<T, impl std::fmt::Display>) -> Result<T, Ap
         ApiError::internal()
     })
 }
-fn operator(actor: &Identity) -> bool {
-    actor.credential_id.is_none() && (actor.is_bootstrap() || actor.principal == "direct")
-}
-fn validate_actor(client: &mut Client, actor: &Identity) -> Result<(), ApiError> {
-    if operator(actor) {
-        return Ok(());
+fn audit_denied(
+    tx: &mut Transaction<'_>,
+    identity: &Identity,
+    action: Action,
+    id: &str,
+    error: &ApiError,
+) -> Result<(), ApiError> {
+    if let Ok(access) = authz::resolve_in(tx, identity) {
+        api(audit::append_in(
+            tx,
+            &audit::Event::new(
+                &access,
+                action,
+                "request",
+                Some(id),
+                "denied",
+                error.0.kind,
+                Some(id),
+            ),
+        ))?;
     }
-    let valid = match &actor.credential_id {
-        Some(id) => api(crate::credentials::resolve_id(client, id))?,
-        None => None,
-    };
-    if valid.is_some_and(|current| current.principal == actor.principal) {
-        Ok(())
-    } else {
-        Err(ApiError::new(
-            failure::UNAUTHORIZED,
-            "credential expired or revoked",
-        ))
-    }
+    Ok(())
 }
 fn payload(row: &Row) -> Result<Payload> {
     Ok(serde_json::from_str(row.get::<_, &str>("payload"))?)
@@ -346,7 +399,6 @@ pub(crate) fn submit(
     protocol: Protocol,
 ) -> Result<SubmitResult, ApiError> {
     request.validate()?;
-    validate_actor(client, actor)?;
     let session_id = session.to_string();
     let boot = epoch.boot_id.to_string();
     let mut tx = api(client.transaction())?;
@@ -355,12 +407,6 @@ pub(crate) fn submit(
         &[&session_id,&epoch.worker_id,&boot]))?.ok_or_else(||ApiError::new(failure::UNKNOWN_SESSION,"unknown session"))?;
     let scope: String = lookup.get(0);
     let principal: String = lookup.get(1);
-    if !operator(actor) && actor.principal != principal {
-        return Err(ApiError::new(
-            failure::FORBIDDEN,
-            "session belongs to another principal",
-        ));
-    }
     api(lock_scopes(&mut tx, &epoch.worker_id, &scope, &principal))?;
     let s=api(tx.query_opt("SELECT * FROM queue_sessions WHERE session_id=$1 AND worker_id=$2 AND boot_id=$3 AND closed_at IS NULL FOR UPDATE NOWAIT",
         &[&session_id,&epoch.worker_id,&boot]))?.ok_or_else(||ApiError::new(failure::UNKNOWN_SESSION,"unknown session"))?;
@@ -370,6 +416,39 @@ pub(crate) fn submit(
     }
     let compute: Value = api(serde_json::from_str(s.get::<_, &str>("compute")))?;
     let placement: Value = api(serde_json::from_str(s.get::<_, &str>("placement")))?;
+    let owner_id = s.get::<_, Option<String>>("owner_principal_id");
+    let operation: TrustedOperation = api(serde_json::from_str(s.get::<_, &str>("operation")))?;
+    let authorized = operation.validate_sql(&request.sql).and_then(|_| {
+        authz::authorize_execution_for_owner_in(
+            &mut tx,
+            actor,
+            owner_id.as_deref(),
+            &compute,
+            &operation,
+        )
+    });
+    let access = match authorized {
+        Ok(access) => access,
+        Err(error) => {
+            audit_denied(
+                &mut tx,
+                actor,
+                operation.action(),
+                &request.request_id.to_string(),
+                &error,
+            )?;
+            api(tx.commit())?;
+            return Err(error);
+        }
+    };
+    if s.get::<_, Option<String>>("namespace_id").as_deref()
+        != Some(access.actor.namespace_id.as_str())
+    {
+        return Err(ApiError::new(
+            failure::FORBIDDEN,
+            "session namespace differs from authenticated namespace",
+        ));
+    }
     let id = request.request_id;
     let id_text = id.to_string();
     let retry = request.retry_of.map(|v| v.to_string());
@@ -387,8 +466,16 @@ pub(crate) fn submit(
         placement: &placement,
         principal: &principal,
     };
-    if let requests::ClaimResult::Duplicate(value) = requests::claim_in(&mut tx, &input, "queued")?
-    {
+    if let requests::ClaimResult::Duplicate(value) = requests::claim_authorized_in(
+        &mut tx,
+        &input,
+        "queued",
+        &requests::Ownership {
+            namespace_id: &access.actor.namespace_id,
+            owner_principal_id: owner_id.as_deref(),
+            actor_kind: access.actor.kind,
+        },
+    )? {
         api(tx.commit())?;
         return Ok(SubmitResult::Duplicate(value));
     }
@@ -396,6 +483,14 @@ pub(crate) fn submit(
     // identity nor history becomes visible until this short transaction commits.
     api(tx.execute("UPDATE requests SET session_id=$2,worker_boot_id=$3,pool_scope=$4,protocol=$5,actor_principal=$6,credential_id=$7,
         queue_timeout_seconds=$8 WHERE request_id=$1",&[&id_text,&session_id,&boot,&scope,&protocol.name(),&actor.principal,&actor.credential_id,&(request.queue_timeout_seconds as i64)]))?;
+    for (table, key) in [("requests", "request_id"), ("query_history", "query_id")] {
+        api(tx.execute(&format!("UPDATE {table} SET namespace_id=$2,owner_principal_id=$3,actor_principal_id=$4,actor_kind=$5,actor_principal=$6,actor_credential_id=$7 WHERE {key}=$1"),
+            &[&id_text,&access.actor.namespace_id,&owner_id,&access.actor.principal_id,&access.actor.kind.name(),&access.actor.principal,&access.actor.credential_id]))?;
+    }
+    api(tx.execute(
+        "UPDATE requests SET authorization_policy_version=$2 WHERE request_id=$1",
+        &[&id_text, &access.policy_version],
+    ))?;
     api(tx.execute(
         "INSERT INTO query_controls(request_id) VALUES($1)",
         &[&id_text],
@@ -410,7 +505,10 @@ pub(crate) fn submit(
         principal: principal.clone(),
         actor: Actor {
             principal: actor.principal.clone(),
-            credential_id: actor.credential_id.clone(),
+            credential_id: access.actor.credential_id.clone(),
+            kind: access.actor.kind,
+            namespace_id: access.actor.namespace_id.clone(),
+            principal_id: access.actor.principal_id.clone(),
         },
         request,
         compute,
@@ -418,6 +516,9 @@ pub(crate) fn submit(
         scope: scope.clone(),
         protocol,
         sequence,
+        namespace_id: access.actor.namespace_id.clone(),
+        owner_principal_id: owner_id.clone(),
+        operation,
     };
     let encoded = api(serde_json::to_string(&p))?;
     let bytes = api(i64::try_from(encoded.len()))?;
@@ -469,11 +570,15 @@ pub(crate) fn submit(
         FROM requests r WHERE query_id=$1 AND r.request_id=query_id",&[&id_text,&sequence,&boot,&scope,&protocol.name(),&s.get::<_,String>("open_span_id")]))?;
     api(tx.execute("INSERT INTO query_permits(request_id,worker_id,boot_id,scope,principal,stage,bytes) VALUES($1,$2,$3,$4,$5,'queued',$6)",
         &[&id_text,&epoch.worker_id,&boot,&scope,&principal,&bytes]))?;
-    let rotate = actor.principal == principal;
+    let rotate = access.actor.principal_id == owner_id
+        && s.get::<_, Option<String>>("actor_kind").as_deref() == Some(access.actor.kind.name());
     let updated = api(tx.query_one(
         "UPDATE queue_sessions SET outstanding=$2,next_sequence=$3,touched_at=clock_timestamp(),
         authority_principal=CASE WHEN $4 THEN $5 ELSE authority_principal END,
         credential_id=CASE WHEN $4 THEN $6 ELSE credential_id END,
+        authority_kind=CASE WHEN $4 THEN $7 ELSE authority_kind END,
+        authority_principal_id=CASE WHEN $4 THEN $8 ELSE authority_principal_id END,
+        authority_policy_version=CASE WHEN $4 THEN $9 ELSE authority_policy_version END,
         authority_generation=authority_generation+CASE WHEN $4 THEN 1 ELSE 0 END
         WHERE session_id=$1 RETURNING authority_generation",
         &[
@@ -483,6 +588,9 @@ pub(crate) fn submit(
             &rotate,
             &actor.principal,
             &actor.credential_id,
+            &access.actor.kind.name(),
+            &access.actor.principal_id,
+            &access.policy_version,
         ],
     ))?;
     let authority_generation = updated.get(0);
@@ -709,7 +817,7 @@ pub(crate) fn grant(client: &mut Client, prepared: Prepared) -> Result<GrantResu
     // Earlier session/control lock waits are already reflected in DB remaining.
     let started = Instant::now();
     let r=api(tx.query_one("SELECT state,state_version,failure_kind,FLOOR(EXTRACT(EPOCH FROM(queue_deadline_at-clock_timestamp()))*1000)::BIGINT AS remaining FROM requests WHERE request_id=$1 FOR UPDATE",&[&id]))?;
-    let refusal = if r.get::<_, String>("state") != "preparing"
+    let mut refusal = if r.get::<_, String>("state") != "preparing"
         || r.get::<_, i64>("state_version") != prepared.selected.version
     {
         Some(stored_refusal(&r))
@@ -734,6 +842,48 @@ pub(crate) fn grant(client: &mut Client, prepared: Prepared) -> Result<GrantResu
     } else {
         None
     };
+    if refusal.is_none() {
+        refusal = p
+            .operation
+            .validate_sql(&p.request.sql)
+            .and_then(|_| {
+                authz::authorize_execution_for_owner_in(
+                    &mut tx,
+                    &p.actor.identity(),
+                    p.owner_principal_id.as_deref(),
+                    &p.compute,
+                    &p.operation,
+                )
+            })
+            .err();
+        if let Some(error) = &refusal {
+            if error.0 == failure::UNAUTHORIZED {
+                // Accepted work already has an immutable authenticated actor.
+                // A revoked token cannot erase that evidence from denial audit.
+                // The helper isolates an audit failure with a savepoint: the
+                // no-execution refusal and zero settlement still commit.
+                if !matches!(
+                    audit::append_accepted_denial_in(
+                        &mut tx,
+                        &id,
+                        p.operation.action(),
+                        error.0.kind
+                    ),
+                    Ok(true)
+                ) {
+                    tracing::warn!("accepted query denied; audit persistence unavailable");
+                }
+            } else {
+                audit_denied(
+                    &mut tx,
+                    &p.actor.identity(),
+                    p.operation.action(),
+                    &id,
+                    error,
+                )?;
+            }
+        }
+    }
     if let Some(error) = refusal {
         api(terminal_unstarted(
             &mut tx,
@@ -885,25 +1035,42 @@ pub(crate) fn request_cancel(
     id: Uuid,
     actor: &Identity,
 ) -> Result<Value, ApiError> {
-    validate_actor(client, actor)?;
     let mut tx = api(client.transaction())?;
     api(bounded(&mut tx))?;
     // MVCC read, not FOR UPDATE: budget preparation owns the request row, but
     // cancellation must still commit its separate control latch immediately.
-    api(tx.query_opt(
-        "SELECT principal,state,status,outcome FROM requests WHERE request_id=$1",
-        &[&id.to_string()],
-    ))?
-    .filter(|r| {
-        operator(actor) || r.get::<_, Option<String>>(0).as_deref() == Some(&actor.principal)
-    })
-    .ok_or_else(|| ApiError::new(failure::NOT_FOUND, "request not found"))?;
+    let access = authz::resolve_in(&mut tx, actor)?;
+    let owner=api(tx.query_opt("SELECT COALESCE(r.owner_principal_id,l.principal_id) FROM requests r LEFT JOIN authz_legacy_owners l
+        ON r.owner_principal_id IS NULL AND r.namespace_id IS NULL AND l.namespace_id=$2 AND l.legacy_name=r.principal
+        WHERE r.request_id=$1 AND COALESCE(r.namespace_id,$2)=$2",&[&id.to_string(),&access.actor.namespace_id]))?
+        .ok_or_else(||ApiError::new(failure::NOT_FOUND,"request not found"))?.get::<_,Option<String>>(0);
+    if let Err(error) = access.require(Action::QueryCancel, owner.as_deref()) {
+        let refusal = if owner.is_some() && owner == access.actor.principal_id {
+            error
+        } else {
+            ApiError::new(failure::NOT_FOUND, "request not found")
+        };
+        persist_cancel_denial(tx, &access, id);
+        return Err(refusal);
+    }
     // Finish takes this same control latch before changing state. Once we hold
     // it, re-read the request so a completion that won the race stays immutable.
     api(tx.query_opt(
         "SELECT request_id FROM query_controls WHERE request_id=$1 FOR UPDATE",
         &[&id.to_string()],
     ))?;
+    // The latch can wait behind terminal persistence. Authorize again at the
+    // mutation boundary rather than spending a grant that changed during wait.
+    let access = authz::resolve_in(&mut tx, actor)?;
+    if let Err(error) = access.require(Action::QueryCancel, owner.as_deref()) {
+        let refusal = if owner.is_some() && owner == access.actor.principal_id {
+            error
+        } else {
+            ApiError::new(failure::NOT_FOUND, "request not found")
+        };
+        persist_cancel_denial(tx, &access, id);
+        return Err(refusal);
+    }
     let r = api(tx.query_one(
         "SELECT principal,state,status,outcome FROM requests WHERE request_id=$1",
         &[&id.to_string()],
@@ -921,48 +1088,164 @@ pub(crate) fn request_cancel(
         &[&id.to_string()],
     ))?
     .is_some_and(|row| row.get(0));
+    api(audit::append_in(
+        &mut tx,
+        &audit::Event::new(
+            &access,
+            Action::QueryCancel,
+            "request",
+            Some(&id.to_string()),
+            "allowed",
+            if terminal {
+                "already_terminal"
+            } else {
+                "cancel_requested"
+            },
+            Some(&id.to_string()),
+        ),
+    ))?;
     api(tx.commit())?;
     Ok(
         json!({"request_id":id,"state":r.get::<_,String>(1),"status":r.get::<_,String>(2),"outcome":r.get::<_,String>(3),
         "cancel_requested":requested,"cancellation_confirmed":terminal&&r.get::<_,String>(2)=="canceled"&&r.get::<_,String>(3)=="not_executed"}),
     )
 }
+fn persist_cancel_denial(mut tx: Transaction<'_>, access: &authz::Access, id: Uuid) {
+    let appended = audit::append_in(
+        &mut tx,
+        &audit::Event::new(
+            access,
+            Action::QueryCancel,
+            "request",
+            Some(&id.to_string()),
+            "denied",
+            "permission_denied",
+            Some(&id.to_string()),
+        ),
+    )
+    .is_ok();
+    if !appended || tx.commit().is_err() {
+        // The denial stays opaque even when the audit store is unavailable.
+        tracing::warn!("query cancellation denied; audit persistence unavailable");
+    }
+}
+fn authority_identity(row: &Row) -> Result<Identity, ApiError> {
+    let kind = match row.get::<_, &str>("authority_kind") {
+        "named" => ActorKind::Named,
+        "bootstrap" => ActorKind::Bootstrap,
+        "internal" => ActorKind::Internal,
+        _ => return Err(ApiError::internal()),
+    };
+    Ok(Identity {
+        principal: row.get("authority_principal"),
+        credential_id: row.get("credential_id"),
+        expires_at: None,
+        kind,
+    })
+}
 pub(crate) fn begin_close(
     client: &mut Client,
     id: Uuid,
     epoch: &WorkerEpoch,
     intent: &CloseIntent,
-) -> Result<bool> {
-    let mut tx = client.transaction()?;
-    bounded(&mut tx)?;
-    let Some(row)=tx.query_opt("SELECT credential_id,authority_generation,touched_at,outstanding FROM queue_sessions WHERE session_id=$1 AND worker_id=$2 AND boot_id=$3 AND closed_at IS NULL FOR UPDATE",
-        &[&id.to_string(),&epoch.worker_id,&epoch.boot_id.to_string()])? else {return Ok(false)};
+) -> Result<bool, ApiError> {
+    let mut tx = api(client.transaction())?;
+    api(bounded(&mut tx))?;
+    let Some(row)=api(tx.query_opt("SELECT * FROM queue_sessions WHERE session_id=$1 AND worker_id=$2 AND boot_id=$3 AND closed_at IS NULL FOR UPDATE",&[&id.to_string(),&epoch.worker_id,&epoch.boot_id.to_string()]))? else {return Ok(false)};
+    let owner = row.get::<_, Option<String>>("owner_principal_id");
     let matches = match intent {
-        CloseIntent::Explicit => true,
+        CloseIntent::Explicit { actor } => {
+            let access = authz::resolve_in(&mut tx, actor)?;
+            if row.get::<_, Option<String>>("namespace_id").as_deref()
+                != Some(access.actor.namespace_id.as_str())
+            {
+                return Err(ApiError::new(failure::NOT_FOUND, "session not found"));
+            }
+            if let Err(error) = access.require(Action::SessionClose, owner.as_deref()) {
+                api(audit::append_in(
+                    &mut tx,
+                    &audit::Event::new(
+                        &access,
+                        Action::SessionClose,
+                        "session",
+                        Some(&id.to_string()),
+                        "denied",
+                        "permission_denied",
+                        None,
+                    ),
+                ))?;
+                api(tx.commit())?;
+                return Err(error);
+            }
+            api(audit::append_in(
+                &mut tx,
+                &audit::Event::new(
+                    &access,
+                    Action::SessionClose,
+                    "session",
+                    Some(&id.to_string()),
+                    "allowed",
+                    "session_close_requested",
+                    None,
+                ),
+            ))?;
+            true
+        }
         CloseIntent::Credential {
             credential_id,
             authority_generation,
         } => {
-            row.get::<_, Option<String>>(0) == *credential_id
-                && row.get::<_, i64>(1) == *authority_generation
+            row.get::<_, Option<String>>("credential_id") == *credential_id
+                && row.get::<_, i64>("authority_generation") == *authority_generation
+        }
+        CloseIntent::Policy {
+            authority_generation,
+            policy_version,
+        } => {
+            if row.get::<_, i64>("authority_generation") != *authority_generation {
+                return Ok(false);
+            }
+            if let Some(id) = row.get::<_, Option<String>>("authority_principal_id") {
+                authz::policy_fence_in(&mut tx, &id)?;
+            }
+            let identity = authority_identity(&row)?;
+            let compute: Value = api(serde_json::from_str(row.get::<_, &str>("compute")))?;
+            let operation: TrustedOperation =
+                api(serde_json::from_str(row.get::<_, &str>("operation")))?;
+            match authz::authorize_execution_for_owner_in(
+                &mut tx,
+                &identity,
+                owner.as_deref(),
+                &compute,
+                &operation,
+            ) {
+                Ok(_) => false,
+                Err(error) if error.0 == failure::UNAUTHORIZED || error.0 == failure::FORBIDDEN => {
+                    // A new policy version is permitted only if fresh validation
+                    // still denies it; a completed regrant always wins this CAS.
+                    let _observed_policy_version = policy_version;
+                    true
+                }
+                Err(error) => return Err(error),
+            }
         }
         CloseIntent::Idle {
             authority_generation,
             touched_at,
         } => {
-            row.get::<_, i64>(1) == *authority_generation
-                && row.get::<_, SystemTime>(2) == *touched_at
-                && row.get::<_, Option<String>>(3).is_none()
+            row.get::<_, i64>("authority_generation") == *authority_generation
+                && row.get::<_, SystemTime>("touched_at") == *touched_at
+                && row.get::<_, Option<String>>("outstanding").is_none()
         }
     };
     if !matches {
         return Ok(false);
     }
-    tx.execute(
+    api(tx.execute(
         "UPDATE queue_sessions SET closing=true WHERE session_id=$1",
         &[&id.to_string()],
-    )?;
-    tx.commit()?;
+    ))?;
+    api(tx.commit())?;
     Ok(true)
 }
 pub(crate) fn authorities(
@@ -971,22 +1254,24 @@ pub(crate) fn authorities(
 ) -> Result<Vec<SessionAuthority>> {
     let mut tx = client.transaction()?;
     bounded(&mut tx)?;
-    let rows=tx.query("SELECT session_id,authority_principal,credential_id,authority_generation,touched_at,outstanding,closing
-        FROM queue_sessions WHERE worker_id=$1 AND boot_id=$2 AND closed_at IS NULL ORDER BY session_id LIMIT 1024",&[&epoch.worker_id,&epoch.boot_id.to_string()])?;
+    let rows=tx.query("SELECT * FROM queue_sessions WHERE worker_id=$1 AND boot_id=$2 AND closed_at IS NULL ORDER BY session_id LIMIT 1024",&[&epoch.worker_id,&epoch.boot_id.to_string()])?;
     let result = rows
         .into_iter()
         .map(|row| {
             Ok(SessionAuthority {
-                session_id: uuid(row.get(0))?,
-                identity: Identity {
-                    principal: row.get(1),
-                    credential_id: row.get(2),
-                    expires_at: None,
-                },
-                generation: row.get(3),
-                touched_at: row.get(4),
-                outstanding: row.get::<_, Option<String>>(5).map(uuid).transpose()?,
-                closing: row.get(6),
+                session_id: uuid(row.get("session_id"))?,
+                identity: authority_identity(&row).map_err(|e| anyhow::anyhow!("{}", e.1))?,
+                generation: row.get("authority_generation"),
+                touched_at: row.get("touched_at"),
+                outstanding: row
+                    .get::<_, Option<String>>("outstanding")
+                    .map(uuid)
+                    .transpose()?,
+                closing: row.get("closing"),
+                owner_principal_id: row.get("owner_principal_id"),
+                compute: serde_json::from_str(row.get::<_, &str>("compute"))?,
+                operation: serde_json::from_str(row.get::<_, &str>("operation"))?,
+                authority_policy_version: row.get("authority_policy_version"),
             })
         })
         .collect();

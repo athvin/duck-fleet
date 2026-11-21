@@ -4,17 +4,20 @@
 //! never enter the DuckDB worker queue, so the billing view stays answerable while
 //! workers are busy or stopped. Reads run read-only; only the budget limits are
 //! writable, and the usage events themselves are immutable in the database.
-use crate::{ApiError, failure, metering, pricing};
-use postgres::{Client, NoTls, Row};
+use crate::{
+    ApiError, audit,
+    authz::{self, Action, MetadataAccess},
+    credentials::Identity,
+    metadata::{self, Relation},
+    metering, pricing,
+};
+use postgres::{Row, Transaction};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
-use tokio::sync::Semaphore;
 
 #[derive(Clone)]
 pub(crate) struct Reader {
-    dsn: Arc<str>,
-    capacity: Arc<Semaphore>,
+    reader: metadata::Reader,
     /// The card new work is priced with, reported on the budget position and used
     /// to settle legacy reservations that predate the stored-rate columns.
     rate: pricing::RateCard,
@@ -89,110 +92,87 @@ impl BudgetUpdate {
     }
 }
 
-const COLUMNS: &str = "event_id,execution_id,meter_name,quantity,unit,resource_units,amount_micro_usd,rate_card_version,worker_id,context,source,corrects,started_at::text,ended_at::text,observed_at::text,ledger_id";
+const COLUMNS:&str="event_id,execution_id,meter_name,quantity,unit,resource_units,amount_micro_usd,rate_card_version,worker_id,
+    CASE WHEN $4 OR ($5 AND owner_principal_id=$2) THEN context ELSE 'null' END,
+    source,corrects,started_at::text,ended_at::text,observed_at::text,ledger_id,namespace_id,owner_principal_id,actor_principal_id,actor_kind,actor_principal,actor_credential_id";
 fn record(row: &Row) -> Value {
     json!({
-        "event_id":row.get::<_, String>(0), "execution_id":row.get::<_, String>(1),
-        "meter_name":row.get::<_, String>(2), "quantity":row.get::<_, i64>(3),
-        "unit":row.get::<_, String>(4), "resource_units":row.get::<_, i64>(5),
-        "amount_micro_usd":row.get::<_, i64>(6), "rate_card_version":row.get::<_, String>(7),
-        "worker_id":row.get::<_, String>(8),
-        "context":serde_json::from_str(row.get::<_, &str>(9)).unwrap_or(Value::Null),
-        "source":row.get::<_, String>(10), "corrects":row.get::<_, Option<String>>(11),
-        "started_at":row.get::<_, String>(12), "ended_at":row.get::<_, String>(13),
-        "observed_at":row.get::<_, String>(14), "ledger_id":row.get::<_, i64>(15)
+        "event_id":row.get::<_,String>(0),"execution_id":row.get::<_,String>(1),"meter_name":row.get::<_,String>(2),"quantity":row.get::<_,i64>(3),
+        "unit":row.get::<_,String>(4),"resource_units":row.get::<_,i64>(5),"amount_micro_usd":row.get::<_,i64>(6),"rate_card_version":row.get::<_,String>(7),"worker_id":row.get::<_,String>(8),
+        "context":serde_json::from_str::<Value>(row.get::<_,&str>(9)).unwrap_or(Value::Null),"source":row.get::<_,String>(10),"corrects":row.get::<_,Option<String>>(11),
+        "started_at":row.get::<_,String>(12),"ended_at":row.get::<_,String>(13),"observed_at":row.get::<_,String>(14),"ledger_id":row.get::<_,i64>(15),
+        "namespace_id":row.get::<_,Option<String>>(16),"owner_principal_id":row.get::<_,Option<String>>(17),"actor_principal_id":row.get::<_,Option<String>>(18),
+        "actor_kind":row.get::<_,Option<String>>(19),"actor_principal":row.get::<_,Option<String>>(20),"actor_credential_id":row.get::<_,Option<String>>(21)
     })
 }
-
+pub(crate) fn events_in(
+    tx: &mut Transaction<'_>,
+    access: &MetadataAccess,
+    filter: Filter,
+) -> Result<Value, ApiError> {
+    filter.validate()?;
+    let plan = metadata::relation_plan(access, Relation::Usage)?;
+    let rows=tx.query(&format!("SELECT {COLUMNS} FROM usage_events WHERE COALESCE(namespace_id,$1)=$1 AND ($3 OR owner_principal_id=$2)
+        AND ($6::BIGINT IS NULL OR ledger_id<$6) AND ($7::TEXT IS NULL OR execution_id=$7) AND ($8::TEXT IS NULL OR source=$8) ORDER BY ledger_id DESC LIMIT $9"),
+        &[&plan.namespace_id,&plan.principal_id,&plan.all,&plan.sql_all,&plan.sql_own,&filter.before,&filter.execution_id,&filter.source,&(filter.limit+1)])
+        .map_err(|_|ApiError::internal())?;
+    let mut events: Vec<_> = rows.iter().map(record).collect();
+    let more = events.len() > filter.limit as usize;
+    events.truncate(filter.limit as usize);
+    let next = if more {
+        events.last().map(|row| row["ledger_id"].clone())
+    } else {
+        None
+    };
+    Ok(json!({"events":events,"next_before":next}))
+}
 impl Reader {
     pub fn new(dsn: String, rate: pricing::RateCard) -> Self {
         Self {
-            dsn: dsn.into(),
-            capacity: Arc::new(Semaphore::new(8)),
+            reader: metadata::Reader::new(dsn),
             rate,
         }
     }
-    async fn run<F>(&self, writable: bool, operation: F) -> Result<Value, ApiError>
-    where
-        F: FnOnce(&mut Client) -> Result<Value, ApiError> + Send + 'static,
-    {
-        let permit = self
-            .capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ApiError::new(failure::CAPACITY, "usage reader capacity reached"))?;
-        let dsn = self.dsn.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut config: postgres::Config = dsn.parse().map_err(|_| ApiError::internal())?;
-            config.connect_timeout(Duration::from_secs(3));
-            config.options(if writable {
-                "-c statement_timeout=3000"
-            } else {
-                "-c default_transaction_read_only=on -c statement_timeout=3000"
-            });
-            let mut client = config.connect(NoTls).map_err(|_| ApiError::internal())?;
-            operation(&mut client)
-        })
-        .await
-        .map_err(|_| ApiError::internal())?
-    }
-
-    pub async fn events(&self, filter: Filter) -> Result<Value, ApiError> {
+    pub async fn events(&self, identity: Identity, filter: Filter) -> Result<Value, ApiError> {
         filter.validate()?;
-        self.run(false, move |client| {
-            let rows = client
-                .query(
-                    &format!(
-                        "SELECT {COLUMNS} FROM usage_events
-                         WHERE ($1::bigint IS NULL OR ledger_id < $1)
-                           AND ($2::text IS NULL OR execution_id=$2)
-                           AND ($3::text IS NULL OR source=$3)
-                         ORDER BY ledger_id DESC LIMIT $4"
-                    ),
-                    &[
-                        &filter.before,
-                        &filter.execution_id,
-                        &filter.source,
-                        &(filter.limit + 1),
-                    ],
-                )
-                .map_err(|_| ApiError::internal())?;
-            let mut events: Vec<Value> = rows.iter().map(record).collect();
-            let has_more = events.len() > filter.limit as usize;
-            events.truncate(filter.limit as usize);
-            let next_before = if has_more {
-                events.last().map(|e| e["ledger_id"].clone())
-            } else {
-                None
-            };
-            Ok(json!({"events":events, "next_before":next_before}))
-        })
-        .await
-    }
-
-    pub async fn budget(&self) -> Result<Value, ApiError> {
-        let rate = self.rate.clone();
-        self.run(false, move |client| metering::summary(client, &rate))
+        self.reader
+            .run(identity, Action::UsageRead, None, move |tx, access| {
+                events_in(tx, &access.metadata(), filter)
+            })
             .await
     }
-
-    pub async fn set_budget(&self, update: BudgetUpdate) -> Result<Value, ApiError> {
+    pub async fn budget(&self, identity: Identity) -> Result<Value, ApiError> {
+        let rate = self.rate.clone();
+        self.reader
+            .run(
+                identity,
+                Action::BudgetRead,
+                Some("local".into()),
+                move |tx, access| {
+                    access.require(Action::BudgetRead, None)?;
+                    metering::summary(tx, &rate)
+                },
+            )
+            .await
+    }
+    pub async fn set_budget(
+        &self,
+        identity: Identity,
+        update: BudgetUpdate,
+    ) -> Result<Value, ApiError> {
         update.validate()?;
         let rate = self.rate.clone();
-        self.run(true, move |client| {
-            // COALESCE leaves an omitted field at its stored value.
-            client
-                .execute(
-                    "UPDATE budget SET prepaid_micro_usd=COALESCE($1,prepaid_micro_usd),
-                     max_job_micro_usd=COALESCE($2,max_job_micro_usd), updated_at=now()
-                     WHERE budget_id='local'",
-                    &[&update.prepaid_micro_usd, &update.max_job_micro_usd],
-                )
-                .map_err(|_| ApiError::internal())?;
-            metering::summary(client, &rate)
-        })
-        .await
+        let current = identity.clone();
+        self.reader.run(identity,Action::BudgetManage,Some("local".into()),move|tx,access|{
+            // Policy lock precedes the budget row. Management cannot commit
+            // against a grant revoked while it waited for another policy writer.
+            if let Some(id)=&access.actor.principal_id {tx.query_one("SELECT principal_id FROM principals WHERE principal_id=$1 FOR UPDATE",&[id]).map_err(|_|ApiError::internal())?;}
+            tx.query_one("SELECT budget_id FROM budget WHERE budget_id='local' FOR UPDATE",&[]).map_err(|_|ApiError::internal())?;
+            let access=authz::resolve_in(tx,&current)?;access.require(Action::BudgetManage,None)?;
+            tx.execute("UPDATE budget SET prepaid_micro_usd=COALESCE($1,prepaid_micro_usd),max_job_micro_usd=COALESCE($2,max_job_micro_usd),updated_at=clock_timestamp() WHERE budget_id='local'",&[&update.prepaid_micro_usd,&update.max_job_micro_usd]).map_err(|_|ApiError::internal())?;
+            audit::append_in(tx,&audit::Event::new(&access,Action::BudgetManage,"budget",Some("local"),"allowed","budget_limits_changed",None)).map_err(|_|ApiError::internal())?;
+            metering::summary(tx,&rate)
+        }).await
     }
 }
 

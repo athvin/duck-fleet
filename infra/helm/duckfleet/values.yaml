@@ -4,6 +4,13 @@ dbtImage: ""
 bucket: duckfleet-dev-797781631727-us-east-2
 region: us-east-2
 secretName: duckfleet-dev
+# Empty entries derive distinct namespace-scoped names. Provision roles separately;
+# the migration login owns platform objects but never receives CREATEROLE.
+databaseRoles: {}
+authorization:
+  # Reviewed seed for existing/new analysts, not a grant for every pool. Repeated
+  # migrations preserve revoked grants. Custom defaults must set this explicitly.
+  defaultPersistentGrant: {pool: small, cpu: 1, memory: 1Gi, disk: 2Gi}
 storageClass: gp3
 # Where pods run. EKS Auto Mode nodes, on whatever pool the cluster offers.
 #

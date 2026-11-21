@@ -28,6 +28,8 @@ mod platform;
 mod pools;
 mod queue_lifecycle;
 mod queue_storage;
+mod rbac;
+mod rbac_storage;
 mod request_identity;
 mod request_upgrade;
 
@@ -45,7 +47,11 @@ pub async fn run(args: Vec<String>) -> i32 {
     let ctx = Ctx { url, token };
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
-    let result: anyhow::Result<()> = if has("--queue-storage") {
+    let result: anyhow::Result<()> = if has("--rbac") {
+        rbac::checks(&ctx).await
+    } else if has("--rbac-storage") {
+        rbac_storage::checks().await
+    } else if has("--queue-storage") {
         queue_storage::checks().await
     } else if has("--queue") || has("--queue-isolated") {
         queue_lifecycle::checks(&ctx, has("--queue-isolated")).await
@@ -125,6 +131,16 @@ pub(crate) struct Ctx {
 }
 
 impl Ctx {
+    /// Harness-only credential for deliberate trusted internal-worker probes.
+    /// The public bootstrap credential is intentionally rejected by workers.
+    pub fn internal_test_token(&self) -> anyhow::Result<String> {
+        std::env::var("DUCKFLEET_INTERNAL_TEST_TOKEN").map_err(|_| {
+            anyhow::anyhow!(
+                "DUCKFLEET_INTERNAL_TEST_TOKEN is required for internal-worker harness probes"
+            )
+        })
+    }
+
     pub fn client(&self) -> Result<Client, RemoteError> {
         Client::new(&self.url, &self.token)
     }
@@ -1239,7 +1255,7 @@ async fn credentials_checks(ctx: &Ctx) -> anyhow::Result<()> {
         format!("{refused}"),
     )?;
 
-    // Management is the bootstrap's alone.
+    // The default analyst preset cannot manage credentials or budgets.
     let service = request_json(
         &admin,
         Method::POST,
@@ -1282,7 +1298,7 @@ async fn credentials_checks(ctx: &Ctx) -> anyhow::Result<()> {
         )
         .await?;
     println!(
-        "PASS: credentials are issued, attributed, revoked at once, and managed by the bootstrap alone"
+        "PASS: credentials are issued, attributed, revoked at once, and the analyst preset cannot manage credentials or budgets"
     );
     Ok(())
 }

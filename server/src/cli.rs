@@ -85,9 +85,22 @@ pub async fn run(args: Vec<String>) -> i32 {
         "budget" => get(&url, &token, "/v1/budget").await,
         "workers" => get(&url, &token, "/v1/workers").await,
         "pools" => get(&url, &token, "/v1/pools").await,
+        "principals" | "credentials" | "audit" => {
+            let mut query = format!("/v1/{}?limit={}", parsed.command, parsed.limit(100));
+            let cursor_flag = if parsed.command == "audit" {
+                "before"
+            } else {
+                "after"
+            };
+            if let Some(cursor) = parsed.value(cursor_flag) {
+                query.push_str(&format!("&{cursor_flag}={cursor}"));
+            }
+            get(&url, &token, &query).await
+        }
+        "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (sql|history|query|request|cancel|usage|budget|workers|pools)"
+                "unknown command: {other} (sql|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -116,6 +129,53 @@ pub async fn run(args: Vec<String>) -> i32 {
                 }
             }
             1
+        }
+    }
+}
+
+async fn run_policy(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
+    let principal = &parsed.positionals[0]; // validated before making a connection
+    let path = format!("/v1/principals/{principal}/policy");
+    match parsed.value("file") {
+        None => get(url, token, &path).await,
+        Some(path_to_policy) => {
+            let invalid = |message: String| RemoteError {
+                status: None,
+                failure_kind: Some("invalid_request".into()),
+                retry_safe: true,
+                message,
+                request_id: None,
+                acceptance: None,
+                status_url: None,
+            };
+            let metadata = std::fs::metadata(path_to_policy)
+                .map_err(|_| invalid("cannot read policy file".into()))?;
+            if metadata.len() > 65_536 {
+                return Err(invalid("policy file must not exceed 64 KiB".into()));
+            }
+            let contents = std::fs::read(path_to_policy)
+                .map_err(|_| invalid("cannot read policy file".into()))?;
+            let policy: Value = serde_json::from_slice(&contents)
+                .map_err(|_| invalid("policy file must contain a JSON object".into()))?;
+            if !policy.is_object() {
+                return Err(invalid("policy file must contain a JSON object".into()));
+            }
+            let client = Client::new(url, token)?;
+            let bytes = client
+                .request(
+                    reqwest::Method::PUT,
+                    &path,
+                    Some(&policy),
+                    std::time::Duration::from_secs(75),
+                )
+                .await?;
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| invalid("server returned an invalid policy response".into()))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).unwrap_or_default()
+            );
+            Ok(())
         }
     }
 }
@@ -330,7 +390,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 10] = [
+    const VALUE_FLAGS: [&'static str; 13] = [
         "url",
         "token",
         "cpu",
@@ -341,6 +401,9 @@ impl Parsed {
         "format",
         "limit",
         "queue-timeout",
+        "file",
+        "after",
+        "before",
     ];
     const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
@@ -386,7 +449,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <sql|history|query|request|cancel|usage|budget|workers|pools> ...",
+                "usage: <sql|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -403,6 +466,40 @@ impl Parsed {
         }
         if parsed.command != "sql" && parsed.value("queue-timeout").is_some() {
             return Err("--queue-timeout applies only to the sql command".into());
+        }
+        if parsed.value("file").is_some() && parsed.command != "policy" {
+            return Err("--file applies only to the policy command".into());
+        }
+        if parsed.command == "policy"
+            && (parsed.positionals.len() != 1
+                || !crate::credentials::valid_principal(&parsed.positionals[0]))
+        {
+            return Err(
+                "policy needs one valid principal name; use --file to replace its entire policy"
+                    .into(),
+            );
+        }
+        for cursor in ["after", "before"] {
+            if let Some(value) = parsed.value(cursor) {
+                let allowed = if cursor == "before" {
+                    parsed.command == "audit"
+                } else {
+                    matches!(parsed.command.as_str(), "principals" | "credentials")
+                };
+                if !allowed || uuid::Uuid::parse_str(value).is_err() {
+                    return Err(format!(
+                        "--{cursor} needs a valid cursor from the corresponding listing"
+                    ));
+                }
+            }
+        }
+        if let Some(value) = parsed.value("limit")
+            && value
+                .parse::<u32>()
+                .ok()
+                .is_none_or(|n| !(1..=500).contains(&n))
+        {
+            return Err("--limit must be a whole number from 1 to 500".into());
         }
         parsed.queue_timeout()?;
         parsed.compute()?;
@@ -469,6 +566,26 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Parsed, String> {
         Parsed::from_args(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn policy_and_pagination_arguments_are_validated_before_network_access() {
+        assert!(parse(&["policy", "analyst", "--file", "policy.json"]).is_ok());
+        for args in [
+            vec!["policy"],
+            vec!["policy", "../admin"],
+            vec!["policy", "one", "two"],
+            vec!["sql", "SELECT 1", "--file", "policy.json"],
+            vec!["principals", "--after", "forged&limit=500"],
+            vec!["audit", "--limit", "501"],
+            vec!["audit", "--limit", "0"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted invalid arguments {args:?}");
+        }
+        let cursor = uuid::Uuid::new_v4().to_string();
+        assert!(parse(&["principals", "--after", &cursor]).is_ok());
+        assert!(parse(&["audit", "--before", &cursor]).is_ok());
+        assert!(parse(&["audit", "--after", &cursor]).is_err());
     }
 
     #[test]

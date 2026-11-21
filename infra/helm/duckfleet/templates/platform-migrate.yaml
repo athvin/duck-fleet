@@ -34,11 +34,14 @@ spec:
             limits: {cpu: 500m, memory: 256Mi}
           env:
             - {name: DUCKFLEET_ROLE, value: migrate}
+            {{- include "duckfleet.authorizationSeed" . | nindent 12 }}
+            {{- $roles := include "duckfleet.databaseRoles" . | fromJson }}
+            - {name: DUCKFLEET_DATABASE_ROLES_JSON, value: {{ dict "gateway" $roles.gateway "worker" $roles.worker "maintainer" $roles.maintainer | toJson | quote }}}
             - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ .Values.platformWaitSeconds | quote }}}
             - {name: DUCKFLEET_MIGRATION_TIMEOUT_SECONDS, value: {{ .Values.platformMigration.timeoutSeconds | quote }}}
             - {name: DUCKFLEET_PREPAID_MICRO_USD, value: {{ .Values.platformMigration.prepaidMicroUsd | int64 | quote }}}
             - {name: DUCKFLEET_MAX_JOB_MICRO_USD, value: {{ .Values.platformMigration.maxJobMicroUsd | int64 | quote }}}
             - name: PLATFORM_DSN
               valueFrom:
-                secretKeyRef: {name: {{ .Values.secretName }}, key: PLATFORM_DSN}
+                secretKeyRef: {name: {{ .Values.secretName }}, key: PLATFORM_MIGRATION_DSN}
 {{- end }}

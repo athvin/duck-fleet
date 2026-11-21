@@ -5,6 +5,7 @@ mkdir -p artifacts
 # Only this Compose project is touched. Volumes deliberately survive the test.
 trap 'result=$?; if [ "$result" -ne 0 ]; then docker compose --profile "*" logs --no-color > artifacts/compose-failure.log 2>&1; fi; exit "$result"' EXIT
 python3 scripts/compute_lifecycle.py check compose
+python3 scripts/test-database-roles.py
 docker compose --profile test build
 docker compose up -d --wait server
 
@@ -50,23 +51,19 @@ fi
 grep -q 'still owned by another process' artifacts/worker-overlap-refusal.log
 echo 'PASS: overlapping worker startup refused recovery of a live predecessor'
 
-# A worker reached directly must refuse isolation too. Naming a resource (cpu/memory)
-# derives an isolated pod, which a persistent worker cannot provide. An empty
-# request uses the worker's persistent pool; explicit persistent selection is
-# exercised by the named-pool stage below.
-session() { # session <worker> <json>
-  docker compose exec -T "$1" sh -c 'curl -sS -o /dev/null -w "%{http_code}" \
-    -X POST http://localhost:8080/v1/sessions \
-    -H "Authorization: Bearer $DUCKFLEET_TOKEN" -H "Content-Type: application/json" \
-    -d '"'$2'"
-}
-test "$(session worker-small '{"compute":{"cpu":1,"memory":"1Gi"}}')" = 501
-test "$(session worker-small '{"compute":{}}')" = 200
-echo 'PASS: a worker addressed directly refuses isolation it cannot provide'
+# A worker only accepts internal service authority. Public bootstrap recovery
+# belongs to the gateway and must never become a direct SQL-worker login.
+status=$(docker compose exec -T -e PUBLIC_TEST_TOKEN="${DUCKFLEET_TOKEN:-duckfleet-local-development-token}" worker-small sh -c '
+  curl -sS -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/v1/sessions \
+    -H "Authorization: Bearer $PUBLIC_TEST_TOKEN" -H "Content-Type: application/json" -d "{}"')
+test "$status" = 401
+echo 'PASS: public bootstrap cannot authenticate directly to a worker'
 
 # dbt must be an option, not a dependency. The `api` image has no dbt binary and
 # reaches the gateway only through the Rust client (the harness --api-workflow stage).
 docker compose run --rm api
+docker compose run --rm dbt duckfleet-server --rbac-storage
+docker compose run --rm dbt duckfleet-server --rbac
 docker compose run --rm dbt duckfleet-server --auth-continuity
 docker compose run --rm dbt duckfleet-server --request-identity
 docker compose run --rm dbt duckfleet-server --platform-maintenance
