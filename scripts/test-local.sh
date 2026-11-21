@@ -55,6 +55,7 @@ echo 'PASS: a worker addressed directly refuses isolation it cannot provide'
 # dbt must be an option, not a dependency. The `api` image has no dbt binary and
 # reaches the gateway only through the Rust client (the harness --api-workflow stage).
 docker compose run --rm api
+docker compose run --rm dbt duckfleet-server --auth-continuity
 # The dbt lifecycle: the `dbt` image runs the Rust integration harness
 # (DUCKFLEET_ROLE=harness), which drives the forked dbt binary. Default = main
 # lifecycle; then the stages that need both the gateway and a fresh fleet.

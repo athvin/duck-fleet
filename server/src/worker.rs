@@ -1,6 +1,7 @@
 use crate::{
     ApiError, Envelope, Operation, Output, QueryRequest, Reply,
     compute::{Mode, Placement, Resources},
+    credentials::{self, Identity},
     failure, metering, pricing,
     secrets::{Redactor, Startup},
 };
@@ -56,6 +57,66 @@ struct Session {
     /// history row the session writes. Server-derived, never caller-supplied:
     /// the caller's own context cannot name someone else.
     principal: String,
+    /// The last credential admitted on this session. Ownership stays with the
+    /// principal, so rotating its token can replace this cleanup authority.
+    authority: Identity,
+}
+
+impl Session {
+    fn claim(&mut self, identity: Identity) -> Result<(), ApiError> {
+        if !session_owner(&identity, &self.principal) {
+            return Err(ApiError::new(
+                failure::FORBIDDEN,
+                "this session belongs to another principal",
+            ));
+        }
+        // An operator acting on somebody else's session does not turn its
+        // revocable credential into an unrevocable bootstrap session.
+        if identity.principal == self.principal {
+            self.authority = identity;
+        }
+        Ok(())
+    }
+}
+
+fn retain_authorized_sessions(sessions: &mut HashMap<Uuid, Session>, valid: &[Identity]) {
+    sessions.retain(|_, session| {
+        operator_identity(&session.authority)
+            || valid.iter().any(|identity| {
+                identity.credential_id == session.authority.credential_id
+                    && identity.principal == session.principal
+            })
+    });
+}
+
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn operator_identity(identity: &Identity) -> bool {
+    identity.credential_id.is_none() && (identity.is_bootstrap() || identity.principal == "direct")
+}
+
+fn session_owner(identity: &Identity, principal: &str) -> bool {
+    operator_identity(identity) || identity.principal == principal
+}
+
+/// Resolving an ID is insufficient unless the authenticated principal matches it.
+fn admitted_identity(claimed: &Identity, resolved: Option<Identity>) -> Result<Identity, ApiError> {
+    if operator_identity(claimed) {
+        return Ok(claimed.clone());
+    }
+    resolved
+        .filter(|identity| {
+            claimed.credential_id.is_some()
+                && identity.credential_id == claimed.credential_id
+                && identity.principal == claimed.principal
+        })
+        .ok_or_else(|| {
+            ApiError::new(
+                failure::UNAUTHORIZED,
+                "credential is revoked, expired, or unknown; no statement ran",
+            )
+        })
 }
 pub(crate) struct Worker {
     root: Connection,
@@ -221,6 +282,57 @@ struct Ledger {
 }
 
 impl Ledger {
+    /// Credential reads fail closed and reconnect once only for a lost socket.
+    /// A statement timeout is already a complete bounded refusal, not a reason
+    /// to retry a credential-table lock and double the admission delay.
+    fn identities(&mut self, ids: &[String]) -> Result<Vec<Identity>, ApiError> {
+        match credentials::resolve_ids(&mut self.client, ids) {
+            Ok(identities) => return Ok(identities),
+            Err(error) if !self.client.is_closed() => {
+                return Err(self.credential_unavailable(&format!("{error:#}")));
+            }
+            Err(error) => tracing::warn!(
+                cause = self.redactor.scrub(&format!("{error:#}")),
+                "credential connection closed; reconnecting once"
+            ),
+        }
+        let mut config: postgres::Config = self.dsn.parse().map_err(|_| {
+            self.unserviceable(
+                "reconnecting for credential validation",
+                "invalid platform configuration",
+            )
+        })?;
+        config.connect_timeout(Duration::from_secs(3));
+        self.client = self
+            .redactor
+            .guard(
+                "reconnecting for credential validation",
+                config.connect(NoTls),
+            )
+            .map_err(|error| {
+                self.unserviceable(
+                    "reconnecting for credential validation",
+                    &format!("{error:#}"),
+                )
+            })?;
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
+        credentials::resolve_ids(&mut self.client, ids)
+            .map_err(|error| self.credential_unavailable(&format!("{error:#}")))
+    }
+
+    fn credential_unavailable(&self, cause: &str) -> ApiError {
+        if self.client.is_closed() {
+            return self.unserviceable("validating credentials", cause);
+        }
+        // A healthy connection may time out on a table lock. Refuse this request
+        // without forcing a worker restart; the next check can succeed on unlock.
+        tracing::error!(
+            cause = self.redactor.scrub(cause),
+            "credential validation unavailable; refusing access"
+        );
+        ApiError::internal()
+    }
+
     /// Runs a statement, replacing the connection and retrying once if it fails.
     ///
     /// `Client::is_closed` reports only a close this client has already observed, so
@@ -569,16 +681,33 @@ impl Worker {
         // without ever holding the engine's queue behind a long delete.
         self.prune_history(1000);
         self.last_prune = Instant::now();
-        while let Some(envelope) = receiver.blocking_recv() {
+        let mut last_housekeeping = Instant::now();
+        loop {
+            // This is still the sole DuckDB thread. Waiting through the runtime
+            // lets idle sessions expire even when no caller sends another request.
+            let remaining = HOUSEKEEPING_INTERVAL.saturating_sub(last_housekeeping.elapsed());
+            let received = self
+                .runtime
+                .block_on(async { tokio::time::timeout(remaining, receiver.recv()).await });
+            let envelope = match received {
+                Ok(Some(envelope)) => envelope,
+                Ok(None) => break,
+                Err(_) => {
+                    self.housekeeping();
+                    last_housekeeping = Instant::now();
+                    continue;
+                }
+            };
             let Envelope {
                 op,
                 reply,
                 query_guard,
             } = envelope;
             let query_guard = query_guard.map(crate::worker_status::QueryGuard::start);
-            // Dropping a connection rolls back an abandoned transaction.
+            // Do not sweep revoked opener credentials before validating this
+            // request: a rotated credential may legitimately claim the session.
             self.sessions
-                .retain(|_, s| s.touched.elapsed() < Duration::from_secs(300));
+                .retain(|_, s| s.touched.elapsed() < SESSION_IDLE_TIMEOUT);
             self.status.set_sessions(self.sessions.len());
             if self.last_prune.elapsed() >= Duration::from_secs(3600) {
                 self.prune_history(1);
@@ -588,7 +717,41 @@ impl Worker {
             self.status.set_sessions(self.sessions.len());
             drop(query_guard);
             let _ = reply.send(response);
+            if last_housekeeping.elapsed() >= HOUSEKEEPING_INTERVAL {
+                self.housekeeping();
+                last_housekeeping = Instant::now();
+            }
         }
+    }
+
+    fn validate_identity(&mut self, claimed: &Identity) -> Result<Identity, ApiError> {
+        if operator_identity(claimed) {
+            return admitted_identity(claimed, None);
+        }
+        let resolved = match &claimed.credential_id {
+            Some(id) => self.ledger.identities(std::slice::from_ref(id))?.pop(),
+            None => None,
+        };
+        admitted_identity(claimed, resolved)
+    }
+
+    fn housekeeping(&mut self) {
+        // Dropping a session connection rolls back any uncommitted transaction.
+        self.sessions
+            .retain(|_, session| session.touched.elapsed() < SESSION_IDLE_TIMEOUT);
+        let ids: Vec<String> = self
+            .sessions
+            .values()
+            .filter_map(|session| session.authority.credential_id.clone())
+            .collect();
+        if !ids.is_empty() {
+            let valid = self.ledger.identities(&ids).unwrap_or_default();
+            // The worker admits at most 32 sessions, bounding this scan and the
+            // one database query. Lookup failure closes named sessions as well:
+            // an unavailable authority cannot indefinitely retain a transaction.
+            retain_authorized_sessions(&mut self.sessions, &valid);
+        }
+        self.status.set_sessions(self.sessions.len());
     }
 
     /// Deletes history older than the configured retention, in bounded batches so a
@@ -647,7 +810,7 @@ impl Worker {
 
     fn handle(&mut self, op: Operation) -> Reply {
         match op {
-            Operation::Open(mut request, principal) => {
+            Operation::Open(mut request, identity) => {
                 // The gateway already routed by mode and size; this is the worker
                 // refusing to serve a placement that is not its own.
                 let placement = request.validate()?;
@@ -683,6 +846,7 @@ impl Worker {
                 if self.sessions.len() >= 32 {
                     return Err(ApiError::new(failure::CAPACITY, "session limit reached"));
                 }
+                let identity = self.validate_identity(&identity)?;
                 let conn = self.root.try_clone().map_err(|_| ApiError::internal())?;
                 conn.execute_batch("USE lake")
                     .map_err(|_| ApiError::internal())?;
@@ -697,7 +861,8 @@ impl Worker {
                         touched: Instant::now(),
                         context: request.context,
                         placement,
-                        principal,
+                        principal: identity.principal.clone(),
+                        authority: identity,
                     },
                 );
                 self.served += 1;
@@ -708,15 +873,30 @@ impl Worker {
                 self.sessions.remove(&id);
                 Ok(Output::Json(json!({"closed":true})))
             }
-            Operation::Query(id, req) => self.query(id, req),
+            Operation::Query(id, req, identity) => self.query(id, req, identity),
         }
     }
 
-    fn query(&mut self, id: Uuid, mut req: QueryRequest) -> Reply {
+    fn query(&mut self, id: Uuid, mut req: QueryRequest, claimed: Identity) -> Reply {
+        let identity = match self.validate_identity(&claimed) {
+            Ok(identity) => identity,
+            Err(error) => {
+                // A revoked token may close only the session still using it, not
+                // a session the same principal already continued with a new token.
+                if self.sessions.get(&id).is_some_and(|session| {
+                    session.principal == claimed.principal
+                        && session.authority.credential_id == claimed.credential_id
+                }) {
+                    self.sessions.remove(&id);
+                }
+                return Err(error);
+            }
+        };
         let session = self
             .sessions
             .get_mut(&id)
             .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
+        session.claim(identity)?;
         session.touched = Instant::now();
         // Read before the ledger is borrowed: billing follows the session's resolved
         // request, not the class of whatever worker served it.
@@ -914,6 +1094,93 @@ fn execute(conn: &Connection, sql: &str, parameters: Vec<SqlValue>) -> Result<(V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named_identity(principal: &str) -> Identity {
+        Identity {
+            principal: principal.into(),
+            credential_id: Some(Uuid::new_v4().to_string()),
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn admission_requires_the_current_credential_and_matching_principal() {
+        let requested = named_identity("analyst");
+        // Revoked, expired, and unknown credentials all resolve to no identity.
+        assert!(matches!(admitted_identity(&requested, None),
+            Err(ApiError(failure, _)) if failure.kind == "unauthorized"));
+        let mut wrong_principal = requested.clone();
+        wrong_principal.principal = "another-analyst".into();
+        assert!(admitted_identity(&requested, Some(wrong_principal)).is_err());
+        assert!(admitted_identity(&requested, Some(named_identity("analyst"))).is_err());
+        assert_eq!(
+            admitted_identity(&requested, Some(requested.clone())).unwrap(),
+            requested
+        );
+        assert!(
+            admitted_identity(&Identity::bootstrap(), None)
+                .unwrap()
+                .is_bootstrap()
+        );
+    }
+
+    #[test]
+    fn cleanup_rolls_back_revoked_sessions_but_preserves_rotated_authority() -> Result<()> {
+        let root = Connection::open_in_memory()?;
+        root.execute_batch("CREATE TABLE cleanup_probe (id INTEGER)")
+            .map_err(|_| anyhow::anyhow!("could not create cleanup fixture"))?;
+        let old = named_identity("analyst");
+        let replacement = named_identity("analyst");
+        let make_session = |identity: Identity| -> Result<Session> {
+            let conn = root.try_clone()?;
+            let profile = crate::profiling::Profile::new(Uuid::new_v4(), false, &conn)?;
+            Ok(Session {
+                conn,
+                profile,
+                touched: Instant::now(),
+                context: json!({}),
+                placement: Placement {
+                    mode: Mode::Persistent,
+                    resources: Resources::default(),
+                },
+                principal: identity.principal.clone(),
+                authority: identity,
+            })
+        };
+        let revoked = make_session(old.clone())?;
+        revoked
+            .conn
+            .execute_batch("BEGIN; INSERT INTO cleanup_probe VALUES (1)")
+            .map_err(|_| anyhow::anyhow!("could not start cleanup fixture transaction"))?;
+        let mut rotated = make_session(old.clone())?;
+        rotated
+            .claim(replacement.clone())
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(rotated.principal, old.principal);
+        assert_eq!(rotated.authority, replacement);
+        assert!(rotated.claim(named_identity("someone-else")).is_err());
+        rotated
+            .claim(Identity::bootstrap())
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(
+            rotated.authority, replacement,
+            "operator access must not replace revocable authority"
+        );
+        let revoked_id = Uuid::new_v4();
+        let rotated_id = Uuid::new_v4();
+        let mut sessions = HashMap::from([(revoked_id, revoked), (rotated_id, rotated)]);
+        retain_authorized_sessions(&mut sessions, std::slice::from_ref(&replacement));
+        assert!(!sessions.contains_key(&revoked_id));
+        assert!(sessions.contains_key(&rotated_id));
+        let rows: i64 = root.query_row("SELECT count(*) FROM cleanup_probe", [], |r| r.get(0))?;
+        assert_eq!(rows, 0, "revoked idle transaction was not rolled back");
+        retain_authorized_sessions(&mut sessions, &[]);
+        assert!(
+            sessions.is_empty(),
+            "failed validation must close named sessions"
+        );
+        Ok(())
+    }
 
     #[test]
     fn retention_defaults_to_forever_and_rejects_what_it_cannot_keep() {

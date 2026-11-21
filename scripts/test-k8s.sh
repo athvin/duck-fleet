@@ -191,6 +191,9 @@ done
 test -z "$(isolated_pods)" || {
   echo "session pods outlived their sessions: $(isolated_pods)" >&2; exit 1; }
 echo 'PASS: closing an isolated session removed its pod'
+harness duckfleet-auth-isolated 'duckfleet-server --auth-isolated' 600
+await_no_isolated_pods
+echo 'PASS: revoked idle credentials released their isolated pods without client cleanup'
 
 # What the pod costs in latency against a persistent worker (#18). Times a
 # persistent open, a cold isolated open (pod created, scheduled, ready), and a

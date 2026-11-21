@@ -332,9 +332,46 @@ record names the `principal` the gateway authenticated — server-derived, so a
 caller's context cannot claim to be someone else; a worker addressed directly
 inside the cluster records `direct`.
 
-Revocation takes effect immediately on the gateway that processed it. Unknown,
-revoked, and expired tokens are all refused with the same `401 unauthorized`,
-so a probing caller learns nothing about which it was.
+HTTP and pgwire retain the authenticated credential ID, principal, and expiry.
+Expiry has no cache grace period. Revocation invalidates the issuing gateway's
+authentication cache before the revocation response returns; another gateway
+or a direct database revocation can leave a cached read authorized for at most
+15 seconds. An earlier lookup cannot repopulate the cache after invalidation.
+Workers independently check the credential against PostgreSQL when admitting
+each session or statement, after it leaves the execution queue. This check is
+the SQL authorization boundary: revoking a credential prevents queued and later
+work from starting, while a statement already admitted may finish within its
+existing deadline (at most 60 seconds). Revocation neither cancels nor replays
+that statement. Operators can still explicitly cancel it.
+
+Unknown, revoked, and expired tokens all return HTTP `401 unauthorized` or
+pgwire SQLSTATE `28P01`. Failed authentication-store lookups fail closed with
+HTTP `503 unavailable` or pgwire `57P01`; they do not count as successful
+authentication. Credential reads have a three-second database statement timeout.
+Pgwire revalidates before its lazy first session and every statement, and checks
+idle connections every five seconds. An authentication refusal ends that wire
+connection and closes its worker session. Protocol writes are bounded so a
+client that stops reading cannot keep the session alive indefinitely.
+
+Workers sweep idle credentials every five seconds, including when no new
+request arrives. A running statement delays that sweep until it completes or
+reaches its deadline. Closing a session rolls back uncommitted transactions;
+an authentication-store failure also closes issued-credential sessions. The
+gateway periodically removes idle revoked or expired routes and releases their
+isolated pods, subject to Kubernetes deletion latency. These checks do not
+require a refused follow-up request to trigger cleanup. The ordinary five-minute
+session idle limit still applies to valid credentials.
+
+Rotate a token by issuing another credential for the same principal, completing
+a statement with it on each existing HTTP session, then revoking the old
+credential. Session ownership
+stays with the principal; cleanup follows the last admitted credential. Tokens
+for other principals cannot claim that session. An idle session still held by
+the revoked token is closed, even if another token exists for its principal.
+Submitting a replacement-token statement that is still queued does not transfer
+the session yet; if cleanup wins that race, reopen the session after the refusal.
+Pgwire clients reconnect with the replacement token because their password is
+fixed for the life of a connection.
 
 Credentials authenticate and attribute, and they scope the platform's levers —
 not its SQL. Every principal reaches the same full SQL surface; per-principal
@@ -342,7 +379,7 @@ SQL scoping is explicitly not built. On the platform API the mutations are
 owned: credential management, lake maintenance, and budget **writes** are
 bootstrap-only (a spend ceiling writable by the spenders it constrains would be
 an accident log, not a control), and a session answers only to the principal
-that opened it — another credential's query, cancel, or close is refused `403
+that opened it — another principal's query, cancel, or close is refused `403
 forbidden`, while the bootstrap may act on any session because interrupting a
 runaway statement is the operator's job. Reads stay org-global by design:
 budget position, query history, and usage — including SQL text — are visible to
