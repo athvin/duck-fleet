@@ -405,6 +405,128 @@ async fn idle_rollback(ctx: &Ctx, admin: &Client) -> Result<()> {
     Ok(())
 }
 
+struct DatabaseLock {
+    release: std::sync::mpsc::Sender<()>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl DatabaseLock {
+    async fn acquire(dsn: &str, statement: &'static str) -> Result<Self> {
+        let dsn = dsn.to_owned();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut config: postgres::Config = dsn.parse()?;
+            config.connect_timeout(Duration::from_secs(3));
+            config.options("-c statement_timeout=15000");
+            let mut client = config.connect(postgres::NoTls)?;
+            let mut transaction = client.transaction()?;
+            transaction.batch_execute(statement)?;
+            let _ = ready.send(());
+            // Dropping DatabaseLock on an assertion failure closes the sender and
+            // releases this transaction too. A failed test never leaves a lock.
+            let _ = released.recv_timeout(Duration::from_secs(20));
+            transaction.rollback()?;
+            Ok(())
+        });
+        tokio::time::timeout(Duration::from_secs(5), started).await??;
+        Ok(Self { release, task })
+    }
+
+    async fn unlock(self) -> Result<()> {
+        let _ = self.release.send(());
+        self.task.await?
+    }
+}
+
+async fn database_contention(ctx: &Ctx, admin: &Client, dsn: &str) -> Result<()> {
+    let credential = issue(admin, "auth-lock-timeout", None).await?;
+    let connection = open(ctx, &credential).await?;
+    let query_id = uuid::Uuid::new_v4().to_string();
+    let lock =
+        DatabaseLock::acquire(dsn, "LOCK TABLE credentials IN ACCESS EXCLUSIVE MODE").await?;
+    let started = Instant::now();
+    let response = connection
+        .client()
+        .request(
+            Method::POST,
+            &format!("{}/queries", connection.path()),
+            Some(&json!({"request_id": query_id, "sql": "select 731 /* auth-store-lock */"})),
+            Duration::from_secs(10),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    lock.unlock().await?;
+    expect_status(response, 503)?;
+    require(
+        elapsed < Duration::from_secs(9),
+        "credential lock blocked admission beyond its bound",
+    )?;
+    expect_status(
+        request_json(admin, Method::GET, &format!("/v1/queries/{query_id}"), None).await,
+        404,
+    )?;
+    let mut recovered = open(ctx, &credential).await?;
+    sql(&recovered, "select 1").await?;
+    recovered.close().await?;
+    revoke(admin, &credential).await?;
+    println!(
+        "PASS: credential-table lock fails closed within a bounded wait and recovers after unlock"
+    );
+
+    let mut operator = ctx.open_named("auth-budget-observer", None).await?;
+    let table = format!("lake.main.auth_budget_{}", uuid::Uuid::new_v4().simple());
+    sql(&operator, &format!("create table {table}(value integer)")).await?;
+    let credential = issue(admin, "auth-budget-wait", None).await?;
+    let connection = open(ctx, &credential).await?;
+    let query_id = uuid::Uuid::new_v4().to_string();
+    let lock = DatabaseLock::acquire(dsn, "SELECT budget_id FROM budget FOR UPDATE").await?;
+    let client = connection.client().clone();
+    let path = format!("{}/queries", connection.path());
+    let body = json!({"request_id": query_id, "sql": format!("insert into {table} values (1)")});
+    let query = tokio::spawn(async move {
+        client
+            .request(Method::POST, &path, Some(&body), Duration::from_secs(30))
+            .await
+    });
+    wait_running(admin, &query_id).await?;
+    revoke(admin, &credential).await?;
+    lock.unlock().await?;
+    expect_status(query.await?, 401)?;
+    let history =
+        request_json(admin, Method::GET, &format!("/v1/queries/{query_id}"), None).await?;
+    require(
+        history["status"] == "refused" && history["failure_kind"] == "unauthorized",
+        format!("late authorization refusal lost its outcome: {history}"),
+    )?;
+    let usage = request_json(
+        admin,
+        Method::GET,
+        &format!("/v1/usage?execution_id={query_id}"),
+        None,
+    )
+    .await?;
+    require(
+        usage["events"].as_array().is_some_and(|events| {
+            events.len() == 1 && events[0]["quantity"] == 0 && events[0]["amount_micro_usd"] == 0
+        }),
+        format!("unexecuted late refusal was not settled at zero: {usage}"),
+    )?;
+    require(
+        rows_eq(
+            &sql(&operator, &format!("select count(*) from {table}")).await?,
+            &[&["0"]],
+        ),
+        "credential revoked during budget admission executed SQL",
+    )?;
+    sql(&operator, &format!("drop table {table}")).await?;
+    operator.close().await?;
+    println!(
+        "PASS: revocation during budget admission executes no SQL and releases its reservation at zero cost"
+    );
+    Ok(())
+}
+
 pub(super) async fn checks(ctx: &Ctx) -> Result<()> {
     let admin = ctx.client()?;
     http_expiry(ctx, &admin).await?;
@@ -412,6 +534,11 @@ pub(super) async fn checks(ctx: &Ctx) -> Result<()> {
     rotation(ctx, &admin).await?;
     queued_revocation(ctx, &admin).await?;
     idle_rollback(ctx, &admin).await?;
+    if let Ok(dsn) = std::env::var("DUCKFLEET_PLATFORM_TEST_DSN") {
+        database_contention(ctx, &admin, &dsn).await?;
+    } else {
+        println!("SKIP: database contention checks require DUCKFLEET_PLATFORM_TEST_DSN");
+    }
     Ok(())
 }
 

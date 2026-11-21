@@ -333,12 +333,13 @@ caller's context cannot claim to be someone else; a worker addressed directly
 inside the cluster records `direct`.
 
 HTTP and pgwire retain the authenticated credential ID, principal, and expiry.
-Expiry has no cache grace period. Revocation invalidates the issuing gateway's
-authentication cache before the revocation response returns; another gateway
+Expiry has no cache grace period. Revocation invalidates the cache on the gateway
+handling the revoke request before its response returns; another gateway
 or a direct database revocation can leave a cached read authorized for at most
 15 seconds. An earlier lookup cannot repopulate the cache after invalidation.
 Workers independently check the credential against PostgreSQL when admitting
-each session or statement, after it leaves the execution queue. This check is
+each session or statement, after it leaves the execution queue and again after
+any wait for budget admission. The final check immediately before execution is
 the SQL authorization boundary: revoking a credential prevents queued and later
 work from starting, while a statement already admitted may finish within its
 existing deadline (at most 60 seconds). Revocation neither cancels nor replays

@@ -89,6 +89,21 @@ fn retain_authorized_sessions(sessions: &mut HashMap<Uuid, Session>, valid: &[Id
     });
 }
 
+fn discard_unauthorized_session(
+    sessions: &mut HashMap<Uuid, Session>,
+    id: Uuid,
+    claimed: &Identity,
+) {
+    // A revoked token may close only the session still using it, not a session
+    // the same principal already continued with a replacement credential.
+    if sessions.get(&id).is_some_and(|session| {
+        session.principal == claimed.principal
+            && session.authority.credential_id == claimed.credential_id
+    }) {
+        sessions.remove(&id);
+    }
+}
+
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -735,6 +750,16 @@ impl Worker {
         admitted_identity(claimed, resolved)
     }
 
+    fn validate_session_identity(
+        &mut self,
+        id: Uuid,
+        claimed: &Identity,
+    ) -> Result<Identity, ApiError> {
+        self.validate_identity(claimed).inspect_err(|_| {
+            discard_unauthorized_session(&mut self.sessions, id, claimed);
+        })
+    }
+
     fn housekeeping(&mut self) {
         // Dropping a session connection rolls back any uncommitted transaction.
         self.sessions
@@ -877,21 +902,52 @@ impl Worker {
         }
     }
 
+    fn close_refused(&mut self, query_id: &str, refusal: &ApiError) {
+        let _ = self.ledger.execute(
+            "closing a refused execution",
+            "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=0,
+             error=$3, failure_kind=$4, retry_safe=$5 WHERE query_id=$1",
+            &[
+                &query_id,
+                &refusal.0.status.unwrap_or("refused"),
+                &refusal.1,
+                &refusal.0.kind,
+                &refusal.0.retry_safe,
+            ],
+        );
+    }
+
+    /// Admission reserved funds, but authority changed before the engine started.
+    /// Zero-time settlement releases the hold without charging for work not run.
+    fn abort_admission(
+        &mut self,
+        admission: &metering::Admission,
+        context: &Value,
+        refusal: ApiError,
+    ) -> Reply {
+        let settled = metering::settle(
+            &mut self.ledger.client,
+            admission,
+            0,
+            &self.worker_id,
+            &context.to_string(),
+            &self.rate,
+        );
+        self.close_refused(&admission.execution_id, &refusal);
+        if let Err(error) = settled {
+            // History records zero elapsed time even if settlement failed. Stop
+            // admissions so restart recovery releases this hold at zero cost;
+            // do this after history's reconnect, which may restore readiness.
+            self.ledger.unserviceable(
+                "releasing a refused admission; recovery will settle it",
+                &format!("{error:#}"),
+            );
+        }
+        Err(refusal)
+    }
+
     fn query(&mut self, id: Uuid, mut req: QueryRequest, claimed: Identity) -> Reply {
-        let identity = match self.validate_identity(&claimed) {
-            Ok(identity) => identity,
-            Err(error) => {
-                // A revoked token may close only the session still using it, not
-                // a session the same principal already continued with a new token.
-                if self.sessions.get(&id).is_some_and(|session| {
-                    session.principal == claimed.principal
-                        && session.authority.credential_id == claimed.credential_id
-                }) {
-                    self.sessions.remove(&id);
-                }
-                return Err(error);
-            }
-        };
+        let identity = self.validate_session_identity(id, &claimed)?;
         let session = self
             .sessions
             .get_mut(&id)
@@ -938,21 +994,20 @@ impl Worker {
         ) {
             Ok(admission) => admission,
             Err(refusal) => {
-                let _ = self.ledger.execute(
-                    "closing a refused execution",
-                    "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=0,
-                     error=$3, failure_kind=$4, retry_safe=$5 WHERE query_id=$1",
-                    &[
-                        &query_id,
-                        &refusal.0.status.unwrap_or("refused"),
-                        &refusal.1,
-                        &refusal.0.kind,
-                        &refusal.0.retry_safe,
-                    ],
-                );
+                self.close_refused(&query_id, &refusal);
                 return Err(refusal);
             }
         };
+        // History writes and budget admission can wait on database locks. Check
+        // authority again after those waits, directly before engine execution:
+        // revocation during admission must never become permission to run SQL.
+        if let Err(refusal) = self.validate_session_identity(id, &claimed) {
+            return self.abort_admission(&admission, &req.context, refusal);
+        }
+        let session = self
+            .sessions
+            .get_mut(&id)
+            .expect("validated session remains on the sole worker thread");
         let cleared = session.profile.clear();
         let started = Instant::now();
         *self.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(Active {
@@ -1152,6 +1207,11 @@ mod tests {
             .conn
             .execute_batch("BEGIN; INSERT INTO cleanup_probe VALUES (1)")
             .map_err(|_| anyhow::anyhow!("could not start cleanup fixture transaction"))?;
+        let refused = make_session(old.clone())?;
+        refused
+            .conn
+            .execute_batch("BEGIN; INSERT INTO cleanup_probe VALUES (2)")
+            .map_err(|_| anyhow::anyhow!("could not start refusal fixture transaction"))?;
         let mut rotated = make_session(old.clone())?;
         rotated
             .claim(replacement.clone())
@@ -1167,8 +1227,19 @@ mod tests {
             "operator access must not replace revocable authority"
         );
         let revoked_id = Uuid::new_v4();
+        let refused_id = Uuid::new_v4();
         let rotated_id = Uuid::new_v4();
-        let mut sessions = HashMap::from([(revoked_id, revoked), (rotated_id, rotated)]);
+        let mut sessions = HashMap::from([
+            (revoked_id, revoked),
+            (refused_id, refused),
+            (rotated_id, rotated),
+        ]);
+        // Both dequeue and post-budget refusals use this cleanup: a stale token
+        // must close its own transaction without destroying rotated authority.
+        discard_unauthorized_session(&mut sessions, rotated_id, &old);
+        assert!(sessions.contains_key(&rotated_id));
+        discard_unauthorized_session(&mut sessions, refused_id, &old);
+        assert!(!sessions.contains_key(&refused_id));
         retain_authorized_sessions(&mut sessions, std::slice::from_ref(&replacement));
         assert!(!sessions.contains_key(&revoked_id));
         assert!(sessions.contains_key(&rotated_id));
