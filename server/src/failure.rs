@@ -140,6 +140,44 @@ pub(crate) const NOT_FOUND: Failure = Failure {
     http: StatusCode::NOT_FOUND,
 };
 
+/// These describe delivery of an accepted job's result, never its SQL outcome.
+pub(crate) const RESULT_PENDING: Failure = Failure {
+    status: None,
+    kind: "result_pending",
+    retry_safe: false,
+    http: StatusCode::ACCEPTED,
+};
+pub(crate) const RESULT_UNAVAILABLE: Failure = Failure {
+    status: None,
+    kind: "result_unavailable",
+    retry_safe: false,
+    http: StatusCode::CONFLICT,
+};
+pub(crate) const RESULT_EXPIRED: Failure = Failure {
+    status: None,
+    kind: "result_expired",
+    retry_safe: false,
+    http: StatusCode::GONE,
+};
+pub(crate) const RESULT_FETCH_UNAVAILABLE: Failure = Failure {
+    status: None,
+    kind: "result_fetch_unavailable",
+    retry_safe: false,
+    http: StatusCode::SERVICE_UNAVAILABLE,
+};
+pub(crate) const JOB_UNAVAILABLE: Failure = Failure {
+    status: None,
+    kind: "jobs_unavailable",
+    retry_safe: true,
+    http: StatusCode::SERVICE_UNAVAILABLE,
+};
+pub(crate) const JOB_PREPARE_REFUSED: Failure = Failure {
+    status: Some("refused"),
+    kind: "job_prepare_refused",
+    retry_safe: false,
+    http: StatusCode::BAD_REQUEST,
+};
+
 /// This attempt ID was already accepted. Durable request identity retains its
 /// outcome independently of diagnostic history; this ID never executes again.
 pub(crate) const DUPLICATE_REQUEST: Failure = Failure {

@@ -75,6 +75,11 @@ pub(crate) struct Pod {
     pub endpoint: String,
 }
 
+pub(crate) struct JobPod {
+    pub pod: Pod,
+    pub uid: String,
+}
+
 pub(crate) struct SweepResult {
     pub confirmed_absent: Vec<String>,
     /// Includes labeled orphans with no reservation or queued work yet.
@@ -183,6 +188,118 @@ impl Isolation {
                 Err(error)
             }
         }
+    }
+
+    /// The caller journals this deterministic name before entering. A retry
+    /// adopts only that exact job pod; a previously observed UID is never replaced.
+    pub async fn start_job(
+        &self,
+        wanted: Resources,
+        name: &str,
+        expected_uid: Option<&str>,
+        runtime_seconds: u64,
+    ) -> Result<JobPod, ApiError> {
+        if self.template["spec"]["activeDeadlineSeconds"]
+            .as_u64()
+            .is_none_or(|lifetime| runtime_seconds.saturating_add(30) > lifetime)
+        {
+            return Err(ApiError::new(
+                failure::JOB_PREPARE_REFUSED,
+                "job execution allowance plus 30 seconds completion time exceeds the operator's isolated pod lifetime",
+            ));
+        }
+        if !name.starts_with(PREFIX)
+            || name.len() > 63
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(ApiError::bad("invalid job pod identity"));
+        }
+        let existing = self
+            .kube
+            .pod(name)
+            .await
+            .map_err(|_| ApiError::internal())?;
+        if existing.is_none() {
+            if expected_uid.is_some() {
+                return Err(ApiError::new(
+                    failure::JOB_UNAVAILABLE,
+                    "the bound job pod is absent",
+                ));
+            }
+            let mut spec = specify(&self.template, &self.owner, name, wanted)
+                .map_err(|_| ApiError::internal())?;
+            spec["metadata"]["labels"]["duckfleet-job"] = json!(name);
+            // Durable job ownership lives in PostgreSQL. Gateway replacement
+            // must not garbage-collect an accepted job's engine process.
+            if let Some(metadata) = spec["metadata"].as_object_mut() {
+                metadata.remove("ownerReferences");
+            }
+            // A lost CREATE acknowledgement is reconciled by this name on the
+            // next attempt. Never switch names after an ambiguous network call.
+            self.create_waiting_out_quota(&spec).await?;
+        }
+        let pod = self
+            .kube
+            .pod(name)
+            .await
+            .map_err(|_| ApiError::internal())?
+            .ok_or_else(ApiError::internal)?;
+        let uid = pod["metadata"]["uid"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(ApiError::internal)?;
+        if pod["metadata"]["labels"]["duckfleet-job"] != name
+            || expected_uid.is_some_and(|expected| expected != uid)
+        {
+            return Err(ApiError::new(
+                failure::JOB_UNAVAILABLE,
+                "job pod identity does not match its durable binding",
+            ));
+        }
+        let uid = uid.to_owned();
+        let endpoint = self.await_ready(name).await?;
+        Ok(JobPod {
+            pod: Pod {
+                name: name.into(),
+                endpoint,
+            },
+            uid,
+        })
+    }
+
+    pub async fn stop_job_confirmed(&self, name: &str, uid: Option<&str>) -> bool {
+        tokio::time::timeout(STOP_WAIT, async {
+            if matches!(self.job_pod_present(name, uid).await, Ok(false)) {
+                return true;
+            }
+            let deleted = match uid {
+                Some(uid) => self.kube.delete_pod_uid(name, uid).await,
+                None => self.kube.delete_pod(name).await,
+            };
+            if deleted.is_err() {
+                return false;
+            }
+            loop {
+                match self.job_pod_present(name, uid).await {
+                    Ok(false) => return true,
+                    Ok(true) => tokio::time::sleep(Duration::from_millis(100)).await,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    pub async fn job_pod_present(&self, name: &str, uid: Option<&str>) -> Result<bool, ApiError> {
+        let pod = self
+            .kube
+            .pod(name)
+            .await
+            .map_err(|_| ApiError::internal())?;
+        Ok(pod.is_some_and(|pod| uid.is_none_or(|expected| pod["metadata"]["uid"] == expected)))
     }
 
     /// Creates the pod, retrying a quota refusal the cluster can cure by itself.
@@ -328,15 +445,32 @@ impl Isolation {
     /// Input comes from durable work, including unreserved queued queries. Merge
     /// it with labeled pods so a failed cleanup before admission can be retried.
     /// Only confirmed_absent may release permits/funds; pending remains retired.
-    pub async fn sweep(&self, orphaned: &[String]) -> SweepResult {
-        self.sweep_bounded(orphaned, STOP_WAIT, SWEEP_WAIT).await
+    pub async fn sweep_excluding(
+        &self,
+        orphaned: &[String],
+        jobs: &BTreeSet<String>,
+    ) -> SweepResult {
+        self.sweep_filtered(orphaned, STOP_WAIT, SWEEP_WAIT, jobs)
+            .await
     }
 
+    #[cfg(test)]
     async fn sweep_bounded(
         &self,
         orphaned: &[String],
         stop_wait: Duration,
         sweep_wait: Duration,
+    ) -> SweepResult {
+        self.sweep_filtered(orphaned, stop_wait, sweep_wait, &BTreeSet::new())
+            .await
+    }
+
+    async fn sweep_filtered(
+        &self,
+        orphaned: &[String],
+        stop_wait: Duration,
+        sweep_wait: Duration,
+        jobs: &BTreeSet<String>,
     ) -> SweepResult {
         let deadline = tokio::time::Instant::now() + sweep_wait;
         let mut names: BTreeSet<String> = orphaned.iter().cloned().collect();
@@ -358,6 +492,7 @@ impl Isolation {
             ),
             Err(_) => tracing::warn!("timed out listing session pods to sweep"),
         }
+        names.retain(|name| !jobs.contains(name));
         let mut pending = names.clone();
         let mut remaining = names.into_iter();
         let mut checks = tokio::task::JoinSet::new();
@@ -562,6 +697,94 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn job_open_reuses_named_uid_and_never_recreates_an_observed_pod() {
+        use axum::{
+            Json,
+            extract::Path,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::{get, post},
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let stored = Arc::new(Mutex::new(None::<Value>));
+        let creates = Arc::new(AtomicUsize::new(0));
+        let read = stored.clone();
+        let write = stored.clone();
+        let counted = creates.clone();
+        let router = axum::Router::new()
+            .route("/api/v1/namespaces/test/pods", post(move |Json(mut pod): Json<Value>| {
+                let write = write.clone(); let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    pod["metadata"]["uid"] = json!("observed-job-uid");
+                    pod["status"] = json!({"podIP":"127.0.0.1","conditions":[{"type":"Ready","status":"True"}]});
+                    *write.lock().unwrap() = Some(pod.clone());
+                    Json(pod)
+                }
+            }))
+            .route("/api/v1/namespaces/test/pods/{name}", get(move |Path(_): Path<String>| {
+                let read = read.clone(); async move {
+                    match read.lock().unwrap().clone() {
+                        Some(pod) => Json(pod).into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }));
+        let api = crate::kube::test_support::FakeKube::serve(router).await;
+        let isolation = Isolation {
+            kube: api.kube.clone(),
+            template: template(),
+            owner: owner("gateway", "gateway-uid"),
+            ready: Duration::from_secs(1),
+            provisioning: Duration::ZERO,
+            quota_wait: Duration::ZERO,
+        };
+        let wanted = Resources {
+            cpu: 1,
+            memory_bytes: GIB,
+            disk_bytes: 2 * GIB,
+        };
+        let name = "duckfleet-session-test-job";
+        let first = isolation.start_job(wanted, name, None, 120).await.unwrap();
+        assert!(
+            stored.lock().unwrap().as_ref().unwrap()["metadata"]
+                .get("ownerReferences")
+                .is_none()
+        );
+        let again = isolation
+            .start_job(wanted, name, Some(&first.uid), 120)
+            .await
+            .unwrap();
+        assert_eq!(first.uid, again.uid);
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert!(
+            isolation
+                .start_job(wanted, name, Some("another-uid"), 120)
+                .await
+                .is_err()
+        );
+        // Cleanup of an old incarnation cannot delete a replacement by name.
+        assert!(
+            isolation
+                .stop_job_confirmed(name, Some("another-uid"))
+                .await
+        );
+        assert!(stored.lock().unwrap().is_some());
+        *stored.lock().unwrap() = None;
+        assert!(
+            isolation
+                .start_job(wanted, name, Some(&first.uid), 120)
+                .await
+                .is_err()
+        );
+        assert!(isolation.start_job(wanted, name, None, 1800).await.is_err());
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn sweep_returns_only_proven_deaths_and_retains_unreserved_labeled_orphans() {

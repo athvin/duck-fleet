@@ -1,4 +1,16 @@
 name: duckfleet-local
+# Local fixture credentials are deliberately explicit. AWS deployments use a
+# result-prefix Pod Identity; these RustFS credentials are not production grants.
+x-result-environment: &result-environment
+  DUCKFLEET_RESULT_DATA_PATH: s3://duckfleet/results/
+  DUCKFLEET_RESULT_LAKE_DATA_PATH: s3://duckfleet/lake/
+  DUCKFLEET_RESULT_AUTH_MODE: static
+  DUCKFLEET_RESULT_ENDPOINT: http://object-store:9000
+  DUCKFLEET_RESULT_ALLOW_HTTP: "true"
+  DUCKFLEET_RESULT_ACCESS_KEY: DUCKFLEETLOCAL
+  DUCKFLEET_RESULT_SECRET_KEY: local-object-store-password
+  AWS_REGION: us-east-1
+  AWS_EC2_METADATA_DISABLED: "true"
 services:
   postgres:
     image: postgres:17.6-bookworm
@@ -85,12 +97,13 @@ services:
   # needs Kubernetes; explicit persistent pools are available via the pools profile.
   worker-small:
     labels:
-      duckfleet.io/platform-schema: "4"
+      duckfleet.io/platform-schema: "5"
     image: duckfleet-worker:local
     build:
       context: .
       dockerfile: docker/server.Dockerfile
     environment: &worker-environment
+      <<: *result-environment
       DUCKFLEET_NAMESPACE: local
       DUCKFLEET_INTERNAL_TOKEN: ${DUCKFLEET_INTERNAL_TOKEN:-duckfleet-local-internal-service-token}
       DUCKFLEET_WORKER_ID: small
@@ -133,7 +146,7 @@ services:
   # the gateway at it via DUCKFLEET_WORKER_URLS.
   worker-small-b:
     labels:
-      duckfleet.io/platform-schema: "4"
+      duckfleet.io/platform-schema: "5"
     profiles: [scale-out]
     image: duckfleet-worker:local
     environment:
@@ -149,14 +162,16 @@ services:
 
   server:
     labels:
-      duckfleet.io/platform-schema: "4"
+      duckfleet.io/platform-schema: "5"
     image: duckfleet-worker:local
     environment:
+      <<: *result-environment
       DUCKFLEET_ROLE: gateway
       DUCKFLEET_NAMESPACE: local
       DUCKFLEET_INTERNAL_TOKEN: ${DUCKFLEET_INTERNAL_TOKEN:-duckfleet-local-internal-service-token}
       DUCKFLEET_GATEWAY_MAX_SESSIONS: "64"
       DUCKFLEET_ADMISSION_LIMITS_JSON: "${DUCKFLEET_ADMISSION_LIMITS_JSON:-{}}"
+      DUCKFLEET_JOB_POLICY_JSON: "${DUCKFLEET_JOB_POLICY_JSON:-{}}"
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       # The gateway coordinates bounded history retention for the whole fleet.
       DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
@@ -188,7 +203,7 @@ services:
   # isolation. Start with: docker compose --profile pools up -d --wait server-pools
   worker-pool-interactive-0:
     labels:
-      duckfleet.io/platform-schema: "4"
+      duckfleet.io/platform-schema: "5"
     profiles: [pools]
     image: duckfleet-worker:local
     environment:
@@ -210,15 +225,17 @@ services:
 
   server-pools:
     labels:
-      duckfleet.io/platform-schema: "4"
+      duckfleet.io/platform-schema: "5"
     profiles: [pools]
     image: duckfleet-worker:local
     environment:
+      <<: *result-environment
       DUCKFLEET_ROLE: gateway
       DUCKFLEET_NAMESPACE: local
       DUCKFLEET_INTERNAL_TOKEN: ${DUCKFLEET_INTERNAL_TOKEN:-duckfleet-local-internal-service-token}
       DUCKFLEET_GATEWAY_MAX_SESSIONS: "64"
       DUCKFLEET_ADMISSION_LIMITS_JSON: "${DUCKFLEET_ADMISSION_LIMITS_JSON:-{}}"
+      DUCKFLEET_JOB_POLICY_JSON: "${DUCKFLEET_JOB_POLICY_JSON:-{}}"
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
       DUCKFLEET_PGWIRE: "true"

@@ -130,11 +130,217 @@ impl Client {
             .map_err(|_| RemoteError::decode("invalid system query response"))
     }
 
+    /// A standalone job has no client-owned engine session. The original ID
+    /// survives ambiguous transport/commit outcomes; this method never resubmits.
+    pub(crate) async fn submit_job(
+        &self,
+        request: &crate::job_policy::JobRequest,
+    ) -> Result<Value, RemoteError> {
+        let id = request.request_id;
+        request.clone().validate().map_err(|error| {
+            Self::job_error(
+                id,
+                RemoteError {
+                    status: None,
+                    failure_kind: Some(error.0.kind.into()),
+                    retry_safe: error.0.retry_safe,
+                    message: error.1,
+                    request_id: None,
+                    acceptance: Some("not_accepted".into()),
+                    status_url: None,
+                },
+            )
+        })?;
+        let value = serde_json::to_value(request).map_err(|_| {
+            Self::job_error(id, RemoteError::decode("could not encode job request"))
+        })?;
+        self.job_json(Method::POST, "/v1/jobs", Some(&value), id)
+            .await
+    }
+
+    pub(crate) async fn job(&self, id: uuid::Uuid) -> Result<Value, RemoteError> {
+        self.job_json(Method::GET, &format!("/v1/jobs/{id}"), None, id)
+            .await
+    }
+
+    pub(crate) async fn cancel_job(&self, id: uuid::Uuid) -> Result<Value, RemoteError> {
+        self.job_json(Method::POST, &format!("/v1/jobs/{id}/cancel"), None, id)
+            .await
+    }
+
+    pub(crate) async fn job_result(&self, id: uuid::Uuid) -> Result<Value, RemoteError> {
+        self.job_json(Method::GET, &format!("/v1/jobs/{id}/result"), None, id)
+            .await
+    }
+
+    fn job_error(id: uuid::Uuid, mut error: RemoteError) -> RemoteError {
+        error
+            .request_id
+            .get_or_insert_with(|| id.to_string().into());
+        error.acceptance.get_or_insert_with(|| "unknown".into());
+        error
+            .status_url
+            .get_or_insert_with(|| format!("/v1/jobs/{id}").into());
+        error
+    }
+
+    async fn job_json(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&Value>,
+        id: uuid::Uuid,
+    ) -> Result<Value, RemoteError> {
+        let submitting = method == Method::POST && path == "/v1/jobs";
+        let reading = method == Method::GET;
+        let mut request = self
+            .http
+            .request(method, format!("{}{}", self.endpoint, path))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(15));
+        if let Some(payload) = payload {
+            request = request.json(payload);
+        }
+        let result = async {
+            let response = request.send().await.map_err(RemoteError::transport)?;
+            let status = response.status();
+            let body = Self::bounded_body(response, crate::artifacts::MAX_MANIFEST_BYTES).await?;
+            if !status.is_success() {
+                return Err(Self::classify(status, &body));
+            }
+            serde_json::from_slice(&body).map_err(|_| RemoteError::decode("invalid job response"))
+        }
+        .await;
+        result.map_err(|mut error| {
+            if !submitting && error.is_kind("transport_failure") {
+                error.message = if reading {
+                    "job retrieval failed in transport; retrieve the same job ID again; no SQL was submitted".into()
+                } else {
+                    "job cancellation response was lost; inspect the same job ID to see whether cancellation took effect; no SQL was submitted".into()
+                };
+                error.retry_safe = reading;
+            }
+            Self::job_error(id, error)
+        })
+    }
+
+    async fn bounded_body(
+        mut response: reqwest::Response,
+        maximum: usize,
+    ) -> Result<Vec<u8>, RemoteError> {
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum as u64)
+        {
+            return Err(RemoteError::decode("job response exceeds its size limit"));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(RemoteError::transport)? {
+            if chunk.len() > maximum.saturating_sub(body.len()) {
+                return Err(RemoteError::decode("job response exceeds its size limit"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    /// Writes one immutable Arrow chunk incrementally. Only generated relative
+    /// routes are used; manifest URLs can never redirect the bearer credential.
+    pub(crate) async fn download_job_chunk<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        id: uuid::Uuid,
+        chunk_id: &str,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        output: &mut W,
+    ) -> Result<(), RemoteError> {
+        use tokio::io::AsyncWriteExt;
+        let result = async {
+            if chunk_id.is_empty()
+                || chunk_id.len() > 128
+                || !chunk_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                || expected_bytes == 0
+                || expected_bytes > 16 * 1024 * 1024
+                || expected_sha256.len() != 64
+                || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(RemoteError::decode("invalid job chunk descriptor"));
+            }
+            let mut response = self
+                .http
+                .get(format!(
+                    "{}/v1/jobs/{id}/result/chunks/{chunk_id}",
+                    self.endpoint
+                ))
+                .bearer_auth(&self.token)
+                .timeout(STATEMENT_TIMEOUT)
+                .send()
+                .await
+                .map_err(RemoteError::transport)?;
+            let status = response.status();
+            if !status.is_success() {
+                let bytes = Self::bounded_body(response, 65536).await?;
+                return Err(Self::classify(status, &bytes));
+            }
+            if response
+                .content_length()
+                .is_some_and(|n| n != expected_bytes)
+            {
+                return Err(RemoteError::decode(
+                    "job chunk length differs from manifest",
+                ));
+            }
+            let mut received = 0u64;
+            let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+            while let Some(chunk) = response.chunk().await.map_err(RemoteError::transport)? {
+                received = received
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| RemoteError::decode("job chunk length overflow"))?;
+                if received > expected_bytes {
+                    return Err(RemoteError::decode("job chunk exceeds manifest length"));
+                }
+                digest.update(&chunk);
+                output
+                    .write_all(&chunk)
+                    .await
+                    .map_err(|_| RemoteError::decode("cannot write job chunk output"))?;
+            }
+            let actual = digest
+                .finish()
+                .as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            if received != expected_bytes || !actual.eq_ignore_ascii_case(expected_sha256) {
+                return Err(RemoteError::decode(
+                    "job chunk checksum or length differs from manifest",
+                ));
+            }
+            output
+                .flush()
+                .await
+                .map_err(|_| RemoteError::decode("cannot flush job chunk output"))?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|mut error| {
+            if error.status.is_none() && error.is_kind("transport_failure") {
+                error.message =
+                    "result download failed in transport; SQL was not submitted or retried".into();
+            }
+            Self::job_error(id, error)
+        })
+    }
+
     /// Builds the client. The process-wide rustls crypto provider must already be
     /// installed (it is, in `main` before any role runs); without it reqwest
     /// panics on build.
     pub fn new(endpoint: &str, token: &str) -> Result<Self, RemoteError> {
         let http = HttpClient::builder()
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(RemoteError::transport)?;
         Ok(Client {
@@ -483,6 +689,102 @@ impl RemoteConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn job_submit_never_follows_redirects_and_preserves_original_identity() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let id = uuid::Uuid::new_v4();
+        let app=Router::new().route("/v1/jobs",post(move |State(calls):State<Arc<AtomicUsize>>,Json(body):Json<Value>| async move {
+            assert_eq!(body["request_id"],id.to_string());
+            calls.fetch_add(1,Ordering::SeqCst);
+            (StatusCode::TEMPORARY_REDIRECT,[("location","/replayed")],"")
+        })).route("/replayed",post(|State(calls):State<Arc<AtomicUsize>>| async move {
+            calls.fetch_add(100,Ordering::SeqCst); StatusCode::ACCEPTED
+        })).with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let request =
+            serde_json::from_value(json!({"request_id":id,"sql":"INSERT INTO t VALUES(1)"}))
+                .unwrap();
+        let error = Client::new(&endpoint, "test")
+            .unwrap()
+            .submit_job(&request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, Some(307));
+        assert_eq!(error.request_id.as_deref(), Some(id.to_string().as_str()));
+        assert_eq!(error.acceptance.as_deref(), Some("unknown"));
+        assert!(!error.retry_safe);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn job_download_checks_manifest_length_and_checksum_before_success() {
+        use axum::{Router, routing::get};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let data = b"one bounded immutable chunk";
+        let app = Router::new().route(
+            "/v1/jobs/{id}/result/chunks/{chunk}",
+            get(|| async { "one bounded immutable chunk" }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = Client::new(&endpoint, "test").unwrap();
+        let id = uuid::Uuid::new_v4();
+        let digest = ring::digest::digest(&ring::digest::SHA256, data)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let mut output = Vec::new();
+        client
+            .download_job_chunk(id, "0", data.len() as u64, &digest, &mut output)
+            .await
+            .unwrap();
+        assert_eq!(output, data);
+        output.clear();
+        assert!(
+            client
+                .download_job_chunk(id, "0", data.len() as u64 - 1, &digest, &mut output)
+                .await
+                .is_err()
+        );
+        assert!(output.is_empty());
+        assert!(
+            client
+                .download_job_chunk(id, "0", data.len() as u64, &"0".repeat(64), &mut output)
+                .await
+                .is_err()
+        );
+        output.clear();
+        assert!(
+            client
+                .download_job_chunk(
+                    id,
+                    "../credentials",
+                    data.len() as u64,
+                    &digest,
+                    &mut output
+                )
+                .await
+                .is_err()
+        );
+        assert!(output.is_empty());
+        task.abort();
+    }
+
     #[test]
     fn classified_errors_preserve_identity_and_unknown_acceptance() {
         let id = uuid::Uuid::new_v4().to_string();

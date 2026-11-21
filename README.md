@@ -422,6 +422,14 @@ network timeout does not prove a backend session has ended; an unreachable
 endpoint can therefore hold capacity until cleanup succeeds. Gateway restart
 abandons its routes and ends client sessions; it is not transaction recovery.
 
+[Durable query jobs](docs/jobs.md) provide submit/status/cancel and private Arrow results.
+Job runtime, result size and retention limits are configured separately from
+interactive query limits. Compose supplies local private result storage; Kubernetes
+requires explicit result-prefix IAM before enabling `results.enabled`. See
+[job storage and policy configuration](infra/README.md#durable-jobs-and-private-results)
+and the [Helm example](examples/jobs-values.yaml). Platform result permissions do
+not isolate untrusted SQL from worker credentials.
+
 ## Credentials
 
 The gateway's `DUCKFLEET_TOKEN` is the operator-held bootstrap recovery credential.
@@ -854,7 +862,9 @@ unsupported future versions with an actionable error.
 Deployment runs `DUCKFLEET_ROLE=migrate` using the same binary and its dedicated
 owner/migrator `PLATFORM_DSN`; runtime processes use their own restricted DSNs.
 This PostgreSQL-only command supports a fresh database, unversioned installations
-and ordered schema-1 through schema-3 upgrades. It adopts existing credentials, request identities,
+and ordered schema-1 through schema-5 upgrades. Schema 5 adds durable jobs, their
+artifact journals and finite job policy envelopes; existing interactive request
+fingerprints, credentials, policies and usage are preserved. It adopts existing request identities,
 reservations and usage without refilling the budget. Migrations commit their
 version atomically; repeats skip the baseline scans. Quiesce older writers for
 an upgrade and preserve the `platform` database along with the DuckLake catalog.
@@ -1214,7 +1224,7 @@ Only SQL models are implemented. The Docker harness runs the two persistent
 compute classes; isolated per-session pods are implemented in the Kubernetes
 chart and exercised by the kind harness, and are refused with `501` wherever the
 pod grant is absent — which includes everywhere in Docker. There is no warm
-pool, durable asynchronous result storage, hostile-tenant isolation, production secret
+pool, hostile-tenant isolation, production secret
 management, or automatic write retry.
 The usage ledger meters compute only, against a configurable rate card whose
 default is a placeholder, and nothing

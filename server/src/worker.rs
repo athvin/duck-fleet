@@ -1,8 +1,8 @@
 use crate::{
-    ApiError, Envelope, Operation, Output, Reply, authz,
+    ApiError, Envelope, Operation, Output, Reply, artifacts, authz,
     compute::{Mode, Placement, Resources, WorkerSessionRequest},
     credentials::{self, Identity},
-    failure, pricing, query, queue, queue_service, requests,
+    engine_stream, failure, job_artifacts, jobs, pricing, query, queue, queue_service, requests,
     secrets::{Redactor, Startup},
 };
 use anyhow::{Context, Result};
@@ -88,6 +88,7 @@ fn execution_failure(error: Option<&str>, reason: Option<&str>) -> Option<failur
 struct Session {
     conn: Connection,
     profile: crate::profiling::Profile,
+    job_binding: Option<jobs::BindingToken>,
 }
 
 struct Completion<'a> {
@@ -100,6 +101,7 @@ struct Completion<'a> {
     error: Option<&'a str>,
     capture: Option<&'a crate::profiling::Capture>,
     outcome: requests::Outcome,
+    job_result: Option<jobs::ResultDisposition>,
 }
 
 fn operator_identity(identity: &Identity) -> bool {
@@ -148,6 +150,7 @@ pub(crate) struct Worker {
     active: ActiveSlot,
     runtime: tokio::runtime::Handle,
     profiling_enabled: bool,
+    result_store: Option<artifacts::Store>,
     redactor: Redactor,
     status: crate::worker_status::Status,
     queue: Arc<queue_service::Service>,
@@ -725,6 +728,9 @@ impl Worker {
                 _ => anyhow::bail!("DUCKFLEET_PROFILING must be true or false"),
             },
             redactor,
+            result_store: artifacts::StoreConfig::from_env()?
+                .map(artifacts::StoreConfig::build)
+                .transpose()?,
             status,
             queue,
             ownership,
@@ -772,6 +778,11 @@ impl Worker {
                 match queue::select_next(&mut self.ledger.client, &self.queue.epoch) {
                     Ok(Some(selected)) => {
                         let request_id = selected.payload.request.request_id;
+                        let job_session = selected
+                            .payload
+                            .job
+                            .as_ref()
+                            .map(|_| selected.payload.session_id);
                         let canceled = self.queue.cancellation(request_id);
                         let reserved =
                             queue::reserve(&mut self.ledger.client, selected, &self.rate);
@@ -795,6 +806,26 @@ impl Worker {
                             Err(error) => self.abort_admission(request_id, error),
                         };
                         self.queue.complete(request_id, result);
+                        if let Some(session_id) = job_session
+                            && !self.queue.is_stopped()
+                        {
+                            // Private job sessions never survive terminalization.
+                            // Drop the real connection before durable close ACK,
+                            // independently of dispatcher/network availability.
+                            self.sessions.remove(&session_id);
+                            if queue::session_closed(
+                                &mut self.ledger.client,
+                                session_id,
+                                &self.queue.epoch,
+                            )
+                            .is_err()
+                            {
+                                self.queue.stop();
+                            } else {
+                                self.queue.session_closed(session_id);
+                            }
+                            self.status.set_sessions(self.sessions.len());
+                        }
                         self.refresh_counts();
                         continue;
                     }
@@ -864,13 +895,14 @@ impl Worker {
                 .unserviceable("worker ownership", "exclusive ownership connection lost"));
         }
         match op {
+            Operation::OpenJob(token) => self.open_job(token),
             Operation::Open(request, identity, protocol, open_span_id, operation) => {
                 if self.queue.draining.load(Ordering::Acquire) {
                     return Err(ApiError::new(failure::DRAINING, "worker draining"));
                 }
                 // The gateway already routed by mode and size; this is the worker
                 // refusing to serve a placement that is not its own.
-                let (mut request, placement, revision) = match request {
+                let (mut request, placement, revision) = match *request {
                     WorkerSessionRequest::Direct(request) => {
                         request.validate()?;
                         let placement = request
@@ -978,13 +1010,111 @@ impl Worker {
                     }
                     return Err(error);
                 }
-                self.sessions.insert(id, Session { conn, profile });
+                self.sessions.insert(
+                    id,
+                    Session {
+                        conn,
+                        profile,
+                        job_binding: None,
+                    },
+                );
                 self.queue.register_local(id);
                 self.served += 1;
                 Ok(Output::Json(json!({"session_id":id, "database":"lake",
                         "duckdb_version": self.placement["duckdb_version"], "placement":diagnostics})))
             }
         }
+    }
+
+    fn open_job(&mut self, token: jobs::BindingToken) -> Reply {
+        if self.result_store.is_none() {
+            return Err(ApiError::new(
+                failure::JOB_UNAVAILABLE,
+                "worker result storage is not configured",
+            ));
+        }
+        let claim = jobs::binding_for_worker(&mut self.ledger.client, &token)?;
+        if let Some(session) = self.sessions.get(&token.session_id) {
+            if session.job_binding.as_ref() != Some(&token) {
+                return Err(ApiError::new(
+                    failure::JOB_UNAVAILABLE,
+                    "job session binding differs",
+                ));
+            }
+            return Ok(Output::Json(
+                json!({"session_id":token.session_id,"database":"lake",
+                "placement":self.placement,"binding_disposition":"existing"}),
+            ));
+        }
+        // A durable registration never authorizes reconstructing its connection.
+        // It may have executed SQL before the dispatcher lost its HTTP response.
+        if claim.bound {
+            return Err(ApiError::new(
+                failure::SESSION_LOST,
+                "bound job connection is no longer present",
+            ));
+        }
+        if self.queue.draining.load(Ordering::Acquire) {
+            return Err(ApiError::new(failure::DRAINING, "worker draining"));
+        }
+        claim
+            .placement
+            .validate_worker(self.pool.as_deref(), self.resources)?;
+        if (claim.placement.mode == Mode::Isolated) != self.dedicated {
+            return Err(crate::compute::unavailable());
+        }
+        if self.sessions.len() >= self.max_sessions || (self.dedicated && self.served > 0) {
+            return Err(ApiError::new(
+                failure::CAPACITY,
+                "job session capacity reached",
+            ));
+        }
+        let conn = self.root.try_clone().map_err(|_| ApiError::internal())?;
+        conn.execute_batch("USE lake")
+            .map_err(|_| ApiError::internal())?;
+        let profile =
+            crate::profiling::Profile::new(token.session_id, self.profiling_enabled, &conn)
+                .map_err(|_| ApiError::internal())?;
+        let dimensions = crate::metadata::capture_session(
+            &crate::compute::ComputeRequest::default(),
+            &claim.placement,
+            self.placement
+                .get("duckdb_version")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            None,
+        )?;
+        if let Err(error) = jobs::bind_session(
+            &mut self.ledger.client,
+            &token,
+            &self.queue.epoch,
+            &claim.placement,
+            &dimensions,
+        ) {
+            if !matches!(
+                error.0.kind,
+                "unauthorized" | "forbidden" | "queue_capacity" | "jobs_unavailable"
+            ) {
+                // A lost COMMIT acknowledgement may have made the registration
+                // durable. Refuse all further SQL until restart recovery.
+                self.queue.stop();
+            }
+            return Err(error);
+        }
+        let id = token.session_id;
+        self.sessions.insert(
+            id,
+            Session {
+                conn,
+                profile,
+                job_binding: Some(token),
+            },
+        );
+        self.queue.register_local(id);
+        self.queue.wake.notify_one();
+        self.served += 1;
+        Ok(Output::Json(json!({"session_id":id,"database":"lake",
+            "placement":self.placement,"binding_disposition":"bound"})))
     }
 
     fn finish_execution(
@@ -1000,24 +1130,26 @@ impl Worker {
                 .map(|c| serde_json::from_str::<Value>(&c.metrics))
                 .transpose()?
                 .unwrap_or_else(|| json!({}));
-            let changed = queue::finish_in(
-                &mut transaction,
-                &queue::Finish {
-                    request_id,
-                    epoch: &self.queue.epoch,
-                    source: "worker",
-                    status: completion.status,
-                    failure: completion.failure,
-                    outcome: completion.outcome,
-                    elapsed_ms: completion.elapsed_ms,
-                    result_rows: completion.result_rows,
-                    error: completion.error,
-                    engine_started_at: completion.engine_started_at,
-                    profile: completion.capture.and_then(|c| c.profile.as_deref()),
-                    profile_status: completion.capture.map_or("not_recorded", |c| c.status),
-                    metrics: &metrics,
-                },
-            )?;
+            let finish = queue::Finish {
+                request_id,
+                epoch: &self.queue.epoch,
+                source: "worker",
+                status: completion.status,
+                failure: completion.failure,
+                outcome: completion.outcome,
+                elapsed_ms: completion.elapsed_ms,
+                result_rows: completion.result_rows,
+                error: completion.error,
+                engine_started_at: completion.engine_started_at,
+                profile: completion.capture.and_then(|c| c.profile.as_deref()),
+                profile_status: completion.capture.map_or("not_recorded", |c| c.status),
+                metrics: &metrics,
+            };
+            let changed = if let Some(result) = completion.job_result {
+                jobs::finish_in(&mut transaction, &finish, result)?
+            } else {
+                queue::finish_in(&mut transaction, &finish)?
+            };
             anyhow::ensure!(
                 changed || completion.outcome == requests::Outcome::NotExecuted,
                 "engine terminal outcome was not persisted; retained state changed unexpectedly"
@@ -1072,9 +1204,223 @@ impl Worker {
                 error: Some(&refusal.1),
                 capture: None,
                 outcome: requests::Outcome::NotExecuted,
+                job_result: None,
             },
         )?;
         Err(refusal)
+    }
+
+    fn execute_job_grant(
+        &mut self,
+        grant: queue::ExecutionGrant,
+        granted_at: Instant,
+        cancellation: Arc<AtomicBool>,
+    ) -> Reply {
+        let queue_deadline = granted_at + grant.remaining_queue;
+        let admission = grant.prepared.admission;
+        let payload = grant.prepared.selected.payload;
+        let execution = payload.job.expect("job execution branch");
+        let id = payload.session_id;
+        let request = payload.request;
+        let query_id = request.request_id;
+        let Some(store) = self.result_store.clone() else {
+            return self.abort_admission(
+                query_id,
+                ApiError::new(failure::JOB_UNAVAILABLE, "result storage unavailable"),
+            );
+        };
+        let parameters = match request
+            .parameters
+            .iter()
+            .map(parameter)
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(parameters) => parameters,
+            Err(error) => return self.abort_admission(query_id, ApiError::bad(error.to_string())),
+        };
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return self.abort_admission(
+                query_id,
+                ApiError::new(failure::SESSION_LOST, "private job session lost"),
+            );
+        };
+        if session.job_binding.as_ref().is_none_or(|binding| {
+            binding.request_id != query_id
+                || binding.generation != execution.token.binding_generation
+        }) {
+            return self.abort_admission(
+                query_id,
+                ApiError::new(failure::JOB_UNAVAILABLE, "job binding mismatch"),
+            );
+        }
+        let cleared = session.profile.clear();
+        let refusal = {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            let failure = if self.ownership.is_closed() {
+                Some(failure::INTERRUPTED)
+            } else if self.queue.draining.load(Ordering::Acquire) {
+                Some(failure::QUEUE_DRAINED)
+            } else if self.queue.session_closing(id) {
+                Some(failure::SESSION_LOST)
+            } else if cancellation.load(Ordering::Acquire) {
+                Some(failure::CANCELED)
+            } else if Instant::now() >= queue_deadline {
+                Some(failure::QUEUE_TIMEOUT)
+            } else {
+                None
+            };
+            if failure.is_none() {
+                *active = Some(Active {
+                    query: query_id,
+                    session: id,
+                    handle: session.conn.interrupt_handle(),
+                    reason: None,
+                });
+            }
+            failure
+        };
+        if let Some(failure) = refusal {
+            return self.abort_admission(
+                query_id,
+                ApiError::new(failure, "job refused before engine entry"),
+            );
+        }
+        let started = Instant::now();
+        let started_at = SystemTime::now();
+        let until = started + Duration::from_secs(admission.deadline_seconds);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let monitor = {
+            let stopped = stopped.clone();
+            let active = self.active.clone();
+            let ownership_lost = self.ledger.ownership_lost.clone();
+            self.runtime.spawn(async move {
+                loop {
+                    let reason = if ownership_lost.load(Ordering::Acquire) {
+                        Some("ownership_lost")
+                    } else if cancellation.load(Ordering::Acquire) {
+                        Some("canceled")
+                    } else if Instant::now() >= until {
+                        Some(if admission.limited_by_budget {
+                            "budget_exceeded"
+                        } else {
+                            "timed_out"
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reason {
+                        stopped.store(true, Ordering::Release);
+                        interrupt(&active, None, Some(query_id), reason);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        };
+        let (result, completion, mut reason, rows) = {
+            let mut run = JobRun {
+                client: &mut self.ledger.client,
+                runtime: &self.runtime,
+                store: &store,
+                execution: &execution,
+                active: &self.active,
+                stopped: &stopped,
+                ownership_lost: &self.ledger.ownership_lost,
+                started,
+                deadline: until,
+                queue_deadline,
+                completion: engine_stream::EngineCompletion::Pending,
+                reason: None,
+                rows: 0,
+                chunks: 0,
+                bytes: 0,
+            };
+            let result = run.execute(&session.conn, &request.sql, parameters);
+            let completion = run.completion;
+            let reason = run.detach();
+            let rows = run.rows;
+            (result, completion, reason, rows)
+        };
+        monitor.abort();
+        if self.ownership.is_closed() && completion == engine_stream::EngineCompletion::Pending {
+            reason = Some("ownership_lost");
+        }
+        let elapsed = elapsed_ms(started);
+        let capture = session.profile.capture(cleared);
+        session.profile.clear();
+        if let Err(JobError::Metadata(cause)) = &result {
+            // A metadata COMMIT may have succeeded without its acknowledgement.
+            // Stop this epoch; recovery reads the milestone, never reruns SQL.
+            self.queue.stop();
+            return Err(self.ledger.unserviceable(
+                "recording job milestone or artifact journal",
+                &format!("{cause:#}"),
+            ));
+        }
+        let mut error = result
+            .as_ref()
+            .err()
+            .map(|error| crate::secrets::scrub_passwords(&self.redactor.scrub(&error.to_string())));
+        let not_executed = result.as_ref().err().is_some_and(JobError::not_executed);
+        let known = completion == engine_stream::EngineCompletion::Succeeded;
+        let failure = if known {
+            None
+        } else if let Some(JobError::Refused(error)) = result.as_ref().err() {
+            Some(error.0)
+        } else if not_executed {
+            Some(failure::JOB_PREPARE_REFUSED)
+        } else if reason.is_some() {
+            execution_failure(error.as_deref(), reason)
+        } else if matches!(result, Err(JobError::Engine(_))) {
+            Some(failure::SQL_ERROR)
+        } else {
+            Some(failure::INTERRUPTED)
+        };
+        let outcome = if not_executed {
+            requests::Outcome::NotExecuted
+        } else if known
+            || (completion == engine_stream::EngineCompletion::Failed && reason.is_none())
+        {
+            requests::Outcome::StatementResult
+        } else {
+            requests::Outcome::Unknown
+        };
+        let status = if known {
+            "succeeded"
+        } else {
+            failure.and_then(|f| f.status).unwrap_or("failed")
+        };
+        let artifact_failure = result.as_ref().err().map(JobError::result_kind);
+        let result = match result {
+            Ok(manifest) => jobs::ResultDisposition::Ready(manifest),
+            Err(_) => {
+                jobs::ResultDisposition::Failed(artifact_failure.unwrap_or("result_unavailable"))
+            }
+        };
+        if known {
+            error = None;
+        }
+        self.finish_execution(
+            query_id,
+            Completion {
+                status,
+                failure,
+                credential_denial: (failure == Some(failure::UNAUTHORIZED))
+                    .then_some(authz::Action::QueryExecute),
+                elapsed_ms: if not_executed { 0 } else { elapsed },
+                engine_started_at: (!not_executed).then_some(started_at),
+                result_rows: i64::try_from(rows).ok(),
+                error: error.as_deref(),
+                capture: Some(&capture),
+                outcome,
+                job_result: Some(result),
+            },
+        )?;
+        tracing::info!(%query_id, session_id=%id, status, elapsed_ms=elapsed,
+            result_failure=artifact_failure, "job finished");
+        // No payload is delivered to a waiting caller. The durable result route
+        // separately authorizes and reads only the verified published manifest.
+        Ok(Output::Json(json!({"request_id":query_id,"status":status})))
     }
 
     fn execute_grant(
@@ -1083,6 +1429,9 @@ impl Worker {
         grant_received: Instant,
         cancellation: Arc<AtomicBool>,
     ) -> Reply {
+        if grant.prepared.selected.payload.job.is_some() {
+            return self.execute_job_grant(grant, grant_received, cancellation);
+        }
         let deadline = grant_received + grant.remaining_queue;
         let admission = grant.prepared.admission;
         let payload = grant.prepared.selected.payload;
@@ -1241,6 +1590,7 @@ impl Worker {
                     error: error.as_deref(),
                     capture: Some(&capture),
                     outcome,
+                    job_result: None,
                 },
             )
             .is_err()
@@ -1275,6 +1625,276 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         self.queue.stop();
+    }
+}
+
+fn elapsed_ms(started: Instant) -> i64 {
+    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+#[derive(Debug)]
+enum JobError {
+    Engine(engine_stream::Error),
+    Artifact(artifacts::ArtifactError),
+    Expired,
+    Metadata(anyhow::Error),
+    Refused(ApiError),
+}
+impl JobError {
+    fn not_executed(&self) -> bool {
+        matches!(self, Self::Refused(_))
+            || matches!(self, Self::Engine(error) if error.not_executed())
+    }
+    fn result_kind(&self) -> &'static str {
+        match self {
+            Self::Artifact(error) => error.kind(),
+            Self::Expired => "result_expired",
+            Self::Engine(engine_stream::Error::Limit(_)) => "result_too_large",
+            Self::Engine(engine_stream::Error::Stream(error))
+                if error.kind == duckdb::StreamErrorKind::Conversion =>
+            {
+                "result_encoding_failed"
+            }
+            _ => "result_unavailable",
+        }
+    }
+}
+impl std::fmt::Display for JobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Engine(error) => error.fmt(f),
+            Self::Artifact(error) => error.fmt(f),
+            Self::Expired => f.write_str("job result expired before publication"),
+            // Metadata connection strings never enter user-visible diagnostics.
+            Self::Metadata(_) => {
+                f.write_str("job metadata unavailable; inspect durable state before retrying")
+            }
+            Self::Refused(error) => f.write_str(&error.1),
+        }
+    }
+}
+impl From<artifacts::ArtifactError> for JobError {
+    fn from(error: artifacts::ArtifactError) -> Self {
+        Self::Artifact(error)
+    }
+}
+impl From<anyhow::Error> for JobError {
+    fn from(error: anyhow::Error) -> Self {
+        if error.is::<job_artifacts::ArtifactExpired>() {
+            Self::Expired
+        } else {
+            Self::Metadata(error)
+        }
+    }
+}
+
+/// Engine and object-store work share a bounded occupied-time budget. SQL
+/// completion is a separate milestone, recorded before any later conversion.
+struct JobRun<'a> {
+    client: &'a mut Client,
+    runtime: &'a tokio::runtime::Handle,
+    store: &'a artifacts::Store,
+    execution: &'a jobs::Execution,
+    active: &'a ActiveSlot,
+    stopped: &'a AtomicBool,
+    ownership_lost: &'a AtomicBool,
+    started: Instant,
+    deadline: Instant,
+    queue_deadline: Instant,
+    completion: engine_stream::EngineCompletion,
+    reason: Option<&'static str>,
+    rows: u64,
+    chunks: u32,
+    bytes: u64,
+}
+impl JobRun<'_> {
+    fn detach(&mut self) -> Option<&'static str> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if active
+            .as_ref()
+            .is_some_and(|a| a.query == self.execution.token.request_id)
+        {
+            self.reason = active.take().and_then(|a| a.reason).or(self.reason);
+        }
+        self.reason
+    }
+    fn check(&self) -> Result<(), JobError> {
+        if self.ownership_lost.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+            return Err(artifacts::ArtifactError::Canceled.into());
+        }
+        if Instant::now() >= self.deadline {
+            return Err(artifacts::ArtifactError::TimedOut.into());
+        }
+        Ok(())
+    }
+    fn completed(&mut self, completion: engine_stream::EngineCompletion) -> Result<(), JobError> {
+        if completion == engine_stream::EngineCompletion::Pending || completion == self.completion {
+            return Ok(());
+        }
+        self.completion = completion;
+        self.detach();
+        // Native materialization or checked EOF proves SQL success even if a
+        // cancellation raced its acknowledgement. Later failure is delivery only.
+        if completion == engine_stream::EngineCompletion::Succeeded {
+            jobs::mark_sql_complete(
+                self.client,
+                &self.execution.token,
+                jobs::SqlCompletion::Succeeded,
+                elapsed_ms(self.started),
+            )?;
+        } else if self.reason.is_none() && !self.ownership_lost.load(Ordering::Acquire) {
+            jobs::mark_sql_complete(
+                self.client,
+                &self.execution.token,
+                jobs::SqlCompletion::Failed,
+                elapsed_ms(self.started),
+            )?;
+        }
+        Ok(())
+    }
+    fn execute(
+        &mut self,
+        conn: &Connection,
+        sql: &str,
+        parameters: Vec<SqlValue>,
+    ) -> Result<job_artifacts::VerifiedManifest, JobError> {
+        let mut prepared = engine_stream::prepare(conn, sql).map_err(JobError::Engine)?;
+        // Preparing can take time. Recheck the retained authority after it and
+        // after any budget wait, immediately before the single native execution.
+        jobs::authorize_execution(self.client, self.execution).map_err(JobError::Refused)?;
+        if Instant::now() >= self.queue_deadline {
+            return Err(JobError::Refused(ApiError::new(
+                failure::QUEUE_TIMEOUT,
+                "job queue deadline expired before SQL",
+            )));
+        }
+        if let Err(error) = self.check() {
+            return Err(JobError::Refused(ApiError::new(
+                failure::CANCELED,
+                error.to_string(),
+            )));
+        }
+        let mut stream = match prepared.start(
+            params_from_iter(parameters),
+            engine_stream::Limits {
+                max_rows: self.execution.policy.limits.result_rows,
+                max_batch_bytes: artifacts::MAX_BATCH_BYTES,
+            },
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                if !error.not_executed() {
+                    self.completed(engine_stream::EngineCompletion::Failed)?;
+                }
+                return Err(JobError::Engine(error));
+            }
+        };
+        self.completed(stream.completion())?;
+        let schema = stream.schema().map_err(JobError::Engine)?;
+        let mut encoder = artifacts::ChunkEncoder::new(schema.clone())?;
+        loop {
+            self.check()?;
+            let fetched = stream.next_batch();
+            self.completed(stream.completion())?;
+            let Some(batch) = fetched.map_err(JobError::Engine)? else {
+                break;
+            };
+            self.rows = self
+                .rows
+                .checked_add(batch.num_rows() as u64)
+                .ok_or(artifacts::ArtifactError::TooLarge)?;
+            if let Some(chunk) = encoder.push(batch)? {
+                self.upload(chunk)?;
+            }
+        }
+        if let Some(chunk) = encoder.finish()? {
+            self.upload(chunk)?;
+        }
+        self.check()?;
+        let parts = job_artifacts::manifest_parts(self.client, &self.execution.token)?;
+        let manifest = artifacts::Manifest {
+            version: 1,
+            request_id: parts.request_id,
+            generation: parts.generation,
+            format: "arrow_ipc_chunks".into(),
+            complete: true,
+            schema: schema.as_ref().clone(),
+            rows: parts.rows,
+            bytes: parts.bytes,
+            expires_at: chrono::DateTime::<chrono::Utc>::from(parts.expires_at).to_rfc3339(),
+            chunks: parts
+                .chunks
+                .into_iter()
+                .map(|chunk| artifacts::ManifestChunk {
+                    chunk_id: chunk.sequence,
+                    rows: chunk.rows,
+                    bytes: chunk.bytes,
+                    sha256: chunk.sha256,
+                })
+                .collect(),
+        }
+        .encode()?;
+        let hash = artifacts::sha256(&manifest);
+        let intent = job_artifacts::intend_manifest(
+            self.client,
+            &self.execution.token,
+            manifest.len() as u64,
+            &hash,
+        )?;
+        if intent.bytes != manifest.len() as u64 || intent.sha256 != hash {
+            return Err(artifacts::ArtifactError::Corrupt.into());
+        }
+        self.runtime.block_on(self.store.put(
+            &intent.relative_key,
+            manifest,
+            &hash,
+            self.deadline.into(),
+            self.stopped,
+        ))?;
+        self.check()?;
+        job_artifacts::ack_upload(self.client, &self.execution.token, &intent)?;
+        Ok(job_artifacts::verified_manifest(
+            self.client,
+            &self.execution.token,
+            &intent,
+        )?)
+    }
+    fn upload(&mut self, chunk: artifacts::EncodedChunk) -> Result<(), JobError> {
+        self.check()?;
+        let total = self
+            .bytes
+            .checked_add(chunk.bytes.len() as u64)
+            .ok_or(artifacts::ArtifactError::TooLarge)?;
+        if self.chunks as usize >= artifacts::MAX_CHUNKS
+            || total > self.execution.policy.limits.result_bytes
+        {
+            return Err(artifacts::ArtifactError::TooLarge.into());
+        }
+        let intent = job_artifacts::intend_chunk(
+            self.client,
+            &self.execution.token,
+            &job_artifacts::BlobDescriptor {
+                sequence: self.chunks,
+                rows: chunk.rows,
+                bytes: chunk.bytes.len() as u64,
+                sha256: chunk.sha256.clone(),
+            },
+        )?;
+        if intent.bytes != chunk.bytes.len() as u64 || intent.sha256 != chunk.sha256 {
+            return Err(artifacts::ArtifactError::Corrupt.into());
+        }
+        self.runtime.block_on(self.store.put(
+            &intent.relative_key,
+            chunk.bytes,
+            &chunk.sha256,
+            self.deadline.into(),
+            self.stopped,
+        ))?;
+        self.check()?;
+        job_artifacts::ack_upload(self.client, &self.execution.token, &intent)?;
+        self.chunks += 1;
+        self.bytes = total;
+        Ok(())
     }
 }
 

@@ -727,7 +727,7 @@ if 'pg_restore' in sys.argv:
     def test_manual_kube_migration_clones_configuration_with_a_new_job_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            source = {'metadata': {'annotations': {'duckfleet.io/platform-schema':'4'}},
+            source = {'metadata': {'annotations': {'duckfleet.io/platform-schema':'5'}},
                       'spec': {'selector': {'matchLabels': {'controller-uid': 'old'}},
                                'manualSelector': False, 'activeDeadlineSeconds': 390,
                                'backoffLimit': 0,
@@ -894,6 +894,51 @@ class QueueDeploymentTests(unittest.TestCase):
                          [['docker','stop','-t','90','gateway'],['docker','stop','-t','90','old-optional-worker']])
         with self.assertRaisesRegex(ValueError,'stop-compute'):
             lifecycle.check_compose_state(containers)
+
+
+class JobDeploymentTests(unittest.TestCase):
+    def test_named_job_envelopes_survive_render_without_overriding_other_pools(self):
+        ceiling = dict(runtime_seconds=900, result_bytes=1073741824,
+                       result_rows=10000000, retention_seconds=86400)
+        pool_limit = dict(ceiling, runtime_seconds=300)
+        pools = {name:dict(value) for name,value in NamedPoolPackagingTests.POOLS.items()}
+        pools['interactive']['jobLimits'] = pool_limit
+        objects = NamedPoolPackagingTests().render(pools,
+            '--set-json', 'jobPolicy='+json.dumps({'ceilings':ceiling}),
+            '--set', 'results.enabled=true', '--set', 'isolatedCompute.enabled=false')
+        registry = json.loads(objects['ConfigMap', 'duckfleet-pools']['data']['pools.json'])
+        self.assertEqual(registry['pools']['interactive']['job_limits'], pool_limit)
+        self.assertNotIn('job_limits', registry['pools']['small'])
+        gateway = objects['Deployment', 'server']['spec']['template']['spec']
+        self.assertEqual(gateway['serviceAccountName'], 'duckfleet-results')
+        env = {item['name']:item.get('value') for item in gateway['containers'][0]['env']}
+        self.assertEqual(json.loads(env['DUCKFLEET_JOB_POLICY_JSON']), {'ceilings':ceiling})
+        self.assertEqual(env['DUCKFLEET_RESULT_AUTH_MODE'], 'pod_identity')
+        self.assertNotIn('S3_DATA_PATH', env)
+        for invalid in [dict(pool_limit,runtime_seconds=901), {'runtime_seconds':60}]:
+            pools['interactive']['jobLimits'] = invalid
+            with self.assertRaises(subprocess.CalledProcessError):
+                NamedPoolPackagingTests().render(pools,
+                    '--set-json', 'jobPolicy='+json.dumps({'ceilings':ceiling}))
+
+    def test_local_results_keep_distinct_prefix_and_explicit_static_identity(self):
+        module = load('job_localizer', 'scripts/kind/localize.py')
+        localizer = module.Localizer()
+        container = {'env':[
+            {'name':'DUCKFLEET_RESULT_AUTH_MODE','value':'pod_identity'},
+            {'name':'DUCKFLEET_RESULT_ALLOW_HTTP','value':'false'},
+            {'name':'DUCKFLEET_RESULT_DATA_PATH','value':'s3://aws-bucket/results/'},
+            {'name':'DUCKFLEET_RESULT_LAKE_DATA_PATH','value':'s3://aws-bucket/lake/'},
+        ]}
+        localizer.container(container)
+        env = {item['name']:item['value'] for item in container['env']}
+        self.assertEqual(env['DUCKFLEET_RESULT_AUTH_MODE'], 'static')
+        self.assertEqual(env['DUCKFLEET_RESULT_DATA_PATH'], 's3://duckfleet/results/')
+        self.assertEqual(env['DUCKFLEET_RESULT_LAKE_DATA_PATH'], 's3://duckfleet/lake/')
+        self.assertEqual(env['DUCKFLEET_RESULT_ENDPOINT'], 'http://object-store:9000')
+        self.assertEqual(env['DUCKFLEET_RESULT_ALLOW_HTTP'], 'true')
+        self.assertTrue(env['DUCKFLEET_RESULT_ACCESS_KEY'])
+        self.assertTrue(env['DUCKFLEET_RESULT_SECRET_KEY'])
 
 
 class ImagePublishingTests(unittest.TestCase):

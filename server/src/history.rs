@@ -127,11 +127,11 @@ fn record(row: &Row, plan: &RelationPlan) -> Value {
     let owner = row.get::<_, Option<&str>>(19);
     let placement = json_column(10);
     let mut value = json!({
-        "query_id":row.get::<_,String>(0),"session_id":row.get::<_,String>(1),"sql":row.get::<_,Option<String>>(2),
+        "query_id":row.get::<_,String>(0),"session_id":row.get::<_,Option<String>>(1),"sql":row.get::<_,Option<String>>(2),
         "context":json_column(3),"status":row.get::<_,String>(4),"accepted_at":row.get::<_,String>(5),
         "finished_at":row.get::<_,Option<String>>(6),"elapsed_ms":row.get::<_,Option<i64>>(7),"result_rows":row.get::<_,Option<i64>>(8),
         "error":row.get::<_,Option<String>>(9),"placement":if plan.sql_visible(owner){placement}else{metadata::safe_placement(&placement)},
-        "history_id":row.get::<_,i64>(11),"worker_id":row.get::<_,String>(12),"profile_status":row.get::<_,String>(13),
+        "history_id":row.get::<_,i64>(11),"worker_id":row.get::<_,Option<String>>(12),"profile_status":row.get::<_,String>(13),
         "metrics":metadata::numeric_metrics(&json_column(14)),"failure_kind":row.get::<_,Option<String>>(15),"retry_safe":row.get::<_,Option<bool>>(16),
         "principal":row.get::<_,String>(17)
     });

@@ -90,6 +90,24 @@ helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$valu
   --set 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32' > "$isolated"
 python3 scripts/check-chart.py "$isolated" > /dev/null
 echo 'PASS: isolated compute renders its pod template and API egress, and no RBAC'
+# Result access adds a separate prefix-only identity; no Kubernetes token is
+# needed for a gateway that retrieves results without provisioning isolated pods.
+results="$validation_dir/results.yaml"
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set results.enabled=true > "$results"
+python3 scripts/check-chart.py "$results" > /dev/null
+for prefix in lake lake/nested; do
+  if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+       --set results.enabled=true --set "results.prefix=$prefix" > /dev/null 2>&1; then
+    echo 'Result artifacts must never share the DuckLake managed prefix' >&2
+    exit 1
+  fi
+done
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set results.enabled=true --set isolatedCompute.enabled=true \
+  --set 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32' > "$results"
+python3 scripts/check-chart.py "$results" > /dev/null
+echo 'PASS: result-only gateway identity, isolated coexistence, and prefix separation'
 # The grant and the quota live outside the release because the deploy identity cannot
 # create either. Render the boundary for the same namespace the chart is restricted to
 # and prove the two do not overlap: anything in both would be applied twice, by two
@@ -292,7 +310,7 @@ for expect in \
   'image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod:--no-hooks --set isolatedCompute.enabled=true --set isolatedCompute.apiServerCidrs[0]=10.96.0.1/32'; do
   # shellcheck disable=SC2086
   helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
-    ${expect#*:} | python3 scripts/kind/localize.py --expect "${expect%%:*}" > /dev/null
+    --set results.enabled=true ${expect#*:} | python3 scripts/kind/localize.py --expect "${expect%%:*}" > /dev/null
 done
 echo 'PASS: the local Kubernetes transform still matches the rendered chart'
 

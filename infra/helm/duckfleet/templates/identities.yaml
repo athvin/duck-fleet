@@ -21,8 +21,8 @@ metadata:
 automountServiceAccountToken: false
 ---
 # The one identity here that holds a token, and the only one the gateway uses when
-# isolated compute is wired up; otherwise it runs as duckfleet-no-aws above and mounts
-# nothing. Created by the chart because the deploy identity may create
+# isolated compute is wired up; otherwise it uses duckfleet-results when enabled
+# or duckfleet-no-aws, both without a Kubernetes token. Created by the chart because the deploy identity may create
 # ServiceAccounts — what it may not create is the Role that makes this one useful, so
 # that lives in infra/kubernetes/boundary and an operator applies it.
 #
@@ -35,3 +35,12 @@ kind: ServiceAccount
 metadata:
   name: duckfleet-gateway
 automountServiceAccountToken: true
+
+---
+# Result-prefix AWS credentials without Kubernetes API capabilities. A gateway
+# using isolated compute instead keeps duckfleet-gateway and its explicit RBAC.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckfleet-results
+automountServiceAccountToken: false

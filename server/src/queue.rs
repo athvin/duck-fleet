@@ -54,6 +54,8 @@ impl Actor {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Payload {
+    #[serde(default)]
+    pub job: Option<crate::jobs::Execution>,
     pub session_id: Uuid,
     pub epoch: WorkerEpoch,
     pub principal: String,
@@ -252,13 +254,27 @@ fn lock_scope(tx: &mut Transaction<'_>, kind: &str, scope: &str, principal: &str
     Ok(())
 }
 fn lock_scopes(tx: &mut Transaction<'_>, worker: &str, scope: &str, principal: &str) -> Result<()> {
-    for (kind, key, owner) in [
-        ("pool", scope, ""),
-        ("principal", scope, principal),
-        ("worker", worker, ""),
-    ] {
-        lock_scope(tx, kind, key, owner)?;
+    lock_scopes_in(tx, Some(worker), scope, principal)
+}
+pub(crate) fn lock_scopes_in(
+    tx: &mut Transaction<'_>,
+    worker: Option<&str>,
+    scope: &str,
+    principal: &str,
+) -> Result<()> {
+    lock_scope(tx, "pool", scope, "")?;
+    lock_scope(tx, "principal", scope, principal)?;
+    if let Some(worker) = worker {
+        lock_scope(tx, "worker", worker, "")?;
     }
+    Ok(())
+}
+/// Job transition fencing precedes session/control/request locks everywhere.
+pub(crate) fn lock_job_in(tx: &mut Transaction<'_>, id: &str) -> Result<()> {
+    tx.query_opt(
+        "SELECT request_id FROM query_jobs WHERE request_id=$1 FOR UPDATE",
+        &[&id],
+    )?;
     Ok(())
 }
 pub(crate) fn register_worker(
@@ -371,6 +387,7 @@ pub(crate) fn session_closed(client: &mut Client, id: Uuid, epoch: &WorkerEpoch)
         "UPDATE session_events SET closed_at=clock_timestamp() WHERE session_id=$1",
         &[&id.to_string()],
     )?;
+    tx.execute("UPDATE job_bindings SET state='closed',closed_at=COALESCE(closed_at,clock_timestamp()) WHERE session_id=$1 AND worker_id=$2 AND boot_id=$3",&[&id.to_string(),&epoch.worker_id,&epoch.boot_id.to_string()])?;
     tx.commit()?;
     Ok(())
 }
@@ -537,6 +554,7 @@ pub(crate) fn submit(
         .checked_add(1)
         .ok_or_else(ApiError::internal)?;
     let p = Payload {
+        job: None,
         session_id: session,
         epoch: epoch.clone(),
         principal: principal.clone(),
@@ -683,6 +701,7 @@ pub(crate) fn select_next(
         let principal: String = candidate.get(1);
         let scope: String = candidate.get(2);
         api(lock_scopes(&mut tx, &epoch.worker_id, &scope, &principal))?;
+        api(lock_job_in(&mut tx, &id))?;
         let Some(p) = api(tx.query_opt(
             "SELECT p.payload FROM query_payloads p JOIN requests r USING(request_id)
             WHERE r.request_id=$1 AND r.state='queued'",
@@ -691,7 +710,7 @@ pub(crate) fn select_next(
         else {
             continue;
         };
-        let p = api(payload(&p))?;
+        let mut p = api(payload(&p))?;
         let session = api(tx.query_one(
             "SELECT closing,outstanding FROM queue_sessions WHERE session_id=$1 FOR UPDATE NOWAIT",
             &[&p.session_id.to_string()],
@@ -753,6 +772,9 @@ pub(crate) fn select_next(
         ))?;
         let turn:i64=api(tx.query_one("UPDATE queue_workers SET next_turn=next_turn+1 WHERE worker_id=$1 AND boot_id=$2 RETURNING next_turn",&[&epoch.worker_id,&epoch.boot_id.to_string()]))?.get(0);
         api(tx.execute("UPDATE queue_fairness SET last_turn=$4 WHERE worker_id=$1 AND boot_id=$2 AND principal=$3",&[&epoch.worker_id,&epoch.boot_id.to_string(),&principal,&turn]))?;
+        if let Some(job) = p.job.as_mut() {
+            job.token.state_version = version + 1;
+        }
         api(tx.commit())?;
         return Ok(Some(Selected {
             payload: p,
@@ -843,6 +865,7 @@ pub(crate) fn grant(client: &mut Client, prepared: Prepared) -> Result<GrantResu
     let id = p.request.request_id.to_string();
     let mut tx = api(client.transaction())?;
     api(bounded(&mut tx))?;
+    api(lock_job_in(&mut tx, &id))?;
     let session = api(tx.query_one(
         "SELECT closing,boot_id,outstanding FROM queue_sessions WHERE session_id=$1 FOR UPDATE",
         &[&p.session_id.to_string()],
@@ -893,6 +916,23 @@ pub(crate) fn grant(client: &mut Client, prepared: Prepared) -> Result<GrantResu
                 )
             })
             .err();
+        if refusal.is_none()
+            && let Some(job) = &p.job
+        {
+            refusal = authz::resolve_in(&mut tx, &p.actor.identity())
+                .and_then(|access| {
+                    let placement = crate::jobs::placement_in(&mut tx, p.request.request_id)?;
+                    let policy = crate::jobs::pool_policy(&mut tx, &p.scope)?;
+                    access.require_job(
+                        p.owner_principal_id.as_deref(),
+                        &placement,
+                        &job.policy,
+                        crate::job_policy::JobLimits::HARD,
+                        &policy,
+                    )
+                })
+                .err();
+        }
         if let Some(error) = &refusal {
             if error.0 == failure::UNAUTHORIZED {
                 // Accepted work already has an immutable authenticated actor.
@@ -953,6 +993,7 @@ fn lock_attempt(
     id: Uuid,
 ) -> Result<Option<(String, Row)>> {
     let id = id.to_string();
+    lock_job_in(tx, &id)?;
     let Some(row) = tx.query_opt("SELECT session_id,state FROM requests WHERE request_id=$1 AND worker_id=$2 AND worker_boot_id=$3", &[&id,&epoch.worker_id,&epoch.boot_id.to_string()])? else {return Ok(None)};
     if row.get::<_, String>(1) == "terminal" {
         return Ok(None);
@@ -976,6 +1017,18 @@ fn lock_attempt(
 /// The caller bounds its transaction. Preserve that timeout so a maintenance
 /// pass can use less than the normal three-second metadata limit.
 pub(crate) fn finish_in(tx: &mut Transaction<'_>, finish: &Finish<'_>) -> Result<bool> {
+    if tx
+        .query_opt(
+            "SELECT request_id FROM query_jobs WHERE request_id=$1",
+            &[&finish.request_id.to_string()],
+        )?
+        .is_some()
+    {
+        return crate::jobs::finish_in(tx, finish, crate::jobs::ResultDisposition::None);
+    }
+    finish_common_in(tx, finish)
+}
+pub(crate) fn finish_common_in(tx: &mut Transaction<'_>, finish: &Finish<'_>) -> Result<bool> {
     let id = finish.request_id.to_string();
     let Some((session, row)) = lock_attempt(tx, finish.epoch, finish.request_id)? else {
         return Ok(false);
@@ -1350,6 +1403,21 @@ fn finalize_candidates(
         };
         let mut tx = client.transaction()?;
         bounded_for(&mut tx, remaining)?;
+        if tx
+            .query_opt(
+                "SELECT request_id FROM query_jobs WHERE request_id=$1",
+                &[&id],
+            )?
+            .is_some()
+            && tx
+                .query_opt(
+                    "SELECT request_id FROM query_jobs WHERE request_id=$1 FOR UPDATE SKIP LOCKED",
+                    &[&id],
+                )?
+                .is_none()
+        {
+            continue;
+        }
         // SKIP LOCKED never establishes completion; a busy preparation is retried
         // next pass. Acquiring the session first retains one global lock order.
         let Some(s)=tx.query_opt("SELECT s.closing FROM queue_sessions s JOIN requests r ON r.session_id=s.session_id WHERE r.request_id=$1 FOR UPDATE OF s SKIP LOCKED",&[&id])? else {continue};
@@ -1389,6 +1457,7 @@ pub(crate) fn poll_control(
     draining: bool,
     batch: usize,
 ) -> Result<ControlReport> {
+    crate::jobs::checkpoint_worker(client, epoch)?;
     finalize_candidates(client, Some(epoch), draining, batch, Duration::from_secs(3))?;
     let mut tx = client.transaction()?;
     bounded(&mut tx)?;
@@ -1470,6 +1539,11 @@ pub(crate) fn recover_worker(
                 "SELECT state,elapsed_ms FROM requests WHERE request_id=$1",
                 &[&id.to_string()],
             )?;
+            if crate::jobs::recover_queued_in(&mut tx, id, &old)? {
+                tx.commit()?;
+                recovered += 1;
+                continue;
+            }
             let unstarted = matches!(r.get::<_, &str>(0), "queued" | "preparing");
             let f = if unstarted {
                 failure::SESSION_LOST
@@ -1537,11 +1611,26 @@ pub(crate) fn recover_isolated(
     Ok(recovered + held)
 }
 pub(crate) fn expire_batch(client: &mut Client, batch: usize, budget: Duration) -> Result<u64> {
-    finalize_candidates(client, None, false, batch, budget)
+    let start = Instant::now();
+    let changed = finalize_candidates(client, None, false, batch, budget)?;
+    Ok(changed
+        + crate::jobs::expire_unbound(client, batch, budget.saturating_sub(start.elapsed()))?)
 }
 pub(crate) fn publish_policies(
     client: &mut Client,
     publication: &PolicyPublication,
+) -> Result<i64> {
+    let jobs = publication
+        .policies
+        .iter()
+        .map(|(scope, _)| (scope.clone(), crate::job_policy::JobLimits::HARD))
+        .collect::<Vec<_>>();
+    publish_policies_with_jobs(client, publication, &jobs)
+}
+pub(crate) fn publish_policies_with_jobs(
+    client: &mut Client,
+    publication: &PolicyPublication,
+    jobs: &[(String, crate::job_policy::JobLimits)],
 ) -> Result<i64> {
     let mut policies = publication.policies.clone();
     policies.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1559,6 +1648,16 @@ pub(crate) fn publish_policies(
         );
         limits.validate()?;
     }
+    anyhow::ensure!(
+        jobs.len() == policies.len()
+            && policies
+                .iter()
+                .all(|(scope, _)| jobs.iter().filter(|(s, _)| s == scope).count() == 1),
+        "job policies must cover every admission scope once"
+    );
+    for (_, limits) in jobs {
+        limits.validate()?;
+    }
     let mut tx = client.transaction()?;
     bounded(&mut tx)?;
     let generation:i64=tx.query_one("INSERT INTO admission_publication(singleton,publication_id,digest,generation) VALUES(true,$1,$2,1)
@@ -1570,6 +1669,15 @@ pub(crate) fn publish_policies(
             ON CONFLICT(scope) DO UPDATE SET max_queued=EXCLUDED.max_queued,max_running=EXCLUDED.max_running,
             principal_queued=EXCLUDED.principal_queued,principal_running=EXCLUDED.principal_running,generation=EXCLUDED.generation",
             &[&scope,&i64::from(limits.max_queued_queries),&i64::from(limits.max_running_queries),&i64::from(limits.max_queued_per_principal),&i64::from(limits.max_running_per_principal),&generation])?;
+        let limits = jobs
+            .iter()
+            .find(|(s, _)| s == &scope)
+            .expect("validated job policy")
+            .1;
+        tx.execute(
+            "UPDATE admission_policies SET job_limits=$2 WHERE scope=$1",
+            &[&scope, &serde_json::to_string(&limits)?],
+        )?;
     }
     tx.commit()?;
     Ok(generation)
