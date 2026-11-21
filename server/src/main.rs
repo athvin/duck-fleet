@@ -115,10 +115,10 @@ pub(crate) fn configured_limit(
 /// which is SIGINT, so on a pod deletion the graceful path never ran at all and the
 /// worker kept admitting new sessions until it was killed. SIGINT is still handled
 /// because that is what an operator running this locally sends.
-/// Bounded shutdown drain, inside the chart's 90-second termination grace.
-/// Explicit long statements may outlive this window and be interrupted by
-/// shutdown. Request identity, not a longer drain, resolves uncertain outcomes.
-const DRAIN: std::time::Duration = std::time::Duration::from_secs(75);
+/// Bounded shutdown drain covering the longest admitted statement plus cleanup,
+/// inside the chart's termination grace. Idle drains still finish after SETTLE.
+const DRAIN: std::time::Duration =
+    std::time::Duration::from_secs(crate::query::MAX_EXECUTION_TIMEOUT + 15);
 /// How long the engine must stay idle before the drain is considered finished.
 const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 

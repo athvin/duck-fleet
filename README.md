@@ -184,14 +184,13 @@ runs — and removing the `RoleBinding` is a supported way to turn the feature o
 `duck-fleet#39` tracks switching it on for the shared development namespace.
 
 A cold isolated open can take as long as `readySeconds` (420s on the AWS lane,
-to pay node scale-up), which is longer than a gateway's drain budget. A gateway
-rollout that lands during one therefore abandons the open — but retry-safe: no
-statement ran, and the client's bounded new-session wait rides through the
-replacement gap and reopens. The drain budget is deliberately **not** stretched
-to cover the full node-provisioning window; doing so would make every rollout
-block for minutes even with nothing in flight, on a single-replica deployment
-where a rollout is already a brief outage. A pod already serving statements
-drains normally within the grace period.
+to pay node scale-up). Provisioning and SQL execution have separate budgets.
+Rollout can still interrupt an open; clients distinguish a definite refusal
+before admission from an uncertain response and never replay SQL. Shutdown allows
+up to the longest admitted statement plus 15 seconds for cleanup (615 seconds),
+inside a 630-second container grace. Idle drains finish after two seconds rather
+than waiting for that maximum. External I/O and process loss can still prevent a
+clean completion; retained request identity is the recovery evidence.
 
 The default lifecycle builds the fixture on the persistent tier with hooks, tests,
 and docs, and rebuilds it idempotently. It verifies Docker's actual CPU/memory
@@ -708,8 +707,8 @@ to select a longer allowance. HTTP clients can explicitly set `timeout_seconds`
 up to 600; the gateway-to-worker wait covers the validated queue plus execution
 allowances and 15 seconds for delivery. The bundled CLI retains its 75-second
 transport wait and 30-second execution default. External clients requesting
-longer statements must also allow a suitably bounded HTTP wait. Shutdown still
-drains for at most 75 seconds, so a long statement can be interrupted by rollout. A timeout or disconnect does not cancel accepted work. On an uncertain
+longer statements must also allow a suitably bounded HTTP wait. Shutdown allows up to 615 seconds within a 630-second container grace,
+covering the maximum statement allowance and cleanup. Idle drains remain short. A timeout or disconnect does not cancel accepted work. On an uncertain
 response, inspect `request <id>` or call `cancel <id>`; the CLI retains this ID
 and reports `acceptance: unknown`. Results are not retained for later download.
 
