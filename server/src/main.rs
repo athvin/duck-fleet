@@ -19,6 +19,7 @@ mod requests;
 mod secrets;
 mod usage;
 mod worker;
+mod worker_ownership;
 mod worker_status;
 use compute::SessionRequest;
 

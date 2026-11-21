@@ -173,6 +173,9 @@ pub(crate) struct Worker {
     profiling_enabled: bool,
     redactor: Redactor,
     status: crate::worker_status::Status,
+    // Last field: engine sessions and their uncommitted transactions are dropped
+    // before another process can acquire this recovery identity.
+    ownership: crate::worker_ownership::Guard,
 }
 
 fn literal(value: &str) -> String {
@@ -619,6 +622,7 @@ impl Worker {
                 )
             },
         )?;
+        let ownership = crate::worker_ownership::Guard::acquire(&platform_dsn, &worker_id, wait)?;
         let mut transaction = ledger.transaction()?;
         transaction.batch_execute("SELECT pg_advisory_xact_lock(4283121);
             CREATE TABLE IF NOT EXISTS query_history (
@@ -697,6 +701,7 @@ impl Worker {
             },
             redactor,
             status,
+            ownership,
         })
     }
 
@@ -723,6 +728,9 @@ impl Worker {
                 Ok(None) => break,
                 Err(_) => {
                     self.housekeeping();
+                    if self.ownership.is_closed() {
+                        break;
+                    }
                     last_housekeeping = Instant::now();
                     continue;
                 }
@@ -746,6 +754,9 @@ impl Worker {
             self.status.set_sessions(self.sessions.len());
             drop(query_guard);
             let _ = reply.send(response);
+            if self.ownership.is_closed() {
+                break;
+            }
             if last_housekeeping.elapsed() >= HOUSEKEEPING_INTERVAL {
                 self.housekeeping();
                 last_housekeeping = Instant::now();
@@ -775,6 +786,14 @@ impl Worker {
     }
 
     fn housekeeping(&mut self) {
+        if !self.ownership.check() {
+            let _ = self
+                .ledger
+                .unserviceable("worker ownership", "exclusive ownership connection lost");
+            self.sessions.clear();
+            self.status.set_sessions(0);
+            return;
+        }
         // Dropping a session connection rolls back any uncommitted transaction.
         self.sessions
             .retain(|_, session| session.touched.elapsed() < SESSION_IDLE_TIMEOUT);
@@ -848,6 +867,11 @@ impl Worker {
     }
 
     fn handle(&mut self, op: Operation) -> Reply {
+        if !self.ownership.check() {
+            return Err(self
+                .ledger
+                .unserviceable("worker ownership", "exclusive ownership connection lost"));
+        }
         match op {
             Operation::Open(mut request, identity) => {
                 // The gateway already routed by mode and size; this is the worker
@@ -1103,6 +1127,13 @@ impl Worker {
         }
         // History, budget, and durable state changes can wait on database locks.
         // Check authority after all of them, directly before engine execution.
+        if !self.ownership.check() {
+            let refusal = self.ledger.unserviceable(
+                "worker ownership",
+                "exclusive ownership connection lost before execution",
+            );
+            return self.abort_admission(&admission, &req.context, refusal);
+        }
         if let Err(refusal) = self.validate_session_identity(id, &claimed) {
             return self.abort_admission(&admission, &req.context, refusal);
         }

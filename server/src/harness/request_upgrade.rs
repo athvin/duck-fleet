@@ -27,6 +27,7 @@ pub(super) async fn checks(_ctx: &Ctx) -> Result<()> {
         config.options(&format!(
             "-c search_path={schema} -c statement_timeout=10000"
         ));
+        ownership_checks(&config, &schema)?;
         let mut client = config
             .connect(NoTls)
             .context("connecting upgrade fixture")?;
@@ -46,6 +47,59 @@ pub(super) async fn checks(_ctx: &Ctx) -> Result<()> {
     println!("PASS: legacy request migration preserves ownership and unknown fingerprints");
     println!("PASS: crash recovery preserves uncertain outcomes and charges each attempt once");
     println!("PASS: retained request timing settles held funds after diagnostic history is pruned");
+    Ok(())
+}
+
+fn ownership_checks(config: &postgres::Config, worker_id: &str) -> Result<()> {
+    use crate::worker_ownership::Guard;
+    let owner =
+        Guard::try_claim(config.connect(NoTls)?, worker_id)?.context("first worker owner")?;
+    require(
+        Guard::try_claim(config.connect(NoTls)?, worker_id)?.is_none(),
+        "replacement worker recovered while the previous process still owned its identity",
+    )?;
+    let sibling = Guard::try_claim(config.connect(NoTls)?, &format!("{worker_id}-sibling"))?;
+    require(
+        sibling.is_some(),
+        "another worker identity was blocked by ownership",
+    )?;
+    require(
+        !owner.is_closed(),
+        "live worker ownership reported disconnected",
+    )?;
+    drop(owner);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if Guard::try_claim(config.connect(NoTls)?, worker_id)?.is_some() {
+            break;
+        }
+        require(
+            std::time::Instant::now() < deadline,
+            "released identity was never available for recovery",
+        )?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut guarded_config = config.clone();
+    guarded_config.application_name(worker_id);
+    let mut lost = Guard::try_claim(guarded_config.connect(NoTls)?, worker_id)?
+        .context("worker owner before forced disconnect")?;
+    let mut admin = config.connect(NoTls)?;
+    let pid: i32 = admin
+        .query_one(
+            "SELECT pid FROM pg_stat_activity WHERE application_name=$1",
+            &[&worker_id],
+        )?
+        .get(0);
+    admin.query_one("SELECT pg_terminate_backend($1)", &[&pid])?;
+    require(
+        !lost.check() && lost.is_closed() && !lost.check(),
+        "disconnected ownership was not permanently refused",
+    )?;
+    require(
+        Guard::try_claim(config.connect(NoTls)?, worker_id)?.is_some(),
+        "replacement could not acquire a terminated backend's identity",
+    )?;
+    println!("PASS: overlapping worker identities cannot recover a live predecessor's requests");
     Ok(())
 }
 

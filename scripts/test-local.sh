@@ -38,6 +38,16 @@ grep -q 'still unreachable' artifacts/worker-boot-failure.log
 grep -q 'catalog-does-not-resolve' artifacts/worker-boot-failure.log
 ! grep -q 'local-catalog-password' artifacts/worker-boot-failure.log
 
+# A deleted pod's replacement can overlap its draining predecessor even under
+# Deployment Recreate. Startup recovery must wait for the stable identity owner.
+if docker compose run --rm --no-deps -T -e DUCKFLEET_CATALOG_WAIT_SECONDS=1 \
+  worker-small > artifacts/worker-overlap-refusal.log 2>&1; then
+  echo 'a second live process acquired the same worker recovery identity' >&2
+  exit 1
+fi
+grep -q 'still owned by another process' artifacts/worker-overlap-refusal.log
+echo 'PASS: overlapping worker startup refused recovery of a live predecessor'
+
 # A worker reached directly must refuse isolation too. Naming a resource (cpu/memory)
 # derives an isolated pod, which a worker cannot provide; a request naming none runs
 # on that worker. (Under the reworked model the mode is derived from presence of

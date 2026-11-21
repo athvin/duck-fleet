@@ -500,6 +500,14 @@ identity, diagnostics if present, and application state before deciding what to
 do. Workers never automatically replay SQL. Restart reconciliation preserves
 uncertainty for that worker's unfinished attempts and leaves other workers alone.
 
+Before recovery, each worker holds an exclusive PostgreSQL advisory lock for its
+stable identity on a dedicated connection. A replacement waits while its
+predecessor drains, including replacements caused by deleting a Kubernetes pod.
+Losing that ownership connection stops further admission and exits the worker;
+it is not silently reacquired. An in-flight write can still have an unknown
+outcome when database connectivity or the process is lost. This lock does not
+provide distributed transaction fencing during a network partition.
+
 Upgrades backfill compact identities once from history and retained ledger keys.
 Historical parameters cannot be reconstructed, so these records permanently
 report `fingerprint_status: legacy_unavailable` and never acquire a fingerprint
