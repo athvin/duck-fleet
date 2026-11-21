@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+pub(crate) const MAX_EXECUTION_TIMEOUT: u64 = 600;
+
 pub(crate) const DEFAULT_QUEUE_TIMEOUT: u64 = 10;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -48,14 +50,25 @@ pub(crate) struct QueryRequest {
     pub queue_timeout_seconds: u64,
 }
 impl QueryRequest {
+    /// A validated request's queue, execution and response-delivery allowance.
+    /// Clamp defensively so even a caller that forgot validation stays bounded.
+    pub fn transport_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            (self.timeout_seconds.min(MAX_EXECUTION_TIMEOUT)
+                + self.queue_timeout_seconds.min(120)
+                + 15)
+                .max(75),
+        )
+    }
+
     pub fn validate(&self) -> Result<(), ApiError> {
         if self.sql.trim().is_empty()
             || self.sql.len() > 262_144
-            || !(1..=60).contains(&self.timeout_seconds)
+            || !(1..=MAX_EXECUTION_TIMEOUT).contains(&self.timeout_seconds)
             || !(1..=120).contains(&self.queue_timeout_seconds)
         {
             return Err(ApiError::bad(
-                "SQL must contain 1–262144 bytes; execution timeout 1–60 seconds; queue timeout 1–120 seconds",
+                "SQL must contain 1–262144 bytes; execution timeout 1–600 seconds; queue timeout 1–120 seconds",
             ));
         }
         if !self.context.is_object()
@@ -185,10 +198,16 @@ mod tests {
             serde_json::from_value(json!({"request_id":id,"sql":"SELECT 1"})).unwrap();
         assert_eq!(request.queue_timeout_seconds, 10);
         assert_eq!(request.timeout_seconds, 30);
+        assert_eq!(request.transport_timeout().as_secs(), 75);
         request.queue_timeout_seconds = 120;
         request.timeout_seconds = 1;
         assert!(request.validate().is_ok());
-        for (queue, execution) in [(0, 30), (121, 30), (10, 0), (10, 61)] {
+        for execution in [61, MAX_EXECUTION_TIMEOUT] {
+            request.timeout_seconds = execution;
+            assert!(request.validate().is_ok());
+            assert_eq!(request.transport_timeout().as_secs(), execution + 120 + 15);
+        }
+        for (queue, execution) in [(0, 30), (121, 30), (10, 0), (10, 601)] {
             request.queue_timeout_seconds = queue;
             request.timeout_seconds = execution;
             assert!(request.validate().is_err());

@@ -503,7 +503,7 @@ no policy cache: each operation resolves the current credential, principal state
 and complete policy snapshot. Workers repeat the check after queue and budget
 waits as the final metadata step before engine entry. Revoked credentials or
 grants prevent queued and subsequent SQL from starting. Already active SQL may
-finish within its existing deadline, at most 60 seconds, unless explicitly
+finish within its existing deadline, at most 600 seconds, unless explicitly
 canceled. A grant change never replays SQL.
 
 Unknown, expired, revoked, and disabled credentials return `401 unauthorized`;
@@ -702,12 +702,24 @@ This preserves the actual DuckDB connection, transactions, temporary tables and
 settings. There is no connection migration or statement pipeline.
 
 Queue allowance defaults to 10 seconds (1–120); execution defaults to 30 seconds
-(1–60). Queue time includes scheduling, preparation and final authorization;
+(1–600). Queue time includes scheduling, preparation and final authorization;
 execution time starts at engine entry. Use `--queue-timeout 60` with CLI `sql`
-to select a longer allowance. The synchronous HTTP transport waits at most 75
-seconds. A timeout or disconnect does not cancel accepted work. On an uncertain
+to select a longer allowance. HTTP clients can explicitly set `timeout_seconds`
+up to 600; the gateway-to-worker wait covers the validated queue plus execution
+allowances and 15 seconds for delivery. The bundled CLI retains its 75-second
+transport wait and 30-second execution default. External clients requesting
+longer statements must also allow a suitably bounded HTTP wait. Shutdown still
+drains for at most 75 seconds, so a long statement can be interrupted by rollout. A timeout or disconnect does not cancel accepted work. On an uncertain
 response, inspect `request <id>` or call `cancel <id>`; the CLI retains this ID
 and reports `acceptance: unknown`. Results are not retained for later download.
+
+Reproduce the long-statement boundary on disposable Compose volumes with
+`python3 scripts/test-long-deadline.py --image <built-image> --output artifacts/long-deadline.json`
+(requires PyArrow). It delays a synthetic HTTP CSV response by 65 seconds,
+checks success with a 120-second allowance and refusal with a one-second
+allowance, and rejects 601 seconds. External I/O can defer when DuckDB observes
+an interrupt; the report records actual elapsed time rather than claiming an
+HTTP read stops immediately at the statement deadline.
 
 Parsed query responses carry `x-query-id`, `x-query-status-url` and
 `x-query-acceptance` (`accepted`, `not_accepted`, or `unknown`). Classified JSON
