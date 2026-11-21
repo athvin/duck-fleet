@@ -56,6 +56,7 @@ echo 'PASS: a worker addressed directly refuses isolation it cannot provide'
 # reaches the gateway only through the Rust client (the harness --api-workflow stage).
 docker compose run --rm api
 docker compose run --rm dbt duckfleet-server --auth-continuity
+docker compose run --rm dbt duckfleet-server --request-identity
 # The dbt lifecycle: the `dbt` image runs the Rust integration harness
 # (DUCKFLEET_ROLE=harness), which drives the forked dbt binary. Default = main
 # lifecycle; then the stages that need both the gateway and a fresh fleet.
@@ -104,6 +105,7 @@ docker compose --profile scale-out up -d --wait worker-small-b
 DUCKFLEET_WORKER_URLS=http://worker-small:8080,http://worker-small-b:8080 \
   docker compose up -d --no-deps --wait server
 docker compose run --rm --no-deps dbt duckfleet-server --spread
+docker compose run --rm --no-deps dbt duckfleet-server --request-identity-concurrent
 docker compose run --rm --no-deps dbt duckfleet-server --worker-status-pgwire
 docker compose stop worker-small
 docker compose run --rm --no-deps dbt duckfleet-server --worker-status-partial-outage

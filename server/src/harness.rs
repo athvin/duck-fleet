@@ -24,6 +24,8 @@ mod aws_harness;
 mod concurrency;
 mod metering;
 mod observability;
+mod request_identity;
+mod request_upgrade;
 
 const ARTIFACTS: &str = "/artifacts";
 
@@ -69,6 +71,10 @@ pub async fn run(args: Vec<String>) -> i32 {
         authentication::checks(&ctx).await
     } else if has("--auth-isolated") {
         authentication::isolated_cleanup(&ctx).await
+    } else if has("--request-identity") {
+        request_identity::checks(&ctx).await
+    } else if has("--request-identity-concurrent") {
+        request_identity::concurrent(&ctx).await
     } else if has("--dbt-isolated") {
         dbt_isolated_checks(&ctx).await
     } else if has("--cold-start") {
@@ -799,6 +805,17 @@ async fn gateway_replaced(ctx: &Ctx) -> anyhow::Result<()> {
         record["status"] == json!("succeeded"),
         format!("the severed insert ended {}", record["status"]),
     )?;
+    let durable = request_json(
+        reopened.client(),
+        Method::GET,
+        &format!("/v1/requests/{request_id}"),
+        None,
+    )
+    .await?;
+    require(
+        durable["status"] == "succeeded" && durable["outcome"] == "statement_result",
+        format!("gateway replacement lost durable outcome: {durable}"),
+    )?;
     println!(
         "PASS: a gateway replaced without grace left classified outcomes and a knowable history"
     );
@@ -827,12 +844,14 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
     let path = connection.path();
     let sql_text =
         format!("insert into {table} select range from range(2000000000) where range % 13 = 5");
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let query_id = request_id.clone();
     let handle = tokio::spawn(async move {
         client
             .request(
                 Method::POST,
                 &format!("{path}/queries"),
-                Some(&json!({"request_id": uuid::Uuid::new_v4().to_string(), "sql": sql_text, "timeout_seconds": 58})),
+                Some(&json!({"request_id": query_id, "sql": sql_text, "timeout_seconds": 58})),
                 client::STATEMENT_TIMEOUT,
             )
             .await
@@ -853,6 +872,19 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
         )?;
     }
     let reader = ctx.open_named("harness-evict3", None).await?;
+    let durable = request_json(
+        reader.client(),
+        Method::GET,
+        &format!("/v1/requests/{request_id}"),
+        None,
+    )
+    .await?;
+    if expect_classified {
+        require(
+            durable["outcome"] == "unknown" && durable["retry_safe"] == false,
+            format!("hard worker loss falsely claimed a replay-safe outcome: {durable}"),
+        )?;
+    }
     let rows = sql(&reader, &format!("select count(*) from {table}")).await?;
     let count = rows
         .first()

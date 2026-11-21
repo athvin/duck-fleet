@@ -9,7 +9,7 @@
 //! it, read Arrow IPC back, and classify failures by the server's own
 //! `{error, failure_kind, retry_safe}` shape. A request that dies in transport
 //! is an *unknown* outcome, never permission to replay a write: the gateway
-//! records every statement in `query_history` before executing it, so a
+//! retains each request identity before executing it, so a
 //! `transport_failure` can be resolved by reading it back by `request_id`.
 
 use std::time::{Duration, Instant};
@@ -57,7 +57,7 @@ pub struct RemoteError {
 
 impl RemoteError {
     /// A request that dies in transport (reset, refused, timed out): whether it
-    /// ran is unknown to the client, but not unknowable — `query_history` records
+    /// ran is unknown to the client; durable request identity records
     /// it by `request_id`. Never retry-safe.
     fn transport(error: reqwest::Error) -> Self {
         RemoteError {
@@ -66,7 +66,7 @@ impl RemoteError {
             retry_safe: false,
             message: format!(
                 "the request failed in transport before any response arrived, so whether it ran \
-                 is unknown; check /v1/queries for its request_id before resending a write ({error})"
+                 is unknown; check /v1/requests/<request_id> before resending a write ({error})"
             ),
         }
     }
@@ -359,7 +359,7 @@ impl RemoteConnection {
                 message: format!(
                     "{error} — this session no longer exists (the gateway restarted, or it sat \
                      idle past expiry); uncommitted work from it can only be rolled back, never \
-                     committed. Open a new connection, and check /v1/queries by request_id before \
+                     committed. Open a new connection, and check /v1/requests/<request_id> before \
                      resending any write"
                 ),
                 ..error

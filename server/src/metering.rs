@@ -176,7 +176,7 @@ fn apply_deltas(transaction: &mut Transaction, spent: i64, held: i64) -> Result<
 /// The price recovery puts on an orphan: the rate stored on the reservation at
 /// admission, so a rate change between admission and recovery cannot reprice work,
 /// with the current card standing in only for rows older than the stored columns.
-/// Charges only what the history row proves ran, and never above the hold.
+/// Charges only what durable execution evidence proves ran, never above the hold.
 fn recovery_amount(
     stored_rate: Option<i64>,
     current: &pricing::RateCard,
@@ -190,8 +190,9 @@ fn recovery_amount(
 
 /// Settles reservations this worker abandoned by restarting, so no accepted
 /// execution is left both unmetered and holding funds. The charge uses whatever
-/// elapsed time the history row recorded; an execution that never reached its
-/// terminal update is charged nothing, and the event says it came from recovery.
+/// elapsed time diagnostic history or the durable request recorded; an execution
+/// without terminal timing evidence is charged nothing. The event identifies
+/// recovery as its source rather than inferring a successful SQL outcome.
 pub(crate) fn recover(
     transaction: &mut Transaction,
     worker_id: &str,
@@ -199,9 +200,10 @@ pub(crate) fn recover(
 ) -> Result<u64> {
     let orphans = transaction.query(
         "SELECT r.execution_id, r.reserved_micro_usd, r.resource_units,
-                COALESCE(h.elapsed_ms,0), COALESCE(h.context,'{}'),
+                COALESCE(q.elapsed_ms,h.elapsed_ms,0), COALESCE(h.context,'{}'),
                 r.rate_micro_usd_per_unit_hour, r.rate_card_version
          FROM reservations r LEFT JOIN query_history h ON h.query_id = r.execution_id
+         LEFT JOIN requests q ON q.request_id = r.execution_id
          WHERE r.state = 'held' AND r.worker_id = $1",
         &[&worker_id],
     )?;
@@ -249,6 +251,7 @@ pub(crate) fn interrupt_abandoned_history(
     transaction: &mut Transaction,
     worker_id: &str,
 ) -> Result<u64> {
+    crate::requests::interrupt_abandoned(transaction, worker_id)?;
     Ok(transaction.execute(
         "UPDATE query_history SET status='interrupted', finished_at=now(),
             error=$2, failure_kind=$3, retry_safe=$4
@@ -269,6 +272,7 @@ pub(crate) fn interrupt_abandoned_prefix(
     transaction: &mut Transaction,
     prefix: &str,
 ) -> Result<u64> {
+    crate::requests::interrupt_abandoned_prefix(transaction, prefix)?;
     Ok(transaction.execute(
         "UPDATE query_history SET status='interrupted', finished_at=now(),
             error=$2, failure_kind=$3, retry_safe=$4
@@ -300,17 +304,18 @@ pub(crate) fn held_matching(client: &mut Client, prefix: &str) -> Result<Vec<Str
         .collect())
 }
 
-/// Reserves funds for one execution. The budget row is locked for the duration, so
-/// concurrent admissions on different workers cannot both pass on the same balance.
-pub(crate) fn admit(
-    client: &mut Client,
+/// Reserves funds inside the caller's request-admission transaction. The caller
+/// commits identity, history, and reservation together before executing SQL.
+/// Budget refusals make no writes and leave the transaction usable for recording
+/// the definite refusal; database failures require the caller to roll back.
+pub(crate) fn admit_in(
+    transaction: &mut Transaction,
     execution_id: &str,
     units: i64,
     timeout_seconds: u64,
     worker_id: &str,
     rate: &pricing::RateCard,
 ) -> Result<Admission, ApiError> {
-    let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
     // The accumulators ride the same locked row as the limits, so admission reads
     // the whole position in one O(1) select however large the ledger has grown.
     let limits = transaction
@@ -342,11 +347,12 @@ pub(crate) fn admit(
     })?;
     // The rate rides on the reservation so settlement and recovery price this
     // execution at the card it was admitted under, whatever the card is by then.
-    transaction
+    let inserted = transaction
         .execute(
             "INSERT INTO reservations (execution_id, reserved_micro_usd, resource_units, state,
                 worker_id, rate_micro_usd_per_unit_hour, rate_card_version)
-             VALUES ($1,$2,$3,'held',$4,$5,$6)",
+             VALUES ($1,$2,$3,'held',$4,$5,$6)
+             ON CONFLICT (execution_id) DO NOTHING",
             &[
                 &execution_id,
                 &reserved_micro_usd,
@@ -357,8 +363,16 @@ pub(crate) fn admit(
             ],
         )
         .map_err(|_| ApiError::internal())?;
-    apply_deltas(&mut transaction, 0, reserved_micro_usd).map_err(|_| ApiError::internal())?;
-    transaction.commit().map_err(|_| ApiError::internal())?;
+    if inserted == 0 {
+        // Retained reservations still protect legacy attempts whose diagnostic
+        // history is gone. Leave the caller's transaction usable so it can
+        // preserve the legacy identity without inventing a new fingerprint.
+        return Err(ApiError::new(
+            failure::DUPLICATE_REQUEST,
+            "request_id already has a reservation; no SQL was executed",
+        ));
+    }
+    apply_deltas(transaction, 0, reserved_micro_usd).map_err(|_| ApiError::internal())?;
     Ok(Admission {
         execution_id: execution_id.to_owned(),
         units,
@@ -407,9 +421,10 @@ fn record(
 
 /// Writes the usage event and releases the unused part of the reservation. Called
 /// for every terminal execution, whatever its status, by the process that admitted
-/// it — so the process card and the admission's card are the same card.
-pub(crate) fn settle(
-    client: &mut Client,
+/// it — so the process card and the admission's card are the same card. The caller
+/// commits these accounting changes with durable outcome and history updates.
+pub(crate) fn settle_in(
+    transaction: &mut Transaction,
     admission: &Admission,
     elapsed_ms: i64,
     worker_id: &str,
@@ -417,9 +432,8 @@ pub(crate) fn settle(
     rate: &pricing::RateCard,
 ) -> Result<i64> {
     let amount = rate.charge_micro_usd(admission.units, u64::try_from(elapsed_ms).unwrap_or(0));
-    let mut transaction = client.transaction()?;
     let inserted = record(
-        &mut transaction,
+        transaction,
         &admission.execution_id,
         admission.units,
         elapsed_ms,
@@ -435,8 +449,7 @@ pub(crate) fn settle(
         &[&admission.execution_id, &amount],
     )?;
     let (spent, held) = budget_deltas(inserted, released, amount, admission.reserved_micro_usd);
-    apply_deltas(&mut transaction, spent, held)?;
-    transaction.commit()?;
+    apply_deltas(transaction, spent, held)?;
     Ok(amount)
 }
 
@@ -520,7 +533,8 @@ mod tests {
         for available in [0, -5_000, 27] {
             let refusal = decide(available, HOUR, 1, 30, &card()).unwrap_err();
             assert_eq!(refusal, failure::BUDGET_EXHAUSTED);
-            // Nothing ran, so sending it again once funded is legitimate.
+            // Nothing ran. The request layer requires a new attempt identifier
+            // linked with retry_of once funding is restored.
             assert!(refusal.retry_safe);
         }
     }

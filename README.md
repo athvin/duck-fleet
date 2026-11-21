@@ -252,7 +252,9 @@ duckfleet sql 'select current_setting("threads")' --cpu 2 --memory 2Gi
 duckfleet sql 'select 1' --cpu 4 --memory 8Gi --disk 20Gi   # a pod of its own
 ```
 
-`duckfleet history`, `query <id>`, `usage`, `budget` and `workers` cover inspection.
+`duckfleet history`, `query <id>`, `request <id>`, `usage`, `budget` and `workers`
+cover inspection. `request <id>` reads durable outcome metadata even after the
+diagnostic history has expired.
 A refusal exits non-zero and prints the server's own classification and `retry_safe`,
 so a shell script can tell "ask differently" from "ask later" without parsing prose.
 
@@ -275,6 +277,7 @@ credential from the environment, or a credential it issued; see
 | POST | `/v1/sessions/{id}/cancel` | Interrupt this session's currently executing statement |
 | GET | `/v1/queries` | Filtered history with cursor pagination; defaults to 500 records |
 | GET | `/v1/queries/{query_id}` | One durable record, metrics, and raw DuckDB profile when available |
+| GET | `/v1/requests/{request_id}` | Owner-scoped durable identity, attempt lineage, outcome, and diagnostic availability; bootstrap can inspect all |
 | GET | `/v1/workers` | Every configured worker's state and execution pressure, observed limits, and whether isolated compute is available |
 | GET | `/v1/usage` | Append-only usage events with cursor pagination |
 | GET | `/v1/budget` | Prepaid balance, held reservations, spend, caps, rate card |
@@ -459,20 +462,58 @@ full table.
 {"error": "…", "failure_kind": "transaction_conflict", "retry_safe": true}
 ```
 
-Request IDs are unique across sessions and retained in PostgreSQL. A repeated ID
-returns HTTP 409 with `failure_kind` `duplicate_request` and without executing SQL
-again; results are not cached or replayed.
-An HTTP/transport failure can occur after a write commits. Inspect history and
-application state before retrying; the adapter does not automatically retry SQL.
-Accepted worker executions are recorded before SQL runs and updated on completion.
-At worker startup, its own unfinished records become `interrupted` with an
-unknown-commit warning; another worker's running records are left alone.
+Each `request_id` identifies one immutable execution attempt across all sessions
+and workers. A compact PostgreSQL identity record has no diagnostic-retention
+expiry and contains no raw SQL, parameters, or profile. Reusing the ID with the
+same payload returns HTTP 409 `duplicate_request`, including the original
+outcome and `diagnostics_available`; it never executes SQL again. Reusing it with
+a different payload returns 409 `request_id_mismatch`. Results are not cached.
+
+The version-1 SHA-256 fingerprint covers exact SQL bytes, validated bound
+parameters (including number types), effective timeout, merged session/query
+context, and resolved compute policy. JSON object key order is irrelevant;
+array order and value types matter. It excludes attempt IDs, credential IDs,
+worker identity, and boot identity. It does not fingerprint ambient session or
+database state, or establish semantic equivalence between different SQL text.
+
+`GET /v1/requests/<id>` exposes identity only to its authenticated principal or
+the bootstrap operator. A different principal receives the same 404 as an absent
+ID, including on duplicate submissions. Credential rotation preserves ownership.
+This protection applies to the request/deduplication API: the existing diagnostic
+history API remains organization-wide until platform RBAC is enabled, and trusted
+administrator SQL is not a data-isolation boundary.
+
+After a `budget_exhausted` refusal, fund the budget and submit the same payload
+with a **new** `request_id` and `"retry_of": "<refused-attempt-id>"`. The response
+from the old ID stays a duplicate of its refusal. Both attempts retain the same
+`logical_request_id`, and only one child attempt may reference each refusal;
+retry a refused child by referring to that latest child. The lookup's `retry`
+object describes whether this controlled retry is allowed. Other kinds of
+failure do not become permission to retry through this mechanism.
+
+Identity, diagnostic acceptance, and budget reservation commit together before
+SQL. Terminal identity, diagnostic completion, and usage settlement also commit
+together. `outcome` distinguishes `not_executed`, `statement_result`, and
+`unknown`. A statement result does not prove an enclosing transaction committed.
+A dropped connection or worker can leave an unknown outcome; inspect durable
+identity, diagnostics if present, and application state before deciding what to
+do. Workers never automatically replay SQL. Restart reconciliation preserves
+uncertainty for that worker's unfinished attempts and leaves other workers alone.
+
+Upgrades backfill compact identities once from history and retained ledger keys.
+Historical parameters cannot be reconstructed, so these records permanently
+report `fingerprint_status: legacy_unavailable` and never acquire a fingerprint
+from a replay. Missing or historical fallback ownership is operator-only.
+Retained reservations continue guarding against duplicate execution. Quiesce
+writers while upgrading before relying on the new fingerprint/retry contract;
+older workers do not implement it. Keep identity records and the usage ledger
+when pruning diagnostic history.
 
 Each worker queue holds at most 64 operations, with at most 32 sessions. The
 gateway allows at most 64 routed sessions. Exceeding either limit returns HTTP 429
 with `failure_kind` `capacity`, which is retry-safe because the request is rejected
 before any SQL runs. Sessions idle for
-five minutes are closed on the next worker operation. Statement execution has a
+five minutes are closed by periodic worker housekeeping. Statement execution has a
 30-second default deadline (1–60 seconds allowed); queue time is additional.
 Responses fail rather than silently truncate beyond 100,000 rows or 16 MiB.
 Each worker has a 1 GiB spill limit and the resource settings listed above.
@@ -604,7 +645,7 @@ stopped by a deadline may still have committed.
 | `failure_kind` | HTTP | `retry_safe` | Meaning |
 | --- | --- | --- | --- |
 | `transaction_conflict` | 409 | yes | Lost a commit race; the transaction was discarded whole |
-| `budget_exhausted` | 402 | yes | The prepaid balance cannot buy a second; nothing ran and nothing was metered |
+| `budget_exhausted` | 402 | yes | Nothing ran or was metered; after funding, use a new ID with `retry_of` pointing to this refusal |
 | `capacity` | 429 | yes | A queue or session limit rejected the request before any SQL ran |
 | `sql_error` | 400 | no | The engine refused or failed the SQL; earlier statements in a multi-statement request may have applied |
 | `timeout` | 400 | no | A deadline interrupted the statement; an interrupted commit may still have committed |
@@ -613,8 +654,10 @@ stopped by a deadline may still have committed.
 | `canceled` | 400 | no | A caller interrupted the statement; same unknown outcome |
 | `invalid_request` | 400 | no | Rejected before execution; correct the request rather than resend it |
 | `unknown_session` | 404 | no | The session expired or was closed; open a new one |
-| `not_found` | 404 | no | No such history record |
-| `duplicate_request` | 409 | no | This `request_id` was already accepted; inspect its history record |
+| `not_found` | 404 | no | No visible record for this ID |
+| `duplicate_request` | 409 | no | This attempt ID was accepted before; the response includes its durable original outcome |
+| `request_id_mismatch` | 409 | no | This attempt ID or linked retry refers to a different payload; no SQL executed |
+| `invalid_retry` | 400 | no | The referenced attempt is not eligible for a linked retry or already has a child |
 | `no_ready_worker` | 503 | yes | Discovery could not find available compute; no session open was forwarded. New-session clients may wait for recovery |
 | `unavailable` | 503 | no | A worker or the history database was unreachable mid-request |
 | `interrupted` | — | no | Recorded at worker startup for its own unfinished records; never an HTTP response |

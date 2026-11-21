@@ -411,6 +411,7 @@ struct Gateway {
     routes: Arc<Mutex<HashMap<Uuid, Route>>>,
     capacity: Arc<Semaphore>,
     history: crate::history::Reader,
+    requests: crate::requests::Reader,
     usage: crate::usage::Reader,
     /// `None` where this deployment cannot create pods, which is most of them. The
     /// capability is absent rather than disabled: there is no code path that would
@@ -1085,6 +1086,17 @@ async fn query_detail(
 ) -> Result<Json<Value>, ApiError> {
     app.history.detail(id).await.map(Json)
 }
+async fn request_detail(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let bootstrap = identity.is_bootstrap();
+    app.requests
+        .detail(id, identity.principal, bootstrap)
+        .await
+        .map(Json)
+}
 async fn usage_events(
     State(app): State<Gateway>,
     Query(filter): Query<crate::usage::Filter>,
@@ -1549,6 +1561,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         routes: Arc::new(Mutex::new(HashMap::new())),
         capacity: Arc::new(Semaphore::new(64)),
         history: crate::history::Reader::new(std::env::var("PLATFORM_DSN")?),
+        requests: crate::requests::Reader::new(std::env::var("PLATFORM_DSN")?),
         usage: crate::usage::Reader::new(
             std::env::var("PLATFORM_DSN")?,
             crate::pricing::RateCard::from_env()?,
@@ -1612,6 +1625,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/queries", get(history))
         .route("/v1/queries/{id}", get(query_detail))
+        .route("/v1/requests/{id}", get(request_detail))
         .route("/v1/usage", get(usage_events))
         .route("/v1/budget", get(budget).put(set_budget))
         .route("/v1/workers", get(workers))
@@ -1797,6 +1811,7 @@ mod tests {
             routes: Arc::new(Mutex::new(HashMap::new())),
             capacity: Arc::new(Semaphore::new(64)),
             history: crate::history::Reader::new(dsn.into()),
+            requests: crate::requests::Reader::new(dsn.into()),
             usage: crate::usage::Reader::new(
                 dsn.into(),
                 crate::pricing::RateCard {
