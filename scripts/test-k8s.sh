@@ -165,6 +165,11 @@ harness duckfleet-harness 'duckfleet-server'
 grep -q 'PASS: protocol checks and dbt lifecycle' artifacts/kind/duckfleet-harness.log
 grep -q 'PASS: resource/sizing routing refuses what it cannot serve' artifacts/kind/duckfleet-harness.log
 
+# Exercise the packaged scale project with the same read-only/non-root pod
+# security and writable artifact mounts used by the AWS harness.
+harness duckfleet-scale 'duckfleet-server --scale'
+grep -q 'PASS: scale build completed' artifacts/kind/duckfleet-scale.log
+
 # On-demand compute. The harness asserts what the API reports; these assert the
 # cluster facts it cannot see, which is the half that matters for a leak.
 isolated_pods() { "${KUBE[@]}" get pods -l duckfleet-compute=isolated -o name; }

@@ -79,6 +79,7 @@ docker compose up -d --wait worker-small server
 # (DUCKFLEET_ROLE=harness), which drives the forked dbt binary. Default = main
 # lifecycle; then the stages that need both the gateway and a fresh fleet.
 docker compose run --rm dbt
+docker compose run --rm dbt duckfleet-server --scale
 docker compose run --rm dbt duckfleet-server --concurrency
 docker compose run --rm dbt duckfleet-server --metering
 
@@ -161,7 +162,7 @@ unset DUCKFLEET_POOLS_DIRECTORY
 #   - worker late-catalog wait, worker ledger-reconnect
 #   - SIGTERM drain of the worker and of the gateway (--drain-inflight /
 #     --gateway-drain-inflight harness stages + docker kill)
-#   - the Phase-1 scale sweep (--scale) and maintenance (--maintenance)
+#   - maintenance (--maintenance)
 #   - the backup/restore drill (scripts/backup-catalog.sh / restore-catalog.sh,
 #     with the post-backup write + restore verification now via `duckfleet-server cli`)
 # The isolated-pod path (a sized model -> dedicated pod) is Kubernetes-only and is
