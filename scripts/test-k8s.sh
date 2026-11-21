@@ -85,7 +85,10 @@ python3 scripts/database_roles.py "$NS" | "${KUBE[@]}" create -f -
 
 digest=$(printf 'a%.0s' {1..64})
 render() {
+  # The RBAC continuity fixture exercises the PostgreSQL wire listener. Keep it
+  # enabled across this test's rerenders; ordinary deployments remain opt-in.
   helm template duckfleet infra/helm/duckfleet --namespace "$NS" \
+    --set pgwire.enabled=true \
     --set "workerImage=$REGISTRY/worker@sha256:$digest" \
     --set "dbtImage=$REGISTRY/dbt@sha256:$digest" "$@"
 }
@@ -530,14 +533,15 @@ team=(kubectl --context "$CONTEXT" -n "$TEAM")
 "${team[@]}" apply -f infra/kind/object-store.yaml
 "${team[@]}" rollout status deployment/object-store --timeout=240s
 "${team[@]}" wait --for=condition=complete job/bucket-init --timeout=240s
-team_token=$("${team[@]}" get secret duckfleet-dev -o jsonpath='{.data.DUCKFLEET_TOKEN}' | base64 -d)
-dev_password=$("${KUBE[@]}" get secret duckfleet-dev -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)
 "${team[@]}" port-forward svc/server 18081:8080 > /dev/null 2>&1 &
 team_forward=$!
+"${KUBE[@]}" port-forward svc/server 18080:8080 > /dev/null 2>&1 &
+source_forward=$!
 sleep 3
 python3 scripts/kind/team_namespace_probe.py --port 18081 \
-  --token "$team_token" --dev-password "$dev_password"
+  --source-port 18080 --context "$CONTEXT" --namespace "$TEAM" --source-namespace "$NS"
 kill "$team_forward" 2> /dev/null || true
+kill "$source_forward" 2> /dev/null || true
 DUCKFLEET_CONFIRM_DEPROVISION=yes DUCKFLEET_KUBE_CONTEXT="$CONTEXT" \
   bash scripts/deprovision-namespace.sh "$TEAM"
 if kubectl --context "$CONTEXT" get namespace "$TEAM" > /dev/null 2>&1; then

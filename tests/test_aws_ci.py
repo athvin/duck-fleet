@@ -1412,6 +1412,42 @@ class DatabaseRolePackagingTests(unittest.TestCase):
         self.assertIn('user=duckfleet_migrator ',services['platform-migrate']['environment']['PLATFORM_DSN'])
         self.assertIn('DUCKFLEET_INTERNAL_TEST_TOKEN',services['dbt']['environment'])
 
+    def test_namespace_probe_uses_current_catalog_role_and_live_service(self):
+        roles = load('probe_database_roles', 'scripts/database_roles.py')
+        probe = load('team_namespace_probe', 'scripts/kind/team_namespace_probe.py')
+        document = roles.secret('duckfleet-dev', host='external-postgres')
+        dsn = document['stringData']['CATALOG_DSN']
+        query = probe.catalog_probe(dsn, 'duckfleet-dev')
+        self.assertIn('host=external-postgres.duckfleet-dev.svc.cluster.local ', query)
+        self.assertIn('user=' + roles.role_names('duckfleet-dev')['catalog'] + ' ', query)
+        self.assertNotIn('user=duckfleet ', query)
+        with self.assertRaises(ValueError):
+            probe.catalog_probe(dsn + ' host=obsolete', 'duckfleet-dev')
+        with self.assertRaises(ValueError):
+            probe.catalog_probe(dsn.replace('host=external-postgres', "host=\"bad'host\""), 'duckfleet-dev')
+
+    def test_namespace_probe_rejects_dns_authentication_and_redaction_false_positives(self):
+        probe = load('team_denial_probe', 'scripts/kind/team_namespace_probe.py')
+        for message in ('could not translate host name', 'password authentication failed',
+                        'postgres_scan does not exist', 'relation ducklake_snapshot does not exist'):
+            with self.subTest(message=message), self.assertRaises(AssertionError):
+                probe.verify_denial({'failure_kind': 'sql_error', 'error': message}, 'fixture-secret')
+        probe.verify_denial({'failure_kind': 'sql_error', 'error': 'connection timed out'}, 'fixture-secret')
+        probe.verify_denial({'failure_kind': 'timeout', 'error': 'query deadline elapsed'}, 'fixture-secret')
+        with self.assertRaises(AssertionError):
+            probe.verify_denial({'failure_kind': 'timeout', 'error': 'fixture-secret'}, 'fixture-secret')
+        calls = []
+        def failed_positive(port, token, method, path, payload=None, timeout=70):
+            calls.append((method, path))
+            if path == '/v1/sessions':
+                return b'{"session_id":"fixture"}'
+            if method == 'POST':
+                raise RuntimeError('positive endpoint unavailable')
+            return b'{}'
+        with mock.patch.object(probe, 'call', side_effect=failed_positive), self.assertRaises(RuntimeError):
+            probe.positive_control(1, 'fixture-token', 'SELECT 1')
+        self.assertEqual(calls[-1], ('DELETE', '/v1/sessions/fixture'))
+
 
 if __name__ == '__main__':
     unittest.main()

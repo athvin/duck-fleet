@@ -16,9 +16,10 @@ test -n "$small_id"
 test "$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$small_id")" = '1000000000 1073741824'
 docker inspect --format '{"container":{{json .Name}},"nano_cpus":{{.HostConfig.NanoCpus}},"memory_bytes":{{.HostConfig.Memory}}}' "$small_id" > artifacts/docker-worker-limits.jsonl
 
-# DuckDB quotes the failing statement in its error and the process prints that error
-# as it exits, so an unscrubbed ATTACH writes the catalog password to the container
-# log on every boot failure. Force the failure and read the log back.
+# Catalog role validation probes PostgreSQL before DuckDB ATTACH. Force that
+# earlier startup failure and verify its bounded, host-only diagnostic never
+# writes the configured DSN or password to the container log. The redactor's
+# unit tests separately cover ATTACH errors that quote the connection string.
 if docker compose run --rm --no-deps -T \
   -e DUCKFLEET_CATALOG_WAIT_SECONDS=0 \
   -e CATALOG_DSN='host=catalog-does-not-resolve port=5432 dbname=lake user=duckfleet password=local-catalog-password' \
@@ -35,10 +36,11 @@ fi
 grep -q 'do not match the configured' artifacts/worker-misconfigured.log
 grep -q 'cpu=1' artifacts/worker-misconfigured.log
 grep -q 'cpu=4' artifacts/worker-misconfigured.log
-grep -q 'attaching the DuckLake catalog' artifacts/worker-boot-failure.log
-grep -q 'still unreachable' artifacts/worker-boot-failure.log
+grep -q 'catalog role validation' artifacts/worker-boot-failure.log
+grep -q 'still unreachable after 0s' artifacts/worker-boot-failure.log
 grep -q 'catalog-does-not-resolve' artifacts/worker-boot-failure.log
 ! grep -q 'local-catalog-password' artifacts/worker-boot-failure.log
+! grep -q 'host=catalog-does-not-resolve port=5432' artifacts/worker-boot-failure.log
 
 # A deleted pod's replacement can overlap its draining predecessor even under
 # Deployment Recreate. Startup recovery must wait for the stable identity owner.
