@@ -22,7 +22,7 @@ RUN rustup component add rustfmt clippy
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=duckfleet-target-${TARGETARCH},target=/app/server/target cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
 
 FROM python:3.12.12-slim-bookworm AS aws-credentials-check
-RUN pip install --no-cache-dir duckdb==1.5.4
+RUN pip install --no-cache-dir duckdb==2.0.1
 COPY --from=build /opt/duckdb /opt/duckdb
 COPY tests/aws_credentials.py /app/aws_credentials.py
 RUN python /app/aws_credentials.py

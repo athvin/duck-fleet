@@ -1,0 +1,14 @@
+{
+  "accepted": [
+    "regex_partial",
+    "factorial_precedence",
+    "binary_literals",
+    "single_arrow_lambda",
+    "missing_relation"
+  ],
+  "fixed": [
+    "integer_division_by_zero",
+    "modulo_by_zero",
+    "untyped_null"
+  ]
+}

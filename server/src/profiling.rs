@@ -33,14 +33,14 @@ impl Profile {
         if enabled {
             let escaped = path.to_string_lossy().replace('\'', "''");
             conn.execute_batch(&format!(
-                "SET enable_profiling='json'; SET profiling_output='{escaped}'; SET profiling_mode='standard'; SET profiling_coverage='ALL';"
+                "SET enable_profiling='json'; SET profiling_output='{escaped}'; SET profiling_coverage='ALL';"
             ))?;
         }
         Ok(Self { path, enabled })
     }
 
-    // Always remove the previous output before executing. Some statements and
-    // failures emit no profile; they must never inherit the previous query's.
+    // Always remove the previous output before executing. If the engine emits no
+    // profile, the statement must never inherit the previous query's.
     pub fn clear(&self) -> bool {
         match fs::remove_file(&self.path) {
             Ok(()) => true,

@@ -54,8 +54,8 @@ def catalog_probe(dsn, namespace):
     # Both controls use this same DSN and its per-address connection deadline.
     fields["connect_timeout"] = "3"
     literal = "'" + " ".join(key + "=" + value for key, value in fields.items()) + "'"
-    return ("SELECT COUNT(*) FROM postgres_scan(" + literal
-            + ", 'public', 'ducklake_snapshot')")
+    return ("ATTACH " + literal + " AS qualification_catalog (TYPE postgres, READ_ONLY); "
+            + "SELECT COUNT(*) FROM qualification_catalog.public.ducklake_snapshot")
 
 
 def call(port, token, method, path, payload=None, timeout=70):
@@ -69,13 +69,19 @@ def call(port, token, method, path, payload=None, timeout=70):
         return response.read()
 
 
-def positive_control(port, token, probe):
+def positive_control(port, token, probe, password):
     opened = json.loads(call(port, token, "POST", "/v1/sessions", {}))
     session = opened["session_id"]
     try:
-        call(port, token, "POST", f"/v1/sessions/{session}/queries",
-             {"request_id": str(uuid.uuid4()), "sql": probe,
-              "timeout_seconds": 25})
+        try:
+            call(port, token, "POST", f"/v1/sessions/{session}/queries",
+                 {"request_id": str(uuid.uuid4()), "sql": probe,
+                  "timeout_seconds": 25})
+        except urllib.error.HTTPError as error:
+            body = error.read().decode()
+            if password in body:
+                raise AssertionError("the positive-control credential leaked") from None
+            raise AssertionError(f"positive-control catalog query failed: {body}") from None
     finally:
         call(port, token, "DELETE", f"/v1/sessions/{session}")
 
@@ -109,7 +115,8 @@ def main():
     team = secret_values(args.context, args.namespace)
     token = team["DUCKFLEET_TOKEN"]
     probe = catalog_probe(source["CATALOG_DSN"], args.source_namespace)
-    positive_control(args.source_port, source["DUCKFLEET_TOKEN"], probe)
+    positive_control(args.source_port, source["DUCKFLEET_TOKEN"], probe,
+                     source["DATABASE_CATALOG_PASSWORD"])
 
     fleet = json.loads(call(args.port, token, "GET", "/v1/workers"))
     assert {w["worker_id"] for w in fleet["workers"]} == {"small"}, fleet
