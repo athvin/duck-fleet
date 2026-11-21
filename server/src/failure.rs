@@ -56,7 +56,7 @@ pub(crate) const CANCELED: Failure = Failure {
 };
 
 /// The prepaid balance cannot cover even a one-second execution. No SQL ran, so
-/// sending the same request again once the balance is topped up is legitimate.
+/// a funded retry may use a new attempt ID linked to this refused request ID.
 pub(crate) const BUDGET_EXHAUSTED: Failure = Failure {
     status: Some("refused"),
     kind: "budget_exhausted",
@@ -140,13 +140,27 @@ pub(crate) const NOT_FOUND: Failure = Failure {
     http: StatusCode::NOT_FOUND,
 };
 
-/// This `request_id` was already accepted. The first attempt owns the outcome;
-/// inspect its history record instead of sending it again under a new ID.
+/// This attempt ID was already accepted. Durable request identity retains its
+/// outcome independently of diagnostic history; this ID never executes again.
 pub(crate) const DUPLICATE_REQUEST: Failure = Failure {
     status: None,
     kind: "duplicate_request",
     retry_safe: false,
     http: StatusCode::CONFLICT,
+};
+
+pub(crate) const REQUEST_ID_MISMATCH: Failure = Failure {
+    status: None,
+    kind: "request_id_mismatch",
+    retry_safe: false,
+    http: StatusCode::CONFLICT,
+};
+
+pub(crate) const INVALID_RETRY: Failure = Failure {
+    status: None,
+    kind: "invalid_retry",
+    retry_safe: false,
+    http: StatusCode::BAD_REQUEST,
 };
 
 /// Rejected by a queue or session limit before any SQL ran, so the same request
@@ -259,6 +273,8 @@ pub(crate) fn by_kind(kind: &str) -> Option<Failure> {
         UNKNOWN_SESSION,
         NOT_FOUND,
         DUPLICATE_REQUEST,
+        REQUEST_ID_MISMATCH,
+        INVALID_RETRY,
         CAPACITY,
         UNAVAILABLE,
         NO_READY_WORKER,

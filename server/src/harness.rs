@@ -24,6 +24,8 @@ mod aws_harness;
 mod concurrency;
 mod metering;
 mod observability;
+mod request_identity;
+mod request_upgrade;
 
 const ARTIFACTS: &str = "/artifacts";
 
@@ -69,6 +71,12 @@ pub async fn run(args: Vec<String>) -> i32 {
         authentication::checks(&ctx).await
     } else if has("--auth-isolated") {
         authentication::isolated_cleanup(&ctx).await
+    } else if has("--request-identity") {
+        request_identity::checks(&ctx).await
+    } else if has("--request-identity-concurrent") {
+        request_identity::concurrent(&ctx).await
+    } else if has("--ownership-loss") {
+        request_identity::ownership_loss(&ctx).await
     } else if has("--dbt-isolated") {
         dbt_isolated_checks(&ctx).await
     } else if has("--cold-start") {
@@ -814,6 +822,17 @@ async fn gateway_replaced(ctx: &Ctx) -> anyhow::Result<()> {
         record["status"] == json!("succeeded"),
         format!("the severed insert ended {}", record["status"]),
     )?;
+    let durable = request_json(
+        reopened.client(),
+        Method::GET,
+        &format!("/v1/requests/{request_id}"),
+        None,
+    )
+    .await?;
+    require(
+        durable["status"] == "succeeded" && durable["outcome"] == "statement_result",
+        format!("gateway replacement lost durable outcome: {durable}"),
+    )?;
     println!(
         "PASS: a gateway replaced without grace left classified outcomes and a knowable history"
     );
@@ -842,12 +861,15 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
     let path = connection.path();
     let sql_text =
         format!("insert into {table} select range from range(2000000000) where range % 13 = 5");
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let payload = json!({"request_id": request_id, "sql": sql_text, "timeout_seconds": 58});
+    let submitted = payload.clone();
     let handle = tokio::spawn(async move {
         client
             .request(
                 Method::POST,
                 &format!("{path}/queries"),
-                Some(&json!({"request_id": uuid::Uuid::new_v4().to_string(), "sql": sql_text, "timeout_seconds": 58})),
+                Some(&submitted),
                 client::STATEMENT_TIMEOUT,
             )
             .await
@@ -860,31 +882,160 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
             .unwrap_or_default(),
     )?;
     let outcome = handle.await?;
-    let committed = outcome.is_ok();
-    if expect_classified {
-        require(
-            !committed,
-            "the statement completed despite an immediate kill",
-        )?;
-    }
-    let reader = ctx.open_named("harness-evict3", None).await?;
-    let rows = sql(&reader, &format!("select count(*) from {table}")).await?;
-    let count = rows
-        .first()
-        .and_then(|r| r[0].as_deref())
-        .unwrap_or("0")
-        .to_owned();
-    if committed {
-        require(
-            count != "0",
-            format!("reported success but table holds {count} rows"),
-        )?;
+    let describe = |result: &Result<Vec<u8>, RemoteError>| match result {
+        Ok(bytes) => json!({"received_success": true, "response_bytes": bytes.len()}),
+        Err(error) => json!({
+            "received_success": false,
+            "http_status": error.status,
+            "failure_kind": error.failure_kind,
+            "retry_safe": error.retry_safe,
+            "error": error.message,
+        }),
+    };
+    let artifact = if expect_classified {
+        "evicted-midquery-hard.json"
     } else {
+        "evicted-midquery-graceful.json"
+    };
+    let mut evidence = json!({
+        "request_id": request_id,
+        "request": payload,
+        "original_response": describe(&outcome),
+        "worker": connection.placement,
+    });
+    write_artifact(artifact, &evidence.to_string());
+    // The connection name is execution context, so reuse it when checking the
+    // exact same attempt on a replacement session. Session/worker IDs may differ.
+    let reader = ctx.open_named("harness-evict2", None).await?;
+    let mut durable = Value::Null;
+    for _ in 0..60 {
+        durable = request_json(
+            reader.client(),
+            Method::GET,
+            &format!("/v1/requests/{request_id}"),
+            None,
+        )
+        .await?;
+        if durable["state"] == "terminal" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let count_rows = || async {
+        let rows = sql(&reader, &format!("select count(*) from {table}")).await?;
+        rows.first()
+            .and_then(|row| row[0].as_deref())
+            .ok_or_else(|| anyhow::anyhow!("eviction row count was absent"))?
+            .parse::<u64>()
+            .map_err(anyhow::Error::from)
+    };
+    let count = count_rows().await?;
+    let usage_path = format!("/v1/usage?execution_id={request_id}");
+    let usage = request_json(reader.client(), Method::GET, &usage_path, None).await?;
+    evidence["durable"] = durable.clone();
+    evidence["row_count"] = json!(count);
+    evidence["usage"] = usage.clone();
+    write_artifact(artifact, &evidence.to_string());
+    // CI's failing-job path prints the harness logs even when it cannot copy the
+    // artifact volume, so keep the original error and durable outcome there too.
+    println!("eviction evidence: {evidence}");
+
+    const EXPECTED_ROWS: u64 = 153_846_154;
+    require(
+        durable["state"] == "terminal",
+        format!("evicted request was never reconciled: {durable}"),
+    )?;
+    require(
+        count == 0 || count == EXPECTED_ROWS,
+        format!("evicted single-statement insert left a partial or repeated result: {count} rows"),
+    )?;
+    // A lost/error response is not proof of rollback. SQL can commit before the
+    // response or terminal metadata is lost; durable unknown remains non-retryable.
+    if outcome.is_ok() || durable["status"] == "succeeded" {
         require(
-            count == "0",
-            format!("a statement that did not commit left {count} rows"),
+            count == EXPECTED_ROWS
+                && durable["status"] == "succeeded"
+                && durable["outcome"] == "statement_result",
+            format!("reported success disagrees with {count} rows or {durable}"),
         )?;
     }
+    match durable["outcome"].as_str() {
+        Some("not_executed") => require(count == 0, "a refused request changed the table")?,
+        Some("unknown") => require(
+            durable["retry_safe"] == false,
+            format!("unknown outcome was marked retry-safe: {durable}"),
+        )?,
+        Some("statement_result") => {}
+        _ => anyhow::bail!("unrecognized durable outcome: {durable}"),
+    }
+    if let Err(error) = &outcome
+        && error.retry_safe
+    {
+        require(count == 0, format!("retry-safe response left {count} rows"))?;
+    }
+    if expect_classified {
+        let error = outcome
+            .as_ref()
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("the statement completed despite an immediate kill"))?;
+        require(
+            error
+                .failure_kind
+                .as_deref()
+                .is_some_and(|kind| !kind.is_empty())
+                && !error.retry_safe,
+            format!("hard worker loss was not classified conservatively: {error:?}"),
+        )?;
+        require(
+            durable["outcome"] == "unknown" && durable["retry_safe"] == false,
+            format!("hard worker loss falsely claimed a replay-safe outcome: {durable}"),
+        )?;
+    }
+    require(
+        usage["events"]
+            .as_array()
+            .is_some_and(|events| events.len() == 1),
+        format!("evicted attempt did not settle exactly once: {usage}"),
+    )?;
+    if !expect_classified {
+        require(
+            durable["status"] == "succeeded"
+                && durable["outcome"] == "statement_result"
+                && usage["events"][0]["source"] == "worker",
+            format!(
+                "graceful replacement recovered work before its predecessor finished: \
+                 durable={durable}, usage={usage}"
+            ),
+        )?;
+    }
+
+    // Replaying the attempt is an identity lookup, even after the original worker
+    // disappeared. It must not execute the insert or append another usage event.
+    let replay = reader
+        .client()
+        .request(
+            Method::POST,
+            &format!("{}/queries", reader.path()),
+            Some(&payload),
+            client::STATEMENT_TIMEOUT,
+        )
+        .await;
+    let count_after = count_rows().await?;
+    let usage_after = request_json(reader.client(), Method::GET, &usage_path, None).await?;
+    evidence["replay_response"] = describe(&replay);
+    evidence["row_count_after_replay"] = json!(count_after);
+    evidence["usage_after_replay"] = usage_after.clone();
+    write_artifact(artifact, &evidence.to_string());
+    println!("eviction replay evidence: {evidence}");
+    let duplicate = expect_status(replay, 409)?;
+    require(
+        duplicate.failure_kind.as_deref() == Some("duplicate_request") && !duplicate.retry_safe,
+        format!("evicted request was not recognized as a duplicate: {duplicate:?}"),
+    )?;
+    require(
+        count_after == count && usage_after["events"] == usage["events"],
+        "replaying the evicted request changed rows or usage",
+    )?;
     println!(
         "PASS: a statement whose worker was deleted mid-run kept committed state consistent ({count} rows)"
     );

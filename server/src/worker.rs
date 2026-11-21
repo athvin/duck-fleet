@@ -2,17 +2,21 @@ use crate::{
     ApiError, Envelope, Operation, Output, QueryRequest, Reply,
     compute::{Mode, Placement, Resources},
     credentials::{self, Identity},
-    failure, metering, pricing,
+    failure, metering, pricing, requests,
     secrets::{Redactor, Startup},
 };
 use anyhow::{Context, Result};
 use arrow_ipc::writer::StreamWriter;
+use axum::http::StatusCode;
 use duckdb::{Connection, InterruptHandle, params_from_iter, types::Value as SqlValue};
 use postgres::{Client, NoTls};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -37,11 +41,31 @@ pub(crate) fn interrupt(
         && session.is_none_or(|id| current.session == id)
         && query.is_none_or(|id| current.query == id)
     {
-        current.reason = Some(reason);
+        // Lost ownership is terminal even if a caller or deadline subsequently
+        // interrupts the same statement. Its commit outcome must stay unknown.
+        if current.reason != Some("ownership_lost") {
+            current.reason = Some(reason);
+        }
         current.handle.interrupt();
         return true;
     }
     false
+}
+
+fn lose_ownership(ready: &AtomicBool, lost: &AtomicBool, active: &ActiveSlot) {
+    lost.store(true, Ordering::Release);
+    ready.store(false, Ordering::Release);
+    interrupt(active, None, None, "ownership_lost");
+}
+
+fn execution_failure(error: Option<&str>, reason: Option<&str>) -> Option<failure::Failure> {
+    if reason == Some("ownership_lost") {
+        // Even an engine success racing with ownership loss is uncertain: a
+        // replacement may already have begun recovering this process's work.
+        Some(failure::INTERRUPTED)
+    } else {
+        error.map(|message| failure::classify(message, reason))
+    }
 }
 
 struct Session {
@@ -60,6 +84,16 @@ struct Session {
     /// The last credential admitted on this session. Ownership stays with the
     /// principal, so rotating its token can replace this cleanup authority.
     authority: Identity,
+}
+
+struct Completion<'a> {
+    status: &'a str,
+    failure: Option<failure::Failure>,
+    elapsed_ms: i64,
+    result_rows: Option<i64>,
+    error: Option<&'a str>,
+    capture: Option<&'a crate::profiling::Capture>,
+    outcome: requests::Outcome,
 }
 
 impl Session {
@@ -162,6 +196,9 @@ pub(crate) struct Worker {
     profiling_enabled: bool,
     redactor: Redactor,
     status: crate::worker_status::Status,
+    // Last field: engine sessions and their uncommitted transactions are dropped
+    // before another process can acquire this recovery identity.
+    ownership: crate::worker_ownership::Guard,
 }
 
 fn literal(value: &str) -> String {
@@ -293,10 +330,23 @@ struct Ledger {
     /// so a worker that could execute nothing still answered 200 and kept receiving
     /// traffic that could only fail.
     ready: Arc<std::sync::atomic::AtomicBool>,
+    ownership_lost: Arc<AtomicBool>,
     redactor: Redactor,
 }
 
 impl Ledger {
+    fn restore_readiness(&self) {
+        if self.ownership_lost.load(Ordering::Acquire) {
+            return;
+        }
+        self.ready.store(true, Ordering::Release);
+        // A metadata reconnect cannot reverse the separate ownership connection's
+        // terminal loss. Recheck after publishing so a concurrent callback wins.
+        if self.ownership_lost.load(Ordering::Acquire) {
+            self.ready.store(false, Ordering::Release);
+        }
+    }
+
     /// Credential reads fail closed and reconnect once only for a lost socket.
     /// A statement timeout is already a complete bounded refusal, not a reason
     /// to retry a credential-table lock and double the admission delay.
@@ -330,7 +380,7 @@ impl Ledger {
                     &format!("{error:#}"),
                 )
             })?;
-        self.ready.store(true, std::sync::atomic::Ordering::Release);
+        self.restore_readiness();
         credentials::resolve_ids(&mut self.client, ids)
             .map_err(|error| self.credential_unavailable(&format!("{error:#}")))
     }
@@ -381,7 +431,7 @@ impl Ledger {
                 self.client = client;
                 // An earlier failure may have taken this worker out of service; a
                 // working connection is what makes it serviceable again.
-                self.ready.store(true, std::sync::atomic::Ordering::Release);
+                self.restore_readiness();
                 tracing::info!(step, "ledger connection replaced");
                 match self.client.execute(sql, params) {
                     Ok(rows) => Ok(rows),
@@ -608,6 +658,13 @@ impl Worker {
                 )
             },
         )?;
+        let mut ownership =
+            crate::worker_ownership::Guard::acquire(&platform_dsn, &worker_id, wait)?;
+        let ownership_lost = Arc::new(AtomicBool::new(false));
+        let loss_ready = ready.clone();
+        let loss_active = active.clone();
+        let loss_latch = ownership_lost.clone();
+        ownership.on_loss(move || lose_ownership(&loss_ready, &loss_latch, &loss_active));
         let mut transaction = ledger.transaction()?;
         transaction.batch_execute("SELECT pg_advisory_xact_lock(4283121);
             CREATE TABLE IF NOT EXISTS query_history (
@@ -631,8 +688,6 @@ impl Worker {
             CREATE INDEX IF NOT EXISTS query_history_invocation ON query_history((context::jsonb #>> '{dbt,invocation_id}'),history_id DESC);
             CREATE INDEX IF NOT EXISTS query_history_model_run ON query_history((context::jsonb ->> 'model_run_id'),history_id DESC);
             CREATE INDEX IF NOT EXISTS query_history_running ON query_history(worker_id) WHERE status='running';")?;
-        // Starting one worker must not terminate records owned by the other worker.
-        metering::interrupt_abandoned_history(&mut transaction, &worker_id)?;
         crate::credentials::migrate(&mut transaction)?;
         // The budget starts from configuration only the first time it is created; a
         // restart must not refill a balance that has already been spent.
@@ -641,6 +696,11 @@ impl Worker {
             env_micro_usd("DUCKFLEET_PREPAID_MICRO_USD", 10_000_000)?,
             env_micro_usd("DUCKFLEET_MAX_JOB_MICRO_USD", 1_000_000)?,
         )?;
+        // The one-time legacy backfill needs both diagnostics and ledger tables.
+        // Recovery must see durable identities before it marks abandoned work.
+        requests::migrate(&mut transaction)?;
+        // Starting one worker must not terminate records owned by the other worker.
+        metering::interrupt_abandoned_history(&mut transaction, &worker_id)?;
         // Funds this worker was holding when it stopped are settled against whatever
         // its history row recorded, so nothing stays both unmetered and reserved.
         let rate = pricing::RateCard::from_env()?;
@@ -652,6 +712,10 @@ impl Worker {
         if recovered > 0 {
             tracing::warn!(recovered, "settled reservations abandoned by a restart");
         }
+        anyhow::ensure!(
+            ownership.check(),
+            "exclusive worker ownership was lost during startup"
+        );
         Ok(Self {
             root,
             worker_id,
@@ -668,6 +732,7 @@ impl Worker {
                 client: ledger,
                 dsn: platform_dsn,
                 ready,
+                ownership_lost,
                 redactor: redactor.clone(),
             },
             sessions: HashMap::new(),
@@ -683,6 +748,7 @@ impl Worker {
             },
             redactor,
             status,
+            ownership,
         })
     }
 
@@ -691,6 +757,12 @@ impl Worker {
     }
 
     pub(crate) fn run(&mut self, mut receiver: mpsc::Receiver<Envelope>) {
+        // Main publishes readiness after construction. A heartbeat can fail in
+        // that narrow interval, so do not begin even maintenance after a loss.
+        if self.ownership.is_closed() {
+            self.ledger.ready.store(false, Ordering::Release);
+            return;
+        }
         // Startup drains any backlog the hourly sweeps missed while this worker was
         // down; afterwards one bounded batch per hour keeps up with new expiry
         // without ever holding the engine's queue behind a long delete.
@@ -709,6 +781,10 @@ impl Worker {
                 Ok(None) => break,
                 Err(_) => {
                     self.housekeeping();
+                    if self.ownership.is_closed() {
+                        self.ledger.ready.store(false, Ordering::Release);
+                        break;
+                    }
                     last_housekeeping = Instant::now();
                     continue;
                 }
@@ -732,6 +808,10 @@ impl Worker {
             self.status.set_sessions(self.sessions.len());
             drop(query_guard);
             let _ = reply.send(response);
+            if self.ownership.is_closed() {
+                self.ledger.ready.store(false, Ordering::Release);
+                break;
+            }
             if last_housekeeping.elapsed() >= HOUSEKEEPING_INTERVAL {
                 self.housekeeping();
                 last_housekeeping = Instant::now();
@@ -761,6 +841,14 @@ impl Worker {
     }
 
     fn housekeeping(&mut self) {
+        if !self.ownership.check() {
+            let _ = self
+                .ledger
+                .unserviceable("worker ownership", "exclusive ownership connection lost");
+            self.sessions.clear();
+            self.status.set_sessions(0);
+            return;
+        }
         // Dropping a session connection rolls back any uncommitted transaction.
         self.sessions
             .retain(|_, session| session.touched.elapsed() < SESSION_IDLE_TIMEOUT);
@@ -834,6 +922,11 @@ impl Worker {
     }
 
     fn handle(&mut self, op: Operation) -> Reply {
+        if !self.ownership.check() {
+            return Err(self
+                .ledger
+                .unserviceable("worker ownership", "exclusive ownership connection lost"));
+        }
         match op {
             Operation::Open(mut request, identity) => {
                 // The gateway already routed by mode and size; this is the worker
@@ -902,19 +995,76 @@ impl Worker {
         }
     }
 
-    fn close_refused(&mut self, query_id: &str, refusal: &ApiError) {
-        let _ = self.ledger.execute(
-            "closing a refused execution",
-            "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=0,
-             error=$3, failure_kind=$4, retry_safe=$5 WHERE query_id=$1",
-            &[
-                &query_id,
-                &refusal.0.status.unwrap_or("refused"),
-                &refusal.1,
-                &refusal.0.kind,
-                &refusal.0.retry_safe,
-            ],
-        );
+    /// Durable outcome, diagnostic history, and the usage ledger become terminal
+    /// together. Never keep a PostgreSQL transaction open across engine execution.
+    fn finish_execution(
+        &mut self,
+        admission: &metering::Admission,
+        context: &Value,
+        completion: Completion<'_>,
+    ) -> Result<(), ApiError> {
+        let finished = (|| -> Result<i64> {
+            let mut transaction = self.ledger.client.transaction()?;
+            let failure_kind = completion.failure.map(|failure| failure.kind);
+            let retry_safe = completion.failure.map(|failure| failure.retry_safe);
+            // Request -> history -> reservation -> budget is also recovery's lock
+            // order. The request's terminal update remains invisible until commit.
+            requests::finish_in(
+                &mut transaction,
+                &admission.execution_id,
+                completion.status,
+                failure_kind,
+                retry_safe,
+                completion.elapsed_ms,
+                completion.result_rows,
+                completion.outcome,
+            )?;
+            let profile_status = completion.capture.map_or("not_recorded", |c| c.status);
+            let profile = completion.capture.and_then(|c| c.profile.as_deref());
+            let metrics = completion.capture.map_or("{}", |c| c.metrics.as_str());
+            transaction.execute(
+                "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=$3,
+                 result_rows=$4, error=$5, profile_status=$6, profile=$7, metrics=$8,
+                 failure_kind=$9, retry_safe=$10 WHERE query_id=$1",
+                &[
+                    &admission.execution_id,
+                    &completion.status,
+                    &completion.elapsed_ms,
+                    &completion.result_rows,
+                    &completion.error,
+                    &profile_status,
+                    &profile,
+                    &metrics,
+                    &failure_kind,
+                    &retry_safe,
+                ],
+            )?;
+            let charged = metering::settle_in(
+                &mut transaction,
+                admission,
+                completion.elapsed_ms,
+                &self.worker_id,
+                &context.to_string(),
+                &self.rate,
+            )?;
+            transaction.commit()?;
+            Ok(charged)
+        })();
+        match finished {
+            Ok(charged) => {
+                tracing::debug!(
+                    query_id = admission.execution_id,
+                    charged_micro_usd = charged,
+                    reserved_micro_usd = admission.reserved_micro_usd,
+                    "usage and request outcome settled"
+                );
+                Ok(())
+            }
+            Err(error) => Err(self.ledger.unserviceable(
+                "persisting terminal request outcome; recovery will settle it",
+                &format!("{error:#}"),
+            )),
+        }
     }
 
     /// Admission reserved funds, but authority changed before the engine started.
@@ -925,24 +1075,19 @@ impl Worker {
         context: &Value,
         refusal: ApiError,
     ) -> Reply {
-        let settled = metering::settle(
-            &mut self.ledger.client,
+        let _ = self.finish_execution(
             admission,
-            0,
-            &self.worker_id,
-            &context.to_string(),
-            &self.rate,
+            context,
+            Completion {
+                status: refusal.0.status.unwrap_or("refused"),
+                failure: Some(refusal.0),
+                elapsed_ms: 0,
+                result_rows: None,
+                error: Some(&refusal.1),
+                capture: None,
+                outcome: requests::Outcome::NotExecuted,
+            },
         );
-        self.close_refused(&admission.execution_id, &refusal);
-        if let Err(error) = settled {
-            // History records zero elapsed time even if settlement failed. Stop
-            // admissions so restart recovery releases this hold at zero cost;
-            // do this after history's reconnect, which may restore readiness.
-            self.ledger.unserviceable(
-                "releasing a refused admission; recovery will settle it",
-                &format!("{error:#}"),
-            );
-        }
         Err(refusal)
     }
 
@@ -970,37 +1115,80 @@ impl Worker {
             query.extend(session.clone());
         }
         let query_id = req.request_id.to_string();
+        let retry_of = req.retry_of.map(|id| id.to_string());
         let principal = session.principal.clone();
-        let inserted = self.ledger.execute(
-            "recording an accepted execution",
-            "INSERT INTO query_history (query_id, session_id, sql, context, status, worker_id, placement, principal) VALUES ($1,$2,$3,$4,'running',$5,$6,$7) ON CONFLICT DO NOTHING",
-            &[&query_id, &id.to_string(), &req.sql, &req.context.to_string(), &self.worker_id, &self.placement.to_string(), &principal],
-        )?;
-        if inserted == 0 {
-            return Err(ApiError::new(
-                failure::DUPLICATE_REQUEST,
-                "request_id already accepted; inspect history, SQL was not replayed",
-            ));
-        }
-        // Reserve funds before any SQL runs. There is no execution path around this:
-        // a refusal closes the record it just accepted instead of leaving it running.
-        let admission = match metering::admit(
+        let resources = session.placement.resources;
+        let compute = json!({
+            "mode": session.placement.mode.name(),
+            "cpu": resources.cpu,
+            "memory_bytes": resources.memory_bytes,
+            "disk_bytes": resources.disk_bytes,
+        });
+        let session_id = id.to_string();
+        let submission = || requests::Submission {
+            request_id: &query_id,
+            retry_of: retry_of.as_deref(),
+            session_id: &session_id,
+            sql: &req.sql,
+            parameters: &req.parameters,
+            context: &req.context,
+            timeout_seconds: req.timeout_seconds,
+            compute: &compute,
+            worker_id: &self.worker_id,
+            placement: &self.placement,
+            principal: &principal,
+        };
+        // Canonicalization sees validated parameters and effective session context,
+        // but no observed worker/boot identity. The claim, history, and reservation
+        // commit atomically; neither diagnostics retention nor a competing worker
+        // can make an accepted request eligible to execute again.
+        let mut admitted = requests::admit(
             &mut self.ledger.client,
-            &query_id,
+            submission(),
             billable_units,
-            req.timeout_seconds,
-            &self.worker_id,
             &self.rate,
-        ) {
-            Ok(admission) => admission,
+        );
+        if admitted.is_err() && self.ledger.client.is_closed() {
+            // No engine statement has run. Reconnecting and claiming the same ID
+            // once is safe: an ambiguous first commit becomes a duplicate instead
+            // of a second admission. Bootstrap sessions need this too, since they
+            // do not perform the credential reads that otherwise repair a socket.
+            self.ledger
+                .execute("reconnecting for request admission", "SELECT 1", &[])?;
+            admitted = requests::admit(
+                &mut self.ledger.client,
+                submission(),
+                billable_units,
+                &self.rate,
+            );
+        }
+        let admission = match admitted {
+            Ok(requests::AdmissionResult::Admitted(admission)) => admission,
+            Ok(requests::AdmissionResult::Duplicate(outcome)) => {
+                return Ok(Output::JsonResponse(StatusCode::CONFLICT, outcome));
+            }
             Err(refusal) => {
-                self.close_refused(&query_id, &refusal);
+                if refusal.0 == failure::UNAVAILABLE {
+                    self.ledger.unserviceable(
+                        "admitting a durable request",
+                        "platform transaction failed; no statement ran",
+                    );
+                }
                 return Err(refusal);
             }
         };
-        // History writes and budget admission can wait on database locks. Check
-        // authority again after those waits, directly before engine execution:
-        // revocation during admission must never become permission to run SQL.
+        if let Err(refusal) = requests::mark_executing(&mut self.ledger.client, &query_id) {
+            return self.abort_admission(&admission, &req.context, refusal);
+        }
+        // History, budget, and durable state changes can wait on database locks.
+        // Check authority after all of them, directly before engine execution.
+        if !self.ownership.check() {
+            let refusal = self.ledger.unserviceable(
+                "worker ownership",
+                "exclusive ownership connection lost before execution",
+            );
+            return self.abort_admission(&admission, &req.context, refusal);
+        }
         if let Err(refusal) = self.validate_session_identity(id, &claimed) {
             return self.abort_admission(&admission, &req.context, refusal);
         }
@@ -1008,14 +1196,32 @@ impl Worker {
             .sessions
             .get_mut(&id)
             .expect("validated session remains on the sole worker thread");
+        let executing = {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            // Credential validation can wait too. Check the local loss latch while
+            // publishing Active: a concurrent loss either refuses admission here
+            // or sees this slot and interrupts it. No database wait follows auth.
+            if self.ownership.is_closed() {
+                false
+            } else {
+                *active = Some(Active {
+                    query: req.request_id,
+                    session: id,
+                    handle: session.conn.interrupt_handle(),
+                    reason: None,
+                });
+                true
+            }
+        };
+        if !executing {
+            let refusal = self.ledger.unserviceable(
+                "worker ownership",
+                "exclusive ownership connection lost before execution",
+            );
+            return self.abort_admission(&admission, &req.context, refusal);
+        }
         let cleared = session.profile.clear();
         let started = Instant::now();
-        *self.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(Active {
-            query: req.request_id,
-            session: id,
-            handle: session.conn.interrupt_handle(),
-            reason: None,
-        });
         let active = self.active.clone();
         // One timer enforces both limits, because a cost cap is just a shorter
         // deadline. Which limit bound it decides how the stop is reported.
@@ -1030,12 +1236,15 @@ impl Worker {
             interrupt(&active, None, Some(request_id), deadline_reason);
         });
         let result = execute(&session.conn, &req.sql, parameters);
-        let reason = self
+        let mut reason = self
             .active
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .and_then(|a| a.reason);
+        if self.ownership.is_closed() {
+            reason = Some("ownership_lost");
+        }
         deadline.abort();
         session.touched = Instant::now();
         let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -1046,53 +1255,65 @@ impl Worker {
         // masks the platform's own credentials; the generic pass masks the ones it
         // cannot know — a caller's connection string quoted back by the engine must
         // not put a live password into a durable history row.
-        let error = result
+        let mut error = result
             .as_ref()
             .err()
             .map(|e| crate::secrets::scrub_passwords(&self.redactor.scrub(&format!("{e:#}"))));
+        if reason == Some("ownership_lost") {
+            error = Some(
+                "worker ownership lost; commit outcome may be unknown, do not blindly retry".into(),
+            );
+        }
         // A timer racing with a completed statement must not imply the write rolled
         // back, so an interruption reason outranks whatever the engine reported.
-        let failure = error
-            .as_deref()
-            .map(|message| failure::classify(message, reason));
+        let failure = execution_failure(error.as_deref(), reason);
         let status = failure.and_then(|f| f.status).unwrap_or(if result.is_ok() {
             "succeeded"
         } else {
             "failed"
         });
         let rows = result.as_ref().ok().map(|(_, rows)| *rows);
-        // Meter before the record goes terminal. If this fails the reservation stays
-        // held and the next worker start settles it, so no execution escapes the
-        // ledger; the SQL has already run, so the caller still gets its outcome.
-        match metering::settle(
-            &mut self.ledger.client,
-            &admission,
-            elapsed,
-            &self.worker_id,
-            &req.context.to_string(),
-            &self.rate,
-        ) {
-            Ok(charged) => tracing::debug!(
-                query_id,
-                charged_micro_usd = charged,
-                reserved_micro_usd = admission.reserved_micro_usd,
-                "usage settled"
-            ),
-            Err(error) => {
-                tracing::error!(
-                    query_id,
-                    ?error,
-                    "usage not settled; recovery will settle it"
-                )
-            }
+        // A known statement result does not assert transaction commit. Interrupted
+        // statements remain uncertain even if the engine returned an error.
+        let outcome = if failure.is_some_and(|failure| {
+            matches!(
+                failure.kind,
+                "canceled" | "timeout" | "budget_exceeded" | "interrupted"
+            )
+        }) {
+            requests::Outcome::Unknown
+        } else {
+            requests::Outcome::StatementResult
+        };
+        if self
+            .finish_execution(
+                &admission,
+                &req.context,
+                Completion {
+                    status,
+                    failure,
+                    elapsed_ms: elapsed,
+                    result_rows: rows,
+                    error: error.as_deref(),
+                    capture: Some(&capture),
+                    outcome,
+                },
+            )
+            .is_err()
+        {
+            return Err(ApiError::new(
+                failure::INTERRUPTED,
+                "statement finished but its durable outcome could not be recorded; \
+                 inspect the request before retrying",
+            ));
         }
-        self.ledger.execute(
-            "recording a finished execution",
-            "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=$3, result_rows=$4, error=$5, profile_status=$6, profile=$7, metrics=$8, failure_kind=$9, retry_safe=$10 WHERE query_id=$1",
-            &[&query_id, &status, &elapsed, &rows, &error, &capture.status, &capture.profile, &capture.metrics,
-              &failure.map(|f| f.kind), &failure.map(|f| f.retry_safe)],
-        )?;
         tracing::info!(query_id, session_id = %id, status, elapsed_ms = elapsed, "query finished");
+        if reason == Some("ownership_lost") {
+            return Err(ApiError::new(
+                failure::INTERRUPTED,
+                error.unwrap_or_else(|| "worker ownership lost; commit outcome unknown".into()),
+            ));
+        }
         result
             .map(|(bytes, _)| Output::Arrow(bytes, req.request_id))
             // Reuses the scrubbed text, so the caller and history never disagree.
@@ -1149,6 +1370,35 @@ fn execute(conn: &Connection, sql: &str, parameters: Vec<SqlValue>) -> Result<(V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_loss_stops_readiness_and_outranks_later_interrupts() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        let ready = AtomicBool::new(true);
+        let lost = AtomicBool::new(false);
+        let active = Arc::new(Mutex::new(Some(Active {
+            query: Uuid::new_v4(),
+            session: Uuid::new_v4(),
+            handle: connection.interrupt_handle(),
+            reason: None,
+        })));
+        lose_ownership(&ready, &lost, &active);
+        assert!(!ready.load(Ordering::Acquire));
+        assert!(lost.load(Ordering::Acquire));
+        for reason in ["canceled", "timed_out", "budget_exceeded"] {
+            assert!(interrupt(&active, None, None, reason));
+        }
+        let reason = active.lock().unwrap().as_ref().unwrap().reason;
+        assert_eq!(reason, Some("ownership_lost"));
+        // Ownership loss racing with either a successful result or a conflict
+        // cannot become success or a retry-safe transaction conflict.
+        for error in [None, Some("Transaction conflict: concurrent write")] {
+            let failure = execution_failure(error, reason).unwrap();
+            assert_eq!(failure, failure::INTERRUPTED);
+            assert!(!failure.retry_safe);
+        }
+        Ok(())
+    }
 
     fn named_identity(principal: &str) -> Identity {
         Identity {

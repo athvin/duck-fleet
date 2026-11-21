@@ -53,6 +53,13 @@ pub async fn run(args: Vec<String>) -> i32 {
                 return 2;
             }
         },
+        "request" => match parsed.positionals.first() {
+            Some(id) => get(&url, &token, &format!("/v1/requests/{id}")).await,
+            None => {
+                eprintln!("request needs an id");
+                return 2;
+            }
+        },
         "usage" => {
             get(
                 &url,
@@ -64,7 +71,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "budget" => get(&url, &token, "/v1/budget").await,
         "workers" => get(&url, &token, "/v1/workers").await,
         other => {
-            eprintln!("unknown command: {other} (sql|history|query|usage|budget|workers)");
+            eprintln!("unknown command: {other} (sql|history|query|request|usage|budget|workers)");
             return 2;
         }
     };

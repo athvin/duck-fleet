@@ -38,6 +38,16 @@ grep -q 'still unreachable' artifacts/worker-boot-failure.log
 grep -q 'catalog-does-not-resolve' artifacts/worker-boot-failure.log
 ! grep -q 'local-catalog-password' artifacts/worker-boot-failure.log
 
+# A deleted pod's replacement can overlap its draining predecessor even under
+# Deployment Recreate. Startup recovery must wait for the stable identity owner.
+if docker compose run --rm --no-deps -T -e DUCKFLEET_CATALOG_WAIT_SECONDS=1 \
+  worker-small > artifacts/worker-overlap-refusal.log 2>&1; then
+  echo 'a second live process acquired the same worker recovery identity' >&2
+  exit 1
+fi
+grep -q 'still owned by another process' artifacts/worker-overlap-refusal.log
+echo 'PASS: overlapping worker startup refused recovery of a live predecessor'
+
 # A worker reached directly must refuse isolation too. Naming a resource (cpu/memory)
 # derives an isolated pod, which a worker cannot provide; a request naming none runs
 # on that worker. (Under the reworked model the mode is derived from presence of
@@ -56,6 +66,11 @@ echo 'PASS: a worker addressed directly refuses isolation it cannot provide'
 # reaches the gateway only through the Rust client (the harness --api-workflow stage).
 docker compose run --rm api
 docker compose run --rm dbt duckfleet-server --auth-continuity
+docker compose run --rm dbt duckfleet-server --request-identity
+docker compose run --rm dbt duckfleet-server --ownership-loss
+# Ownership loss is terminal for that worker process. Start a fresh owner before
+# the ordinary query/dbt workflow; the gateway's metadata reads stayed available.
+docker compose up -d --wait worker-small server
 # The dbt lifecycle: the `dbt` image runs the Rust integration harness
 # (DUCKFLEET_ROLE=harness), which drives the forked dbt binary. Default = main
 # lifecycle; then the stages that need both the gateway and a fresh fleet.
@@ -104,6 +119,7 @@ docker compose --profile scale-out up -d --wait worker-small-b
 DUCKFLEET_WORKER_URLS=http://worker-small:8080,http://worker-small-b:8080 \
   docker compose up -d --no-deps --wait server
 docker compose run --rm --no-deps dbt duckfleet-server --spread
+docker compose run --rm --no-deps dbt duckfleet-server --request-identity-concurrent
 docker compose run --rm --no-deps dbt duckfleet-server --worker-status-pgwire
 docker compose stop worker-small
 docker compose run --rm --no-deps dbt duckfleet-server --worker-status-partial-outage

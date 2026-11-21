@@ -489,7 +489,7 @@ async fn database_contention(ctx: &Ctx, admin: &Client, dsn: &str) -> Result<()>
             .request(Method::POST, &path, Some(&body), Duration::from_secs(30))
             .await
     });
-    wait_running(admin, &query_id).await?;
+    wait_budget_lock(dsn).await?;
     revoke(admin, &credential).await?;
     lock.unlock().await?;
     expect_status(query.await?, 401)?;
@@ -525,6 +525,36 @@ async fn database_contention(ctx: &Ctx, admin: &Client, dsn: &str) -> Result<()>
         "PASS: revocation during budget admission executes no SQL and releases its reservation at zero cost"
     );
     Ok(())
+}
+
+async fn wait_budget_lock(dsn: &str) -> Result<()> {
+    let dsn = dsn.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut config: postgres::Config = dsn.parse()?;
+        config.connect_timeout(Duration::from_secs(3));
+        config.options("-c statement_timeout=3000");
+        let mut client = config.connect(postgres::NoTls)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let blocked: bool = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
+                 AND pid<>pg_backend_pid() AND state='active' AND wait_event_type='Lock'
+                 AND query LIKE '%budget%FOR UPDATE%')",
+                    &[],
+                )?
+                .get(0);
+            if blocked {
+                return Ok(());
+            }
+            require(
+                Instant::now() < deadline,
+                "query did not wait on the budget lock",
+            )?;
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })
+    .await?
 }
 
 pub(super) async fn checks(ctx: &Ctx) -> Result<()> {

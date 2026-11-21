@@ -15,9 +15,11 @@ mod metering;
 mod pgwire;
 mod pricing;
 mod profiling;
+mod requests;
 mod secrets;
 mod usage;
 mod worker;
+mod worker_ownership;
 mod worker_status;
 use compute::SessionRequest;
 
@@ -46,6 +48,7 @@ struct App {
     active: Arc<Mutex<Option<worker::Active>>>,
     token: Arc<str>,
     history: history::Reader,
+    requests: requests::Reader,
     usage: usage::Reader,
     /// Set once the worker has attached its catalog. The HTTP server is bound before
     /// that happens so a slow catalog shows as not-ready rather than refusing
@@ -74,6 +77,7 @@ enum Operation {
 }
 enum Output {
     Json(Value),
+    JsonResponse(StatusCode, Value),
     Arrow(Vec<u8>, Uuid),
 }
 
@@ -81,6 +85,8 @@ enum Output {
 #[serde(deny_unknown_fields)]
 struct QueryRequest {
     request_id: Uuid,
+    #[serde(default)]
+    retry_of: Option<Uuid>,
     sql: String,
     #[serde(default)]
     parameters: Vec<Value>,
@@ -185,6 +191,7 @@ impl IntoResponse for Output {
     fn into_response(self) -> Response {
         match self {
             Self::Json(value) => Json(value).into_response(),
+            Self::JsonResponse(status, value) => (status, Json(value)).into_response(),
             Self::Arrow(bytes, id) => (
                 [
                     (
@@ -340,6 +347,14 @@ async fn history(State(app): State<App>, Query(filter): Query<history::Filter>) 
 async fn query_detail(State(app): State<App>, Path(id): Path<Uuid>) -> Reply {
     app.history.detail(id).await.map(Output::Json)
 }
+async fn request_detail(State(app): State<App>, Path(id): Path<Uuid>, headers: HeaderMap) -> Reply {
+    let identity = worker_identity(&headers)?;
+    let operator = identity.credential_id.is_none();
+    app.requests
+        .detail(id, identity.principal, operator)
+        .await
+        .map(Output::Json)
+}
 async fn query(
     State(app): State<App>,
     Path(id): Path<Uuid>,
@@ -462,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
         active,
         token: token.into(),
         history: history::Reader::new(std::env::var("PLATFORM_DSN")?),
+        requests: requests::Reader::new(std::env::var("PLATFORM_DSN")?),
         usage: usage::Reader::new(
             std::env::var("PLATFORM_DSN")?,
             pricing::RateCard::from_env()?,
@@ -476,6 +492,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/queries", get(history))
         .route("/v1/queries/{id}", get(query_detail))
+        .route("/v1/requests/{id}", get(request_detail))
         .route("/v1/usage", get(usage_events))
         .route("/v1/budget", get(budget).put(set_budget))
         .route("/v1/worker", get(info))
@@ -604,6 +621,7 @@ mod tests {
                 active: Arc::new(Mutex::new(None)),
                 token: "test-token".into(),
                 history: history::Reader::new("postgres://unused".into()),
+                requests: requests::Reader::new("postgres://unused".into()),
                 usage: usage::Reader::new("postgres://unused".into(), pricing::dev()),
                 ready,
                 draining,
@@ -617,6 +635,7 @@ mod tests {
             Uuid::new_v4(),
             QueryRequest {
                 request_id: Uuid::new_v4(),
+                retry_of: None,
                 sql: "select 1".into(),
                 parameters: vec![],
                 context: json!({}),

@@ -34,6 +34,13 @@ cleanup() {
     "${KUBE[@]}" logs -l app=duckfleet-worker --tail=200 --prefix --previous > artifacts/kind/workers-previous.log 2>&1 || true
     "${KUBE[@]}" logs -l app=duckfleet-gateway --tail=200 --prefix --previous > artifacts/kind/gateway-previous.log 2>&1 || true
     "${KUBE[@]}" get pods -o yaml > artifacts/kind/pods.yaml 2>&1 || true
+    # Capture ownership blockers without logging SQL text or credential material.
+    "${KUBE[@]}" exec statefulset/duckfleet-postgres -- env PGOPTIONS='-c statement_timeout=3000' \
+      psql -U duckfleet -d platform -P pager=off -c \
+      "SELECT a.pid,a.application_name,a.client_addr,a.state,a.wait_event_type,a.wait_event,
+              now()-a.state_change AS state_age,l.classid,l.objid,l.objsubid,l.granted
+       FROM pg_stat_activity a LEFT JOIN pg_locks l ON l.pid=a.pid AND l.locktype='advisory'
+       WHERE a.datname='platform' ORDER BY a.pid" > artifacts/kind/platform-connections.txt 2>&1 || true
   fi
   rm -rf "$work"
   [[ "${DUCKFLEET_KEEP_CLUSTER:-false}" == true ]] || kind delete cluster --name "$CLUSTER" > /dev/null 2>&1 || true
