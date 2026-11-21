@@ -1491,6 +1491,9 @@ class DatabaseRolePackagingTests(unittest.TestCase):
         self.assertIn('user=' + roles.role_names('duckfleet-dev')['catalog'] + ' ', query)
         self.assertNotIn('user=duckfleet ', query)
         self.assertIn(" connect_timeout=3'", query)
+        self.assertIn('ATTACH ', query)
+        self.assertIn('TYPE postgres, READ_ONLY', query)
+        self.assertIn('qualification_catalog.public.ducklake_snapshot', query)
         self.assertEqual(query.count('connect_timeout='), 1)
         with self.assertRaises(ValueError):
             probe.catalog_probe(dsn + ' host=obsolete', 'duckfleet-dev')
@@ -1517,7 +1520,7 @@ class DatabaseRolePackagingTests(unittest.TestCase):
                 raise RuntimeError('positive endpoint unavailable')
             return b'{}'
         with mock.patch.object(probe, 'call', side_effect=failed_positive), self.assertRaises(RuntimeError):
-            probe.positive_control(1, 'fixture-token', 'SELECT 1')
+            probe.positive_control(1, 'fixture-token', 'SELECT 1', 'fixture-secret')
         self.assertEqual(calls[-1], ('DELETE', '/v1/sessions/fixture'))
 
 
