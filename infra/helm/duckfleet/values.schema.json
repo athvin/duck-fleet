@@ -10,6 +10,14 @@
     "admissionLimits": {
       "type": "object", "additionalProperties": false,
       "properties": {
+        "maxQueuedQueries": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "maxRunningQueries": {"type": "integer", "minimum": 1, "maximum": 1024},
+        "maxQueuedPerPrincipal": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "maxRunningPerPrincipal": {"type": "integer", "minimum": 1, "maximum": 1024}
+      }
+    }
+  },
+  "properties": {
     "databaseRoles": {
       "type": "object",
       "additionalProperties": false,
@@ -74,14 +82,6 @@
         }
       }
     },
-        "maxQueuedQueries": {"type": "integer", "minimum": 1, "maximum": 65535},
-        "maxRunningQueries": {"type": "integer", "minimum": 1, "maximum": 1024},
-        "maxQueuedPerPrincipal": {"type": "integer", "minimum": 1, "maximum": 65535},
-        "maxRunningPerPrincipal": {"type": "integer", "minimum": 1, "maximum": 1024}
-      }
-    }
-  },
-  "properties": {
     "workerImage": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9.-]*(:[0-9]+)?/[a-zA-Z0-9._/-]+@sha256:[a-f0-9]{64}$"

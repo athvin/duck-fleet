@@ -1314,6 +1314,26 @@ class OwnershipBoundaryTests(unittest.TestCase):
 
 
 class DatabaseRolePackagingTests(unittest.TestCase):
+    def test_helm_schema_rejects_invalid_roles_and_authorization_at_the_top_level(self):
+        cases = [
+            ('databaseRoles', {'worker': 'Invalid-Role'}, 'databaseRoles.worker'),
+            ('databaseRoles', {'worker': 12}, 'databaseRoles.worker'),
+            ('databaseRoles', {'typo': 'fixture_role'}, 'databaseRoles'),
+            ('authorization.defaultPersistentGrant.cpu', 65, 'authorization.defaultPersistentGrant.cpu'),
+            ('authorization.defaultPersistentGrant.cpu', 1.5, 'authorization.defaultPersistentGrant.cpu'),
+            ('authorization.defaultPersistentGrant.memory', '1GB', 'authorization.defaultPersistentGrant.memory'),
+            ('authorization.unknown', True, 'authorization'),
+            ('admissionLimits.default.databaseRoles', {'worker': 'fixture_role'}, 'admissionLimits.default'),
+        ]
+        for key, value, error_path in cases:
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(subprocess.CalledProcessError) as error:
+                    chart(['--set-json', key+'='+json.dumps(value)])
+                self.assertIn('schema', error.exception.stderr)
+                self.assertIn(error_path, error.exception.stderr)
+        chart(['--set-json', 'databaseRoles='+json.dumps({
+            part: 'fixture_'+part for part in ('migrator','gateway','worker','maintainer','catalog')})])
+
     def test_namespace_roles_are_distinct_bounded_and_do_not_alias_sanitized_names(self):
         roles = load('database_roles', 'scripts/database_roles.py')
         first = roles.role_names('a-'+'b'*60)
