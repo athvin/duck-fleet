@@ -530,6 +530,28 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn query_parameters_preserve_f64_bits_when_decoding_json() {
+        for expected in [
+            0.0012033694344163659_f64,
+            1.2345678901234567,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::MAX,
+            -0.0,
+        ] {
+            let body = serde_json::to_vec(&json!({
+                "request_id": Uuid::nil(),
+                "sql": "SELECT ?::DOUBLE",
+                "parameters": [expected]
+            }))
+            .unwrap();
+            let request: QueryRequest = serde_json::from_slice(&body).unwrap();
+            let actual = request.parameters[0].as_f64().unwrap();
+            assert_eq!(actual.to_bits(), expected.to_bits(), "{expected}");
+        }
+    }
+
+    #[test]
     fn internal_identity_requires_a_complete_named_credential() {
         let id = Uuid::new_v4().to_string();
         for (principal, credential) in [
