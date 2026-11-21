@@ -68,6 +68,40 @@ docker compose run --rm dbt duckfleet-server --rbac-storage
 docker compose run --rm dbt duckfleet-server --rbac
 docker compose run --rm dbt duckfleet-server --system-storage
 docker compose run --rm dbt duckfleet-server --system
+docker compose run --rm dbt duckfleet-server --jobs-storage
+docker compose run --rm dbt duckfleet-server --jobs
+# Fail only artifact publication after successful SQL; catalog/lake IO remains
+# healthy. Restore the ordinary worker configuration before subsequent stages.
+cat > artifacts/jobs-store-failure.override.yaml <<'EOF'
+services:
+  worker-small:
+    environment:
+      DUCKFLEET_RESULT_ENDPOINT: http://127.0.0.1:9
+EOF
+docker compose -f compose.yaml -f artifacts/jobs-store-failure.override.yaml up -d --no-deps --wait worker-small
+docker compose run --rm --no-deps dbt duckfleet-server --jobs-store-failure
+docker compose up -d --no-deps --wait worker-small
+# A detached submitter reconnects by durable ID while the gateway is replaced.
+# Only this project is restarted; the SQL worker keeps its accepted execution.
+rm -f artifacts/jobs-long.started
+jobs_long_container=$(docker compose run -d --no-deps dbt duckfleet-server --jobs-long)
+jobs_long_ready=false
+for attempt in $(seq 1 120); do
+  if [ -f artifacts/jobs-long.started ]; then jobs_long_ready=true; break; fi
+  if [ "$(docker inspect -f '{{.State.Running}}' "$jobs_long_container")" != true ]; then break; fi
+  sleep 1
+done
+if [ "$jobs_long_ready" != true ]; then
+  docker logs "$jobs_long_container" > artifacts/jobs-long.log 2>&1
+  echo 'long job never reached execution' >&2
+  exit 1
+fi
+docker compose restart --no-deps server
+jobs_long_status=$(docker wait "$jobs_long_container")
+docker logs "$jobs_long_container" > artifacts/jobs-long.log 2>&1
+docker rm "$jobs_long_container" > /dev/null
+cat artifacts/jobs-long.log
+test "$jobs_long_status" = 0
 docker compose run --rm dbt duckfleet-server --auth-continuity
 docker compose run --rm dbt duckfleet-server --request-identity
 docker compose run --rm dbt duckfleet-server --platform-maintenance

@@ -22,6 +22,8 @@ mod api_workflow;
 mod authentication;
 mod aws_harness;
 mod concurrency;
+mod jobs;
+mod jobs_storage;
 mod metering;
 mod observability;
 mod platform;
@@ -49,7 +51,15 @@ pub async fn run(args: Vec<String>) -> i32 {
     let ctx = Ctx { url, token };
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
-    let result: anyhow::Result<()> = if has("--system") {
+    let result: anyhow::Result<()> = if has("--jobs-storage") {
+        jobs_storage::checks().await
+    } else if has("--jobs-long") {
+        jobs::long_running(&ctx).await
+    } else if has("--jobs-store-failure") {
+        jobs::store_failure(&ctx).await
+    } else if has("--jobs") || has("--jobs-isolated") {
+        jobs::checks(&ctx, has("--jobs-isolated")).await
+    } else if has("--system") {
         system_api::checks(&ctx).await
     } else if has("--system-storage") {
         system_storage::checks().await

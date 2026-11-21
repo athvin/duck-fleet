@@ -372,6 +372,14 @@ pub(crate) fn admit_in(
         transaction.execute("UPDATE reservations SET namespace_id=$2,owner_principal_id=$3,actor_principal_id=$4,actor_kind=$5,actor_principal=$6,actor_credential_id=$7 WHERE execution_id=$1",
             &[&execution_id,&attribution["namespace_id"].as_str(),&attribution["owner_principal_id"].as_str(),&attribution["actor_principal_id"].as_str(),&attribution["actor_kind"].as_str(),&attribution["actor_principal"].as_str(),&attribution["actor_credential_id"].as_str()]).map_err(|_|ApiError::internal())?;
     }
+    if attribution.get("work_kind").is_some() {
+        transaction
+            .execute(
+                "UPDATE reservations SET deadline_seconds=$2 WHERE execution_id=$1",
+                &[&execution_id, &(deadline_seconds as i64)],
+            )
+            .map_err(|_| ApiError::internal())?;
+    }
     if attribution.get("selected_mode").is_some() {
         transaction.execute("UPDATE reservations SET selected_mode=$2,selected_pool=$3,owner_principal_name=$4,model_id=$5,invocation_id=$6,model_run_id=$7 WHERE execution_id=$1",
         &[&execution_id,&attribution["selected_mode"].as_str(),&attribution["selected_pool"].as_str(),&attribution["principal"].as_str(),&attribution["model_id"].as_str(),&attribution["invocation_id"].as_str(),&attribution["model_run_id"].as_str()]).map_err(|_|ApiError::internal())?;
@@ -540,6 +548,26 @@ pub(crate) fn settle_saved_in(
         version: row
             .get::<_, Option<String>>(3)
             .ok_or_else(|| anyhow::anyhow!("queued reservation has no saved rate version"))?,
+    };
+    // Standalone occupied time is diagnostic; billing never exceeds the saved
+    // admitted deadline/hold, including slow result-store or recovery time.
+    let job = transaction
+        .query_one(
+            "SELECT work_kind='job' FROM requests WHERE request_id=$1",
+            &[&execution_id],
+        )?
+        .get::<_, bool>(0);
+    let elapsed_ms = if job {
+        let deadline = transaction
+            .query_one(
+                "SELECT deadline_seconds FROM reservations WHERE execution_id=$1",
+                &[&execution_id],
+            )?
+            .get::<_, Option<i64>>(0)
+            .unwrap_or(0);
+        elapsed_ms.max(0).min(deadline.saturating_mul(1000))
+    } else {
+        elapsed_ms
     };
     let amount = rate.charge_micro_usd(units, u64::try_from(elapsed_ms).unwrap_or(0));
     let inserted = record(

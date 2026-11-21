@@ -117,6 +117,10 @@ seccompProfile:
 {{- $pools := dict -}}
 {{- range $name, $pool := include "duckfleet.pools" . | fromJson -}}
 {{- $configured := dict "cpu" $pool.cpu "memory" $pool.memory "disk" $pool.disk "endpoints" (include "duckfleet.poolEndpoints" (dict "name" $name "workers" $pool.workers) | fromJsonArray) "max_sessions_per_worker" $pool.maxSessionsPerWorker -}}
+{{- if hasKey $pool "jobLimits" -}}
+{{- include "duckfleet.validateJobLimits" (dict "limits" $pool.jobLimits "ceiling" ($.Values.jobPolicy.ceilings | default dict)) -}}
+{{- $_ := set $configured "job_limits" $pool.jobLimits -}}
+{{- end -}}
 {{- if hasKey $pool "admission" -}}
 {{- $_ := set $configured "admission" (include "duckfleet.admissionJson" $pool.admission | fromJson) -}}
 {{- end -}}
@@ -151,7 +155,22 @@ seccompProfile:
 {{- toJson $config -}}
 {{- end -}}
 {{/* Runtime exact-version checks remain authoritative; this marks rollout intent. */}}
-{{- define "duckfleet.platformSchema" -}}4{{- end -}}
+{{- define "duckfleet.platformSchema" -}}5{{- end -}}
+{{/* Supplied envelopes are complete (JSON schema); each pool remains inside the
+operator envelope. Defaults may exceed it because omitted request options clip. */}}
+{{- define "duckfleet.validateJobLimits" -}}
+{{- $hard := dict "runtime_seconds" 3600 "result_bytes" 1073741824 "result_rows" 10000000 "retention_seconds" 86400 -}}
+{{- range $key, $value := .limits -}}
+{{- $maximum := get $.ceiling $key | default (get $hard $key) | int64 -}}
+{{- if gt (int64 $value) $maximum -}}{{- fail (printf "job limit %s exceeds operator ceiling" $key) -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- define "duckfleet.jobPolicy" -}}
+{{- if hasKey .Values.jobPolicy "isolated" -}}
+{{- include "duckfleet.validateJobLimits" (dict "limits" .Values.jobPolicy.isolated "ceiling" (.Values.jobPolicy.ceilings | default dict)) -}}
+{{- end -}}
+{{- toJson .Values.jobPolicy -}}
+{{- end -}}
 {{/*
 The worker container's environment, defined once. The persistent Deployments and the
 isolated pod template both render from this, so they cannot drift apart on secret
@@ -163,6 +182,22 @@ An isolated pod's identity is only known when it is created, so the gateway over
 It refuses to start a pod if any of the three is missing, which is what keeps this
 template and the code that patches it from drifting silently.
 */}}
+{{/* Results never share DuckLake's managed prefix. Only paths, not lake
+credentials, are sent to the gateway for the same runtime overlap validation. */}}
+{{- define "duckfleet.resultEnv" -}}
+{{- if .Values.results.enabled -}}
+{{- $lake := trimSuffix "/" .Values.lakePrefix -}}
+{{- $result := trimSuffix "/" .Values.results.prefix -}}
+{{- if or (eq $lake $result) (hasPrefix (printf "%s/" $lake) $result) (hasPrefix (printf "%s/" $result) $lake) -}}
+{{- fail "results.prefix and lakePrefix must be separate non-overlapping prefixes" -}}
+{{- end -}}
+- {name: DUCKFLEET_RESULT_DATA_PATH, value: {{ printf "s3://%s/%s/" .Values.bucket $result | quote }}}
+- {name: DUCKFLEET_RESULT_LAKE_DATA_PATH, value: {{ printf "s3://%s/%s/" .Values.bucket $lake | quote }}}
+- {name: DUCKFLEET_RESULT_AUTH_MODE, value: pod_identity}
+- {name: DUCKFLEET_RESULT_ALLOW_HTTP, value: "false"}
+{{- end -}}
+{{- end -}}
+
 {{- define "duckfleet.workerEnv" -}}
 {{- $ := .root -}}
 {{- if gt (add $.Values.catalogWaitSeconds $.Values.platformWaitSeconds) 600 -}}
@@ -185,6 +220,7 @@ template and the code that patches it from drifting silently.
 # cpu and memory, in the isolated pod template before creating a sized session.
 - {name: DUCKFLEET_WORKER_DISK, value: {{ .disk | quote }}}
 - {name: S3_AUTH_MODE, value: pod_identity}
+{{ include "duckfleet.resultEnv" $ }}
 - {name: DUCKFLEET_PROFILING, value: {{ $.Values.profiling | quote }}}
 - {name: DUCKFLEET_CATALOG_WAIT_SECONDS, value: {{ $.Values.catalogWaitSeconds | quote }}}
 - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ $.Values.platformWaitSeconds | quote }}}

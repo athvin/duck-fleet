@@ -192,6 +192,23 @@ impl Kube {
         Self::expect_success(status, body, "deleting a session pod").map(|_| ())
     }
 
+    /// Delete only the observed pod incarnation, never a replacement with the
+    /// same name created while cleanup was waiting on the API server.
+    pub async fn delete_pod_uid(&self, name: &str, uid: &str) -> Result<()> {
+        let options = serde_json::json!({"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":uid}});
+        let (status, body) = self
+            .send(
+                Method::DELETE,
+                &format!("{}/{name}", self.pods),
+                Some(&options),
+            )
+            .await?;
+        if status == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        Self::expect_success(status, body, "deleting a job pod").map(|_| ())
+    }
+
     /// A DELETE acknowledgement only requests termination. Release durable work
     /// only after a separate GET proves absence; even a failed DELETE can race GC.
     /// The deadline bounds response bodies and every poll, not just connect time.

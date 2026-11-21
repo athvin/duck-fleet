@@ -129,11 +129,15 @@ pub(crate) struct DeliveryGuard {
 
 impl Connection {
     pub fn delivery(&self) -> DeliveryGuard {
+        self.delivery_with_timeout(DELIVERY_TIMEOUT)
+    }
+
+    pub fn delivery_with_timeout(&self, timeout: Duration) -> DeliveryGuard {
         let connection = self.clone();
         let finished = Arc::new(AtomicBool::new(false));
         let observed = finished.clone();
         // Capture the deadline now, rather than when the spawned task is polled.
-        let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + timeout;
         let timer = tokio::spawn(async move {
             tokio::time::sleep_until(deadline).await;
             // There is no await between winning expiry and shutting down. If

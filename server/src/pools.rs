@@ -13,6 +13,7 @@ use serde_json::json;
 use crate::{
     ApiError,
     compute::{ComputeRequest, Mode, Placement, Resources, Selection, valid_pool_name},
+    job_policy::{JobDefaults, JobLimits},
     query::{AdmissionLimits, AdmissionLimitsOverride},
 };
 
@@ -22,6 +23,7 @@ pub(crate) struct Pool {
     pub endpoints: Vec<String>,
     pub max_sessions_per_worker: usize,
     pub admission: AdmissionLimits,
+    pub job_limits: JobLimits,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -31,8 +33,13 @@ pub(crate) struct PoolRegistry {
     pub revision: String,
     pub legacy: bool,
     pub isolated_admission: AdmissionLimits,
+    pub job_ceiling: JobLimits,
+    pub job_defaults: JobDefaults,
+    pub isolated_job_limits: JobLimits,
     #[serde(skip)]
     admission_config: AdmissionConfig,
+    #[serde(skip)]
+    job_config: JobPolicyConfig,
 }
 
 /// Retain omission separately from the effective value: a pool's running
@@ -70,6 +77,45 @@ impl AdmissionConfig {
     }
 }
 
+/// Operator defaults are retained across a pool-file reload. Explicit envelopes
+/// are complete finite values, so a misspelled/omitted grant dimension cannot
+/// accidentally inherit an unlimited allowance.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct JobPolicyConfig {
+    ceilings: JobLimits,
+    defaults: JobDefaults,
+    isolated: Option<JobLimits>,
+}
+impl Default for JobPolicyConfig {
+    fn default() -> Self {
+        Self {
+            ceilings: JobLimits::HARD,
+            defaults: JobDefaults::default(),
+            isolated: None,
+        }
+    }
+}
+impl JobPolicyConfig {
+    fn from_json(source: &str) -> Result<Self> {
+        let config: Self =
+            serde_json::from_str(source).context("invalid DUCKFLEET_JOB_POLICY_JSON")?;
+        config.ceilings.validate()?;
+        config.defaults.validate()?;
+        config.effective(config.isolated)?;
+        Ok(config)
+    }
+    fn effective(&self, local: Option<JobLimits>) -> Result<JobLimits> {
+        let limits = local.unwrap_or(self.ceilings);
+        limits.validate()?;
+        anyhow::ensure!(
+            self.ceilings.covers(limits),
+            "pool job limits exceed operator ceilings"
+        );
+        Ok(limits.intersect(self.ceilings))
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Configuration {
@@ -88,6 +134,8 @@ struct PoolConfiguration {
     max_sessions_per_worker: usize,
     #[serde(default)]
     admission: AdmissionLimitsOverride,
+    #[serde(default)]
+    job_limits: Option<JobLimits>,
 }
 fn default_sessions() -> usize {
     32
@@ -117,6 +165,13 @@ impl PoolRegistry {
             })
             .context("DUCKFLEET_ADMISSION_LIMITS_JSON must contain valid Unicode JSON")?;
         let admission = AdmissionConfig::from_json(&configured_admission)?;
+        let configured_jobs = std::env::var("DUCKFLEET_JOB_POLICY_JSON")
+            .or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok("{}".into()),
+                other => Err(other),
+            })
+            .context("DUCKFLEET_JOB_POLICY_JSON must contain valid Unicode JSON")?;
+        let jobs = JobPolicyConfig::from_json(&configured_jobs)?;
         let file = std::env::var("DUCKFLEET_POOLS_FILE").ok();
         let inline = std::env::var("DUCKFLEET_POOLS_JSON").ok();
         anyhow::ensure!(
@@ -139,10 +194,10 @@ impl PoolRegistry {
             let path = PathBuf::from(file);
             let source =
                 std::fs::read_to_string(&path).context("reading configured pool registry file")?;
-            return Ok((Self::with_admission(&source, admission)?, Some(path)));
+            return Ok((Self::with_policies(&source, admission, jobs)?, Some(path)));
         }
         if let Some(source) = inline {
-            return Ok((Self::with_admission(&source, admission)?, None));
+            return Ok((Self::with_policies(&source, admission, jobs)?, None));
         }
         let urls = std::env::var("DUCKFLEET_WORKER_URLS").context(
             "configure DUCKFLEET_POOLS_FILE, DUCKFLEET_POOLS_JSON, or legacy DUCKFLEET_WORKER_URLS",
@@ -161,19 +216,26 @@ impl PoolRegistry {
             "cpu":1,"memory":"1Gi","disk":"2Gi","endpoints":endpoints,
             "max_sessions_per_worker":default_sessions()
         }}});
-        let mut registry = Self::with_admission(&source.to_string(), admission)?;
+        let mut registry = Self::with_policies(&source.to_string(), admission, jobs)?;
         registry.legacy = true;
         registry.refresh_revision()?;
         Ok((registry, None))
     }
 
-    #[cfg(test)]
     pub fn from_json(source: &str) -> Result<Self> {
-        Self::with_admission(source, AdmissionConfig::default())
+        Self::with_policies(
+            source,
+            AdmissionConfig::default(),
+            JobPolicyConfig::default(),
+        )
     }
 
     pub fn reloaded(&self, source: &str) -> Result<Self> {
-        Self::with_admission(source, self.admission_config.clone())
+        Self::with_policies(
+            source,
+            self.admission_config.clone(),
+            self.job_config.clone(),
+        )
     }
 
     pub fn admission_policies(&self) -> Vec<(String, AdmissionLimits)> {
@@ -187,7 +249,27 @@ impl PoolRegistry {
             .collect()
     }
 
+    pub fn job_policies(&self) -> Vec<(String, JobLimits)> {
+        self.pools
+            .iter()
+            .map(|(name, pool)| (format!("persistent:{name}"), pool.job_limits))
+            .chain(std::iter::once((
+                "isolated".into(),
+                self.isolated_job_limits,
+            )))
+            .collect()
+    }
+
+    #[cfg(test)]
     fn with_admission(source: &str, admission_config: AdmissionConfig) -> Result<Self> {
+        Self::with_policies(source, admission_config, JobPolicyConfig::default())
+    }
+
+    fn with_policies(
+        source: &str,
+        admission_config: AdmissionConfig,
+        job_config: JobPolicyConfig,
+    ) -> Result<Self> {
         let config: Configuration =
             serde_json::from_str(source).context("invalid pool registry JSON")?;
         anyhow::ensure!(
@@ -232,12 +314,15 @@ impl PoolRegistry {
                 .pool(&configured.admission)
                 .with_context(|| format!("invalid admission limits for pool {name}"))?;
             pools.insert(
-                name,
+                name.clone(),
                 Pool {
                     resources,
                     endpoints: members,
                     max_sessions_per_worker: configured.max_sessions_per_worker,
                     admission,
+                    job_limits: job_config
+                        .effective(configured.job_limits)
+                        .with_context(|| format!("invalid job limits for pool {name}"))?,
                 },
             );
         }
@@ -249,7 +334,11 @@ impl PoolRegistry {
             isolated_admission: admission_config
                 .isolated
                 .resolve(AdmissionLimits::default())?,
+            job_ceiling: job_config.ceilings,
+            job_defaults: job_config.defaults.clone(),
+            isolated_job_limits: job_config.effective(job_config.isolated)?,
             admission_config,
+            job_config,
         };
         registry.refresh_revision()?;
         Ok(registry)
@@ -258,7 +347,9 @@ impl PoolRegistry {
     fn refresh_revision(&mut self) -> Result<()> {
         let canonical = serde_json::to_vec(
             &json!({"default_pool":self.default_pool,"pools":self.pools,"legacy":self.legacy,
-                "isolated_admission": self.isolated_admission}),
+                "isolated_admission": self.isolated_admission,
+                "job_ceiling":self.job_ceiling,"job_defaults":self.job_defaults,
+                "isolated_job_limits":self.isolated_job_limits}),
         )?;
         let hash = ring::digest::digest(&ring::digest::SHA256, &canonical);
         self.revision = hash
@@ -406,6 +497,52 @@ mod tests {
                 .unwrap()
                 .revision
         );
+    }
+
+    #[test]
+    fn job_policy_publication_is_finite_and_reload_retains_operator_defaults() {
+        let mut source = config();
+        let ceilings = JobLimits {
+            runtime_seconds: 900,
+            ..JobLimits::HARD
+        };
+        let local = JobLimits {
+            runtime_seconds: 300,
+            ..ceilings
+        };
+        source["pools"]["small"]["job_limits"] = serde_json::to_value(local).unwrap();
+        let jobs = JobPolicyConfig::from_json(&json!({"ceilings":ceilings}).to_string()).unwrap();
+        let registry =
+            PoolRegistry::with_policies(&source.to_string(), AdmissionConfig::default(), jobs)
+                .unwrap();
+        assert_eq!(registry.job_defaults.queue_timeout_seconds, 120);
+        assert_eq!(registry.pools["small"].job_limits, local);
+        assert_eq!(registry.isolated_job_limits, ceilings);
+        assert!(
+            registry
+                .job_policies()
+                .iter()
+                .all(|(_, limits)| ceilings.covers(*limits))
+        );
+        source["pools"]["small"]["job_limits"]["runtime_seconds"] = json!(600);
+        let reloaded = registry.reloaded(&source.to_string()).unwrap();
+        assert_eq!(reloaded.job_defaults, registry.job_defaults);
+        assert_eq!(reloaded.job_ceiling, ceilings);
+        assert_ne!(reloaded.revision, registry.revision);
+        source["pools"]["small"]["job_limits"]["runtime_seconds"] = json!(901);
+        assert!(registry.reloaded(&source.to_string()).is_err());
+    }
+
+    #[test]
+    fn operator_job_configuration_rejects_unknown_and_unbounded_values() {
+        assert!(JobPolicyConfig::from_json(r#"{"ceiling":{}}"#).is_err());
+        assert!(
+            JobPolicyConfig::from_json(
+                &json!({"ceilings":JobLimits{runtime_seconds:0,..JobLimits::HARD}}).to_string()
+            )
+            .is_err()
+        );
+        assert!(JobPolicyConfig::from_json(&json!({"ceilings":JobLimits{runtime_seconds:600,..JobLimits::HARD},"isolated":JobLimits::HARD}).to_string()).is_err());
     }
 
     #[test]

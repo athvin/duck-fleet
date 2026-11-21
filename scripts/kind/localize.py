@@ -84,7 +84,19 @@ class Localizer:
                 ]
             )
             self.mark("s3-auth")
-        for name in ["S3_DATA_PATH", "EXPECT_S3_PREFIX"]:
+        if by_name.get("DUCKFLEET_RESULT_AUTH_MODE", {}).get("value") == "pod_identity":
+            by_name["DUCKFLEET_RESULT_AUTH_MODE"]["value"] = "static"
+            by_name["DUCKFLEET_RESULT_ALLOW_HTTP"]["value"] = "true"
+            env.extend([
+                {"name": "DUCKFLEET_RESULT_ACCESS_KEY", "value": S3_ACCESS_KEY},
+                {"name": "DUCKFLEET_RESULT_SECRET_KEY", "value": S3_SECRET_KEY},
+                {"name": "DUCKFLEET_RESULT_ENDPOINT", "value": "http://" + OBJECT_STORE},
+            ])
+            self.mark("s3-auth")
+        if "DUCKFLEET_RESULT_DATA_PATH" in by_name:
+            by_name["DUCKFLEET_RESULT_DATA_PATH"]["value"] = DATA_PATH.rstrip("/").rsplit("/", 1)[0] + "/results/"
+            self.mark("s3-path")
+        for name in ["S3_DATA_PATH", "EXPECT_S3_PREFIX", "DUCKFLEET_RESULT_LAKE_DATA_PATH"]:
             if name in by_name and by_name[name].get("value", "").startswith("s3://"):
                 by_name[name]["value"] = DATA_PATH
                 self.mark("s3-path")

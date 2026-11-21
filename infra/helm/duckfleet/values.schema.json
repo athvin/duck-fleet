@@ -15,6 +15,38 @@
         "maxQueuedPerPrincipal": {"type": "integer", "minimum": 1, "maximum": 65535},
         "maxRunningPerPrincipal": {"type": "integer", "minimum": 1, "maximum": 1024}
       }
+    },
+    "jobLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime_seconds",
+        "result_bytes",
+        "result_rows",
+        "retention_seconds"
+      ],
+      "properties": {
+        "runtime_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "result_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1073741824
+        },
+        "result_rows": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000000
+        },
+        "retention_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        }
+      }
     }
   },
   "properties": {
@@ -172,6 +204,7 @@
           "disk": {"type": "string", "pattern": "^[1-9][0-9]{0,8}(Ki|Mi|Gi)$"},
           "workers": {"type": "integer", "minimum": 0, "maximum": 16},
           "maxSessionsPerWorker": {"type": "integer", "minimum": 1, "maximum": 1024},
+        "jobLimits": {"$ref": "#/definitions/jobLimits"},
           "admission": {"$ref": "#/definitions/admissionLimits"}
         }
       }
@@ -242,6 +275,59 @@
         "annotations": {
           "type": "object",
           "additionalProperties": {"type": "string"}
+        }
+      }
+    },
+    "results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "prefix"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_-][A-Za-z0-9_.-]*(/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$"
+        }
+      }
+    },
+    "jobPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ceilings": {
+          "$ref": "#/definitions/jobLimits"
+        },
+        "isolated": {
+          "$ref": "#/definitions/jobLimits"
+        },
+        "defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "limits",
+            "queue_timeout_seconds",
+            "format"
+          ],
+          "properties": {
+            "limits": {
+              "$ref": "#/definitions/jobLimits"
+            },
+            "queue_timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3600
+            },
+            "format": {
+              "const": "arrow_ipc_chunks"
+            }
+          }
         }
       }
     }

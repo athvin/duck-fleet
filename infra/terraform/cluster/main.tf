@@ -77,6 +77,22 @@ variable "lake_bucket" {
   type    = string
   default = "duckfleet-dev-797781631727-us-east-2"
 }
+variable "lake_prefix" {
+  type    = string
+  default = "lake"
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-][A-Za-z0-9_.-]*(/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$", var.lake_prefix))
+    error_message = "lake_prefix must contain nonempty safe path segments without a trailing slash."
+  }
+}
+variable "results_prefix" {
+  type    = string
+  default = "results"
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-][A-Za-z0-9_.-]*(/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$", var.results_prefix)) && var.results_prefix != var.lake_prefix && !startswith(var.results_prefix, "${var.lake_prefix}/") && !startswith(var.lake_prefix, "${var.results_prefix}/")
+    error_message = "results_prefix must be safe and separate from lake_prefix."
+  }
+}
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -277,7 +293,7 @@ resource "aws_eks_access_policy_association" "ci" {
   }
 }
 
-# The identity a worker pod assumes: the lake prefix and nothing else. A worker runs
+# The worker identity: managed lake data plus PUT to the separate results prefix. A worker runs
 # user SQL, so its credentials are the ones most worth bounding.
 resource "aws_iam_role" "worker" {
   name               = "${var.cluster}-worker"
@@ -293,27 +309,59 @@ resource "aws_iam_role_policy" "worker" {
       {
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"]
-        Resource = "arn:aws:s3:::${var.lake_bucket}/lake/*"
+        Resource = "arn:aws:s3:::${var.lake_bucket}/${var.lake_prefix}/*"
       },
       {
         Effect   = "Allow"
         Action   = "s3:ListBucket"
         Resource = "arn:aws:s3:::${var.lake_bucket}"
         # Prefix-conditioned, so a worker cannot enumerate the whole bucket.
-        Condition = { StringLike = { "s3:prefix" = ["lake/*", "lake"] } }
+        Condition = { StringLike = { "s3:prefix" = ["${var.lake_prefix}/*", var.lake_prefix] } }
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "arn:aws:s3:::${var.lake_bucket}/${var.results_prefix}/*"
       },
     ]
   })
 }
 
-# Binds that role to the one service account the workers run as. The gateway's service
-# account is not associated, because the gateway never touches S3.
+# The worker's lake grant is never associated with a gateway service account.
 resource "aws_eks_pod_identity_association" "worker" {
   cluster_name    = aws_eks_cluster.main.name
   namespace       = var.namespace
   service_account = "duckfleet-worker"
   role_arn        = aws_iam_role.worker.arn
 }
+
+# Metadata/result retrieval and cleanup need no lake read or result write grant.
+# Either gateway service account can use this role; only the isolated-compute
+# account has separately installed Kubernetes RBAC/token access.
+resource "aws_iam_role" "gateway_results" {
+  name               = "${var.cluster}-gateway-results"
+  assume_role_policy = local.assume.worker
+}
+resource "aws_iam_role_policy" "gateway_results" {
+  name = "result-read-cleanup"
+  role = aws_iam_role.gateway_results.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject", "s3:DeleteObject"]
+      Resource = "arn:aws:s3:::${var.lake_bucket}/${var.results_prefix}/*"
+    }]
+  })
+}
+resource "aws_eks_pod_identity_association" "gateway_results" {
+  for_each        = toset(["duckfleet-gateway", "duckfleet-results"])
+  cluster_name    = aws_eks_cluster.main.name
+  namespace       = var.namespace
+  service_account = each.value
+  role_arn        = aws_iam_role.gateway_results.arn
+}
+output "gateway_results_role_arn" { value = aws_iam_role.gateway_results.arn }
 
 output "cluster_name" { value = aws_eks_cluster.main.name }
 output "cluster_endpoint" { value = aws_eks_cluster.main.endpoint }

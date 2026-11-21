@@ -353,7 +353,7 @@ assert not present or len(present) == len(ISOLATED), (
 assert by_name['ServiceAccount', 'duckfleet-gateway']['automountServiceAccountToken'] is True
 # Only the gateway holds one. A worker runs user SQL, so a token there would let a
 # query reach the API server.
-for account in ['duckfleet-worker', 'duckfleet-no-aws']:
+for account in ['duckfleet-worker', 'duckfleet-no-aws', 'duckfleet-results']:
     assert by_name['ServiceAccount', account]['automountServiceAccountToken'] is False
 
 gateway_pod = by_name['Deployment', 'server']['spec']['template']['spec']
@@ -361,7 +361,7 @@ if not present:
     # The default: the gateway runs as the identity that mounts no token at all, so it
     # cannot reach the API server whatever RBAC exists, and `compute: isolated` is
     # refused rather than served from a shared worker.
-    assert gateway_pod['serviceAccountName'] == 'duckfleet-no-aws'
+    assert gateway_pod['serviceAccountName'] == ('duckfleet-results' if 'DUCKFLEET_RESULT_DATA_PATH' in gateway_env else 'duckfleet-no-aws')
     assert {volume['name'] for volume in gateway_pod.get('volumes', [])} <= {'persistent-pools'}
 else:
     assert gateway_pod['serviceAccountName'] == 'duckfleet-gateway'
@@ -460,3 +460,20 @@ assert gateway_keys['DUCKFLEET_TOKEN'] != gateway_keys['DUCKFLEET_INTERNAL_TOKEN
 if migrations:
     keys = secret_keys(migrations[0]['spec']['template']['spec']['containers'][0])
     assert keys == {'PLATFORM_DSN': 'PLATFORM_MIGRATION_DSN'}
+
+# Result data never shares DuckLake's cleanup prefix or ambient/node credentials.
+result_path = gateway_env.get('DUCKFLEET_RESULT_DATA_PATH')
+if result_path:
+    assert gateway_env['DUCKFLEET_RESULT_AUTH_MODE'] == 'pod_identity'
+    assert gateway_env['DUCKFLEET_RESULT_ALLOW_HTTP'] == 'false'
+    assert gateway_env['AWS_EC2_METADATA_DISABLED'] == 'true'
+    lake = gateway_env['DUCKFLEET_RESULT_LAKE_DATA_PATH'].rstrip('/')
+    result = result_path.rstrip('/')
+    assert lake != result and not lake.startswith(result + '/') and not result.startswith(lake + '/')
+    assert 'S3_ACCESS_KEY' not in gateway_env and 'S3_SECRET_KEY' not in gateway_env
+    assert 'DUCKFLEET_RESULT_SECRET_KEY' not in gateway_env
+    assert ('NetworkPolicy', 'duckfleet-gateway-results') in by_name
+    for container in [doc['spec']['template']['spec']['containers'][0] for doc in objects if doc['kind'] == 'Deployment' and doc['metadata']['name'].startswith('worker-')]:
+        env = {item['name']: item.get('value') for item in container['env']}
+        assert env['DUCKFLEET_RESULT_DATA_PATH'] == result_path
+        assert env['DUCKFLEET_RESULT_AUTH_MODE'] == 'pod_identity'

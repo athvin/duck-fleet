@@ -3,9 +3,10 @@
 pub(crate) use crate::credentials::ActorKind;
 use crate::{
     ApiError, audit,
-    compute::{Mode, Resources},
+    compute::{Mode, Placement, Resources},
     credentials::{self, Identity},
     failure,
+    job_policy::{AcceptedJobPolicy, JobDefaults, JobLimits, JobPoolPolicy, ValidatedJobRequest},
 };
 use anyhow::Result;
 use postgres::{Client, Transaction};
@@ -43,6 +44,8 @@ pub(crate) enum Action {
     SqlRead,
     #[serde(rename = "profile.read")]
     ProfileRead,
+    #[serde(rename = "result.read")]
+    ResultRead,
     #[serde(rename = "usage.read")]
     UsageRead,
     #[serde(rename = "fleet.read")]
@@ -71,6 +74,7 @@ impl Action {
             Self::HistoryRead => "history.read",
             Self::SqlRead => "sql.read",
             Self::ProfileRead => "profile.read",
+            Self::ResultRead => "result.read",
             Self::UsageRead => "usage.read",
             Self::FleetRead => "fleet.read",
             Self::FleetManage => "fleet.manage",
@@ -163,6 +167,8 @@ pub(crate) struct ComputeGrant {
     pub cpu: u16,
     pub memory_bytes: u64,
     pub disk_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_limits: Option<JobLimits>,
 }
 impl ComputeGrant {
     fn validate(&self) -> Result<()> {
@@ -177,6 +183,9 @@ impl ComputeGrant {
             self.memory_bytes <= i64::MAX as u64 && self.disk_bytes <= i64::MAX as u64,
             "compute grant too large"
         );
+        if let Some(limits) = self.job_limits {
+            limits.validate()?;
+        }
         match self.mode {
             Mode::Persistent => anyhow::ensure!(
                 self.pool
@@ -273,6 +282,7 @@ impl Access {
                     | Action::HistoryRead
                     | Action::SqlRead
                     | Action::ProfileRead
+                    | Action::ResultRead
                     | Action::UsageRead => Some(Scope::Own),
                     _ => None,
                 },
@@ -352,6 +362,91 @@ impl Access {
             usage: self.scope(Action::UsageRead),
         }
     }
+    /// Resolve omitted job options once. Each candidate comes from one complete
+    /// compute grant; choosing a deterministic candidate never unions its fields.
+    pub fn resolve_job_policy(
+        &self,
+        owner_id: Option<&str>,
+        placement: &Placement,
+        request: &ValidatedJobRequest,
+        defaults: &JobDefaults,
+        operator_ceiling: JobLimits,
+        pool: &JobPoolPolicy,
+    ) -> Result<AcceptedJobPolicy, ApiError> {
+        request.request().compute.validate_resolved(placement)?;
+        let compute = serde_json::to_value(placement).map_err(|_| ApiError::internal())?;
+        self.require_execution(owner_id, &compute, &TrustedOperation::Sql)?;
+        operator_ceiling
+            .validate()
+            .map_err(|_| ApiError::internal())?;
+        pool.ceilings.validate().map_err(|_| ApiError::internal())?;
+        let ceiling = operator_ceiling.intersect(pool.ceilings);
+        if self.actor.kind != ActorKind::Named {
+            return request
+                .options()
+                .resolve(defaults, ceiling, pool.generation);
+        }
+        let asked = allocation(&compute)?;
+        let mut selected: Option<AcceptedJobPolicy> = None;
+        for grant in self.compute.iter().filter(|grant| grant.covers(&asked)) {
+            let limit = ceiling.intersect(grant.job_limits.unwrap_or(JobLimits::BASELINE));
+            match request.options().resolve(defaults, limit, pool.generation) {
+                Ok(candidate)
+                    if selected
+                        .as_ref()
+                        .is_none_or(|old| candidate.limits > old.limits) =>
+                {
+                    selected = Some(candidate);
+                }
+                Ok(_) => {}
+                Err(error) if error.0.kind == failure::FORBIDDEN.kind => {}
+                Err(error) => return Err(error),
+            }
+        }
+        selected.ok_or_else(|| denied("job bounds are outside the principal's compute grants"))
+    }
+
+    /// Current permission must cover the retained policy; never shorten or
+    /// re-resolve a replay or accepted queued job when defaults change.
+    pub fn require_job(
+        &self,
+        owner_id: Option<&str>,
+        placement: &Placement,
+        accepted: &AcceptedJobPolicy,
+        operator_ceiling: JobLimits,
+        pool: &JobPoolPolicy,
+    ) -> Result<(), ApiError> {
+        let compute = serde_json::to_value(placement).map_err(|_| ApiError::internal())?;
+        self.require_execution(owner_id, &compute, &TrustedOperation::Sql)?;
+        accepted.validate().map_err(|_| ApiError::internal())?;
+        operator_ceiling
+            .validate()
+            .map_err(|_| ApiError::internal())?;
+        pool.ceilings.validate().map_err(|_| ApiError::internal())?;
+        if !operator_ceiling
+            .intersect(pool.ceilings)
+            .covers(accepted.limits)
+        {
+            return Err(denied(
+                "accepted job exceeds the current operator or pool limits",
+            ));
+        }
+        let asked = allocation(&compute)?;
+        if self.actor.kind != ActorKind::Named
+            || self.compute.iter().any(|grant| {
+                grant.covers(&asked)
+                    && grant
+                        .job_limits
+                        .unwrap_or(JobLimits::BASELINE)
+                        .covers(accepted.limits)
+            })
+        {
+            Ok(())
+        } else {
+            Err(denied("accepted job is outside the current compute grants"))
+        }
+    }
+
     pub fn require_compute(&self, compute: &Value) -> Result<(), ApiError> {
         let asked = allocation(compute)?;
         if self.actor.kind != ActorKind::Named || self.compute.iter().any(|g| g.covers(&asked)) {
@@ -394,6 +489,7 @@ fn allocation(value: &Value) -> Result<ComputeGrant, ApiError> {
             .get("disk_bytes")
             .and_then(Value::as_u64)
             .ok_or_else(|| ApiError::bad("invalid resolved disk"))?,
+        job_limits: None,
     };
     grant
         .validate()
@@ -433,6 +529,7 @@ impl Seed {
                 cpu: resources.cpu,
                 memory_bytes: resources.memory_bytes,
                 disk_bytes: resources.disk_bytes,
+                job_limits: None,
             },
         };
         seed.compute.validate()?;
@@ -1034,6 +1131,7 @@ mod tests {
                 cpu: 1,
                 memory_bytes: 4 << 30,
                 disk_bytes: 2 << 30,
+                job_limits: None,
             },
             ComputeGrant {
                 pool: Some("small".into()),
@@ -1041,11 +1139,200 @@ mod tests {
                 cpu: 4,
                 memory_bytes: 1 << 30,
                 disk_bytes: 2 << 30,
+                job_limits: None,
             },
         ];
         assert!(a.require_compute(&json!({"mode":"persistent","pool":"small","cpu":4,"memory_bytes":4u64<<30,"disk_bytes":2u64<<30})).is_err());
         assert!(a.require_compute(&json!({"mode":"persistent","pool":"small","cpu":1,"memory_bytes":1u64<<30,"disk_bytes":2u64<<30})).is_ok());
     }
+    fn job_placement() -> Placement {
+        Placement {
+            mode: Mode::Persistent,
+            pool: Some("small".into()),
+            resources: Resources::default(),
+        }
+    }
+    fn job_request(options: Value) -> ValidatedJobRequest {
+        let mut value = json!({"request_id":Uuid::new_v4(),"sql":"SELECT 1"});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        serde_json::from_value::<crate::job_policy::JobRequest>(value)
+            .unwrap()
+            .validate()
+            .unwrap()
+    }
+    fn job_grant(limits: Option<JobLimits>) -> ComputeGrant {
+        ComputeGrant {
+            pool: Some("small".into()),
+            mode: Mode::Persistent,
+            cpu: 1,
+            memory_bytes: 1 << 30,
+            disk_bytes: 2 << 30,
+            job_limits: limits,
+        }
+    }
+
+    #[test]
+    fn result_permission_is_independent_and_owner_scoped() {
+        assert!(
+            access(Role::Analyst)
+                .require(Action::ResultRead, Some("owner"))
+                .is_ok()
+        );
+        assert!(
+            access(Role::Analyst)
+                .require(Action::ResultRead, Some("other"))
+                .is_err()
+        );
+        for role in [Role::Operator, Role::Viewer] {
+            assert!(
+                access(role)
+                    .require(Action::ResultRead, Some("owner"))
+                    .is_err()
+            );
+        }
+        assert!(
+            access(Role::Admin)
+                .require(Action::ResultRead, Some("other"))
+                .is_ok()
+        );
+        let mut custom = access(Role::Viewer);
+        custom.permissions = vec![
+            PermissionGrant {
+                action: Action::SqlRead,
+                scope: Scope::All,
+            },
+            PermissionGrant {
+                action: Action::ProfileRead,
+                scope: Scope::All,
+            },
+        ];
+        assert!(custom.require(Action::ResultRead, Some("owner")).is_err());
+        custom.permissions.push(PermissionGrant {
+            action: Action::ResultRead,
+            scope: Scope::All,
+        });
+        assert!(custom.require(Action::ResultRead, Some("other")).is_ok());
+    }
+
+    #[test]
+    fn job_resolution_uses_one_complete_envelope_and_is_order_independent() {
+        let mut actor = access(Role::Analyst);
+        actor.compute = vec![
+            job_grant(Some(JobLimits {
+                runtime_seconds: 900,
+                retention_seconds: 60,
+                ..JobLimits::HARD
+            })),
+            job_grant(Some(JobLimits {
+                runtime_seconds: 60,
+                retention_seconds: 86400,
+                ..JobLimits::HARD
+            })),
+        ];
+        let pool = JobPoolPolicy {
+            ceilings: JobLimits::HARD,
+            generation: 1,
+        };
+        let impossible =
+            job_request(json!({"timeout_seconds":900,"result":{"retention_seconds":86400}}));
+        assert!(
+            actor
+                .resolve_job_policy(
+                    Some("owner"),
+                    &job_placement(),
+                    &impossible,
+                    &JobDefaults::default(),
+                    JobLimits::HARD,
+                    &pool
+                )
+                .is_err()
+        );
+        let omitted = job_request(json!({}));
+        let first = actor
+            .resolve_job_policy(
+                Some("owner"),
+                &job_placement(),
+                &omitted,
+                &JobDefaults::default(),
+                JobLimits::HARD,
+                &pool,
+            )
+            .unwrap();
+        actor.compute.reverse();
+        assert_eq!(
+            first,
+            actor
+                .resolve_job_policy(
+                    Some("owner"),
+                    &job_placement(),
+                    &omitted,
+                    &JobDefaults::default(),
+                    JobLimits::HARD,
+                    &pool
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            (first.limits.runtime_seconds, first.limits.retention_seconds),
+            (300, 60)
+        );
+    }
+
+    #[test]
+    fn job_defaults_are_conservative_and_retained_policy_is_not_rewritten() {
+        let mut actor = access(Role::Analyst);
+        actor.compute = vec![job_grant(None)];
+        let mut pool = JobPoolPolicy {
+            ceilings: JobLimits::HARD,
+            generation: 1,
+        };
+        let accepted = actor
+            .resolve_job_policy(
+                Some("owner"),
+                &job_placement(),
+                &job_request(json!({})),
+                &JobDefaults::default(),
+                JobLimits::HARD,
+                &pool,
+            )
+            .unwrap();
+        assert_eq!(accepted.limits.runtime_seconds, 60);
+        pool.generation = 99;
+        assert!(
+            actor
+                .require_job(
+                    Some("owner"),
+                    &job_placement(),
+                    &accepted,
+                    JobLimits::HARD,
+                    &pool
+                )
+                .is_ok()
+        );
+        pool.ceilings.runtime_seconds = 30;
+        assert!(
+            actor
+                .require_job(
+                    Some("owner"),
+                    &job_placement(),
+                    &accepted,
+                    JobLimits::HARD,
+                    &pool
+                )
+                .is_err()
+        );
+        let privileged = Access::bootstrap_for_test();
+        assert!(
+            privileged
+                .require_job(None, &job_placement(), &accepted, JobLimits::HARD, &pool)
+                .is_err()
+        );
+        assert_eq!(accepted.limits.runtime_seconds, 60);
+    }
+
     #[test]
     fn maintenance_requires_exact_server_template() {
         let op = TrustedOperation::LakeMaintenance {

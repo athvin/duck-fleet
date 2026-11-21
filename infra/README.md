@@ -193,6 +193,79 @@ The local acceptance script uses a copy in `artifacts/pools-config` and leaves t
 tracked example unchanged. Stop the optional allocation with
 `docker compose --profile pools stop server-pools worker-pool-interactive-0`.
 
+## Durable jobs and private results
+
+Compose enables job results using its local RustFS credentials. The Helm chart
+keeps `results.enabled: false` until the operator supplies result-prefix access
+for both gateways and workers. Enable it with the reviewed overlay in
+[`examples/jobs-values.yaml`](../examples/jobs-values.yaml). Standalone processes
+can use [`examples/jobs.env`](../examples/jobs.env) as a configuration reference;
+the placeholder credentials must be replaced and must not be committed.
+
+Result objects live under `s3://<bucket>/<results.prefix>/`, separate from
+`lakePrefix`. Neither prefix may contain the other: DuckLake cleanup must never
+own result objects. Gateways receive the lake path only for this overlap check,
+through `DUCKFLEET_RESULT_LAKE_DATA_PATH`; they receive no lake credentials. The
+gateway needs `s3:GetObject` and `s3:DeleteObject` on the result prefix. Workers
+need `s3:PutObject` there in addition to their existing lake access. Neither role
+needs result-prefix listing. Clients retrieve authenticated chunks through the
+gateway; responses contain no bucket keys or presigned URLs.
+
+The cluster Terraform module adds a result-only IAM role and Pod Identity
+associations for `duckfleet-results` and `duckfleet-gateway`. A gateway without
+isolated compute uses the former service account without a Kubernetes API token;
+an isolated-enabled gateway keeps the latter. Workers keep `duckfleet-worker`.
+Apply the reviewed IAM changes before enabling results. Set Terraform
+`lake_prefix`/`results_prefix` and chart `lakePrefix`/`results.prefix` consistently.
+Team namespace provisioning selects `<namespace>/lake` and
+`<namespace>/results`; its operator must install matching per-namespace IAM and
+Pod Identity associations. The primary namespace's associations do not cover it.
+
+AWS uses `DUCKFLEET_RESULT_AUTH_MODE=pod_identity` and the explicit EKS container
+credential endpoint/token injected by Pod Identity. An absent or malformed
+identity fails configuration; result storage does not fall back to a node role.
+Local and other S3-compatible stores use `static` with explicit result credentials.
+Custom HTTP endpoints require `DUCKFLEET_RESULT_ALLOW_HTTP=true`; deployed AWS
+configuration uses HTTPS. The result path and credentials must agree across
+gateways and workers before submitting jobs.
+
+`jobPolicy` maps directly to `DUCKFLEET_JOB_POLICY_JSON`. Its optional `ceilings`
+and `isolated` fields, and each named pool's optional `jobLimits`, are complete
+envelopes with `runtime_seconds`, `result_bytes`, `result_rows`, and
+`retention_seconds`. The hard maximum is 3600 seconds, 1 GiB, 10 million rows,
+and 24 hours. Defaults are 300 seconds and one-hour retention; omitted options
+clip to the current matching principal, pool, and operator limits. A principal
+compute grant without `job_limits` keeps a 60-second runtime and one-hour
+retention. Raising only the operator or pool envelope never raises that principal
+grant. Explicit over-limit requests are refused. Pools preserve their own lower
+envelopes; changing global defaults does not rewrite accepted jobs or replay hashes.
+
+Job queue time defaults to 120 seconds and accepts explicit values from 1 to
+3600 seconds. Its original deadline is durable; reconnecting or retrying the
+same ID does not extend it. Interactive queries retain their separate 30-second
+execution default, 600-second maximum, and 10-second queue default.
+
+An isolated pod's `maxSessionSeconds` remains an operator-owned lifetime limit.
+Provisioning refuses a job whose runtime plus the completion allowance cannot
+fit that lifetime. Startup and queuing still consume pod lifetime. Persistent
+workers drain for 615 seconds and Kubernetes grants 630 seconds; longer jobs can
+be interrupted during rollout or shutdown. Neither a maximum execution allowance
+nor durable acceptance promises survival beyond the pod's deadline or grace.
+No SQL is replayed to recover from a lost worker.
+
+PostgreSQL controls result expiry immediately. Cleanup deletes only journaled
+objects under the private prefix; temporary object-store failures are retried
+without rerunning SQL. The development bucket adds a two-day result-only lifecycle
+backstop, including noncurrent versions, and a one-day abandoned multipart rule.
+Custom/team prefixes need corresponding lifecycle rules. Do not apply result
+expiration to `lake/`: DuckLake owns its data-file retention. Backups of the
+platform database retain result metadata but do not replace object-store backup
+or extend an expired result's authorization window.
+
+These are platform and object-prefix permissions for trusted SQL executors.
+They do not isolate a hostile SQL process from the worker's environment or
+credentials; that separate execution boundary is tracked in #106.
+
 ## Platform schema and maintenance
 
 The release runs a PostgreSQL-only migration Job before compute can become ready.
@@ -202,6 +275,12 @@ root README's "Platform migrations and maintenance" section for their bounds,
 manual commands and operational tables. This is separate from DuckLake data
 compaction and snapshot expiry below.
 
+Schema 5 adds job identity/options, binding and artifact journal state plus finite
+job admission policy. Migration preserves old request fingerprints and retained
+accounting; it does not refill budgets or restore revoked grants. Full SQL,
+parameters and application context are not copied into retained job option rows.
+Repeated current-version migration remains read-only.
+
 `platformMigration.runId` changes the migration Job identity independently of the
 image digest. Deploy and namespace-provisioning helpers supply a fresh run ID.
 After restoring or retargeting `PLATFORM_DSN`, explicitly rerun migration with
@@ -210,7 +289,7 @@ The migration uses the `duckfleet-no-aws` service account, has no mounted API to
 and receives no object-store credentials. Failed Jobs prevent rollout success;
 inspect their logs to diagnose the schema or database problem.
 
-Schema 3 requires a quiesced upgrade from schemas 1 or 2: all old gateways, persistent
+Schema 5 requires a quiesced upgrade from any older schema: all old gateways, persistent
 workers, isolated workers, and any separately managed direct workers must stop
 before migration. A per-Deployment Recreate rollout is not a fleet-wide barrier.
 The deploy/provision/manual migration helpers perform a read-only preflight and
@@ -238,18 +317,18 @@ the migration Job.
 After stopping compute, rerun administrator database provisioning. Schema 4 requires
 the gateway role to have a finite `temp_file_limit` of at most 16MB; the bundled
 provisioner sets 16MB, and an external database administrator must apply the same
-setting. The gateway cannot raise this setting. Then apply the schema 4 chart/image with a fresh
+setting. The gateway cannot raise this setting. Then apply the schema 5 chart/image with a fresh
 `platformMigration.runId` and wait for migration/rollout; new compute cannot become
-usable before schema 4, its runtime grants, and its admission policy exist. For Compose, build/pull the
+usable before schema 5, its runtime grants, and its admission policy exist. For Compose, build/pull the
 desired image, run `scripts/migrate-platform.sh compose`, then explicitly start
 the desired services. Bare Helm/template-apply users must follow the same stop/apply
 sequence. Do not automatically roll back the binary after migration commits.
 
 Restore also uses this stop flow, restores both databases under their dedicated
 owners with backup ACLs discarded, runs a fresh migration and explicit
-`platform-grants` repair, and leaves compute stopped for explicit restart. A schema 1, 2, or 3 backup is upgraded to 4
-by the current image. `migrate-platform.sh kube` requires the current schema 4 Job
-template; cloning an old schema 1/2/3 image cannot perform this upgrade. Apply the
+`platform-grants` repair, and leaves compute stopped for explicit restart. A schema 1–4 backup is upgraded to 5
+by the current image. `migrate-platform.sh kube` requires the current schema 5 Job
+template; cloning an old schema 1–4 image cannot perform this upgrade. Apply the
 desired chart only after old compute has stopped. Same-image DB reset/retarget
 still requires a fresh Job/runId; prior completion does not prove the new database.
 
@@ -322,7 +401,7 @@ public/internal tokens, and set `postgres.bundled=false`, reviewed external CIDR
 and `databaseRoles` to your chosen names. External database deployments do not need
 the administrator or `DATABASE_*_PASSWORD` seed keys in their chart Secret. Apply
 the chart after provisioning; the migration installs explicit table/column grants
-in the same transaction as schema 4. Ordinary current-version migration remains
+in the same transaction as schema 5. Ordinary current-version migration remains
 read-only. For an intentional grant repair after restoring or changing role names:
 
 ```sh

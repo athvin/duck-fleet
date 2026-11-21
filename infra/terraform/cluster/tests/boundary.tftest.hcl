@@ -77,10 +77,18 @@ run "ci_access_is_confined_to_one_namespace" {
   }
 }
 
-run "worker_identity_reaches_only_the_lake_prefix" {
+run "worker_identity_reaches_lake_and_result_prefixes_only" {
   command = plan
 
   // The worker runs user SQL, so its credentials are the ones worth bounding.
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.worker.policy).Statement :
+      toset(statement.Action) == toset(["s3:PutObject"])
+      if statement.Resource == "arn:aws:s3:::duckfleet-dev-797781631727-us-east-2/results/*"
+    ])
+    error_message = "Worker artifact access must not grant result reads or deletes."
+  }
   assert {
     condition     = aws_eks_pod_identity_association.worker.service_account == "duckfleet-worker"
     error_message = "Only the worker service account may assume the lake role."
@@ -106,5 +114,21 @@ run "worker_identity_reaches_only_the_lake_prefix" {
       can(regex("sts:TagSession", policy)) == (name != "node")
     ])
     error_message = "EKS and Pod Identity principals pass session tags; EC2 does not."
+  }
+}
+
+run "result_identity_cannot_read_lake_or_write_results" {
+  command = plan
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.gateway_results.policy).Statement :
+      statement.Resource == "arn:aws:s3:::duckfleet-dev-797781631727-us-east-2/results/*" &&
+      toset(statement.Action) == toset(["s3:GetObject", "s3:DeleteObject"])
+    ])
+    error_message = "Gateway result identity must have only result-prefix read/delete."
+  }
+  assert {
+    condition     = toset(keys(aws_eks_pod_identity_association.gateway_results)) == toset(["duckfleet-gateway", "duckfleet-results"])
+    error_message = "Only gateway service accounts may assume the result-reader role."
   }
 }

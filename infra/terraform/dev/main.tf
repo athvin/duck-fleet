@@ -71,7 +71,22 @@ resource "aws_s3_bucket_lifecycle_configuration" "lake" {
     status = "Enabled"
     filter { prefix = "" }
     abort_incomplete_multipart_upload { days_after_initiation = 1 }
-    # No object expiration: DuckLake owns file/snapshot cleanup.
+    # No lake object expiration: DuckLake owns file/snapshot cleanup.
+  }
+  # Secondary leak guard only. API TTL is enforced by PostgreSQL immediately;
+  # versioned S3 deletes retain old versions until this separate bounded policy.
+  rule {
+    id     = "expired-result-artifacts"
+    status = "Enabled"
+    filter { prefix = "results/" }
+    expiration { days = 2 }
+    noncurrent_version_expiration { noncurrent_days = 2 }
+  }
+  rule {
+    id     = "expired-result-delete-markers"
+    status = "Enabled"
+    filter { prefix = "results/" }
+    expiration { expired_object_delete_marker = true }
   }
 }
 resource "aws_ecr_repository" "images" {

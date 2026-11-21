@@ -36,6 +36,7 @@ fn config(name: &str, schema: &str) -> Result<Config> {
 }
 fn compute_grant() -> authz::ComputeGrant {
     authz::ComputeGrant {
+        job_limits: None,
         pool: Some("small".into()),
         mode: crate::compute::Mode::Persistent,
         cpu: 1,

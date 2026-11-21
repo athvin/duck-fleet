@@ -30,13 +30,13 @@ spec:
         duckfleet.io/platform-schema: {{ include "duckfleet.platformSchema" . | quote }}
       labels: {app: duckfleet-gateway}
     spec:
-      # The gateway drains like a worker: proxied statements share the same 60-second
+      # The gateway drains like a worker: proxied statements share the same 600-second
       # cap, so the same grace period is what lets one finish. check-chart.py asserts
       # the coupling here as it does for the workers.
       {{- include "duckfleet.termination" . | nindent 6 }}
       # Identity follows capability: a gateway that creates pods needs a token, and
       # one that cannot must not have one.
-      serviceAccountName: {{ ternary "duckfleet-gateway" "duckfleet-no-aws" .Values.isolatedCompute.enabled }}
+      serviceAccountName: {{ ternary "duckfleet-gateway" (ternary "duckfleet-results" "duckfleet-no-aws" .Values.results.enabled) .Values.isolatedCompute.enabled }}
       {{- include "duckfleet.placement" . | nindent 6 }}
       securityContext:
         {{- include "duckfleet.podSecurity" . | nindent 8 }}
@@ -53,6 +53,12 @@ spec:
             - {name: DUCKFLEET_NAMESPACE, value: {{ .Release.Namespace | quote }}}
             - {name: DUCKFLEET_GATEWAY_MAX_SESSIONS, value: {{ .Values.gatewayMaxSessions | quote }}}
             - {name: DUCKFLEET_ADMISSION_LIMITS_JSON, value: {{ include "duckfleet.admissionConfig" . | quote }}}
+            - {name: DUCKFLEET_JOB_POLICY_JSON, value: {{ include "duckfleet.jobPolicy" . | quote }}}
+            {{- if .Values.results.enabled }}
+            {{- include "duckfleet.resultEnv" . | nindent 12 }}
+            - {name: AWS_REGION, value: {{ .Values.region | quote }}}
+            - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+            {{- end }}
             - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ .Values.platformWaitSeconds | quote }}}
             - {name: DUCKFLEET_HISTORY_RETENTION_DAYS, value: {{ .Values.historyRetentionDays | quote }}}
             - {name: DUCKFLEET_PGWIRE, value: {{ .Values.pgwire.enabled | quote }}}

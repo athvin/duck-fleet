@@ -35,6 +35,9 @@ use std::{
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+#[path = "gateway_jobs.rs"]
+mod job_api;
+
 #[derive(Clone)]
 enum Cleanup {
     Credential(Option<String>),
@@ -459,6 +462,9 @@ struct Gateway {
     pools_file: Option<Arc<PathBuf>>,
     publishing: Arc<Mutex<()>>,
     controls: Arc<Semaphore>,
+    artifact_store: Option<crate::artifacts::Store>,
+    result_slots: Arc<Semaphore>,
+    dispatcher_owner: Uuid,
     max_sessions: usize,
     fleet: Arc<Mutex<Option<Fleet>>>,
     /// Last successful observations remain available for diagnosis, never routing.
@@ -743,17 +749,20 @@ impl Gateway {
 
     async fn publish_policy(&self, registry: &PoolRegistry) -> Result<(), ApiError> {
         let policies = registry.admission_policies();
+        let job_policies = registry.job_policies();
         let publication = PolicyPublication {
             publication_id: Uuid::new_v4(),
             digest: credentials::digest(
-                &serde_json::to_string(&policies).map_err(|_| ApiError::internal())?,
+                &serde_json::to_string(&(&policies, &job_policies))
+                    .map_err(|_| ApiError::internal())?,
             ),
             policies,
         };
         let pending = publication.clone();
         let published = self
             .control_db(move |db| {
-                queue::publish_policies(db, &pending).map_err(|_| ApiError::internal())
+                queue::publish_policies_with_jobs(db, &pending, &job_policies)
+                    .map_err(|_| ApiError::internal())
             })
             .await;
         if published.is_ok() {
@@ -2552,6 +2561,11 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         pools_file: pools_file.map(Arc::new),
         publishing: Arc::new(Mutex::new(())),
         controls: Arc::new(Semaphore::new(8)),
+        artifact_store: crate::artifacts::StoreConfig::from_env()?
+            .map(|c| c.build())
+            .transpose()?,
+        result_slots: Arc::new(Semaphore::new(2)),
+        dispatcher_owner: Uuid::new_v4(),
         max_sessions,
         fleet: Arc::new(Mutex::new(None)),
         observations: Arc::new(Mutex::new(HashMap::new())),
@@ -2586,7 +2600,13 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             .map_err(|error| {
                 anyhow::anyhow!("cannot establish isolated recovery set: {}", error.1)
             })?;
-        let swept = isolation.sweep(&orphaned).await;
+        let job_pods = app
+            .control_db(|db| crate::jobs::live_job_pods(db).map_err(|_| ApiError::internal()))
+            .await
+            .map_err(|_| anyhow::anyhow!("cannot establish durable job pod recovery set"))?
+            .into_iter()
+            .collect();
+        let swept = isolation.sweep_excluding(&orphaned, &job_pods).await;
         app.retired_pods
             .lock()
             .await
@@ -2602,6 +2622,11 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         tracing::info!("isolated compute is available");
     }
     let api = Router::new()
+        .route("/v1/jobs", post(job_api::submit))
+        .route("/v1/jobs/{id}", get(job_api::detail))
+        .route("/v1/jobs/{id}/cancel", post(request_cancel))
+        .route("/v1/jobs/{id}/result", get(job_api::manifest))
+        .route("/v1/jobs/{id}/result/chunks/{chunk}", get(job_api::chunk))
         .route("/v1/sessions", post(open))
         .route("/v1/sessions/{id}", axum::routing::delete(close))
         .route("/v1/sessions/{id}/queries", post(query))
@@ -2664,11 +2689,16 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            tokio::join!(cleanup.expire(), cleanup.retry_retired());
+            tokio::join!(
+                cleanup.expire(),
+                cleanup.retry_retired(),
+                cleanup.reconcile_job_pods()
+            );
         }
     });
     let draining = app.draining.clone();
     let inflight = app.inflight.clone();
+    let job_dispatcher = app.spawn_job_dispatcher();
     let router = Router::new()
         .route("/healthz", get(health))
         .merge(api)
@@ -2698,6 +2728,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
     })
     .await;
     maintenance.abort();
+    job_dispatcher.abort();
     served?;
     Ok(())
 }
@@ -2856,6 +2887,9 @@ mod tests {
             pools_file: None,
             publishing: Arc::new(Mutex::new(())),
             controls: Arc::new(Semaphore::new(8)),
+            artifact_store: None,
+            result_slots: Arc::new(Semaphore::new(2)),
+            dispatcher_owner: Uuid::new_v4(),
             max_sessions: 64,
             fleet: Arc::new(Mutex::new(None)),
             observations: Arc::new(Mutex::new(HashMap::new())),

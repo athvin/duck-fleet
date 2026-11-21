@@ -226,7 +226,24 @@ fn migration_failure(client: &mut Client) -> Result<()> {
 /// This generated-schema fixture reconstructs the real schema-1 surface before
 /// testing upgrades. Merely deleting version markers leaves schema-2 DDL behind
 /// and does not represent any supported historical installation.
+pub(super) fn remove_job_fixture_schema(client: &mut Client) -> Result<()> {
+    let current: i32 = client
+        .query_one("SELECT MAX(version) FROM platform_schema_migrations", &[])?
+        .get(0);
+    if current < 5 {
+        return Ok(());
+    }
+    client.batch_execute("DROP TABLE job_artifacts,job_bindings,query_jobs,job_dispatch_fairness; DROP SEQUENCE job_dispatch_turn;
+        ALTER TABLE requests DROP COLUMN work_kind; ALTER TABLE requests ALTER COLUMN worker_id SET NOT NULL;
+        ALTER TABLE query_history DROP COLUMN work_kind; ALTER TABLE query_history ALTER COLUMN worker_id SET NOT NULL; ALTER TABLE query_history ALTER COLUMN session_id SET NOT NULL;
+        ALTER TABLE query_permits ALTER COLUMN worker_id SET NOT NULL; ALTER TABLE query_permits ALTER COLUMN boot_id SET NOT NULL;
+        ALTER TABLE query_permits DROP CONSTRAINT query_permits_check,DROP CONSTRAINT query_permits_check1;
+        ALTER TABLE admission_policies DROP COLUMN job_limits;ALTER TABLE reservations DROP COLUMN deadline_seconds;
+        DELETE FROM platform_maintenance_tasks WHERE task='artifacts';DELETE FROM platform_schema_migrations WHERE version=5;")?;
+    Ok(())
+}
 pub(super) fn remove_system_fixture_schema(client: &mut Client) -> Result<()> {
+    remove_job_fixture_schema(client)?;
     let current: i32 = client
         .query_one("SELECT MAX(version) FROM platform_schema_migrations", &[])?
         .get(0);

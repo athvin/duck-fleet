@@ -39,6 +39,7 @@ pub async fn run(args: Vec<String>) -> i32 {
     let result = match parsed.command.as_str() {
         "sql" => run_sql(&url, &token, &parsed).await,
         "system" => run_system(&url, &token, &parsed).await,
+        "job" => run_job(&url, &token, &parsed).await,
         "history" => {
             let mut path = format!("/v1/queries?limit={}", parsed.limit(20));
             if let Some(worker) = parsed.value("worker-id") {
@@ -101,7 +102,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (sql|system|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -132,6 +133,275 @@ pub async fn run(args: Vec<String>) -> i32 {
             1
         }
     }
+}
+
+fn job_local_error(id: Option<uuid::Uuid>, message: impl Into<String>) -> RemoteError {
+    RemoteError {
+        status: None,
+        failure_kind: Some("job_client_error".into()),
+        retry_safe: false,
+        message: message.into(),
+        request_id: id.map(|id| id.to_string().into()),
+        acceptance: None,
+        status_url: id.map(|id| format!("/v1/jobs/{id}").into()),
+    }
+}
+fn print_json(value: &Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    );
+}
+
+async fn run_job(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
+    let client = Client::new(url, token)?;
+    if parsed.is_job_submit() {
+        let request = parsed
+            .job_request(uuid::Uuid::new_v4())
+            .map_err(|e| job_local_error(None, e))?;
+        // Emit the stable reconciliation handle before any request can commit.
+        eprintln!(
+            "request_id: {}; status: /v1/jobs/{}",
+            request.request_id, request.request_id
+        );
+        print_json(&client.submit_job(&request).await?);
+        return Ok(());
+    }
+    let id = uuid::Uuid::parse_str(&parsed.positionals[1]).expect("validated job ID");
+    match parsed.positionals[0].as_str() {
+        "cancel" => print_json(&client.cancel_job(id).await?),
+        "status" => {
+            let waiting = parsed.flags.iter().any(|f| f == "wait");
+            loop {
+                let status = client.job(id).await?;
+                let terminal =
+                    status["state"] == "terminal" || status["request"]["state"] == "terminal";
+                print_json(&status);
+                if !waiting || terminal {
+                    break;
+                }
+                tokio::select! {
+                    _=tokio::time::sleep(std::time::Duration::from_secs(2))=>{},
+                    _=tokio::signal::ctrl_c()=>break,
+                }
+            }
+        }
+        "result" => {
+            download_job_result(
+                &client,
+                id,
+                parsed.value("output").expect("validated output"),
+                parsed.flags.iter().any(|f| f == "resume"),
+            )
+            .await?
+        }
+        _ => unreachable!("validated job command"),
+    }
+    Ok(())
+}
+
+async fn download_job_result(
+    client: &Client,
+    id: uuid::Uuid,
+    directory: &str,
+    resume: bool,
+) -> Result<(), RemoteError> {
+    use tokio::io::AsyncWriteExt;
+    let value = client.job_result(id).await?;
+    if value["complete"] != true {
+        print_json(&value);
+        return Err(job_local_error(
+            Some(id),
+            "job result is not complete; inspect status before downloading",
+        ));
+    }
+    let manifest: crate::artifacts::Manifest = serde_json::from_value(value.clone())
+        .map_err(|_| job_local_error(Some(id), "invalid job result manifest"))?;
+    if manifest.request_id != id
+        || manifest.bytes > crate::job_policy::JobLimits::HARD.result_bytes
+        || manifest.rows > crate::job_policy::JobLimits::HARD.result_rows
+    {
+        return Err(job_local_error(
+            Some(id),
+            "job manifest identity or result bounds are invalid",
+        ));
+    }
+    let encoded_manifest = manifest
+        .encode()
+        .map_err(|_| job_local_error(Some(id), "job result manifest failed validation"))?;
+    let path = std::path::Path::new(directory);
+    if resume {
+        let meta = tokio::fs::symlink_metadata(path)
+            .await
+            .map_err(|_| job_local_error(Some(id), "cannot read result directory"))?;
+        if !meta.is_dir() {
+            return Err(job_local_error(
+                Some(id),
+                "result directory must be a real directory",
+            ));
+        }
+        let manifest_path = path.join("manifest.json");
+        let meta = tokio::fs::symlink_metadata(&manifest_path)
+            .await
+            .map_err(|_| job_local_error(Some(id), "resume needs the matching manifest.json"))?;
+        if !meta.is_file() || meta.len() > crate::artifacts::MAX_MANIFEST_BYTES as u64 {
+            return Err(job_local_error(
+                Some(id),
+                "resume manifest must be a bounded regular file",
+            ));
+        }
+        let stored = tokio::fs::read(manifest_path)
+            .await
+            .map_err(|_| job_local_error(Some(id), "resume needs the matching manifest.json"))?;
+        if stored.len() > crate::artifacts::MAX_MANIFEST_BYTES
+            || serde_json::from_slice::<Value>(&stored).ok().as_ref() != Some(&value)
+        {
+            return Err(job_local_error(
+                Some(id),
+                "resume manifest differs from the authorized result generation",
+            ));
+        }
+    } else {
+        tokio::fs::create_dir(path).await.map_err(|_| {
+            job_local_error(
+                Some(id),
+                "cannot create result directory; existing directories require --resume",
+            )
+        })?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.join("manifest.json"))
+            .await
+            .map_err(|_| job_local_error(Some(id), "cannot create manifest.json"))?;
+        file.write_all(&encoded_manifest)
+            .await
+            .map_err(|_| job_local_error(Some(id), "cannot write result manifest"))?;
+        file.flush()
+            .await
+            .map_err(|_| job_local_error(Some(id), "cannot flush result manifest"))?;
+    }
+    for chunk in &manifest.chunks {
+        let final_path = path.join(format!("{:06}.arrow", chunk.chunk_id));
+        if resume && tokio::fs::symlink_metadata(&final_path).await.is_ok() {
+            verify_local_chunk(id, &final_path, chunk, &manifest.schema).await?;
+            continue;
+        }
+        let temporary = path.join(format!("{:06}.arrow.part", chunk.chunk_id));
+        if resume && let Ok(meta) = tokio::fs::symlink_metadata(&temporary).await {
+            if !meta.is_file() {
+                return Err(job_local_error(
+                    Some(id),
+                    "partial chunk must be a regular file",
+                ));
+            }
+            tokio::fs::remove_file(&temporary)
+                .await
+                .map_err(|_| job_local_error(Some(id), "cannot replace partial chunk"))?;
+        }
+        let mut output = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await
+            .map_err(|_| job_local_error(Some(id), "cannot create partial chunk"))?;
+        client
+            .download_job_chunk(
+                id,
+                &chunk.chunk_id.to_string(),
+                chunk.bytes,
+                &chunk.sha256,
+                &mut output,
+            )
+            .await?;
+        drop(output);
+        verify_local_chunk(id, &temporary, chunk, &manifest.schema).await?;
+        // Publish without overwriting a path created concurrently or left by a
+        // different download. Both names are in the same output directory.
+        tokio::fs::hard_link(&temporary, &final_path)
+            .await
+            .map_err(|_| {
+                job_local_error(
+                    Some(id),
+                    "cannot publish chunk without replacing an existing file",
+                )
+            })?;
+        tokio::fs::remove_file(&temporary)
+            .await
+            .map_err(|_| job_local_error(Some(id), "cannot remove completed partial chunk"))?;
+    }
+    eprintln!(
+        "downloaded {} rows in {} chunks to {}",
+        manifest.rows,
+        manifest.chunks.len(),
+        directory
+    );
+    Ok(())
+}
+
+async fn verify_local_chunk(
+    id: uuid::Uuid,
+    path: &std::path::Path,
+    chunk: &crate::artifacts::ManifestChunk,
+    schema: &arrow_schema::Schema,
+) -> Result<(), RemoteError> {
+    let path = path.to_path_buf();
+    let expected_bytes = chunk.bytes;
+    let expected_rows = chunk.rows;
+    let checksum = chunk.sha256.clone();
+    let schema = schema.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek};
+        let bad = || {
+            job_local_error(
+                Some(id),
+                "local chunk failed length, checksum, schema, or row-count validation",
+            )
+        };
+        let meta = std::fs::symlink_metadata(&path).map_err(|_| bad())?;
+        if !meta.is_file()
+            || meta.len() != expected_bytes
+            || expected_bytes > crate::artifacts::MAX_CHUNK_BYTES as u64
+        {
+            return Err(bad());
+        }
+        let mut file = std::fs::File::open(path).map_err(|_| bad())?;
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buffer).map_err(|_| bad())?;
+            if n == 0 {
+                break;
+            }
+            digest.update(&buffer[..n]);
+        }
+        let actual = digest
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        if actual != checksum {
+            return Err(bad());
+        }
+        file.rewind().map_err(|_| bad())?;
+        let reader = arrow_ipc::reader::StreamReader::try_new(file, None).map_err(|_| bad())?;
+        if *reader.schema() != schema {
+            return Err(bad());
+        }
+        let mut rows = 0u64;
+        for batch in reader {
+            rows = rows
+                .checked_add(batch.map_err(|_| bad())?.num_rows() as u64)
+                .ok_or_else(bad)?;
+        }
+        if rows != expected_rows {
+            return Err(bad());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| job_local_error(Some(id), "chunk verification task failed"))?
 }
 
 async fn run_system(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
@@ -442,7 +712,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 13] = [
+    const VALUE_FLAGS: [&'static str; 21] = [
         "url",
         "token",
         "cpu",
@@ -456,6 +726,14 @@ impl Parsed {
         "file",
         "after",
         "before",
+        "request-id",
+        "retry-of",
+        "timeout",
+        "result-retention",
+        "result-max-bytes",
+        "result-max-rows",
+        "output",
+        "sql",
     ];
     const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
@@ -469,7 +747,7 @@ impl Parsed {
         while index < args.len() {
             let arg = &args[index];
             if let Some(name) = arg.strip_prefix("--") {
-                if name == "placement" {
+                if ["placement", "wait", "resume"].contains(&name) {
                     flags.push(name.to_owned());
                     index += 1;
                 } else if name == "param"
@@ -501,7 +779,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <sql|system|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -509,12 +787,13 @@ impl Parsed {
             flags,
         };
         if parsed.command != "sql"
+            && !parsed.is_job_submit()
             && parsed
                 .values
                 .iter()
                 .any(|(name, _)| Self::COMPUTE_FLAGS.contains(&name.as_str()))
         {
-            return Err("compute selection flags apply only to the sql command".into());
+            return Err("compute selection flags apply only to sql or job submit".into());
         }
         if parsed.command == "system" {
             let valid = match parsed.positionals.first().map(String::as_str) {
@@ -537,8 +816,11 @@ impl Parsed {
                 return Err("system --format must be table or json".into());
             }
         }
-        if parsed.command != "sql" && parsed.value("queue-timeout").is_some() {
-            return Err("--queue-timeout applies only to the sql command".into());
+        if parsed.command != "sql"
+            && !parsed.is_job_submit()
+            && parsed.value("queue-timeout").is_some()
+        {
+            return Err("--queue-timeout applies only to sql or job submit".into());
         }
         if parsed.value("file").is_some() && parsed.command != "policy" {
             return Err("--file applies only to the policy command".into());
@@ -574,9 +856,109 @@ impl Parsed {
         {
             return Err("--limit must be a whole number from 1 to 500".into());
         }
-        parsed.queue_timeout()?;
+        for flag in [
+            "request-id",
+            "retry-of",
+            "timeout",
+            "result-retention",
+            "result-max-bytes",
+            "result-max-rows",
+            "sql",
+        ] {
+            if parsed.value(flag).is_some() && !parsed.is_job_submit() {
+                return Err(format!("--{flag} applies only to job submit"));
+            }
+        }
+        if parsed.value("output").is_some()
+            && !(parsed.command == "job"
+                && parsed.positionals.first().is_some_and(|s| s == "result"))
+        {
+            return Err("--output applies only to job result".into());
+        }
+        for (flag, subcommand) in [("wait", "status"), ("resume", "result")] {
+            if parsed.flags.iter().any(|f| f == flag)
+                && !(parsed.command == "job"
+                    && parsed.positionals.first().is_some_and(|s| s == subcommand))
+            {
+                return Err(format!("--{flag} applies only to job {subcommand}"));
+            }
+        }
+        if parsed.command == "job" {
+            match parsed.positionals.first().map(String::as_str) {
+                Some("submit") => { parsed.job_request(uuid::Uuid::nil())?; }
+                Some("status"|"cancel"|"result") if parsed.positionals.len()==2 && uuid::Uuid::parse_str(&parsed.positionals[1]).is_ok() => {
+                    if !parsed.params.is_empty() || parsed.value("format").is_some() { return Err("job reads and cancellation do not accept parameters or formats".into()); }
+                    if parsed.positionals[0]=="result" && parsed.value("output").is_none() { return Err("job result requires --output <directory>".into()); }
+                }
+                _ => return Err("job needs submit --sql <statement>, status <id>, cancel <id>, or result <id> --output <directory>".into()),
+            }
+        } else {
+            parsed.queue_timeout()?;
+        }
         parsed.compute()?;
         Ok(parsed)
+    }
+
+    fn is_job_submit(&self) -> bool {
+        self.command == "job" && self.positionals.first().is_some_and(|s| s == "submit")
+    }
+
+    fn job_request(
+        &self,
+        generated_id: uuid::Uuid,
+    ) -> Result<crate::job_policy::JobRequest, String> {
+        let sql = match (self.value("sql"), self.positionals.as_slice()) {
+            (Some(sql), [subcommand]) if subcommand == "submit" => sql.to_owned(),
+            (None, [subcommand, sql]) if subcommand == "submit" => sql.clone(),
+            _ => {
+                return Err(
+                    "job submit needs exactly one SQL argument or --sql <statement>".into(),
+                );
+            }
+        };
+        let id = |name: &str| {
+            self.value(name)
+                .map(|v| uuid::Uuid::parse_str(v).map_err(|_| format!("--{name} needs a UUID")))
+                .transpose()
+        };
+        let number = |name: &str| {
+            self.value(name)
+                .map(|v| {
+                    v.parse::<u64>()
+                        .map_err(|_| format!("--{name} needs a positive whole number"))
+                })
+                .transpose()
+        };
+        let format = self
+            .value("format")
+            .map(|s| {
+                if s == "arrow_ipc_chunks" {
+                    Ok(crate::job_policy::ResultFormat::ArrowIpcChunks)
+                } else {
+                    Err("job format must be arrow_ipc_chunks".to_owned())
+                }
+            })
+            .transpose()?;
+        let result = crate::job_policy::JobResultRequest {
+            format,
+            retention_seconds: number("result-retention")?,
+            max_bytes: number("result-max-bytes")?,
+            max_rows: number("result-max-rows")?,
+        };
+        let request = crate::job_policy::JobRequest {
+            request_id: id("request-id")?.unwrap_or(generated_id),
+            retry_of: id("retry-of")?,
+            sql,
+            parameters: self.params.iter().cloned().map(Value::String).collect(),
+            context: json!({}),
+            compute: serde_json::from_value(self.compute()?.unwrap_or_else(|| json!({})))
+                .map_err(|_| "invalid compute selection".to_owned())?,
+            timeout_seconds: number("timeout")?,
+            queue_timeout_seconds: number("queue-timeout")?,
+            result: (result != crate::job_policy::JobResultRequest::default()).then_some(result),
+        };
+        request.clone().validate().map_err(|e| e.1)?;
+        Ok(request)
     }
 
     fn value(&self, name: &str) -> Option<&str> {
@@ -639,6 +1021,53 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Parsed, String> {
         Parsed::from_args(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn job_arguments_keep_original_omission_and_separate_queue_allowance() {
+        let parsed = parse(&["job", "submit", "--sql", "SELECT 1"]).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let request = parsed.job_request(id).unwrap();
+        assert_eq!(request.request_id, id);
+        assert_eq!(request.timeout_seconds, None);
+        assert_eq!(request.queue_timeout_seconds, None);
+        assert!(request.result.is_none());
+        let parsed = parse(&[
+            "job",
+            "submit",
+            "SELECT 1",
+            "--timeout",
+            "3600",
+            "--queue-timeout",
+            "3600",
+            "--pool",
+            "batch",
+            "--result-retention",
+            "86400",
+        ])
+        .unwrap();
+        let request = parsed.job_request(id).unwrap();
+        assert_eq!(request.timeout_seconds, Some(3600));
+        assert_eq!(request.queue_timeout_seconds, Some(3600));
+        assert_eq!(request.compute.pool.as_deref(), Some("batch"));
+        assert_eq!(request.result.unwrap().retention_seconds, Some(86400));
+        assert!(parse(&["sql", "SELECT 1", "--queue-timeout", "3600"]).is_err());
+        for args in [
+            vec!["job", "submit", "--sql", "SELECT 1", "SELECT 2"],
+            vec!["job", "submit", "SELECT 1", "--timeout", "3601"],
+            vec!["job", "submit", "SELECT 1", "--queue-timeout", "0"],
+            vec!["job", "submit", "SELECT 1", "--format", "parquet"],
+            vec!["job", "submit", "SELECT 1", "--request-id", "bad"],
+            vec!["workers", "--timeout", "60"],
+            vec!["job", "submit", "SELECT 1", "--resume"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+        let text = id.to_string();
+        assert!(parse(&["job", "status", &text, "--wait"]).is_ok());
+        assert!(parse(&["job", "result", &text, "--output", "results", "--resume"]).is_ok());
+        assert!(parse(&["job", "result", &text]).is_err());
+        assert!(parse(&["job", "cancel", &text, "--pool", "batch"]).is_err());
     }
 
     #[test]

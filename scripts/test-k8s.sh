@@ -89,6 +89,7 @@ render() {
   # enabled across this test's rerenders; ordinary deployments remain opt-in.
   helm template duckfleet infra/helm/duckfleet --namespace "$NS" \
     --set pgwire.enabled=true \
+    --set results.enabled=true \
     --set "workerImage=$REGISTRY/worker@sha256:$digest" \
     --set "dbtImage=$REGISTRY/dbt@sha256:$digest" "$@"
 }
@@ -141,12 +142,13 @@ python3 scripts/kind/check_networkpolicy.py --context "$CONTEXT" --namespace "$N
 # normally runs additionally asserts the real development bucket, which cannot be
 # true here; the Parquet check below covers the local equivalent.
 "${KUBE[@]}" apply -f infra/kind/harness-artifacts.yaml
-harness() { # harness <job-name> <command> [timeout]
+harness() { # harness <job-name> <command> [timeout] [extra harness_job.py args...]
   local name="$1" command="$2" timeout="${3:-1200}"
+  shift $(($# < 3 ? $# : 3))
   render --show-only templates/harness.yaml \
     | python3 scripts/kind/localize.py --expect image,cpu-request,s3-path,node-selector \
     | python3 scripts/kind/harness_job.py --name "$name" --command "$command" \
-      --artifacts-claim duckfleet-harness-artifacts \
+      --artifacts-claim duckfleet-harness-artifacts "$@" \
     > "$work/$name.yaml"
   "${KUBE[@]}" apply -f "$work/$name.yaml"
   python3 scripts/kind/await_job.py --context "$CONTEXT" --namespace "$NS" \
@@ -161,6 +163,12 @@ harness() { # harness <job-name> <command> [timeout]
 python3 scripts/kind/assert_role_posture.py --context "$CONTEXT" --namespace "$NS" > artifacts/kind/role-secret-posture.json
 harness duckfleet-rbac 'duckfleet-server --rbac' 900
 harness duckfleet-system 'duckfleet-server --system' 300
+# The jobs harness verifies private-session cleanup against the platform database
+# directly. The kind lane generates the admin password per deploy, so the Job
+# receives the DSN for this run only.
+jobs_dsn_password=$("${KUBE[@]}" get secret duckfleet-dev -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)
+harness duckfleet-jobs 'duckfleet-server --jobs-isolated' 600 \
+  --env "DUCKFLEET_PLATFORM_TEST_DSN=host=postgres port=5432 dbname=platform user=duckfleet password=$jobs_dsn_password"
 harness duckfleet-harness 'duckfleet-server'
 grep -q 'PASS: protocol checks and dbt lifecycle' artifacts/kind/duckfleet-harness.log
 grep -q 'PASS: resource/sizing routing refuses what it cannot serve' artifacts/kind/duckfleet-harness.log

@@ -33,6 +33,7 @@ fn actor(client: &mut Client, name: &str) -> Result<Identity> {
             roles: vec![authz::Role::Analyst],
             permissions: vec![],
             compute: vec![authz::ComputeGrant {
+                job_limits: None,
                 pool: Some("fixture".into()),
                 mode: crate::compute::Mode::Persistent,
                 cpu: 1,

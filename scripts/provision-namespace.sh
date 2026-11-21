@@ -35,7 +35,7 @@ fi
 "${kube[@]}" get secret duckfleet-dev -o json | python3 scripts/database_roles.py "$ns" --check
 migration_run=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 helm template duckfleet infra/helm/duckfleet --namespace "$ns" \
-  --set "lakePrefix=$ns/lake" --set-string "platformMigration.runId=$migration_run" "$@" \
+  --set "lakePrefix=$ns/lake" --set "results.prefix=$ns/results" --set-string "platformMigration.runId=$migration_run" "$@" \
   | sh -c "$transform" \
   | "${kube[@]}" apply -f -
 python3 scripts/aws/wait-rollout.py --context "$context" --namespace "$ns" --prune-migrations

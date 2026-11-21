@@ -69,6 +69,7 @@ fn policy(
             permissions,
             disabled,
             compute: vec![authz::ComputeGrant {
+                job_limits: None,
                 pool: Some("small".into()),
                 mode: Mode::Persistent,
                 cpu: 1,

@@ -8,11 +8,12 @@ anyhow = "1.0.104"
 arrow-array = "58.4.1"
 arrow-cast = "58.4.1"
 arrow-ipc = "58.4.1"
-arrow-schema = "58.4.1"
+arrow-schema = { version = "58.4.1", features = ["serde"] }
 axum = "0.8"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 duckdb = "=1.10504.0"
 futures-util = "0.3.32"
+object_store = { version = "=0.14.2", default-features = false, features = ["aws-base", "reqwest", "ring"] }
 postgres = "0.19.14"
 # rustls, used with the built-in roots switched off: the only certificate the
 # gateway trusts for the Kubernetes API is the cluster CA the kubelet mounts, which
@@ -35,7 +36,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.29.2", features = ["v4", "serde"] }
 
 [dev-dependencies]
+duckdb = { version = "=1.10504.0", features = ["vtab"] }
 # `test-util` enables paused time, which is what lets the drain-wait tests cover a
 # 75-second deadline without spending it. Tests only; the served binary keeps the
 # feature set above.
 tokio = { version = "1.54.1", features = ["full", "test-util"] }
+
+[patch.crates-io]
+duckdb = { path = "vendor/duckdb" }

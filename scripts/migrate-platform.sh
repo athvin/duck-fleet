@@ -32,8 +32,8 @@ case "$mode" in
     python3 - "$work/template.json" "$name" "$role" <<'PY' | "${kube[@]}" create -f -
 import json, sys
 source = json.load(open(sys.argv[1]))
-if source.get('metadata', {}).get('annotations', {}).get('duckfleet.io/platform-schema') != '4':
-    sys.exit('Current migration template predates schema 4; stop compute and apply the desired chart/image first')
+if source.get('metadata', {}).get('annotations', {}).get('duckfleet.io/platform-schema') != '5':
+    sys.exit('Current migration template predates schema 5; stop compute and apply the desired chart/image first')
 spec = source['spec']
 for container in spec['template']['spec']['containers']:
     for item in container.get('env', []):
@@ -50,7 +50,7 @@ for label in ('controller-uid', 'job-name', 'batch.kubernetes.io/controller-uid'
 spec['ttlSecondsAfterFinished'] = 86400
 print(json.dumps({'apiVersion': 'batch/v1', 'kind': 'Job',
                   'metadata': {'name': sys.argv[2], 'labels': {'app': 'duckfleet-platform-migrate'},
-                               'annotations': {'duckfleet.io/platform-schema': '4'}},
+                               'annotations': {'duckfleet.io/platform-schema': '5'}},
                   'spec': spec}))
 PY
     deadline=$(python3 - "$work/template.json" <<'PY'

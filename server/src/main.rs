@@ -1,4 +1,5 @@
 //! Local, single-tenant DuckFleet SQL service. All DuckDB work stays on one worker thread.
+mod artifacts;
 #[allow(dead_code)]
 mod audit;
 mod authz;
@@ -8,12 +9,16 @@ mod client;
 mod compute;
 mod credentials;
 mod db_roles;
+mod engine_stream;
 mod failure;
 mod gateway;
 mod harness;
 mod history;
 mod http_transport;
 mod isolated;
+mod job_artifacts;
+mod job_policy;
+mod jobs;
 mod kube;
 mod metadata;
 mod metering;
@@ -85,10 +90,11 @@ struct Envelope {
     reply: oneshot::Sender<Reply>,
 }
 enum Operation {
+    OpenJob(jobs::BindingToken),
     /// Request identity travels on the authenticated internal hop, independently
     /// of the caller's SQL context and the credential that opened a session.
     Open(
-        WorkerSessionRequest,
+        Box<WorkerSessionRequest>,
         credentials::Identity,
         Protocol,
         Uuid,
@@ -278,6 +284,15 @@ async fn dispatch(app: App, op: Operation) -> Reply {
         .map_err(|_| ApiError::new(failure::CAPACITY, "worker queue full or closed"))?;
     receiver.await.map_err(|_| ApiError::internal())?
 }
+async fn open_job(State(app): State<App>, body: Bytes) -> Reply {
+    if app.draining.load(Ordering::Acquire) {
+        return Err(ApiError::new(failure::DRAINING, "worker is draining"));
+    }
+    let token: jobs::BindingToken =
+        serde_json::from_slice(&body).map_err(|_| ApiError::bad("invalid internal job binding"))?;
+    dispatch(app, Operation::OpenJob(token)).await
+}
+
 async fn open(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Reply {
     // Only new sessions are refused. Queries on sessions already open continue, which
     // is the drain: the grace period bounds how long that can take, so a client cannot
@@ -305,7 +320,7 @@ async fn open(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Reply 
     dispatch(
         app,
         Operation::Open(
-            request,
+            Box::new(request),
             identity,
             worker_protocol(&headers)?,
             open_span(&headers)?,
@@ -680,6 +695,7 @@ async fn main() -> anyhow::Result<()> {
         draining: draining.clone(),
     };
     let api = Router::new()
+        .route("/v1/internal/jobs/open", post(open_job))
         .route("/v1/sessions", post(open))
         .route("/v1/sessions/{id}", axum::routing::delete(close))
         .route("/v1/sessions/{id}/queries", post(query))

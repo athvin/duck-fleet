@@ -1,0 +1,21 @@
+# Apply only after configuring matching result-prefix Pod Identity associations.
+results:
+  enabled: true
+  prefix: results
+jobPolicy:
+  ceilings:
+    runtime_seconds: 3600
+    result_bytes: 1073741824
+    result_rows: 10000000
+    retention_seconds: 86400
+  defaults:
+    limits:
+      runtime_seconds: 300
+      result_bytes: 1073741824
+      result_rows: 10000000
+      retention_seconds: 3600
+    queue_timeout_seconds: 120
+    format: arrow_ipc_chunks
+# Longer runtime requires a complete job_limits envelope on a matching principal
+# compute grant as well; omitted job_limits retains the 60-second analyst limit.
+# isolatedCompute.maxSessionSeconds remains an independent hard pod lifetime.

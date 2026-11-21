@@ -87,7 +87,7 @@ fn canonical(value: &Value) -> Value {
     }
 }
 
-fn hash_payload(domain: &[u8], payload: &Value) -> Result<String, ApiError> {
+pub(crate) fn hash_payload(domain: &[u8], payload: &Value) -> Result<String, ApiError> {
     let encoded = serde_json::to_vec(&canonical(payload)).map_err(|_| ApiError::internal())?;
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
     digest.update(domain);
@@ -259,6 +259,20 @@ const USAGE_BACKFILL: &str = "INSERT INTO requests (
  FROM usage_events u";
 
 fn backfill(transaction: &mut Transaction<'_>, request_id: Option<&str>) -> anyhow::Result<()> {
+    // Typed jobs may have truthful NULL assignment before binding. A retained
+    // identity already wins; never reconstruct it through the legacy INSERT
+    // (whose interactive CHECK is evaluated even with ON CONFLICT DO NOTHING).
+    if let Some(id) = request_id
+        && transaction
+            .query_opt(
+                "SELECT request_id FROM requests WHERE request_id=$1",
+                &[&id],
+            )?
+            .is_some()
+    {
+        return Ok(());
+    }
+
     for (source, key, group) in [
         (HISTORY_BACKFILL, "h.query_id", ""),
         (RESERVATION_BACKFILL, "r.execution_id", ""),
@@ -342,7 +356,7 @@ const COLUMNS: &str = "r.request_id,r.principal,r.logical_request_id,r.retry_of,
     EXISTS(SELECT 1 FROM query_history h WHERE h.query_id=r.request_id) AS diagnostics_available,
     (SELECT child.request_id FROM requests child WHERE child.retry_of=r.request_id) AS next_attempt_id, to_jsonb(r)::text AS queue_record";
 
-struct Stored {
+pub(crate) struct Stored {
     request_id: String,
     principal: Option<String>,
     logical_request_id: String,
@@ -354,7 +368,7 @@ struct Stored {
     outcome: String,
     failure_kind: Option<String>,
     retry_safe: Option<bool>,
-    worker_id: String,
+    worker_id: Option<String>,
     accepted_at: String,
     finished_at: Option<String>,
     elapsed_ms: Option<i64>,
@@ -406,6 +420,17 @@ impl Stored {
             // Only the isolated pre-schema-3 upgrade fixtures use this path.
             return self.authorize(input.principal, is_bootstrap(input.principal));
         };
+        self.authorize_typed(tx, authority)
+    }
+
+    pub(crate) fn is_job(&self) -> bool {
+        self.queue_record["work_kind"].as_str() == Some("job")
+    }
+    pub(crate) fn authorize_typed(
+        &self,
+        tx: &mut Transaction<'_>,
+        authority: &Ownership<'_>,
+    ) -> Result<(), ApiError> {
         let namespace = self.queue_record["namespace_id"].as_str();
         if namespace.is_some_and(|ns| ns != authority.namespace_id) {
             return Err(not_found());
@@ -417,17 +442,48 @@ impl Stored {
             .as_str()
             .map(str::to_owned);
         if owner.is_none() && namespace.is_none() {
-            // This migration-only mapping records credible pre-upgrade owners.
-            // Never resolve an unknown legacy label through today's dictionary.
-            owner = tx.query_opt(
-                "SELECT principal_id FROM authz_legacy_owners WHERE namespace_id=$1 AND legacy_name=$2",
-                &[&authority.namespace_id, &self.principal],
-            ).map_err(|_|ApiError::internal())?.map(|row| row.get(0));
+            owner = tx.query_opt("SELECT principal_id FROM authz_legacy_owners WHERE namespace_id=$1 AND legacy_name=$2",
+                &[&authority.namespace_id,&self.principal]).map_err(|_|ApiError::internal())?.map(|r|r.get(0));
         }
         if owner.is_none() || owner.as_deref() != authority.owner_principal_id {
             return Err(not_found());
         }
         Ok(())
+    }
+    pub(crate) fn job_duplicate(
+        &self,
+        hash: &str,
+        retry_of: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        if !self.is_job()
+            || self.fingerprint_version != Some(4)
+            || self.payload_hash.as_deref() != Some(hash)
+            || self.retry_of.as_deref() != retry_of
+        {
+            return Err(ApiError::new(
+                failure::REQUEST_ID_MISMATCH,
+                "request_id belongs to a different job payload or retry chain; no SQL ran",
+            ));
+        }
+        Ok(
+            json!({"error":"request_id was already accepted; SQL was not replayed","failure_kind":failure::DUPLICATE_REQUEST.kind,
+            "retry_safe":false,"request_id":self.request_id,"original":self.detail()}),
+        )
+    }
+    pub(crate) fn job_parent(&self, hash: &str) -> Result<String, ApiError> {
+        if !self.is_job() || self.fingerprint_version != Some(4) || !self.retryable() {
+            return Err(ApiError::new(
+                failure::INVALID_RETRY,
+                "retry_of must name an eligible owned job budget refusal",
+            ));
+        }
+        if self.payload_hash.as_deref() != Some(hash) {
+            return Err(ApiError::new(
+                failure::REQUEST_ID_MISMATCH,
+                "retry payload differs from its parent",
+            ));
+        }
+        Ok(self.logical_request_id.clone())
     }
 
     fn retryable(&self) -> bool {
@@ -435,7 +491,8 @@ impl Stored {
             && self.outcome == Outcome::NotExecuted.name()
             && self.retry_safe == Some(true)
             && self.failure_kind.as_deref() == Some("budget_exhausted")
-            && matches!(self.fingerprint_version, Some(1..=3))
+            && (matches!(self.fingerprint_version, Some(1..=3))
+                || (self.fingerprint_version == Some(4) && self.is_job()))
             && self.payload_hash.is_some()
             && self.principal.is_some()
             && self.next_attempt_id.is_none()
@@ -459,7 +516,7 @@ impl Stored {
         }
     }
 
-    fn detail(&self) -> Value {
+    pub(crate) fn detail(&self) -> Value {
         let mut detail = json!({
             "request_id": self.request_id,
             "logical_request_id": self.logical_request_id,
@@ -478,7 +535,7 @@ impl Stored {
             "result_rows": self.result_rows,
             "fingerprint_version": self.fingerprint_version,
             "fingerprint_status": if self.payload_hash.is_none() { "legacy_unavailable" }
-                else if matches!(self.fingerprint_version, Some(1..=3)) { "known" }
+                else if matches!(self.fingerprint_version, Some(1..=4)) { "known" }
                 else { "unsupported_version" },
             "diagnostics_available": self.diagnostics_available,
             "retry": {
@@ -488,6 +545,7 @@ impl Stored {
             },
         });
         for key in [
+            "work_kind",
             "namespace_id",
             "owner_principal_id",
             "actor_principal_id",
@@ -520,6 +578,12 @@ impl Stored {
 
     fn duplicate(&self, input: &Submission<'_>, hash: &str) -> Result<Value, ApiError> {
         // The caller checks immutable owner authority before invoking this.
+        if self.is_job() {
+            return Err(ApiError::new(
+                failure::REQUEST_ID_MISMATCH,
+                "request_id belongs to a different work kind; no SQL ran",
+            ));
+        }
         // Legacy fingerprints stay unknown permanently. Returning their outcome
         // is safe; asserting either equality or mismatch would invent evidence.
         if self.retry_of.as_deref() != input.retry_of
@@ -550,7 +614,7 @@ fn not_found() -> ApiError {
     ApiError::new(failure::NOT_FOUND, "request not found")
 }
 
-fn load(client: &mut impl GenericClient, id: &str) -> Result<Option<Stored>, ApiError> {
+pub(crate) fn load(client: &mut impl GenericClient, id: &str) -> Result<Option<Stored>, ApiError> {
     client
         .query_opt(
             &format!("SELECT {COLUMNS} FROM requests r WHERE r.request_id=$1"),
@@ -558,6 +622,19 @@ fn load(client: &mut impl GenericClient, id: &str) -> Result<Option<Stored>, Api
         )
         .map(|row| row.map(Stored::from_row))
         .map_err(|_| ApiError::internal())
+}
+
+pub(crate) fn load_for_claim(
+    tx: &mut Transaction<'_>,
+    id: &str,
+    authority: &Ownership<'_>,
+) -> Result<Option<Stored>, ApiError> {
+    backfill(tx, Some(id)).map_err(|_| ApiError::internal())?;
+    let stored = load(tx, id)?;
+    if let Some(stored) = &stored {
+        stored.authorize_typed(tx, authority)?;
+    }
+    Ok(stored)
 }
 
 /// A legacy writer may race a quiesced-upgrade invariant. Keep its reservation
@@ -936,7 +1013,7 @@ mod tests {
             outcome: "statement_result".into(),
             failure_kind: None,
             retry_safe: None,
-            worker_id: "small".into(),
+            worker_id: Some("small".into()),
             accepted_at: "2026-11-20 12:00:00+00".into(),
             finished_at: Some("2026-11-20 12:00:01+00".into()),
             elapsed_ms: Some(1000),

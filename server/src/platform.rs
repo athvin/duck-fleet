@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{credentials, metering, pricing::RateCard, requests};
 
-pub(crate) const SCHEMA_VERSION: i32 = 4;
+pub(crate) const SCHEMA_VERSION: i32 = 5;
 const MIGRATION_LOCK: i64 = 4_283_121;
 const POLL: Duration = Duration::from_millis(250);
 const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
@@ -206,7 +206,7 @@ pub(crate) fn wait_schema(dsn: &str, wait: Duration) -> Result<Client> {
         })();
         match attempt {
             Ok((client, Some(current))) if current == SCHEMA_VERSION => return Ok(client),
-            Ok((_, Some(1..=3))) => {}
+            Ok((_, Some(1..=4))) => {}
             Ok((_, Some(current))) => {
                 supported(current)?;
             }
@@ -296,7 +296,7 @@ fn migrate_with_roles(
             });
         }
         anyhow::ensure!(
-            matches!(current, 1..=3),
+            matches!(current, 1..=4),
             "unsupported migration source version {current}"
         );
     }
@@ -315,7 +315,7 @@ fn migrate_with_roles(
         });
     }
     anyhow::ensure!(
-        current.is_none() || matches!(current, Some(1..=3)),
+        current.is_none() || matches!(current, Some(1..=4)),
         "unsupported migration source version"
     );
     if current.is_none() {
@@ -361,9 +361,13 @@ fn migrate_with_roles(
         &[],
     )?;
     }
-    crate::metadata::migrate_system(&mut transaction)?;
+    if current.is_none() || current.is_some_and(|v| v < 4) {
+        crate::metadata::migrate_system(&mut transaction)?;
+        transaction.execute("INSERT INTO platform_schema_migrations(version,name) VALUES(4,'typed-system-metadata')",&[])?;
+    }
+    crate::jobs::migrate(&mut transaction)?;
     transaction.execute(
-        "INSERT INTO platform_schema_migrations(version,name) VALUES(4,'typed-system-metadata')",
+        "INSERT INTO platform_schema_migrations(version,name) VALUES(5,'durable-jobs')",
         &[],
     )?;
     if let Some(roles) = roles {
@@ -501,7 +505,9 @@ impl MaintenanceConfig {
     }
 
     fn interval(&self, task: &str) -> Duration {
-        if task == "retention" {
+        if task == "artifacts" {
+            Duration::from_secs(60)
+        } else if task == "retention" {
             self.retention_interval
         } else {
             self.reconcile_interval
@@ -767,6 +773,15 @@ pub(crate) fn run_claimed(
     config: &MaintenanceConfig,
     force: bool,
 ) -> Result<PassReport> {
+    run_claimed_with_store(client, lease, config, force, None)
+}
+fn run_claimed_with_store(
+    client: &mut Client,
+    lease: &Lease,
+    config: &MaintenanceConfig,
+    force: bool,
+    store: Option<&crate::artifacts::Store>,
+) -> Result<PassReport> {
     config.validate()?;
     let started = Instant::now();
     let mut report = PassReport {
@@ -779,9 +794,9 @@ pub(crate) fn run_claimed(
         let tasks: Vec<String> = transaction
             .query(
                 "SELECT task FROM platform_maintenance_tasks
-                 WHERE task IN ('retention','reconcile')
+                 WHERE task IN ('retention','reconcile') OR ($1 AND task='artifacts')
                  ORDER BY next_due_at, CASE task WHEN 'retention' THEN 0 ELSE 1 END",
-                &[],
+                &[&store.is_some()],
             )?
             .iter()
             .map(|row| row.get(0))
@@ -824,6 +839,44 @@ pub(crate) fn run_claimed(
         );
         let result = if task == "retention" {
             retention(client, lease, config, &run_id, started)
+        } else if task == "artifacts" {
+            (|| -> Result<()> {
+                let store = store.context("artifact store unavailable")?;
+                let candidates =
+                    crate::job_artifacts::deletion_candidates(client, lease, config, 8)?;
+                let mut failures = 0_u32;
+                for object in candidates {
+                    let remaining = config.pass_budget.saturating_sub(started.elapsed());
+                    if remaining < Duration::from_millis(1) {
+                        break;
+                    }
+                    // No SQL transaction or lease-row lock is held during IO.
+                    if tokio::runtime::Handle::current()
+                        .block_on(store.delete(
+                            &object.relative_key,
+                            tokio::time::Instant::now() + remaining,
+                        ))
+                        .is_err()
+                    {
+                        failures += 1;
+                        continue;
+                    }
+                    let mut bounded = config.clone();
+                    bounded.statement_timeout = config.statement_timeout.min(
+                        config
+                            .pass_budget
+                            .saturating_sub(started.elapsed())
+                            .max(Duration::from_millis(1)),
+                    );
+                    bounded.lock_timeout = config.lock_timeout.min(bounded.statement_timeout);
+                    crate::job_artifacts::ack_delete(client, lease, &bounded, &object)?;
+                }
+                anyhow::ensure!(
+                    failures == 0,
+                    "{failures} artifact deletions failed; durable retries remain scheduled"
+                );
+                Ok(())
+            })()
         } else {
             (|| -> Result<()> {
                 let remaining = config.pass_budget.saturating_sub(started.elapsed());
@@ -863,6 +916,15 @@ pub(crate) fn maintenance_pass(
     config: &MaintenanceConfig,
     force: bool,
 ) -> Result<PassReport> {
+    maintenance_with_store(client, owner, config, force, None)
+}
+fn maintenance_with_store(
+    client: &mut Client,
+    owner: Uuid,
+    config: &MaintenanceConfig,
+    force: bool,
+    store: Option<&crate::artifacts::Store>,
+) -> Result<PassReport> {
     check_schema(client)?;
 
     let Some(lease) = claim_maintenance(client, owner, config)? else {
@@ -872,7 +934,10 @@ pub(crate) fn maintenance_pass(
             tasks: Vec::new(),
         });
     };
-    let result = run_claimed(client, &lease, config, force);
+    let result = match store {
+        Some(store) => run_claimed_with_store(client, &lease, config, force, Some(store)),
+        None => run_claimed(client, &lease, config, force),
+    };
     let release = release_maintenance(client, &lease, config);
     match result {
         Ok(report) => {
@@ -944,10 +1009,13 @@ pub(crate) async fn grants_command() -> Result<()> {
 pub(crate) async fn maintain_command() -> Result<()> {
     let dsn = std::env::var("PLATFORM_DSN")?;
     let config = MaintenanceConfig::from_env()?;
+    let store = crate::artifacts::StoreConfig::from_env()?
+        .map(crate::artifacts::StoreConfig::build)
+        .transpose()?;
     let report = tokio::task::spawn_blocking(move || -> Result<PassReport> {
         let mut client = connect(&dsn, Duration::from_secs(3), config.statement_timeout)?;
         crate::db_roles::validate_runtime(&mut client, crate::db_roles::RuntimeRole::Maintainer)?;
-        maintenance_pass(&mut client, Uuid::new_v4(), &config, true)
+        maintenance_with_store(&mut client, Uuid::new_v4(), &config, true, store.as_ref())
     })
     .await
     .context("platform maintenance task")??;
@@ -964,6 +1032,17 @@ pub(crate) fn spawn_maintenance(
     config: MaintenanceConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let store = match crate::artifacts::StoreConfig::from_env()
+            .and_then(|config| config.map(crate::artifacts::StoreConfig::build).transpose())
+        {
+            Ok(store) => store,
+            Err(_) => {
+                tracing::error!(
+                    "artifact cleanup configuration unavailable; metadata maintenance continues"
+                );
+                None
+            }
+        };
         let owner = Uuid::new_v4();
         let mut interval = tokio::time::interval(MAINTENANCE_TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -971,13 +1050,14 @@ pub(crate) fn spawn_maintenance(
             interval.tick().await;
             let dsn = dsn.clone();
             let config = config.clone();
+            let store = store.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<PassReport> {
                 let mut client = connect(&dsn, Duration::from_secs(3), config.statement_timeout)?;
                 crate::db_roles::validate_runtime(
                     &mut client,
                     crate::db_roles::RuntimeRole::Maintainer,
                 )?;
-                maintenance_pass(&mut client, owner, &config, false)
+                maintenance_with_store(&mut client, owner, &config, false, store.as_ref())
             })
             .await;
             match result {
