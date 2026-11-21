@@ -408,6 +408,14 @@ sampled availability separately. Isolated workers still serve one session for
 their lifetime. These are concurrency limits, not provisioned-cost ceilings;
 provisioned/idle compute accounting and budget caps are tracked in #107.
 
+Session permits remain held while a backend close is unconfirmed. Discovery
+reports `gateway_closing_sessions` and `gateway_closing_endpoints`, including
+endpoints removed from the current registry. Restore reachability so the worker
+can acknowledge closure before permanently retiring an endpoint. A reload or a
+network timeout does not prove a backend session has ended; an unreachable
+endpoint can therefore hold capacity until cleanup succeeds. Gateway restart
+abandons its routes and ends client sessions; it is not transaction recovery.
+
 ## Credentials
 
 The environment token (`DUCKFLEET_TOKEN`) is the **bootstrap credential**: the
@@ -616,8 +624,10 @@ writers while upgrading before relying on the new fingerprint/retry contract;
 older workers do not implement it. Keep identity records and the usage ledger
 when pruning diagnostic history.
 
-Each worker queue holds at most 64 operations, with at most 32 sessions. The
-gateway allows at most 64 routed sessions. Exceeding either limit returns HTTP 429
+By default each worker queues at most 64 operations and serves at most 32
+sessions; the gateway permits 64 backend sessions across all protocols. These
+limits are configurable as described under persistent pools. Admission that
+exceeds an enforced queue or session limit returns HTTP 429
 with `failure_kind` `capacity`, which is retry-safe because the request is rejected
 before any SQL runs. Sessions idle for
 five minutes are closed by periodic worker housekeeping. Statement execution has a

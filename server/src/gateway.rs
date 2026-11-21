@@ -21,7 +21,7 @@ use reqwest::{Client, Method};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
         Arc, RwLock,
@@ -1605,6 +1605,16 @@ async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
 async fn pool_discovery(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
     let registry = app.registry();
     let fleet = app.fleet_snapshot(&registry).await;
+    // Cleanup can outlive a registry entry. Count every retained closing route,
+    // since its backend slot remains reserved until the worker acknowledges close.
+    let (closing_sessions, closing_endpoints) = {
+        let routes = app.routes.lock().await;
+        let mut endpoints = BTreeMap::<String, usize>::new();
+        for route in routes.values().filter(|route| route.closing) {
+            *endpoints.entry(route.endpoint.clone()).or_default() += 1;
+        }
+        (endpoints.values().sum::<usize>(), endpoints)
+    };
     let pools: Vec<Value> = registry.pools.iter().map(|(name, pool)| {
         let eligible = ranked_endpoints(&fleet.workers, pool.resources, name,
             &pool.endpoints, pool.max_sessions_per_worker, registry.legacy);
@@ -1632,6 +1642,8 @@ async fn pool_discovery(State(app): State<Gateway>) -> Result<Json<Value>, ApiEr
         "reload_available": app.pools_file.is_some(), "pools": pools,
         "gateway_max_sessions": app.max_sessions,
         "gateway_open_sessions": app.max_sessions.saturating_sub(app.capacity.available_permits()),
+        "gateway_closing_sessions": closing_sessions,
+        "gateway_closing_endpoints": closing_endpoints,
         "isolated_compute": app.isolation.is_some(),
         "observation_age_ms": u64::try_from(fleet.discovered.elapsed().as_millis()).unwrap_or(u64::MAX),
     })))
@@ -2322,6 +2334,63 @@ mod tests {
         assert!(!app.routes.lock().await.contains_key(&id));
         assert_eq!(app.capacity.available_permits(), 64);
         assert_eq!(server.closes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn closing_routes_remain_visible_after_endpoint_removal_until_close_is_acknowledged() {
+        let server = status_server(status("ready")).await;
+        // The current registry no longer lists this endpoint, but prior sessions
+        // still have their pinned route and consume backend-session permits.
+        let app = test_gateway(Vec::new());
+        let first = insert_test_route(
+            &app,
+            server.endpoint.clone(),
+            Identity::bootstrap(),
+            Instant::now(),
+        )
+        .await;
+        let second = insert_test_route(
+            &app,
+            server.endpoint.clone(),
+            Identity::bootstrap(),
+            Instant::now(),
+        )
+        .await;
+        let active = insert_test_route(
+            &app,
+            server.endpoint.clone(),
+            Identity::bootstrap(),
+            Instant::now(),
+        )
+        .await;
+        *server.close_status.lock().await = StatusCode::SERVICE_UNAVAILABLE;
+        app.close_internal(first).await;
+        app.close_internal(second).await;
+        assert_eq!(app.capacity.available_permits(), 61);
+        let Json(pending) = pool_discovery(State(app.clone())).await.unwrap();
+        assert_eq!(pending["pools"][0]["configured_workers"], 0);
+        assert_eq!(pending["gateway_open_sessions"], 3);
+        assert_eq!(pending["gateway_closing_sessions"], 2);
+        assert_eq!(
+            pending["gateway_closing_endpoints"],
+            json!({server.endpoint.clone(): 2})
+        );
+        assert!(app.routes.lock().await.contains_key(&first));
+        assert!(app.routes.lock().await.contains_key(&second));
+
+        *server.close_status.lock().await = StatusCode::OK;
+        app.expire().await;
+        assert_eq!(app.capacity.available_permits(), 63);
+        assert!(!app.routes.lock().await.contains_key(&first));
+        assert!(!app.routes.lock().await.contains_key(&second));
+        assert!(app.routes.lock().await.contains_key(&active));
+        let Json(cleaned) = pool_discovery(State(app.clone())).await.unwrap();
+        assert_eq!(cleaned["gateway_open_sessions"], 1);
+        assert_eq!(cleaned["gateway_closing_sessions"], 0);
+        assert_eq!(cleaned["gateway_closing_endpoints"], json!({}));
+        assert_eq!(server.closes.load(Ordering::SeqCst), 4);
+        app.close_internal(active).await;
+        assert_eq!(app.capacity.available_permits(), 64);
     }
 
     #[tokio::test]
