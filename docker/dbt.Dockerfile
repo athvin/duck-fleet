@@ -2,8 +2,15 @@
 # The dbt test image: the forked dbt-core binary (which embeds the DuckFleet
 # adapter) PLUS the duckfleet-server binary run as DUCKFLEET_ROLE=harness (the
 # Rust integration harness, which shells out to `dbt`) PLUS the test fixtures.
-# No Python. The Rust build stage mirrors docker/server.Dockerfile and shares its
-# cargo/target cache id, so building this image reuses that compile.
+# No Python in the runtime image. The Rust build stage mirrors
+# docker/server.Dockerfile and shares its cargo/target cache id, so building this
+# image reuses that compile.
+# Generate the deterministic scale project at build time. The harness runtime
+# needs only dbt and the generated files, including on read-only Kubernetes pods.
+FROM python:3.12.12-slim-bookworm AS scale-fixture
+COPY tests/dbt/scale/generate.py /generate.py
+RUN python /generate.py /scale-project
+
 FROM rust:1.99.0-bookworm AS build
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends curl unzip && rm -rf /var/lib/apt/lists/*
@@ -36,6 +43,7 @@ RUN ldconfig
 COPY --from=build /opt/duckdb /opt/duckdb
 COPY --from=build /tmp/duckfleet-server /usr/local/bin/duckfleet-server
 COPY tests /app/tests
+COPY --from=scale-fixture /scale-project /app/scale-project
 ENV DBT_PROFILES_DIR=/app/tests/dbt DBT_SEND_ANONYMOUS_USAGE_STATS=false NO_COLOR=1 DUCKFLEET_ROLE=harness
 WORKDIR /app/tests/dbt
 # Default runs the harness main lifecycle; override with stage flags

@@ -1060,28 +1060,24 @@ async fn evicted_midquery(ctx: &Ctx, expect_classified: bool) -> anyhow::Result<
 // --- scale / maintenance / credentials --------------------------------------
 
 async fn scale_checks(ctx: &Ctx) -> anyhow::Result<()> {
-    let project = "/tmp/duckfleet-scale";
-    // The scale generator remains a small script invoked by path.
-    std::process::Command::new("duckfleet-scale-generate")
-        .arg(project)
-        .status()
-        .ok();
-    let status = std::process::Command::new("dbt")
-        .args([
-            "--no-use-colors",
+    let project = "/app/scale-project";
+    require(
+        std::path::Path::new(project)
+            .join("dbt_project.yml")
+            .is_file(),
+        "scale fixture missing from the harness image; rebuild docker/dbt.Dockerfile",
+    )?;
+    dbt(
+        ctx,
+        "scale",
+        &[
             "build",
             "--project-dir",
             project,
             "--profiles-dir",
             "/app/tests/dbt",
-        ])
-        .env("DUCKFLEET_URL", &ctx.url)
-        .env("DUCKFLEET_TOKEN", &ctx.token)
-        .env("DBT_TARGET_PATH", format!("{ARTIFACTS}/scale/target"))
-        .status()?;
-    require(
-        status.success(),
-        format!("scale dbt build exited {:?}", status.code()),
+        ],
+        0,
     )?;
     println!("PASS: scale build completed (counting/attribution checks are runtime-only)");
     Ok(())

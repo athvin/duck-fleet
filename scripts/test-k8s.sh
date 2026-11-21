@@ -165,6 +165,11 @@ harness duckfleet-harness 'duckfleet-server'
 grep -q 'PASS: protocol checks and dbt lifecycle' artifacts/kind/duckfleet-harness.log
 grep -q 'PASS: resource/sizing routing refuses what it cannot serve' artifacts/kind/duckfleet-harness.log
 
+# Exercise the packaged scale project with the same read-only/non-root pod
+# security and writable artifact mounts used by the AWS harness.
+harness duckfleet-scale 'duckfleet-server --scale'
+grep -q 'PASS: scale build completed' artifacts/kind/duckfleet-scale.log
+
 # On-demand compute. The harness asserts what the API reports; these assert the
 # cluster facts it cannot see, which is the half that matters for a leak.
 isolated_pods() { "${KUBE[@]}" get pods -l duckfleet-compute=isolated -o name; }
@@ -406,8 +411,15 @@ DUCKFLEET_KUBE_CONTEXT="$CONTEXT" DUCKFLEET_NAMESPACE="$NS" \
   bash scripts/backup-catalog.sh kube "$work/catalog-backup"
 for database in lake platform; do
   test -s "$work/catalog-backup/$database.dump"
-  "${KUBE[@]}" exec -i statefulset/duckfleet-postgres -- pg_restore --list \
-    < "$work/catalog-backup/$database.dump" > /dev/null
+  # pg_restore --list reads only the archive header/table of contents. With a
+  # larger scale fixture it can exit while kubectl is still streaming stdin,
+  # leaving exec blocked. Receive the full archive before inspecting it.
+  "${KUBE[@]}" exec -i statefulset/duckfleet-postgres -- sh -ec '
+    archive=$(mktemp)
+    trap "rm -f \"$archive\"" EXIT
+    cat > "$archive"
+    pg_restore --list "$archive"
+  ' < "$work/catalog-backup/$database.dump" > /dev/null
 done
 echo 'PASS: the kube backup produced restorable archives for both databases'
 
