@@ -116,10 +116,42 @@ seccompProfile:
 {{- define "duckfleet.poolConfig" -}}
 {{- $pools := dict -}}
 {{- range $name, $pool := include "duckfleet.pools" . | fromJson -}}
-{{- $_ := set $pools $name (dict "cpu" $pool.cpu "memory" $pool.memory "disk" $pool.disk "endpoints" (include "duckfleet.poolEndpoints" (dict "name" $name "workers" $pool.workers) | fromJsonArray) "max_sessions_per_worker" $pool.maxSessionsPerWorker) -}}
+{{- $configured := dict "cpu" $pool.cpu "memory" $pool.memory "disk" $pool.disk "endpoints" (include "duckfleet.poolEndpoints" (dict "name" $name "workers" $pool.workers) | fromJsonArray) "max_sessions_per_worker" $pool.maxSessionsPerWorker -}}
+{{- if hasKey $pool "admission" -}}
+{{- $_ := set $configured "admission" (include "duckfleet.admissionJson" $pool.admission | fromJson) -}}
+{{- end -}}
+{{- include "duckfleet.validateAdmission" (mergeOverwrite (deepCopy ($.Values.admissionLimits.default | default dict)) ($pool.admission | default dict)) -}}
+{{- $_ := set $pools $name $configured -}}
 {{- end -}}
 {{- toJson (dict "default_pool" .Values.defaultPool "pools" $pools) -}}
 {{- end -}}
+{{/* Preserve omitted fields until global and pool overrides have been merged. */}}
+{{- define "duckfleet.admissionJson" -}}
+{{- $json := dict -}}
+{{- range $camel, $snake := dict "maxQueuedQueries" "max_queued_queries" "maxRunningQueries" "max_running_queries" "maxQueuedPerPrincipal" "max_queued_per_principal" "maxRunningPerPrincipal" "max_running_per_principal" -}}
+{{- if hasKey $ $camel -}}{{- $_ := set $json $snake (get $ $camel | int64) -}}{{- end -}}
+{{- end -}}
+{{- toJson $json -}}
+{{- end -}}
+{{- define "duckfleet.validateAdmission" -}}
+{{- $queued := int64 (get . "maxQueuedQueries" | default 256) -}}
+{{- $running := int64 (get . "maxRunningQueries" | default 16) -}}
+{{- $principalQueued := int64 (get . "maxQueuedPerPrincipal" | default 16) -}}
+{{- $principalRunning := int64 (get . "maxRunningPerPrincipal" | default $running) -}}
+{{- if or (gt $principalQueued $queued) (gt $principalRunning $running) -}}
+{{- fail "admission principal limits cannot exceed effective pool limits" -}}
+{{- end -}}
+{{- end -}}
+{{- define "duckfleet.admissionConfig" -}}
+{{- $config := dict -}}
+{{- range $scope, $limits := .Values.admissionLimits -}}
+{{- include "duckfleet.validateAdmission" $limits -}}
+{{- $_ := set $config $scope (include "duckfleet.admissionJson" $limits | fromJson) -}}
+{{- end -}}
+{{- toJson $config -}}
+{{- end -}}
+{{/* Runtime exact-version checks remain authoritative; this marks rollout intent. */}}
+{{- define "duckfleet.platformSchema" -}}2{{- end -}}
 {{/*
 The worker container's environment, defined once. The persistent Deployments and the
 isolated pod template both render from this, so they cannot drift apart on secret
@@ -142,6 +174,8 @@ template and the code that patches it from drifting silently.
 {{- end }}
 - {name: DUCKFLEET_WORKER_MAX_SESSIONS, value: {{ .maxSessions | default 1 | quote }}}
 - {name: DUCKFLEET_WORKER_QUEUE_CAPACITY, value: {{ $.Values.workerQueueCapacity | quote }}}
+- {name: DUCKFLEET_WORKER_MAX_QUEUED_QUERIES, value: {{ $.Values.workerMaxQueuedQueries | int64 | quote }}}
+- {name: DUCKFLEET_WORKER_MAX_QUEUED_BYTES, value: {{ $.Values.workerMaxQueuedBytes | int64 | quote }}}
 # Declared from the same values as the limits. The worker refuses to start if the
 # container it actually got disagrees.
 - {name: DUCKFLEET_WORKER_CPU, value: {{ .cpu | quote }}}
@@ -183,6 +217,8 @@ catalog again under an identity whose session the gateway has already forgotten.
 apiVersion: v1
 kind: Pod
 metadata:
+  annotations:
+    duckfleet.io/platform-schema: {{ include "duckfleet.platformSchema" . | quote }}
   labels:
     app: duckfleet-worker
     duckfleet-compute: isolated

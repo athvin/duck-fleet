@@ -26,6 +26,8 @@ mod metering;
 mod observability;
 mod platform;
 mod pools;
+mod queue_lifecycle;
+mod queue_storage;
 mod request_identity;
 mod request_upgrade;
 
@@ -43,7 +45,11 @@ pub async fn run(args: Vec<String>) -> i32 {
     let ctx = Ctx { url, token };
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
-    let result: anyhow::Result<()> = if has("--pools") || has("--pools-isolated") {
+    let result: anyhow::Result<()> = if has("--queue-storage") {
+        queue_storage::checks().await
+    } else if has("--queue") || has("--queue-isolated") {
+        queue_lifecycle::checks(&ctx, has("--queue-isolated")).await
+    } else if has("--pools") || has("--pools-isolated") {
         pools::checks(&ctx, has("--pools-isolated")).await
     } else if has("--platform-maintenance") {
         platform::checks().await
@@ -196,6 +202,9 @@ pub(crate) async fn request_json(
         .request(method, path, payload, client::STATEMENT_TIMEOUT)
         .await?;
     serde_json::from_slice(&bytes).map_err(|_| RemoteError {
+        request_id: None,
+        acceptance: None,
+        status_url: None,
         status: None,
         failure_kind: Some("invalid_response".to_owned()),
         retry_safe: false,

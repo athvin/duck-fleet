@@ -14,8 +14,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: server
-  {{- if not .Values.suspended }}
   annotations:
+    duckfleet.io/platform-schema: {{ include "duckfleet.platformSchema" . | quote }}
+  {{- if not .Values.suspended }}
     duckfleet.io/migration-job: {{ include "duckfleet.migrationJob" . | quote }}
   {{- end }}
 spec:
@@ -25,6 +26,8 @@ spec:
     matchLabels: {app: duckfleet-gateway}
   template:
     metadata:
+      annotations:
+        duckfleet.io/platform-schema: {{ include "duckfleet.platformSchema" . | quote }}
       labels: {app: duckfleet-gateway}
     spec:
       # The gateway drains like a worker: proxied statements share the same 60-second
@@ -48,6 +51,7 @@ spec:
           env:
             - {name: DUCKFLEET_ROLE, value: gateway}
             - {name: DUCKFLEET_GATEWAY_MAX_SESSIONS, value: {{ .Values.gatewayMaxSessions | quote }}}
+            - {name: DUCKFLEET_ADMISSION_LIMITS_JSON, value: {{ include "duckfleet.admissionConfig" . | quote }}}
             - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ .Values.platformWaitSeconds | quote }}}
             - {name: DUCKFLEET_HISTORY_RETENTION_DAYS, value: {{ .Values.historyRetentionDays | quote }}}
             - {name: DUCKFLEET_PGWIRE, value: {{ .Values.pgwire.enabled | quote }}}

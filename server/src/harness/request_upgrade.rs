@@ -221,6 +221,7 @@ fn submit(
             parameters: &[json!(1)],
             context: &json!({"fixture": "upgrade"}),
             timeout_seconds: 60,
+            queue_timeout_seconds: 10,
             compute: &json!({"mode":"persistent","cpu":1,"memory_bytes":1073741824_u64,"disk_bytes":1073741824_u64}),
             worker_id: WORKER,
             placement: &json!({"worker_id": WORKER}),
@@ -433,7 +434,7 @@ fn fixtures(client: &mut Client, schema: &str) -> Result<()> {
     require(
         preserved.get::<_, String>("payload_hash") == fingerprint
             && preserved.get::<_, String>("principal") == PRINCIPAL
-            && preserved.get::<_, i32>("fingerprint_version") == 2,
+            && preserved.get::<_, i32>("fingerprint_version") == 3,
         "repeated migration rewrote a fingerprinted request",
     )?;
     require(
@@ -609,6 +610,7 @@ fn policy_upgrade_fixtures(client: &mut Client, rate: &RateCard) -> Result<()> {
             parameters: &parameters,
             context: &context,
             timeout_seconds: 30,
+            queue_timeout_seconds: 10,
             compute: &compute,
             worker_id: WORKER,
             placement: &placement,
@@ -617,7 +619,7 @@ fn policy_upgrade_fixtures(client: &mut Client, rate: &RateCard) -> Result<()> {
         let replay = requests::admit(client, input(&parent, None), 2, rate)
             .map_err(|error| anyhow::anyhow!("v1 {name} replay: {}", error.1))?;
         require(
-            matches!(replay, requests::AdmissionResult::Duplicate(_)),
+            matches!(replay, requests::AdmissionResult::Duplicate(value) if value["failure_kind"] == "duplicate_request"),
             "v1 replay executed again",
         )?;
         let mut foreign = input(&parent, None);
@@ -639,7 +641,7 @@ fn policy_upgrade_fixtures(client: &mut Client, rate: &RateCard) -> Result<()> {
         {
             requests::AdmissionResult::Admitted(admission) => admission,
             requests::AdmissionResult::Duplicate(_) => {
-                anyhow::bail!("fresh v2 child was duplicate")
+                anyhow::bail!("fresh v3 child was duplicate")
             }
         };
         let identities = client.query_one(
@@ -650,13 +652,13 @@ fn policy_upgrade_fixtures(client: &mut Client, rate: &RateCard) -> Result<()> {
         require(
             identities.get::<_, i32>("fingerprint_version") == 1
                 && identities.get::<_, String>("payload_hash") == hash
-                && identities.get::<_, i32>("child_version") == 2
+                && identities.get::<_, i32>("child_version") == 3
                 && identities.get::<_, String>("logical_request_id") == parent
                 && identities.get::<_, String>("retry_of") == parent,
-            "v1 parent -> v2 child changed historical evidence or lost lineage",
+            "v1 parent -> v3 child changed historical evidence or lost lineage",
         )?;
         requests::mark_executing(client, &child)
-            .map_err(|error| anyhow::anyhow!("v2 execution grant: {}", error.1))?;
+            .map_err(|error| anyhow::anyhow!("v3 execution grant: {}", error.1))?;
         let mut transaction = client.transaction()?;
         finish(
             &mut transaction,

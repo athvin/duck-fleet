@@ -17,6 +17,9 @@ mod platform;
 mod pools;
 mod pricing;
 mod profiling;
+mod query;
+mod queue;
+mod queue_service;
 mod requests;
 mod secrets;
 mod usage;
@@ -24,6 +27,8 @@ mod worker;
 mod worker_ownership;
 mod worker_status;
 use compute::WorkerSessionRequest;
+pub(crate) use query::QueryRequest;
+use query::{Acceptance, Protocol};
 
 use axum::{
     Json, Router,
@@ -34,7 +39,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{
     Arc, Mutex,
@@ -46,6 +50,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct App {
     sender: mpsc::Sender<Envelope>,
+    queue: Arc<queue_service::Service>,
     status: worker_status::Status,
     active: Arc<Mutex<Option<worker::Active>>>,
     token: Arc<str>,
@@ -68,40 +73,16 @@ type Reply = Result<Output, ApiError>;
 struct Envelope {
     op: Operation,
     reply: oneshot::Sender<Reply>,
-    query_guard: Option<worker_status::QueryGuard>,
 }
 enum Operation {
     /// Request identity travels on the authenticated internal hop, independently
     /// of the caller's SQL context and the credential that opened a session.
-    Open(WorkerSessionRequest, credentials::Identity),
-    Close(Uuid),
-    Query(Uuid, QueryRequest, credentials::Identity),
+    Open(WorkerSessionRequest, credentials::Identity, Protocol, Uuid),
 }
 enum Output {
     Json(Value),
     JsonResponse(StatusCode, Value),
     Arrow(Vec<u8>, Uuid),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QueryRequest {
-    request_id: Uuid,
-    #[serde(default)]
-    retry_of: Option<Uuid>,
-    sql: String,
-    #[serde(default)]
-    parameters: Vec<Value>,
-    #[serde(default = "default_context")]
-    context: Value,
-    #[serde(default = "default_timeout")]
-    timeout_seconds: u64,
-}
-fn default_context() -> Value {
-    json!({})
-}
-fn default_timeout() -> u64 {
-    30
 }
 
 pub(crate) fn configured_limit(
@@ -275,14 +256,9 @@ async fn dispatch(app: App, op: Operation) -> Reply {
         ));
     }
     let (reply, receiver) = oneshot::channel();
-    let query_guard = matches!(&op, Operation::Query(..)).then(|| app.status.enqueue());
     // A rejected send never reached the engine, so this request may be sent again.
     app.sender
-        .try_send(Envelope {
-            op,
-            reply,
-            query_guard,
-        })
+        .try_send(Envelope { op, reply })
         .map_err(|_| ApiError::new(failure::CAPACITY, "worker queue full or closed"))?;
     receiver.await.map_err(|_| ApiError::internal())?
 }
@@ -310,7 +286,16 @@ async fn open(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Reply 
         })?
     };
     let identity = worker_identity(&headers)?;
-    dispatch(app, Operation::Open(request, identity)).await
+    dispatch(
+        app,
+        Operation::Open(
+            request,
+            identity,
+            worker_protocol(&headers)?,
+            open_span(&headers)?,
+        ),
+    )
+    .await
 }
 
 /// Only the shared internal token can reach this handler. A named identity must
@@ -354,8 +339,67 @@ fn worker_identity(headers: &HeaderMap) -> Result<credentials::Identity, ApiErro
 async fn info(State(app): State<App>) -> Reply {
     Ok(Output::Json(app.status.snapshot()))
 }
-async fn close(State(app): State<App>, Path(id): Path<Uuid>) -> Reply {
-    dispatch(app, Operation::Close(id)).await
+async fn close(State(app): State<App>, Path(id): Path<Uuid>, headers: HeaderMap) -> Reply {
+    let reason = match headers
+        .get("x-duckfleet-close-reason")
+        .and_then(|v| v.to_str().ok())
+    {
+        None => queue_service::CloseRequest::Explicit,
+        Some("idle") => queue_service::CloseRequest::Idle,
+        Some("credential") => {
+            let credential_id = headers
+                .get("x-duckfleet-close-credential-id")
+                .map(|v| v.to_str().map(str::to_owned))
+                .transpose()
+                .map_err(|_| ApiError::bad("invalid close credential"))?;
+            if credential_id
+                .as_deref()
+                .is_some_and(|id| Uuid::parse_str(id).is_err())
+            {
+                return Err(ApiError::bad("invalid close credential"));
+            }
+            let generation = headers
+                .get("x-duckfleet-close-authority-generation")
+                .map(|v| {
+                    v.to_str()
+                        .ok()
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .filter(|v| *v >= 0)
+                        .ok_or_else(|| ApiError::bad("invalid close authority generation"))
+                })
+                .transpose()?;
+            queue_service::CloseRequest::Credential {
+                credential_id,
+                generation,
+            }
+        }
+        Some(_) => return Err(ApiError::bad("invalid close reason")),
+    };
+    app.queue.close(id, reason).await
+}
+fn open_span(headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    headers.get("x-duckfleet-open-span-id").map_or_else(
+        || Ok(Uuid::new_v4()),
+        |value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or_else(|| ApiError::bad("invalid internal open span ID"))
+        },
+    )
+}
+fn worker_protocol(headers: &HeaderMap) -> Result<Protocol, ApiError> {
+    match headers.get("x-duckfleet-protocol") {
+        None => Ok(Protocol::Direct),
+        Some(value) => match value.to_str().ok() {
+            Some("http") => Ok(Protocol::Http),
+            Some("pgwire") => Ok(Protocol::Pgwire),
+            Some("platform") => Ok(Protocol::Platform),
+            Some("direct") => Ok(Protocol::Direct),
+            _ => Err(ApiError::bad("invalid internal protocol")),
+        },
+    }
 }
 async fn history(State(app): State<App>, Query(filter): Query<history::Filter>) -> Reply {
     app.history.list(filter).await.map(Output::Json)
@@ -376,25 +420,50 @@ async fn query(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(req): Json<QueryRequest>,
-) -> Reply {
-    if req.sql.trim().is_empty()
-        || req.sql.len() > 262_144
-        || !(1..=60).contains(&req.timeout_seconds)
+) -> Response {
+    let request_id = req.request_id;
+    let (acceptance, reply) = match worker_identity(&headers)
+        .and_then(|identity| worker_protocol(&headers).map(|protocol| (identity, protocol)))
     {
-        return Err(ApiError::bad(
-            "SQL must contain 1–262144 bytes; timeout must be 1–60 seconds",
-        ));
-    }
-    if !req.context.is_object()
-        || req.parameters.len() > 10_000
-        || req.context.to_string().len() > 8192
-    {
-        return Err(ApiError::bad(
-            "too many parameters or context exceeds 8192 bytes",
-        ));
-    }
-    let identity = worker_identity(&headers)?;
-    dispatch(app, Operation::Query(id, req, identity)).await
+        Ok((identity, protocol)) => app.queue.submit(id, req, identity, protocol).await,
+        Err(error) => (Acceptance::NotAccepted, Err(error)),
+    };
+    query_response(request_id, acceptance, reply)
+}
+fn query_response(id: Uuid, acceptance: Acceptance, reply: Reply) -> Response {
+    let mut response = match reply {
+        Err(error) => (
+            error.0.http,
+            Json(json!({"error":error.1, "failure_kind":error.0.kind,
+            "retry_safe":error.0.retry_safe, "request_id":id, "acceptance":acceptance,
+            "status_url":format!("/v1/requests/{id}")})),
+        )
+            .into_response(),
+        Ok(Output::JsonResponse(status, mut value)) => {
+            value["request_id"] = json!(id);
+            value["acceptance"] = json!(acceptance);
+            value["status_url"] = json!(format!("/v1/requests/{id}"));
+            (status, Json(value)).into_response()
+        }
+        Ok(output) => output.into_response(),
+    };
+    response
+        .headers_mut()
+        .insert("x-query-id", id.to_string().parse().expect("UUID header"));
+    response.headers_mut().insert(
+        "x-query-status-url",
+        format!("/v1/requests/{id}")
+            .parse()
+            .expect("UUID URL header"),
+    );
+    response.headers_mut().insert(
+        "x-query-acceptance",
+        acceptance.as_str().parse().expect("acceptance header"),
+    );
+    response
+}
+async fn request_cancel(State(app): State<App>, Path(id): Path<Uuid>, headers: HeaderMap) -> Reply {
+    app.queue.cancel(id, worker_identity(&headers)?).await
 }
 async fn usage_events(State(app): State<App>, Query(filter): Query<usage::Filter>) -> Reply {
     app.usage.events(filter).await.map(Output::Json)
@@ -454,6 +523,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let active = Arc::new(Mutex::new(None));
     let queue_capacity = configured_limit("DUCKFLEET_WORKER_QUEUE_CAPACITY", 64, 4096)?;
+    let worker_limits = query::WorkerLimits::from_env()?;
     let (sender, receiver) = mpsc::channel(queue_capacity);
     let (failed_tx, failed_rx) = oneshot::channel();
     let ready = Arc::new(AtomicBool::new(false));
@@ -467,8 +537,24 @@ async fn main() -> anyhow::Result<()> {
                 else { Some(std::env::var("DUCKFLEET_POOL").unwrap_or_else(|_| "small".into())) },
             "max_sessions": configured_limit("DUCKFLEET_WORKER_MAX_SESSIONS", 32, 1024)?,
             "queue_capacity": queue_capacity,
+            "max_queued_queries": worker_limits.max_queued_queries,
+            "max_queued_bytes": worker_limits.max_queued_bytes,
         }),
     );
+    let queue = queue_service::Service::new(
+        std::env::var("PLATFORM_DSN")?,
+        queue::WorkerEpoch {
+            worker_id: std::env::var("DUCKFLEET_WORKER_ID")?,
+            boot_id: status.boot_id(),
+        },
+        ready.clone(),
+        draining.clone(),
+        active.clone(),
+        status.clone(),
+    )?;
+    let worker_queue = queue.clone();
+    let queue_for_drain = queue.clone();
+    let drain_active = active.clone();
     let worker_active = active.clone();
     let status_for_drain = status.clone();
     let worker_ready = ready.clone();
@@ -487,6 +573,8 @@ async fn main() -> anyhow::Result<()> {
                 runtime,
                 worker_ready.clone(),
                 worker_status.clone(),
+                worker_queue,
+                worker_limits,
             ) {
                 Ok(mut worker) => {
                     worker_status.initialize(worker.placement().clone());
@@ -501,6 +589,7 @@ async fn main() -> anyhow::Result<()> {
         })?;
     let app = App {
         sender,
+        queue,
         status,
         active,
         token: token.into(),
@@ -521,6 +610,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/queries", get(history))
         .route("/v1/queries/{id}", get(query_detail))
         .route("/v1/requests/{id}", get(request_detail))
+        .route("/v1/requests/{id}/cancel", post(request_cancel))
         .route("/v1/usage", get(usage_events))
         .route("/v1/budget", get(budget).put(set_budget))
         .route("/v1/worker", get(info))
@@ -546,13 +636,16 @@ async fn main() -> anyhow::Result<()> {
             // below can never be returned. The first version of this did exactly that,
             // and the harness caught `/healthz` being unreachable rather than saying
             // "draining". So the shutdown waits here while the pod is still answering.
-            draining.store(true, Ordering::Release);
+            {
+                let _active = drain_active.lock().unwrap_or_else(|e| e.into_inner());
+                draining.store(true, Ordering::Release);
+            }
             tracing::info!(
-                "termination signal received; refusing new sessions and finishing open work"
+                "termination signal received; refusing intake, draining unstarted work, and finishing active SQL"
             );
             // Include queued SQL and admission/settlement, which remain work even
             // before or after the DuckDB interrupt slot is occupied.
-            drain_until_idle(move || status_for_drain.has_queries())
+            drain_until_idle(move || status_for_drain.has_queries() || queue_for_drain.has_waiting_queries())
             .await;
             tracing::info!("drain complete; shutting down");
         }) => served?,
@@ -636,103 +729,32 @@ mod tests {
         assert!(identity.expires_at.is_none());
     }
 
-    fn status_test_app() -> (App, mpsc::Receiver<Envelope>) {
-        let (sender, receiver) = mpsc::channel(1);
-        let ready = Arc::new(AtomicBool::new(true));
-        let draining = Arc::new(AtomicBool::new(false));
-        let status =
-            worker_status::Status::new("small".into(), ready.clone(), draining.clone(), json!({}));
-        status.initialize(json!({"worker_id":"small", "cpu":1}));
-        (
-            App {
-                sender,
-                status,
-                active: Arc::new(Mutex::new(None)),
-                token: "test-token".into(),
-                history: history::Reader::new("postgres://unused".into()),
-                requests: requests::Reader::new("postgres://unused".into()),
-                usage: usage::Reader::new("postgres://unused".into(), pricing::dev()),
-                ready,
-                draining,
-            },
-            receiver,
-        )
-    }
-
-    fn status_test_query() -> Operation {
-        Operation::Query(
-            Uuid::new_v4(),
-            QueryRequest {
-                request_id: Uuid::new_v4(),
-                retry_of: None,
-                sql: "select 1".into(),
-                parameters: vec![],
-                context: json!({}),
-                timeout_seconds: 30,
-            },
-            credentials::Identity::bootstrap(),
-        )
+    #[test]
+    fn trusted_protocol_and_conditional_close_inputs_are_strict() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(worker_protocol(&headers).unwrap(), Protocol::Direct);
+        headers.insert("x-duckfleet-protocol", "pgwire".parse().unwrap());
+        assert_eq!(worker_protocol(&headers).unwrap(), Protocol::Pgwire);
+        headers.insert("x-duckfleet-protocol", "forged".parse().unwrap());
+        assert!(worker_protocol(&headers).is_err());
     }
 
     #[tokio::test]
-    async fn status_bypasses_a_full_queue_and_disconnect_preserves_work() {
-        let (app, mut receiver) = status_test_app();
-        let request = tokio::spawn(dispatch(app.clone(), status_test_query()));
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while app.status.snapshot()["queued_queries"] != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        // No worker is reading the channel: this is the full/blocked queue that
-        // formerly prevented the information handler from replying.
-        let Output::Json(snapshot) = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            info(State(app.clone())),
-        )
-        .await
-        .unwrap()
-        .unwrap() else {
-            panic!("expected JSON")
-        };
-        assert_eq!(snapshot["queued_queries"], 1);
-        assert!(matches!(dispatch(app.clone(), status_test_query()).await,
-            Err(ApiError(failure, _)) if failure.kind == "capacity"));
-        assert_eq!(app.status.snapshot()["queued_queries"], 1);
-        request.abort();
-        assert!(matches!(request.await, Err(error) if error.is_cancelled()));
-        assert_eq!(app.status.snapshot()["queued_queries"], 1);
-        let envelope = receiver.recv().await.unwrap();
-        let active = envelope.query_guard.unwrap().start();
-        assert_eq!(app.status.snapshot()["queued_queries"], 0);
-        assert_eq!(app.status.snapshot()["active_queries"], 1);
-        assert!(envelope.reply.send(Ok(Output::Json(json!({})))).is_err());
-        assert_eq!(app.status.snapshot()["active_queries"], 1);
-        drop(active);
-        assert!(!app.status.has_queries());
-    }
-
-    #[tokio::test]
-    async fn a_lost_worker_queue_releases_admitted_and_refused_queries() {
-        let (app, receiver) = status_test_app();
-        let request = tokio::spawn(dispatch(app.clone(), status_test_query()));
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while app.status.snapshot()["queued_queries"] != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        drop(receiver);
-        assert!(request.await.unwrap().is_err());
-        assert!(!app.status.has_queries());
-        assert!(dispatch(app.clone(), status_test_query()).await.is_err());
-        assert!(!app.status.has_queries());
-        app.ready.store(false, Ordering::Release);
-        assert!(matches!(dispatch(app.clone(), status_test_query()).await,
-            Err(ApiError(failure, _)) if failure.kind == "starting"));
-        assert!(!app.status.has_queries());
+    async fn parsed_query_errors_keep_attempt_identity_and_acceptance() {
+        let id = Uuid::new_v4();
+        let response = query_response(id, Acceptance::Unknown, Err(ApiError::internal()));
+        assert_eq!(response.headers()["x-query-id"], id.to_string());
+        assert_eq!(
+            response.headers()["x-query-status-url"],
+            format!("/v1/requests/{id}")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["request_id"], id.to_string());
+        assert_eq!(body["acceptance"], "unknown");
+        assert_eq!(body["retry_safe"], false);
     }
 
     #[tokio::test(start_paused = true)]

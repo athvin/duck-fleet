@@ -18,8 +18,8 @@ use arrow_ipc::reader::StreamReader;
 use reqwest::{Client as HttpClient, Method, StatusCode};
 use serde_json::{Value, json};
 
-/// Longer than the server's maximum statement deadline, so a statement never
-/// times out in transport before the gateway returns its classified verdict.
+/// Transport allowance for the default queue and execution deadlines. An explicit
+/// longer queue may outlive this timeout; accepted work continues independently.
 pub const STATEMENT_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Covers the server's own ready budget with margin: opening an isolated session
@@ -53,6 +53,9 @@ pub struct RemoteError {
     pub failure_kind: Option<String>,
     pub retry_safe: bool,
     pub message: String,
+    pub request_id: Option<Box<str>>,
+    pub acceptance: Option<Box<str>>,
+    pub status_url: Option<Box<str>>,
 }
 
 impl RemoteError {
@@ -61,6 +64,9 @@ impl RemoteError {
     /// it by `request_id`. Never retry-safe.
     fn transport(error: reqwest::Error) -> Self {
         RemoteError {
+            request_id: None,
+            acceptance: None,
+            status_url: None,
             status: None,
             failure_kind: Some("transport_failure".to_owned()),
             retry_safe: false,
@@ -73,6 +79,9 @@ impl RemoteError {
 
     fn decode(message: impl Into<String>) -> Self {
         RemoteError {
+            request_id: None,
+            acceptance: None,
+            status_url: None,
             status: None,
             failure_kind: Some("invalid_response".to_owned()),
             retry_safe: false,
@@ -148,6 +157,9 @@ impl Client {
 
     fn classify(status: StatusCode, bytes: &[u8]) -> RemoteError {
         let mut error = RemoteError {
+            request_id: None,
+            acceptance: None,
+            status_url: None,
             status: Some(status.as_u16()),
             failure_kind: None,
             retry_safe: false,
@@ -165,6 +177,9 @@ impl Client {
                 .get("retry_safe")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            error.request_id = payload["request_id"].as_str().map(Into::into);
+            error.acceptance = payload["acceptance"].as_str().map(Into::into);
+            error.status_url = payload["status_url"].as_str().map(Into::into);
         }
         error
     }
@@ -328,17 +343,39 @@ impl RemoteConnection {
         sql: &str,
         parameters: Vec<Value>,
     ) -> Result<(String, QueryResult), RemoteError> {
+        self.execute_with_queue_timeout(sql, parameters, crate::query::DEFAULT_QUEUE_TIMEOUT)
+            .await
+    }
+
+    /// A queue allowance is independent of the SQL execution deadline. Transport
+    /// loss retains the identity for status/cancellation; it never retries SQL.
+    pub async fn execute_with_queue_timeout(
+        &self,
+        sql: &str,
+        parameters: Vec<Value>,
+        queue_timeout_seconds: u64,
+    ) -> Result<(String, QueryResult), RemoteError> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let body = json!({
-            "request_id": request_id,
-            "sql": sql,
-            "parameters": parameters,
-            "context": self.context,
+            "request_id": request_id, "sql": sql, "parameters": parameters,
+            "context": self.context, "queue_timeout_seconds": queue_timeout_seconds,
         });
-        let bytes = self
+        let result = self
             .session_request(Method::POST, "/queries", Some(&body))
-            .await?;
-        Ok((request_id, QueryResult::from_arrow(&bytes)?))
+            .await
+            .and_then(|bytes| QueryResult::from_arrow(&bytes));
+        result
+            .map(|rows| (request_id.clone(), rows))
+            .map_err(|mut error| {
+                error
+                    .request_id
+                    .get_or_insert_with(|| request_id.clone().into());
+                error
+                    .status_url
+                    .get_or_insert_with(|| format!("/v1/requests/{request_id}").into());
+                error.acceptance.get_or_insert_with(|| "unknown".into());
+                error
+            })
     }
 
     /// A session-scoped request, with the one session-scoped failure explained:
@@ -375,16 +412,9 @@ impl RemoteConnection {
         sql: &str,
         parameters: Vec<Value>,
     ) -> Result<QueryResult, RemoteError> {
-        let body = json!({
-            "request_id": uuid::Uuid::new_v4().to_string(),
-            "sql": sql,
-            "parameters": parameters,
-            "context": self.context,
-        });
-        let bytes = self
-            .session_request(Method::POST, "/queries", Some(&body))
-            .await?;
-        QueryResult::from_arrow(&bytes)
+        self.execute_tracked(sql, parameters)
+            .await
+            .map(|(_, rows)| rows)
     }
 
     pub async fn commit(&self) -> Result<(), RemoteError> {
@@ -407,15 +437,48 @@ impl RemoteConnection {
         if self.closed {
             return Ok(());
         }
-        self.closed = true;
         match self
             .client
             .request(Method::DELETE, &self.path(), None, STATEMENT_TIMEOUT)
             .await
         {
-            Ok(_) => Ok(()),
-            Err(error) if error.is_kind("unknown_session") => Ok(()),
+            Ok(bytes) => {
+                let confirmed = serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .is_some_and(|value| value["closed"] == true);
+                if !confirmed {
+                    return Err(RemoteError::decode("session closure is not confirmed"));
+                }
+                self.closed = true;
+                Ok(())
+            }
+            Err(error) if error.is_kind("unknown_session") => {
+                self.closed = true;
+                Ok(())
+            }
             Err(error) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn classified_errors_preserve_identity_and_unknown_acceptance() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = format!("/v1/requests/{id}");
+        let error = Client::classify(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &serde_json::to_vec(
+                &json!({"error":"transport lost","failure_kind":"unavailable",
+                "retry_safe":false,"request_id":id,"acceptance":"unknown","status_url":path}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(error.request_id.as_deref(), Some(id.as_str()));
+        assert_eq!(error.status_url.as_deref(), Some(path.as_str()));
+        assert_eq!(error.acceptance.as_deref(), Some("unknown"));
+        assert!(!error.retry_safe);
     }
 }

@@ -374,10 +374,6 @@ pub(crate) fn unavailable() -> ApiError {
 }
 
 impl Placement {
-    pub fn units(&self) -> i64 {
-        self.resources.units()
-    }
-
     pub fn validate_worker(
         &self,
         pool: Option<&str>,
@@ -744,11 +740,21 @@ mod tests {
     /// sessions, and disk never enters the price.
     #[test]
     fn billable_units_follow_cpu_and_memory_not_disk() {
-        assert_eq!(placement(json!({})).units(), 1);
-        assert_eq!(placement(json!({"cpu": 2, "memory": "2Gi"})).units(), 2);
+        assert_eq!(placement(json!({})).resources.units(), 1);
+        assert_eq!(
+            placement(json!({"cpu": 2, "memory": "2Gi"}))
+                .resources
+                .units(),
+            2
+        );
         // Memory-heavy sizes bill on memory: 32 GiB / 4 outweighs 2 vCPU.
-        assert_eq!(placement(json!({"cpu": 2, "memory": "32Gi"})).units(), 8);
+        assert_eq!(
+            placement(json!({"cpu": 2, "memory": "32Gi"}))
+                .resources
+                .units(),
+            8
+        );
         // A huge disk on an otherwise default size is still one unit.
-        assert_eq!(placement(json!({"disk": "1000Gi"})).units(), 1);
+        assert_eq!(placement(json!({"disk": "1000Gi"})).resources.units(), 1);
     }
 }

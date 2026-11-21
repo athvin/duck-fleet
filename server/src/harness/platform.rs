@@ -134,6 +134,7 @@ fn admit(client: &mut Client, id: &str, worker: &str) -> Result<metering::Admiss
             parameters: &[],
             context: &json!({}),
             timeout_seconds: 30,
+            queue_timeout_seconds: 10,
             compute: &json!({"mode":"persistent","cpu":1}),
             worker_id: worker,
             placement: &json!({"worker_id":worker}),
@@ -222,6 +223,114 @@ fn migration_failure(client: &mut Client) -> Result<()> {
     Ok(())
 }
 
+/// This generated-schema fixture reconstructs the real schema-1 surface before
+/// testing upgrades. Merely deleting version markers leaves schema-2 DDL behind
+/// and does not represent any supported historical installation.
+fn remove_queue_fixture_schema(client: &mut Client) -> Result<()> {
+    client.batch_execute(
+        "DROP TABLE admission_policies,admission_publication,admission_scopes,
+        queue_workers,queue_sessions,query_payloads,query_controls,query_permits,
+        queue_fairness,queue_notifications,session_events",
+    )?;
+    for column in [
+        "session_id",
+        "session_sequence",
+        "worker_boot_id",
+        "pool_scope",
+        "protocol",
+        "actor_principal",
+        "credential_id",
+        "queued_at",
+        "selected_at",
+        "execution_granted_at",
+        "engine_started_at",
+        "queue_deadline_at",
+        "queue_timeout_seconds",
+        "policy_generation",
+        "state_version",
+        "delivery_state",
+    ] {
+        client.batch_execute(&format!("ALTER TABLE requests DROP COLUMN {column}"))?;
+    }
+    for column in [
+        "queued_at",
+        "selected_at",
+        "execution_granted_at",
+        "engine_started_at",
+        "queue_deadline_at",
+        "session_sequence",
+        "worker_boot_id",
+        "pool_scope",
+        "protocol",
+        "open_span_id",
+    ] {
+        client.batch_execute(&format!("ALTER TABLE query_history DROP COLUMN {column}"))?;
+    }
+    client.batch_execute(
+        "ALTER TABLE requests DROP CONSTRAINT requests_state_check;
+        ALTER TABLE requests ADD CHECK(state IN ('accepted','executing','terminal'))",
+    )?;
+    Ok(())
+}
+
+fn versioned_queue_upgrade(client: &mut Client) -> Result<()> {
+    let baseline: String = client
+        .query_one(
+            "SELECT applied_at::TEXT FROM platform_schema_migrations WHERE version=1",
+            &[],
+        )?
+        .get(0);
+    let before: i64 = client
+        .query_one(
+            "SELECT spent_micro_usd FROM budget WHERE budget_id='local'",
+            &[],
+        )?
+        .get(0);
+    remove_queue_fixture_schema(client)?;
+    client.execute(
+        "DELETE FROM platform_schema_migrations WHERE version=2",
+        &[],
+    )?;
+    // A version-1 upgrade must not rerun the baseline's global reconciliation.
+    client.execute(
+        "UPDATE budget SET spent_micro_usd=spent_micro_usd+19 WHERE budget_id='local'",
+        &[],
+    )?;
+    let report = platform::migrate(client, &seed())?;
+    require(
+        report.applied && report.version == 2,
+        "ordered queue migration missing",
+    )?;
+    require(
+        client
+            .query_one(
+                "SELECT spent_micro_usd FROM budget WHERE budget_id='local'",
+                &[],
+            )?
+            .get::<_, i64>(0)
+            == before + 19,
+        "versioned queue upgrade repeated global accounting reconciliation",
+    )?;
+    require(
+        client
+            .query_one(
+                "SELECT applied_at::TEXT FROM platform_schema_migrations WHERE version=1",
+                &[],
+            )?
+            .get::<_, String>(0)
+            == baseline,
+        "versioned queue upgrade rewrote the baseline marker",
+    )?;
+    client.execute(
+        "UPDATE budget SET spent_micro_usd=$1 WHERE budget_id='local'",
+        &[&before],
+    )?;
+    println!(
+        "PASS: schema1 upgrades to2 without repeating baseline scans or budget reconciliation"
+    );
+    Ok(())
+}
+
 fn adoption_and_future_schema(client: &mut Client, credential_id: &str) -> Result<()> {
     let credential: String = client
         .query_one(
@@ -244,6 +353,7 @@ fn adoption_and_future_schema(client: &mut Client, credential_id: &str) -> Resul
             &[],
         )?
         .get(0);
+    remove_queue_fixture_schema(client)?;
     // Reconstruct the supported pre-#100 deployment: #99 request identities and
     // its one-time marker already exist, but platform version/maintenance tables
     // do not. No durable customer or billing table is dropped.
@@ -423,6 +533,7 @@ fn checks_in_schema(client: &mut Client, config: &postgres::Config) -> Result<()
     println!(
         "PASS: fresh and repeat migration preserve budget, credentials, fingerprints and immutable usage"
     );
+    versioned_queue_upgrade(client)?;
     adoption_and_future_schema(client, &credential.credential_id)?;
 
     let cfg = platform::MaintenanceConfig {

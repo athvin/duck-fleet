@@ -1,13 +1,12 @@
 use crate::{
-    ApiError, Envelope, Operation, Output, QueryRequest, Reply,
+    ApiError, Envelope, Operation, Output, Reply,
     compute::{Mode, Placement, Resources, WorkerSessionRequest},
     credentials::{self, Identity},
-    failure, metering, pricing, requests,
+    failure, pricing, query, queue, queue_service, requests,
     secrets::{Redactor, Startup},
 };
 use anyhow::{Context, Result};
 use arrow_ipc::writer::StreamWriter;
-use axum::http::StatusCode;
 use duckdb::{Connection, InterruptHandle, params_from_iter, types::Value as SqlValue};
 use postgres::{Client, NoTls};
 use serde_json::{Value, json};
@@ -17,7 +16,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -54,8 +53,12 @@ pub(crate) fn interrupt(
 
 fn lose_ownership(ready: &AtomicBool, lost: &AtomicBool, active: &ActiveSlot) {
     lost.store(true, Ordering::Release);
+    let mut slot = active.lock().unwrap_or_else(|e| e.into_inner());
     ready.store(false, Ordering::Release);
-    interrupt(active, None, None, "ownership_lost");
+    if let Some(active) = slot.as_mut() {
+        active.reason = Some("ownership_lost");
+        active.handle.interrupt();
+    }
 }
 
 fn execution_failure(error: Option<&str>, reason: Option<&str>) -> Option<failure::Failure> {
@@ -63,91 +66,34 @@ fn execution_failure(error: Option<&str>, reason: Option<&str>) -> Option<failur
         // Even an engine success racing with ownership loss is uncertain: a
         // replacement may already have begun recovering this process's work.
         Some(failure::INTERRUPTED)
+    } else if reason.is_some() {
+        Some(failure::classify(
+            error.unwrap_or("query interrupted"),
+            reason,
+        ))
     } else {
-        error.map(|message| failure::classify(message, reason))
+        error.map(|message| failure::classify(message, None))
     }
 }
 
 struct Session {
     conn: Connection,
     profile: crate::profiling::Profile,
-    touched: Instant,
-    context: Value,
-    /// What the caller asked for, resolved once when the session opened. Billing
-    /// reads this rather than the worker's own class, so a future placement that
-    /// exceeds the request cannot quietly start charging for the provision.
-    placement: Placement,
-    diagnostics: Value,
-    /// Who the gateway authenticated when this session opened, recorded on every
-    /// history row the session writes. Server-derived, never caller-supplied:
-    /// the caller's own context cannot name someone else.
-    principal: String,
-    /// The last credential admitted on this session. Ownership stays with the
-    /// principal, so rotating its token can replace this cleanup authority.
-    authority: Identity,
 }
 
 struct Completion<'a> {
     status: &'a str,
     failure: Option<failure::Failure>,
     elapsed_ms: i64,
+    engine_started_at: Option<SystemTime>,
     result_rows: Option<i64>,
     error: Option<&'a str>,
     capture: Option<&'a crate::profiling::Capture>,
     outcome: requests::Outcome,
 }
 
-impl Session {
-    fn claim(&mut self, identity: Identity) -> Result<(), ApiError> {
-        if !session_owner(&identity, &self.principal) {
-            return Err(ApiError::new(
-                failure::FORBIDDEN,
-                "this session belongs to another principal",
-            ));
-        }
-        // An operator acting on somebody else's session does not turn its
-        // revocable credential into an unrevocable bootstrap session.
-        if identity.principal == self.principal {
-            self.authority = identity;
-        }
-        Ok(())
-    }
-}
-
-fn retain_authorized_sessions(sessions: &mut HashMap<Uuid, Session>, valid: &[Identity]) {
-    sessions.retain(|_, session| {
-        operator_identity(&session.authority)
-            || valid.iter().any(|identity| {
-                identity.credential_id == session.authority.credential_id
-                    && identity.principal == session.principal
-            })
-    });
-}
-
-fn discard_unauthorized_session(
-    sessions: &mut HashMap<Uuid, Session>,
-    id: Uuid,
-    claimed: &Identity,
-) {
-    // A revoked token may close only the session still using it, not a session
-    // the same principal already continued with a replacement credential.
-    if sessions.get(&id).is_some_and(|session| {
-        session.principal == claimed.principal
-            && session.authority.credential_id == claimed.credential_id
-    }) {
-        sessions.remove(&id);
-    }
-}
-
-const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
 fn operator_identity(identity: &Identity) -> bool {
     identity.credential_id.is_none() && (identity.is_bootstrap() || identity.principal == "direct")
-}
-
-fn session_owner(identity: &Identity, principal: &str) -> bool {
-    operator_identity(identity) || identity.principal == principal
 }
 
 /// Resolving an ID is insufficient unless the authenticated principal matches it.
@@ -170,9 +116,6 @@ fn admitted_identity(claimed: &Identity, resolved: Option<Identity>) -> Result<I
 }
 pub(crate) struct Worker {
     root: Connection,
-    /// Stable identity used by history and reservation recovery. Separate from
-    /// `resources`, which the worker reads from its cgroup.
-    worker_id: String,
     resources: Resources,
     placement: Value,
     pool: Option<String>,
@@ -195,6 +138,7 @@ pub(crate) struct Worker {
     profiling_enabled: bool,
     redactor: Redactor,
     status: crate::worker_status::Status,
+    queue: Arc<queue_service::Service>,
     // Last field: engine sessions and their uncommitted transactions are dropped
     // before another process can acquire this recovery identity.
     ownership: crate::worker_ownership::Guard,
@@ -295,11 +239,13 @@ struct Ledger {
     /// traffic that could only fail.
     ready: Arc<std::sync::atomic::AtomicBool>,
     ownership_lost: Arc<AtomicBool>,
+    active: ActiveSlot,
     redactor: Redactor,
 }
 
 impl Ledger {
     fn restore_readiness(&self) {
+        let _active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         if self.ownership_lost.load(Ordering::Acquire) {
             return;
         }
@@ -311,9 +257,26 @@ impl Ledger {
         }
     }
 
+    /// Probe before selection, so a stale socket is repaired before any queue
+    /// transition. Never retry a failed selection/grant commit blindly.
+    fn ensure_connection(&mut self) -> Result<(), ApiError> {
+        if self.client.check_connection().is_ok() {
+            return Ok(());
+        }
+        let mut config: postgres::Config = self.dsn.parse().map_err(|_| ApiError::internal())?;
+        config.connect_timeout(Duration::from_secs(3));
+        config.tcp_user_timeout(Duration::from_secs(3));
+        config.keepalives_idle(Duration::from_secs(2));
+        config.keepalives_interval(Duration::from_secs(1));
+        config.keepalives_retries(2);
+        self.client = config.connect(NoTls).map_err(|error| {
+            self.unserviceable("reconnecting before queue selection", &format!("{error:#}"))
+        })?;
+        Ok(())
+    }
+
     /// Credential reads fail closed and reconnect once only for a lost socket.
-    /// A statement timeout is already a complete bounded refusal, not a reason
-    /// to retry a credential-table lock and double the admission delay.
+    /// A statement timeout is already a bounded refusal, not a retry signal.
     fn identities(&mut self, ids: &[String]) -> Result<Vec<Identity>, ApiError> {
         match credentials::resolve_ids(&mut self.client, ids) {
             Ok(identities) => return Ok(identities),
@@ -362,50 +325,6 @@ impl Ledger {
         ApiError::internal()
     }
 
-    /// Runs a statement, replacing the connection and retrying once if it fails.
-    ///
-    /// `Client::is_closed` reports only a close this client has already observed, so
-    /// PostgreSQL restarting is invisible until a statement is attempted: the first
-    /// one afterwards always fails. Checking beforehand is therefore not enough, and
-    /// the first version of this fix did exactly that — the worker dutifully reported
-    /// itself unserviceable in a situation where reconnecting would have worked. The
-    /// retry is what makes that statement succeed rather than merely fail honestly.
-    ///
-    /// Retried once, not repeatedly: a second failure on a fresh connection is not a
-    /// stale socket, and reporting not-ready is the better answer for that.
-    fn execute(
-        &mut self,
-        step: &str,
-        sql: &str,
-        params: &[&(dyn postgres::types::ToSql + Sync)],
-    ) -> Result<u64, ApiError> {
-        match self.client.execute(sql, params) {
-            Ok(rows) => return Ok(rows),
-            Err(error) => tracing::warn!(
-                step,
-                cause = self.redactor.scrub(&causes(&error)),
-                "a ledger statement failed; replacing the connection"
-            ),
-        }
-        match self.redactor.guard(
-            "reconnecting to the platform database",
-            Client::connect(&self.dsn, NoTls),
-        ) {
-            Ok(client) => {
-                self.client = client;
-                // An earlier failure may have taken this worker out of service; a
-                // working connection is what makes it serviceable again.
-                self.restore_readiness();
-                tracing::info!(step, "ledger connection replaced");
-                match self.client.execute(sql, params) {
-                    Ok(rows) => Ok(rows),
-                    Err(again) => Err(self.unserviceable(step, &causes(&again))),
-                }
-            }
-            Err(error) => Err(self.unserviceable(step, &format!("{error:#}"))),
-        }
-    }
-
     /// Takes this worker out of service and says why.
     ///
     /// Clearing readiness is what the chart's liveness probe already watches, so the
@@ -426,21 +345,6 @@ impl Ledger {
         );
         ApiError::internal()
     }
-}
-
-/// Flattens an error and its causes into one line.
-///
-/// `postgres::Error` displays as "db error" and keeps the server's message in its
-/// source, so logging the error alone says nothing about what went wrong.
-fn causes(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut line = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        line.push_str(": ");
-        line.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    line
 }
 
 /// What the cgroup says this container got, with the raw values kept for evidence.
@@ -492,7 +396,10 @@ impl Worker {
         runtime: tokio::runtime::Handle,
         ready: Arc<std::sync::atomic::AtomicBool>,
         status: crate::worker_status::Status,
+        queue: Arc<queue_service::Service>,
+        limits: query::WorkerLimits,
     ) -> Result<Self> {
+        let startup_started = Instant::now();
         // Identity, not size. Reservation recovery keys on this, so it has to stay
         // stable even if the worker is later given different resources.
         let worker_id = required("DUCKFLEET_WORKER_ID")?;
@@ -653,7 +560,12 @@ impl Worker {
         let loss_ready = ready.clone();
         let loss_active = active.clone();
         let loss_latch = ownership_lost.clone();
-        ownership.on_loss(move || lose_ownership(&loss_ready, &loss_latch, &loss_active));
+        let loss_queue = queue.clone();
+        ownership.on_loss(move || {
+            loss_latch.store(true, Ordering::Release);
+            loss_queue.stop();
+            lose_ownership(&loss_ready, &loss_latch, &loss_active);
+        });
         // The earlier schema connection may have gone stale during catalog
         // attachment or predecessor drain. Refresh metadata access without ever
         // replacing the lifetime ownership connection.
@@ -692,9 +604,31 @@ impl Worker {
             ownership.check(),
             "exclusive worker ownership was lost during startup"
         );
+        let scope = pool.as_ref().map_or_else(
+            || "isolated".to_owned(),
+            |name| format!("persistent:{name}"),
+        );
+        loop {
+            anyhow::ensure!(
+                ownership.check(),
+                "worker ownership lost waiting for admission policy"
+            );
+            if redactor.guard(
+                "registering worker admission limits",
+                queue::register_worker(&mut ledger, &queue.epoch, &scope, limits),
+            )? {
+                break;
+            }
+            anyhow::ensure!(
+                startup_started.elapsed() < platform_wait,
+                "policy_unavailable: admission policy {scope} did not appear within platform startup deadline"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        placement["max_queued_queries"] = json!(limits.max_queued_queries);
+        placement["max_queued_bytes"] = json!(limits.max_queued_bytes);
         Ok(Self {
             root,
-            worker_id,
             resources,
             placement,
             pool,
@@ -707,6 +641,7 @@ impl Worker {
                 dsn: platform_dsn,
                 ready,
                 ownership_lost,
+                active: active.clone(),
                 redactor: redactor.clone(),
             },
             sessions: HashMap::new(),
@@ -722,6 +657,7 @@ impl Worker {
             },
             redactor,
             status,
+            queue,
             ownership,
         })
     }
@@ -731,56 +667,113 @@ impl Worker {
     }
 
     pub(crate) fn run(&mut self, mut receiver: mpsc::Receiver<Envelope>) {
-        // Main publishes readiness after construction. A heartbeat can fail in
-        // that narrow interval, so do not begin even maintenance after a loss.
         if self.ownership.is_closed() {
-            self.ledger.ready.store(false, Ordering::Release);
+            self.queue.stop();
             return;
         }
-        let mut last_housekeeping = Instant::now();
+        self.queue.start();
         loop {
-            // This is still the sole DuckDB thread. Waiting through the runtime
-            // lets idle sessions expire even when no caller sends another request.
-            let remaining = HOUSEKEEPING_INTERVAL.saturating_sub(last_housekeeping.elapsed());
-            let received = self
-                .runtime
-                .block_on(async { tokio::time::timeout(remaining, receiver.recv()).await });
-            let envelope = match received {
-                Ok(Some(envelope)) => envelope,
-                Ok(None) => break,
-                Err(_) => {
-                    self.housekeeping();
-                    if self.ownership.is_closed() {
-                        self.ledger.ready.store(false, Ordering::Release);
-                        break;
-                    }
-                    last_housekeeping = Instant::now();
-                    continue;
-                }
-            };
-            let Envelope {
-                op,
-                reply,
-                query_guard,
-            } = envelope;
-            let query_guard = query_guard.map(crate::worker_status::QueryGuard::start);
-            // Do not sweep revoked opener credentials before validating this
-            // request: a rotated credential may legitimately claim the session.
-            self.sessions
-                .retain(|_, s| s.touched.elapsed() < SESSION_IDLE_TIMEOUT);
-            self.status.set_sessions(self.sessions.len());
-            let response = self.handle(op);
-            self.status.set_sessions(self.sessions.len());
-            drop(query_guard);
-            let _ = reply.send(response);
-            if self.ownership.is_closed() {
-                self.ledger.ready.store(false, Ordering::Release);
+            if self.ownership.is_closed() || self.queue.is_stopped() {
+                self.queue.stop();
                 break;
             }
-            if last_housekeeping.elapsed() >= HOUSEKEEPING_INTERVAL {
-                self.housekeeping();
-                last_housekeeping = Instant::now();
+            for id in self.queue.take_close_ready() {
+                // Storage has already made closing durable and released all
+                // outstanding work. Drop the real connection before close ACK.
+                self.sessions.remove(&id);
+                if queue::session_closed(&mut self.ledger.client, id, &self.queue.epoch).is_err() {
+                    self.queue.stop();
+                    return;
+                }
+                self.queue.session_closed(id);
+                self.status.set_sessions(self.sessions.len());
             }
+            // A bounded control quota prevents new-session floods starving SQL.
+            for _ in 0..4 {
+                match receiver.try_recv() {
+                    Ok(envelope) => self.respond(envelope),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return,
+                }
+            }
+            if !self.queue.draining.load(Ordering::Acquire)
+                && self.ledger.ready.load(Ordering::Acquire)
+                && self.ledger.ensure_connection().is_ok()
+            {
+                match queue::select_next(&mut self.ledger.client, &self.queue.epoch) {
+                    Ok(Some(selected)) => {
+                        let request_id = selected.payload.request.request_id;
+                        let canceled = self.queue.cancellation(request_id);
+                        let reserved =
+                            queue::reserve(&mut self.ledger.client, selected, &self.rate);
+                        let grant = reserved
+                            .and_then(|prepared| queue::grant(&mut self.ledger.client, prepared));
+                        let grant_received = Instant::now();
+                        self.refresh_counts();
+                        let result = match grant {
+                            Ok(queue::GrantResult::Granted(grant)) => {
+                                self.execute_grant(*grant, grant_received, canceled)
+                            }
+                            Ok(queue::GrantResult::Refused {
+                                request_id: refused,
+                                error,
+                            }) => {
+                                if refused != request_id {
+                                    self.queue.stop();
+                                }
+                                Err(error)
+                            }
+                            Err(error) => self.abort_admission(request_id, error),
+                        };
+                        self.queue.complete(request_id, result);
+                        self.refresh_counts();
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.ledger
+                            .unserviceable("selecting durable queue", &error.1);
+                        // A lost commit ACK might have left a preparing permit.
+                        // Restart recovery proves it unstarted; another select
+                        // must not ignore an abandoned current-boot selection.
+                        if self.ledger.client.is_closed() {
+                            self.queue.stop();
+                            break;
+                        }
+                    }
+                }
+            }
+            let received = self.runtime.block_on(async {
+                tokio::select! {
+                    message = receiver.recv() => Some(message),
+                    _ = self.queue.wake.notified() => None,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => None,
+                }
+            });
+            match received {
+                Some(Some(envelope)) => self.respond(envelope),
+                Some(None) => break,
+                None => {}
+            }
+        }
+    }
+
+    fn respond(&mut self, envelope: Envelope) {
+        let response = self.handle(envelope.op);
+        self.status.set_sessions(self.sessions.len());
+        let _ = envelope.reply.send(response);
+    }
+
+    fn refresh_counts(&mut self) {
+        let counts = (|| -> Result<queue::Counts> {
+            let mut tx = self.ledger.client.transaction()?;
+            tx.batch_execute("SET LOCAL statement_timeout=3000; SET LOCAL lock_timeout=1000")?;
+            let counts = queue::counts(&mut tx, &self.queue.epoch)?;
+            tx.commit()?;
+            Ok(counts)
+        })();
+        if let Ok(counts) = counts {
+            self.status.set_queue(counts);
         }
     }
 
@@ -795,43 +788,6 @@ impl Worker {
         admitted_identity(claimed, resolved)
     }
 
-    fn validate_session_identity(
-        &mut self,
-        id: Uuid,
-        claimed: &Identity,
-    ) -> Result<Identity, ApiError> {
-        self.validate_identity(claimed).inspect_err(|_| {
-            discard_unauthorized_session(&mut self.sessions, id, claimed);
-        })
-    }
-
-    fn housekeeping(&mut self) {
-        if !self.ownership.check() {
-            let _ = self
-                .ledger
-                .unserviceable("worker ownership", "exclusive ownership connection lost");
-            self.sessions.clear();
-            self.status.set_sessions(0);
-            return;
-        }
-        // Dropping a session connection rolls back any uncommitted transaction.
-        self.sessions
-            .retain(|_, session| session.touched.elapsed() < SESSION_IDLE_TIMEOUT);
-        let ids: Vec<String> = self
-            .sessions
-            .values()
-            .filter_map(|session| session.authority.credential_id.clone())
-            .collect();
-        if !ids.is_empty() {
-            let valid = self.ledger.identities(&ids).unwrap_or_default();
-            // The configured session ceiling bounds this scan and the
-            // one database query. Lookup failure closes named sessions as well:
-            // an unavailable authority cannot indefinitely retain a transaction.
-            retain_authorized_sessions(&mut self.sessions, &valid);
-        }
-        self.status.set_sessions(self.sessions.len());
-    }
-
     fn handle(&mut self, op: Operation) -> Reply {
         if !self.ownership.check() {
             return Err(self
@@ -839,7 +795,10 @@ impl Worker {
                 .unserviceable("worker ownership", "exclusive ownership connection lost"));
         }
         match op {
-            Operation::Open(request, identity) => {
+            Operation::Open(request, identity, protocol, open_span_id) => {
+                if self.queue.draining.load(Ordering::Acquire) {
+                    return Err(ApiError::new(failure::DRAINING, "worker draining"));
+                }
                 // The gateway already routed by mode and size; this is the worker
                 // refusing to serve a placement that is not its own.
                 let (mut request, placement, revision) = match request {
@@ -904,259 +863,179 @@ impl Worker {
                 let id = Uuid::new_v4();
                 let profile = crate::profiling::Profile::new(id, self.profiling_enabled, &conn)
                     .map_err(|_| ApiError::internal())?;
-                self.sessions.insert(
-                    id,
-                    Session {
-                        conn,
-                        profile,
-                        touched: Instant::now(),
-                        context: request.context,
-                        placement,
-                        diagnostics: diagnostics.clone(),
-                        principal: identity.principal.clone(),
-                        authority: identity,
-                    },
-                );
+                let resources = placement.resources;
+                let registration = queue::SessionRegistration {
+                    session_id: id,
+                    epoch: self.queue.epoch.clone(),
+                    principal: identity.principal.clone(),
+                    authority: identity,
+                    context: request.context,
+                    compute: json!({"mode":placement.mode.name(),"pool":placement.pool,
+                        "cpu":resources.cpu,"memory_bytes":resources.memory_bytes,"disk_bytes":resources.disk_bytes}),
+                    placement: diagnostics.clone(),
+                    scope: self
+                        .pool
+                        .as_ref()
+                        .map_or_else(|| "isolated".into(), |name| format!("persistent:{name}")),
+                    protocol,
+                    open_span_id,
+                };
+                if queue::register_session(&mut self.ledger.client, &registration).is_err() {
+                    // A lost registration ACK must not leave a usable local
+                    // session; restart recovery retires any committed evidence.
+                    self.queue.stop();
+                    return Err(ApiError::internal());
+                }
+                self.sessions.insert(id, Session { conn, profile });
+                self.queue.register_local(id);
                 self.served += 1;
                 Ok(Output::Json(json!({"session_id":id, "database":"lake",
                         "duckdb_version": self.placement["duckdb_version"], "placement":diagnostics})))
             }
-            Operation::Close(id) => {
-                self.sessions.remove(&id);
-                Ok(Output::Json(json!({"closed":true})))
-            }
-            Operation::Query(id, req, identity) => self.query(id, req, identity),
         }
     }
 
-    /// Durable outcome, diagnostic history, and the usage ledger become terminal
-    /// together. Never keep a PostgreSQL transaction open across engine execution.
     fn finish_execution(
         &mut self,
-        admission: &metering::Admission,
-        context: &Value,
+        request_id: Uuid,
         completion: Completion<'_>,
     ) -> Result<(), ApiError> {
-        let finished = (|| -> Result<i64> {
+        let finished = (|| -> Result<()> {
             let mut transaction = self.ledger.client.transaction()?;
-            let failure_kind = completion.failure.map(|failure| failure.kind);
-            let retry_safe = completion.failure.map(|failure| failure.retry_safe);
-            // Request -> history -> reservation -> budget is also recovery's lock
-            // order. The request's terminal update remains invisible until commit.
-            requests::finish_in(
+            transaction.batch_execute("SET LOCAL statement_timeout=3000; SET LOCAL lock_timeout=3000; SET LOCAL idle_in_transaction_session_timeout=3000")?;
+            let metrics = completion
+                .capture
+                .map(|c| serde_json::from_str::<Value>(&c.metrics))
+                .transpose()?
+                .unwrap_or_else(|| json!({}));
+            let changed = queue::finish_in(
                 &mut transaction,
-                &admission.execution_id,
-                completion.status,
-                failure_kind,
-                retry_safe,
-                completion.elapsed_ms,
-                completion.result_rows,
-                completion.outcome,
+                &queue::Finish {
+                    request_id,
+                    epoch: &self.queue.epoch,
+                    source: "worker",
+                    status: completion.status,
+                    failure: completion.failure,
+                    outcome: completion.outcome,
+                    elapsed_ms: completion.elapsed_ms,
+                    result_rows: completion.result_rows,
+                    error: completion.error,
+                    engine_started_at: completion.engine_started_at,
+                    profile: completion.capture.and_then(|c| c.profile.as_deref()),
+                    profile_status: completion.capture.map_or("not_recorded", |c| c.status),
+                    metrics: &metrics,
+                },
             )?;
-            let profile_status = completion.capture.map_or("not_recorded", |c| c.status);
-            let profile = completion.capture.and_then(|c| c.profile.as_deref());
-            let metrics = completion.capture.map_or("{}", |c| c.metrics.as_str());
-            transaction.execute(
-                "UPDATE query_history SET status=$2, finished_at=now(), elapsed_ms=$3,
-                 result_rows=$4, error=$5, profile_status=$6, profile=$7, metrics=$8,
-                 failure_kind=$9, retry_safe=$10 WHERE query_id=$1",
-                &[
-                    &admission.execution_id,
-                    &completion.status,
-                    &completion.elapsed_ms,
-                    &completion.result_rows,
-                    &completion.error,
-                    &profile_status,
-                    &profile,
-                    &metrics,
-                    &failure_kind,
-                    &retry_safe,
-                ],
-            )?;
-            let charged = metering::settle_in(
-                &mut transaction,
-                admission,
-                completion.elapsed_ms,
-                &self.worker_id,
-                &context.to_string(),
-                &self.rate,
-            )?;
+            anyhow::ensure!(
+                changed || completion.outcome == requests::Outcome::NotExecuted,
+                "engine terminal outcome was not persisted; retained state changed unexpectedly"
+            );
             transaction.commit()?;
-            Ok(charged)
+            Ok(())
         })();
-        match finished {
-            Ok(charged) => {
-                tracing::debug!(
-                    query_id = admission.execution_id,
-                    charged_micro_usd = charged,
-                    reserved_micro_usd = admission.reserved_micro_usd,
-                    "usage and request outcome settled"
-                );
-                Ok(())
-            }
-            Err(error) => Err(self.ledger.unserviceable(
-                "persisting terminal request outcome; recovery will settle it",
+        finished.map_err(|error| {
+            self.queue.stop();
+            self.ledger.unserviceable(
+                "persisting terminal request outcome; recovery required",
                 &format!("{error:#}"),
-            )),
-        }
+            )
+        })
     }
 
-    /// Admission reserved funds, but authority changed before the engine started.
-    /// Zero-time settlement releases the hold without charging for work not run.
-    fn abort_admission(
-        &mut self,
-        admission: &metering::Admission,
-        context: &Value,
-        refusal: ApiError,
-    ) -> Reply {
-        let _ = self.finish_execution(
-            admission,
-            context,
+    fn abort_admission(&mut self, request_id: Uuid, refusal: ApiError) -> Reply {
+        self.finish_execution(
+            request_id,
             Completion {
                 status: refusal.0.status.unwrap_or("refused"),
                 failure: Some(refusal.0),
                 elapsed_ms: 0,
+                engine_started_at: None,
                 result_rows: None,
                 error: Some(&refusal.1),
                 capture: None,
                 outcome: requests::Outcome::NotExecuted,
             },
-        );
+        )?;
         Err(refusal)
     }
 
-    fn query(&mut self, id: Uuid, mut req: QueryRequest, claimed: Identity) -> Reply {
-        let identity = self.validate_session_identity(id, &claimed)?;
-        let session = self
-            .sessions
-            .get_mut(&id)
-            .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
-        session.claim(identity)?;
-        session.touched = Instant::now();
-        // Read before the ledger is borrowed: billing follows the session's resolved
-        // request, not the class of whatever worker served it.
-        let billable_units = session.placement.units();
-        let parameters = req
+    fn execute_grant(
+        &mut self,
+        grant: queue::ExecutionGrant,
+        grant_received: Instant,
+        cancellation: Arc<AtomicBool>,
+    ) -> Reply {
+        let deadline = grant_received + grant.remaining_queue;
+        let admission = grant.prepared.admission;
+        let payload = grant.prepared.selected.payload;
+        let id = payload.session_id;
+        let req = payload.request;
+        let query_id = req.request_id;
+        let claimed = payload.actor.identity();
+        let parameters = match req
             .parameters
             .iter()
             .map(parameter)
             .collect::<Result<Vec<_>>>()
-            .map_err(|e| ApiError::bad(e.to_string()))?;
-        // Session identity and policy cannot change midway through a materialization.
-        if let (Some(query), Some(session)) =
-            (req.context.as_object_mut(), session.context.as_object())
         {
-            query.extend(session.clone());
-        }
-        let query_id = req.request_id.to_string();
-        let retry_of = req.retry_of.map(|id| id.to_string());
-        let principal = session.principal.clone();
-        let resources = session.placement.resources;
-        let compute = json!({
-            "mode": session.placement.mode.name(),
-            "pool": session.placement.pool,
-            "cpu": resources.cpu,
-            "memory_bytes": resources.memory_bytes,
-            "disk_bytes": resources.disk_bytes,
-        });
-        let placement = session.diagnostics.clone();
-        let session_id = id.to_string();
-        let submission = || requests::Submission {
-            request_id: &query_id,
-            retry_of: retry_of.as_deref(),
-            session_id: &session_id,
-            sql: &req.sql,
-            parameters: &req.parameters,
-            context: &req.context,
-            timeout_seconds: req.timeout_seconds,
-            compute: &compute,
-            worker_id: &self.worker_id,
-            placement: &placement,
-            principal: &principal,
+            Ok(values) => values,
+            Err(error) => return self.abort_admission(query_id, ApiError::bad(error.to_string())),
         };
-        // Canonicalization sees validated parameters and effective session context,
-        // but no observed worker/boot identity. The claim, history, and reservation
-        // commit atomically; neither diagnostics retention nor a competing worker
-        // can make an accepted request eligible to execute again.
-        let mut admitted = requests::admit(
-            &mut self.ledger.client,
-            submission(),
-            billable_units,
-            &self.rate,
-        );
-        if admitted.is_err() && self.ledger.client.is_closed() {
-            // No engine statement has run. Reconnecting and claiming the same ID
-            // once is safe: an ambiguous first commit becomes a duplicate instead
-            // of a second admission. Bootstrap sessions need this too, since they
-            // do not perform the credential reads that otherwise repair a socket.
-            self.ledger
-                .execute("reconnecting for request admission", "SELECT 1", &[])?;
-            admitted = requests::admit(
-                &mut self.ledger.client,
-                submission(),
-                billable_units,
-                &self.rate,
+        if !self.sessions.contains_key(&id) {
+            return self.abort_admission(
+                query_id,
+                ApiError::new(failure::SESSION_LOST, "registered engine session was lost"),
             );
         }
-        let admission = match admitted {
-            Ok(requests::AdmissionResult::Admitted(admission)) => admission,
-            Ok(requests::AdmissionResult::Duplicate(outcome)) => {
-                return Ok(Output::JsonResponse(StatusCode::CONFLICT, outcome));
-            }
-            Err(refusal) => {
-                if refusal.0 == failure::UNAVAILABLE {
-                    self.ledger.unserviceable(
-                        "admitting a durable request",
-                        "platform transaction failed; no statement ran",
-                    );
-                }
-                return Err(refusal);
-            }
-        };
-        if let Err(refusal) = requests::mark_executing(&mut self.ledger.client, &query_id) {
-            return self.abort_admission(&admission, &req.context, refusal);
-        }
-        // History, budget, and durable state changes can wait on database locks.
-        // Check authority after all of them, directly before engine execution.
         if !self.ownership.check() {
-            let refusal = self.ledger.unserviceable(
-                "worker ownership",
-                "exclusive ownership connection lost before execution",
-            );
-            return self.abort_admission(&admission, &req.context, refusal);
+            let refusal = self
+                .ledger
+                .unserviceable("worker ownership", "exclusive ownership lost before SQL");
+            return self.abort_admission(query_id, refusal);
         }
-        if let Err(refusal) = self.validate_session_identity(id, &claimed) {
-            return self.abort_admission(&admission, &req.context, refusal);
-        }
-        let session = self
+        let cleared = self
             .sessions
             .get_mut(&id)
-            .expect("validated session remains on the sole worker thread");
-        let executing = {
+            .expect("session checked")
+            .profile
+            .clear();
+        // The last metadata operation before engine entry is authoritative auth.
+        if let Err(refusal) = self.validate_identity(&claimed) {
+            return self.abort_admission(query_id, refusal);
+        }
+        let session = self.sessions.get_mut(&id).expect("engine session checked");
+        let refusal = {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            // Credential validation can wait too. Check the local loss latch while
-            // publishing Active: a concurrent loss either refuses admission here
-            // or sees this slot and interrupts it. No database wait follows auth.
-            if self.ownership.is_closed() {
-                false
+            let failure = if self.ownership.is_closed() {
+                Some(failure::INTERRUPTED)
+            } else if self.queue.draining.load(Ordering::Acquire) {
+                Some(failure::QUEUE_DRAINED)
+            } else if self.queue.session_closing(id) {
+                Some(failure::SESSION_LOST)
+            } else if cancellation.load(Ordering::Acquire) {
+                Some(failure::CANCELED)
+            } else if Instant::now() >= deadline {
+                Some(failure::QUEUE_TIMEOUT)
             } else {
+                None
+            };
+            if failure.is_none() {
                 *active = Some(Active {
-                    query: req.request_id,
+                    query: query_id,
                     session: id,
                     handle: session.conn.interrupt_handle(),
                     reason: None,
                 });
-                true
             }
+            failure
         };
-        if !executing {
-            let refusal = self.ledger.unserviceable(
-                "worker ownership",
-                "exclusive ownership connection lost before execution",
+        if let Some(failure) = refusal {
+            return self.abort_admission(
+                query_id,
+                ApiError::new(failure, "query refused before engine entry"),
             );
-            return self.abort_admission(&admission, &req.context, refusal);
         }
-        let cleared = session.profile.clear();
+        let engine_started_at = SystemTime::now();
         let started = Instant::now();
         let active = self.active.clone();
         // One timer enforces both limits, because a cost cap is just a shorter
@@ -1182,7 +1061,6 @@ impl Worker {
             reason = Some("ownership_lost");
         }
         deadline.abort();
-        session.touched = Instant::now();
         let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
         let capture = session.profile.capture(cleared);
         session.profile.clear();
@@ -1223,12 +1101,12 @@ impl Worker {
         };
         if self
             .finish_execution(
-                &admission,
-                &req.context,
+                query_id,
                 Completion {
                     status,
                     failure,
                     elapsed_ms: elapsed,
+                    engine_started_at: Some(engine_started_at),
                     result_rows: rows,
                     error: error.as_deref(),
                     capture: Some(&capture),
@@ -1243,11 +1121,13 @@ impl Worker {
                  inspect the request before retrying",
             ));
         }
-        tracing::info!(query_id, session_id = %id, status, elapsed_ms = elapsed, "query finished");
-        if reason == Some("ownership_lost") {
+        tracing::info!(%query_id, session_id = %id, status, elapsed_ms = elapsed, "query finished");
+        if reason.is_some()
+            && let Some(failure) = failure
+        {
             return Err(ApiError::new(
-                failure::INTERRUPTED,
-                error.unwrap_or_else(|| "worker ownership lost; commit outcome unknown".into()),
+                failure,
+                error.unwrap_or_else(|| "query interrupted; commit outcome may be unknown".into()),
             ));
         }
         result
@@ -1259,6 +1139,12 @@ impl Worker {
                     error.unwrap_or_else(|| "query failed".into()),
                 )
             })
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.queue.stop();
     }
 }
 
@@ -1336,6 +1222,46 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn active_interruption_racing_engine_success_remains_uncertain() {
+        for (reason, expected) in [
+            ("canceled", failure::CANCELED),
+            ("timed_out", failure::TIMEOUT),
+            ("budget_exceeded", failure::BUDGET_EXCEEDED),
+        ] {
+            let failure = execution_failure(None, Some(reason)).unwrap();
+            assert_eq!(failure, expected);
+            assert!(!failure.retry_safe);
+        }
+    }
+
+    #[test]
+    fn delayed_cancel_for_prior_request_never_interrupts_next_request() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        let previous = Uuid::new_v4();
+        let next = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let active = Arc::new(Mutex::new(Some(Active {
+            query: next,
+            session,
+            handle: connection.interrupt_handle(),
+            reason: None,
+        })));
+        assert!(!interrupt(
+            &active,
+            Some(session),
+            Some(previous),
+            "canceled"
+        ));
+        assert_eq!(active.lock().unwrap().as_ref().unwrap().reason, None);
+        assert!(interrupt(&active, None, Some(next), "canceled"));
+        assert_eq!(
+            active.lock().unwrap().as_ref().unwrap().reason,
+            Some("canceled")
+        );
+        Ok(())
+    }
+
     fn named_identity(principal: &str) -> Identity {
         Identity {
             principal: principal.into(),
@@ -1363,82 +1289,6 @@ mod tests {
                 .unwrap()
                 .is_bootstrap()
         );
-    }
-
-    #[test]
-    fn cleanup_rolls_back_revoked_sessions_but_preserves_rotated_authority() -> Result<()> {
-        let root = Connection::open_in_memory()?;
-        root.execute_batch("CREATE TABLE cleanup_probe (id INTEGER)")
-            .map_err(|_| anyhow::anyhow!("could not create cleanup fixture"))?;
-        let old = named_identity("analyst");
-        let replacement = named_identity("analyst");
-        let make_session = |identity: Identity| -> Result<Session> {
-            let conn = root.try_clone()?;
-            let profile = crate::profiling::Profile::new(Uuid::new_v4(), false, &conn)?;
-            Ok(Session {
-                conn,
-                profile,
-                touched: Instant::now(),
-                context: json!({}),
-                placement: Placement {
-                    mode: Mode::Persistent,
-                    resources: Resources::default(),
-                    pool: Some("small".into()),
-                },
-                diagnostics: json!({}),
-                principal: identity.principal.clone(),
-                authority: identity,
-            })
-        };
-        let revoked = make_session(old.clone())?;
-        revoked
-            .conn
-            .execute_batch("BEGIN; INSERT INTO cleanup_probe VALUES (1)")
-            .map_err(|_| anyhow::anyhow!("could not start cleanup fixture transaction"))?;
-        let refused = make_session(old.clone())?;
-        refused
-            .conn
-            .execute_batch("BEGIN; INSERT INTO cleanup_probe VALUES (2)")
-            .map_err(|_| anyhow::anyhow!("could not start refusal fixture transaction"))?;
-        let mut rotated = make_session(old.clone())?;
-        rotated
-            .claim(replacement.clone())
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        assert_eq!(rotated.principal, old.principal);
-        assert_eq!(rotated.authority, replacement);
-        assert!(rotated.claim(named_identity("someone-else")).is_err());
-        rotated
-            .claim(Identity::bootstrap())
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        assert_eq!(
-            rotated.authority, replacement,
-            "operator access must not replace revocable authority"
-        );
-        let revoked_id = Uuid::new_v4();
-        let refused_id = Uuid::new_v4();
-        let rotated_id = Uuid::new_v4();
-        let mut sessions = HashMap::from([
-            (revoked_id, revoked),
-            (refused_id, refused),
-            (rotated_id, rotated),
-        ]);
-        // Both dequeue and post-budget refusals use this cleanup: a stale token
-        // must close its own transaction without destroying rotated authority.
-        discard_unauthorized_session(&mut sessions, rotated_id, &old);
-        assert!(sessions.contains_key(&rotated_id));
-        discard_unauthorized_session(&mut sessions, refused_id, &old);
-        assert!(!sessions.contains_key(&refused_id));
-        retain_authorized_sessions(&mut sessions, std::slice::from_ref(&replacement));
-        assert!(!sessions.contains_key(&revoked_id));
-        assert!(sessions.contains_key(&rotated_id));
-        let rows: i64 = root.query_row("SELECT count(*) FROM cleanup_probe", [], |r| r.get(0))?;
-        assert_eq!(rows, 0, "revoked idle transaction was not rolled back");
-        retain_authorized_sessions(&mut sessions, &[]);
-        assert!(
-            sessions.is_empty(),
-            "failed validation must close named sessions"
-        );
-        Ok(())
     }
 
     #[test]

@@ -18,6 +18,8 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: worker-{{ $id }}
+  annotations:
+    duckfleet.io/platform-schema: {{ include "duckfleet.platformSchema" $ | quote }}
 spec:
   # No concurrent writers with the same worker identity during upgrades.
   replicas: {{ ternary 0 1 $.Values.suspended }}
@@ -35,6 +37,8 @@ spec:
     {{- end }}
   template:
     metadata:
+      annotations:
+        duckfleet.io/platform-schema: {{ include "duckfleet.platformSchema" $ | quote }}
       labels: {app: duckfleet-worker, size: {{ $size }}, duckfleet-pool: {{ $size }}, worker-index: {{ $index | quote }}}
     spec:
       {{- include "duckfleet.termination" . | nindent 6 }}

@@ -5,6 +5,7 @@ source "$(dirname "$0")/common.sh"
 cd "$ROOT"
 assert_cluster
 [[ -f artifacts/aws/values.json ]] || { echo 'Publish images first' >&2; exit 1; }
+python3 scripts/compute_lifecycle.py check kube --context "$KUBE_CONTEXT" --namespace "$NAMESPACE"
 # The values only the live cluster can supply — isolated compute on with the API
 # server's real egress address, workers pinned to the DuckFleet pool — merged into
 # values.json before anything reads it. Written here rather than baked into chart

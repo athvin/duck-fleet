@@ -30,6 +30,7 @@ const BUDGET_ID: &str = "local";
 const METER: &str = "compute";
 
 /// What admission granted: how long the statement may run, and what it reserved.
+#[derive(Clone, Debug)]
 pub(crate) struct Admission {
     pub execution_id: String,
     pub units: i64,
@@ -288,24 +289,6 @@ pub(crate) fn interrupt_abandoned_prefix(
     )?)
 }
 
-/// Worker identities that still hold funds and whose names begin with `prefix`.
-///
-/// For a session pod the identity is the pod's own name, so these are the holds that
-/// no restart will ever settle: a persistent worker recovers its own when it comes
-/// back, but a pod that has been deleted never comes back. The gateway is the only
-/// process left that knows they existed.
-pub(crate) fn held_matching(client: &mut Client, prefix: &str) -> Result<Vec<String>> {
-    Ok(client
-        .query(
-            "SELECT DISTINCT worker_id FROM reservations
-             WHERE state = 'held' AND worker_id LIKE $1 || '%'",
-            &[&prefix],
-        )?
-        .iter()
-        .map(|row| row.get(0))
-        .collect())
-}
-
 /// Reserves funds inside the caller's request-admission transaction. The caller
 /// commits identity, history, and reservation together before executing SQL.
 /// Budget refusals make no writes and leave the transaction usable for recording
@@ -453,6 +436,56 @@ pub(crate) fn settle_in(
     let (spent, held) = budget_deltas(inserted, released, amount, admission.reserved_micro_usd);
     apply_deltas(transaction, spent, held)?;
     Ok(amount)
+}
+
+/// Queue cleanup/recovery prices a held reservation using its immutable card.
+/// A queued request with no reservation generates no fictional usage event.
+pub(crate) fn settle_saved_in(
+    transaction: &mut Transaction<'_>,
+    execution_id: &str,
+    elapsed_ms: i64,
+    worker_id: &str,
+    context: &str,
+    source: &str,
+) -> Result<Option<i64>> {
+    let Some(row) = transaction.query_opt(
+        "SELECT resource_units,reserved_micro_usd,rate_micro_usd_per_unit_hour,rate_card_version
+         FROM reservations WHERE execution_id=$1 AND state='held' FOR UPDATE",
+        &[&execution_id],
+    )?
+    else {
+        return Ok(None);
+    };
+    let units: i64 = row.get(0);
+    let reserved: i64 = row.get(1);
+    let rate = pricing::RateCard {
+        compute_micro_usd_per_unit_hour: row
+            .get::<_, Option<i64>>(2)
+            .ok_or_else(|| anyhow::anyhow!("queued reservation has no saved rate"))?,
+        version: row
+            .get::<_, Option<String>>(3)
+            .ok_or_else(|| anyhow::anyhow!("queued reservation has no saved rate version"))?,
+    };
+    let amount = rate.charge_micro_usd(units, u64::try_from(elapsed_ms).unwrap_or(0));
+    let inserted = record(
+        transaction,
+        execution_id,
+        units,
+        elapsed_ms,
+        amount,
+        &rate.version,
+        worker_id,
+        context,
+        source,
+    )?;
+    let released = transaction.execute(
+        "UPDATE reservations SET state='settled',settled_micro_usd=$2,settled_at=clock_timestamp()
+         WHERE execution_id=$1 AND state='held'",
+        &[&execution_id, &amount],
+    )?;
+    let (spent, held) = budget_deltas(inserted, released, amount, reserved);
+    apply_deltas(transaction, spent, held)?;
+    Ok(Some(amount))
 }
 
 /// Current budget position, for the operator view. The rate reported is the card

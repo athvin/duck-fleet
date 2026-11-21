@@ -13,6 +13,7 @@ use serde_json::json;
 use crate::{
     ApiError,
     compute::{ComputeRequest, Mode, Placement, Resources, Selection, valid_pool_name},
+    query::{AdmissionLimits, AdmissionLimitsOverride},
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -20,6 +21,7 @@ pub(crate) struct Pool {
     pub resources: Resources,
     pub endpoints: Vec<String>,
     pub max_sessions_per_worker: usize,
+    pub admission: AdmissionLimits,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -28,6 +30,44 @@ pub(crate) struct PoolRegistry {
     pub pools: BTreeMap<String, Pool>,
     pub revision: String,
     pub legacy: bool,
+    pub isolated_admission: AdmissionLimits,
+    #[serde(skip)]
+    admission_config: AdmissionConfig,
+}
+
+/// Retain omission separately from the effective value: a pool's running
+/// override changes an inherited principal limit, but not an explicit one.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AdmissionConfig {
+    default: AdmissionLimitsOverride,
+    isolated: AdmissionLimitsOverride,
+}
+
+impl AdmissionConfig {
+    fn from_json(source: &str) -> Result<Self> {
+        let config: Self =
+            serde_json::from_str(source).context("invalid DUCKFLEET_ADMISSION_LIMITS_JSON")?;
+        config.default.resolve(AdmissionLimits::default())?;
+        config.isolated.resolve(AdmissionLimits::default())?;
+        Ok(config)
+    }
+
+    fn pool(&self, local: &AdmissionLimitsOverride) -> Result<AdmissionLimits> {
+        AdmissionLimitsOverride {
+            max_queued_queries: local.max_queued_queries.or(self.default.max_queued_queries),
+            max_running_queries: local
+                .max_running_queries
+                .or(self.default.max_running_queries),
+            max_queued_per_principal: local
+                .max_queued_per_principal
+                .or(self.default.max_queued_per_principal),
+            max_running_per_principal: local
+                .max_running_per_principal
+                .or(self.default.max_running_per_principal),
+        }
+        .resolve(AdmissionLimits::default())
+    }
 }
 
 #[derive(Deserialize)]
@@ -46,6 +86,8 @@ struct PoolConfiguration {
     endpoints: Vec<String>,
     #[serde(default = "default_sessions")]
     max_sessions_per_worker: usize,
+    #[serde(default)]
+    admission: AdmissionLimitsOverride,
 }
 fn default_sessions() -> usize {
     32
@@ -68,6 +110,13 @@ fn endpoint(value: &str) -> Result<String> {
 
 impl PoolRegistry {
     pub fn load() -> Result<(Self, Option<PathBuf>)> {
+        let configured_admission = std::env::var("DUCKFLEET_ADMISSION_LIMITS_JSON")
+            .or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok("{}".into()),
+                other => Err(other),
+            })
+            .context("DUCKFLEET_ADMISSION_LIMITS_JSON must contain valid Unicode JSON")?;
+        let admission = AdmissionConfig::from_json(&configured_admission)?;
         let file = std::env::var("DUCKFLEET_POOLS_FILE").ok();
         let inline = std::env::var("DUCKFLEET_POOLS_JSON").ok();
         anyhow::ensure!(
@@ -90,10 +139,10 @@ impl PoolRegistry {
             let path = PathBuf::from(file);
             let source =
                 std::fs::read_to_string(&path).context("reading configured pool registry file")?;
-            return Ok((Self::from_json(&source)?, Some(path)));
+            return Ok((Self::with_admission(&source, admission)?, Some(path)));
         }
         if let Some(source) = inline {
-            return Ok((Self::from_json(&source)?, None));
+            return Ok((Self::with_admission(&source, admission)?, None));
         }
         let urls = std::env::var("DUCKFLEET_WORKER_URLS").context(
             "configure DUCKFLEET_POOLS_FILE, DUCKFLEET_POOLS_JSON, or legacy DUCKFLEET_WORKER_URLS",
@@ -112,13 +161,33 @@ impl PoolRegistry {
             "cpu":1,"memory":"1Gi","disk":"2Gi","endpoints":endpoints,
             "max_sessions_per_worker":default_sessions()
         }}});
-        let mut registry = Self::from_json(&source.to_string())?;
+        let mut registry = Self::with_admission(&source.to_string(), admission)?;
         registry.legacy = true;
         registry.refresh_revision()?;
         Ok((registry, None))
     }
 
+    #[cfg(test)]
     pub fn from_json(source: &str) -> Result<Self> {
+        Self::with_admission(source, AdmissionConfig::default())
+    }
+
+    pub fn reloaded(&self, source: &str) -> Result<Self> {
+        Self::with_admission(source, self.admission_config.clone())
+    }
+
+    pub fn admission_policies(&self) -> Vec<(String, AdmissionLimits)> {
+        self.pools
+            .iter()
+            .map(|(name, pool)| (format!("persistent:{name}"), pool.admission))
+            .chain(std::iter::once((
+                "isolated".into(),
+                self.isolated_admission,
+            )))
+            .collect()
+    }
+
+    fn with_admission(source: &str, admission_config: AdmissionConfig) -> Result<Self> {
         let config: Configuration =
             serde_json::from_str(source).context("invalid pool registry JSON")?;
         anyhow::ensure!(
@@ -159,12 +228,16 @@ impl PoolRegistry {
                     Ok(endpoint)
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let admission = admission_config
+                .pool(&configured.admission)
+                .with_context(|| format!("invalid admission limits for pool {name}"))?;
             pools.insert(
                 name,
                 Pool {
                     resources,
                     endpoints: members,
                     max_sessions_per_worker: configured.max_sessions_per_worker,
+                    admission,
                 },
             );
         }
@@ -173,6 +246,10 @@ impl PoolRegistry {
             pools,
             revision: String::new(),
             legacy: false,
+            isolated_admission: admission_config
+                .isolated
+                .resolve(AdmissionLimits::default())?,
+            admission_config,
         };
         registry.refresh_revision()?;
         Ok(registry)
@@ -180,7 +257,8 @@ impl PoolRegistry {
 
     fn refresh_revision(&mut self) -> Result<()> {
         let canonical = serde_json::to_vec(
-            &json!({"default_pool":self.default_pool,"pools":self.pools,"legacy":self.legacy}),
+            &json!({"default_pool":self.default_pool,"pools":self.pools,"legacy":self.legacy,
+                "isolated_admission": self.isolated_admission}),
         )?;
         let hash = ring::digest::digest(&ring::digest::SHA256, &canonical);
         self.revision = hash
@@ -328,5 +406,82 @@ mod tests {
                 .unwrap()
                 .revision
         );
+    }
+
+    #[test]
+    fn admission_inheritance_preserves_explicit_defaults_across_reload() {
+        let mut source = config();
+        source["pools"]["interactive"]["admission"] = json!({"max_running_queries": 4});
+        let inherited = PoolRegistry::from_json(&source.to_string()).unwrap();
+        assert_eq!(
+            inherited.pools["interactive"]
+                .admission
+                .max_running_per_principal,
+            4
+        );
+        assert_eq!(
+            inherited.pools["small"].admission.max_running_per_principal,
+            16
+        );
+        let explicit = PoolRegistry::with_admission(&source.to_string(), AdmissionConfig::from_json(
+            r#"{"default":{"max_running_per_principal":1},"isolated":{"max_running_queries":3}}"#,
+        ).unwrap()).unwrap();
+        assert_eq!(
+            explicit.pools["interactive"]
+                .admission
+                .max_running_per_principal,
+            1
+        );
+        assert_eq!(explicit.isolated_admission.max_running_per_principal, 3);
+        source["pools"]["interactive"]["admission"]["max_running_queries"] = json!(8);
+        let reloaded = explicit.reloaded(&source.to_string()).unwrap();
+        assert_eq!(
+            reloaded.pools["interactive"]
+                .admission
+                .max_running_per_principal,
+            1
+        );
+        assert_ne!(explicit.revision, reloaded.revision);
+        assert_eq!(reloaded.isolated_admission, explicit.isolated_admission);
+    }
+
+    #[test]
+    fn admission_validation_and_scope_identity_are_independent_of_registry_revision() {
+        for source in [
+            r#"{"defualt":{}}"#,
+            r#"{"default":{"max_queued_queries":0}}"#,
+            r#"{"default":{"max_queued_queries":1}}"#,
+            r#"{"isolated":{"max_running_queries":1025}}"#,
+        ] {
+            assert!(
+                AdmissionConfig::from_json(source).is_err(),
+                "accepted {source}"
+            );
+        }
+        let mut source = config();
+        for admission in [
+            json!({"max_running_queries":0}),
+            json!({"max_running_queries":2,"max_running_per_principal":3}),
+            json!({"max_queued_queries":65536}),
+            json!({"max_running_queries":"2"}),
+            json!({"unknown":1}),
+        ] {
+            source["pools"]["small"]["admission"] = admission;
+            assert!(PoolRegistry::from_json(&source.to_string()).is_err());
+        }
+        source["pools"]["small"]["admission"] = json!({});
+        source["pools"]["isolated"] = source["pools"]["same-size"].clone();
+        let registry = PoolRegistry::from_json(&source.to_string()).unwrap();
+        let scopes: Vec<_> = registry
+            .admission_policies()
+            .into_iter()
+            .map(|(scope, _)| scope)
+            .collect();
+        assert!(scopes.contains(&"isolated".to_string()));
+        assert!(scopes.contains(&"persistent:isolated".to_string()));
+        source["default_pool"] = json!("small");
+        let reloaded = registry.reloaded(&source.to_string()).unwrap();
+        assert_ne!(registry.revision, reloaded.revision);
+        assert_eq!(registry.admission_policies(), reloaded.admission_policies());
     }
 }

@@ -51,6 +51,8 @@ services:
   # Legacy default pool. Resource-only requests still ask for isolation, which
   # needs Kubernetes; explicit persistent pools are available via the pools profile.
   worker-small:
+    labels:
+      duckfleet.io/platform-schema: "2"
     image: duckfleet-worker:local
     build:
       context: .
@@ -61,6 +63,8 @@ services:
       DUCKFLEET_POOL: small
       DUCKFLEET_WORKER_MAX_SESSIONS: "32"
       DUCKFLEET_WORKER_QUEUE_CAPACITY: "64"
+      DUCKFLEET_WORKER_MAX_QUEUED_QUERIES: "64"
+      DUCKFLEET_WORKER_MAX_QUEUED_BYTES: "16777216"
       DUCKFLEET_WORKER_CPU: "1"
       DUCKFLEET_WORKER_MEMORY: 1Gi
       DUCKFLEET_WORKER_DISK: 2Gi
@@ -87,13 +91,15 @@ services:
       retries: 40
     mem_limit: 1g
     cpus: 1
-    stop_grace_period: 10s
+    stop_grace_period: 90s
 
   # A second worker of the same size, for the scale-out stage: same resources, its
   # own identity. Behind a profile so the default run keeps exactly one worker and
   # its deterministic placement assertions; the harness brings this up and points
   # the gateway at it via DUCKFLEET_WORKER_URLS.
   worker-small-b:
+    labels:
+      duckfleet.io/platform-schema: "2"
     profiles: [scale-out]
     image: duckfleet-worker:local
     environment:
@@ -105,13 +111,16 @@ services:
     healthcheck: *worker-health
     mem_limit: 1g
     cpus: 1
-    stop_grace_period: 10s
+    stop_grace_period: 90s
 
   server:
+    labels:
+      duckfleet.io/platform-schema: "2"
     image: duckfleet-worker:local
     environment:
       DUCKFLEET_ROLE: gateway
       DUCKFLEET_GATEWAY_MAX_SESSIONS: "64"
+      DUCKFLEET_ADMISSION_LIMITS_JSON: "${DUCKFLEET_ADMISSION_LIMITS_JSON:-{}}"
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       # The gateway coordinates bounded history retention for the whole fleet.
       DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
@@ -132,14 +141,17 @@ services:
       platform-migrate:
         condition: service_completed_successfully
       worker-small:
-        condition: service_healthy
+        condition: service_started
     healthcheck: *worker-health
     mem_limit: 256m
     cpus: 0.5
+    stop_grace_period: 90s
 
   # An optional second allocation, independent of the legacy default and of
   # isolation. Start with: docker compose --profile pools up -d --wait server-pools
   worker-pool-interactive-0:
+    labels:
+      duckfleet.io/platform-schema: "2"
     profiles: [pools]
     image: duckfleet-worker:local
     environment:
@@ -160,11 +172,14 @@ services:
     stop_grace_period: 90s
 
   server-pools:
+    labels:
+      duckfleet.io/platform-schema: "2"
     profiles: [pools]
     image: duckfleet-worker:local
     environment:
       DUCKFLEET_ROLE: gateway
       DUCKFLEET_GATEWAY_MAX_SESSIONS: "64"
+      DUCKFLEET_ADMISSION_LIMITS_JSON: "${DUCKFLEET_ADMISSION_LIMITS_JSON:-{}}"
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
       DUCKFLEET_PGWIRE: "true"
@@ -182,9 +197,9 @@ services:
       platform-migrate:
         condition: service_completed_successfully
       worker-small:
-        condition: service_healthy
+        condition: service_started
       worker-pool-interactive-0:
-        condition: service_healthy
+        condition: service_started
     healthcheck: *worker-health
     mem_limit: 256m
     cpus: 0.5

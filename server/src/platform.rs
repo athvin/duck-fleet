@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{credentials, metering, pricing::RateCard, requests};
 
-pub(crate) const SCHEMA_VERSION: i32 = 1;
+pub(crate) const SCHEMA_VERSION: i32 = 2;
 const MIGRATION_LOCK: i64 = 4_283_121;
 const POLL: Duration = Duration::from_millis(250);
 const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
@@ -205,9 +205,10 @@ pub(crate) fn wait_schema(dsn: &str, wait: Duration) -> Result<Client> {
             Ok((client, current))
         })();
         match attempt {
-            Ok((client, Some(current))) => {
+            Ok((client, Some(current))) if current == SCHEMA_VERSION => return Ok(client),
+            Ok((_, Some(1))) => {}
+            Ok((_, Some(current))) => {
                 supported(current)?;
-                return Ok(client);
             }
             Err(error) if fatal_startup(&error) => return Err(startup_error(&error)),
             Ok((_, None)) | Err(_) => {}
@@ -280,51 +281,67 @@ pub(crate) fn migrate(client: &mut Client, seed: &Seed) -> Result<MigrationRepor
         "budget seeds must be positive"
     );
     if let Some(current) = version(client)? {
-        supported(current)?;
-        return Ok(MigrationReport {
-            version: current,
-            applied: false,
-            elapsed_ms: elapsed_ms(started),
-        });
+        if current == SCHEMA_VERSION {
+            return Ok(MigrationReport {
+                version: current,
+                applied: false,
+                elapsed_ms: elapsed_ms(started),
+            });
+        }
+        anyhow::ensure!(
+            current == 1,
+            "unsupported migration source version {current}"
+        );
     }
     let mut transaction = client.transaction()?;
     transaction.batch_execute("SET LOCAL lock_timeout='3s'")?;
     // Retain the preceding worker binary's lock during the supported quiesced
     // upgrade. This lock serializes migrations, never routine worker startup.
     transaction.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK])?;
-    if let Some(current) = version(&mut transaction)? {
-        supported(current)?;
+    let current = version(&mut transaction)?;
+    if current == Some(SCHEMA_VERSION) {
         transaction.commit()?;
         return Ok(MigrationReport {
-            version: current,
+            version: SCHEMA_VERSION,
             applied: false,
             elapsed_ms: elapsed_ms(started),
         });
     }
-    transaction.batch_execute(HISTORY_SCHEMA)?;
-    credentials::migrate(&mut transaction)?;
-    metering::migrate(
-        &mut transaction,
-        seed.prepaid_micro_usd,
-        seed.max_job_micro_usd,
-    )?;
-    requests::migrate(&mut transaction)?;
-    // Older workers could emit synthetic retention audit history after #99's
-    // backfill marker committed. Adopt those remaining identities once here,
-    // preserving known owners/outcomes and never inventing old fingerprints.
-    requests::backfill_missing_history(&mut transaction)?;
-    // Adoption repairs old accumulator drift once. No worker identities are
-    // interrupted here: schema ownership is not evidence of worker death.
-    metering::reconcile(&mut transaction)?;
-    transaction.batch_execute(MAINTENANCE_SCHEMA)?;
-    transaction.batch_execute(
-        "CREATE TABLE IF NOT EXISTS platform_schema_migrations (
+    anyhow::ensure!(
+        current.is_none() || current == Some(1),
+        "unsupported migration source version"
+    );
+    if current.is_none() {
+        transaction.batch_execute(HISTORY_SCHEMA)?;
+        credentials::migrate(&mut transaction)?;
+        metering::migrate(
+            &mut transaction,
+            seed.prepaid_micro_usd,
+            seed.max_job_micro_usd,
+        )?;
+        requests::migrate(&mut transaction)?;
+        // Older workers could emit synthetic retention audit history after #99's
+        // backfill marker committed. Adopt those remaining identities once here,
+        // preserving known owners/outcomes and never inventing old fingerprints.
+        requests::backfill_missing_history(&mut transaction)?;
+        // Adoption repairs old accumulator drift once. No worker identities are
+        // interrupted here: schema ownership is not evidence of worker death.
+        metering::reconcile(&mut transaction)?;
+        transaction.batch_execute(MAINTENANCE_SCHEMA)?;
+        transaction.batch_execute(
+            "CREATE TABLE IF NOT EXISTS platform_schema_migrations (
         version INTEGER PRIMARY KEY CHECK(version > 0),name TEXT NOT NULL,
         applied_at TIMESTAMPTZ NOT NULL DEFAULT now())",
-    )?;
+        )?;
+        transaction.execute(
+            "INSERT INTO platform_schema_migrations(version,name) VALUES (1,'platform-baseline')",
+            &[],
+        )?;
+    }
+    crate::queue::migrate(&mut transaction)?;
     transaction.execute(
-        "INSERT INTO platform_schema_migrations(version,name) VALUES ($1,'platform-baseline')",
-        &[&SCHEMA_VERSION],
+        "INSERT INTO platform_schema_migrations(version,name) VALUES (2,'durable-query-queue')",
+        &[],
     )?;
     transaction.commit()?;
     Ok(MigrationReport {
@@ -351,6 +368,15 @@ pub(crate) fn worker_startup(
 ) -> Result<WorkerStartup> {
     let started = Instant::now();
     check_schema(client)?;
+    let queued_recovered = crate::queue::recover_worker(
+        client,
+        &crate::queue::WorkerEpoch {
+            worker_id: worker_id.to_owned(),
+            boot_id: Uuid::nil(),
+        },
+        rate,
+    )?;
+
     let mut transaction = client.transaction()?;
     timeouts(
         &mut transaction,
@@ -358,7 +384,7 @@ pub(crate) fn worker_startup(
         Duration::from_secs(3),
     )?;
     metering::interrupt_abandoned_history(&mut transaction, worker_id)?;
-    let recovered = metering::recover(&mut transaction, worker_id, rate)?;
+    let recovered = queued_recovered + metering::recover(&mut transaction, worker_id, rate)?;
     transaction.commit()?;
     let report = WorkerStartup {
         recovered,
@@ -589,9 +615,11 @@ fn safe_error(error: &anyhow::Error) -> String {
     }
 }
 
-const ELIGIBLE: &str = "h.accepted_at < now()-($1::INT * interval '1 day') AND h.status <> 'running'
+const ELIGIBLE: &str =
+    "h.accepted_at < now()-($1::INT * interval '1 day') AND h.status <> 'running'
     AND EXISTS(SELECT 1 FROM requests r WHERE r.request_id=h.query_id AND r.state='terminal')
-    AND NOT EXISTS(SELECT 1 FROM reservations s WHERE s.execution_id=h.query_id AND s.state='held')";
+    AND NOT EXISTS(SELECT 1 FROM reservations s WHERE s.execution_id=h.query_id AND s.state='held')
+    AND NOT EXISTS(SELECT 1 FROM query_permits p WHERE p.request_id=h.query_id)";
 
 fn retention(
     client: &mut Client,
@@ -622,6 +650,12 @@ fn retention(
             ),
             &[&days, &config.retention_batch_size],
         )?;
+        transaction.execute("DELETE FROM session_events WHERE open_span_id IN (
+            SELECT open_span_id FROM session_events WHERE COALESCE(closed_at,finished_at,provisioning_started_at)<now()-($1::INT*interval '1 day')
+            AND NOT EXISTS(SELECT 1 FROM queue_sessions s WHERE s.open_span_id=session_events.open_span_id AND s.closed_at IS NULL)
+            ORDER BY COALESCE(closed_at,finished_at,provisioning_started_at),open_span_id LIMIT $2 FOR UPDATE SKIP LOCKED)", &[&days,&config.retention_batch_size])?;
+        transaction.execute("DELETE FROM queue_sessions WHERE session_id IN (SELECT session_id FROM queue_sessions
+            WHERE closed_at<now()-($1::INT*interval '1 day') AND outstanding IS NULL ORDER BY closed_at,session_id LIMIT $2 FOR UPDATE SKIP LOCKED)", &[&days,&config.retention_batch_size])?;
         transaction.execute(
             "UPDATE platform_maintenance_runs SET rows_pruned=rows_pruned+$2 WHERE run_id=$1",
             &[&run_id, &(removed as i64)],
@@ -729,6 +763,19 @@ pub(crate) fn run_claimed(
         transaction.commit()?;
         tasks
     };
+    // Queue expiry is a conditional row transition, safe alongside live worker
+    // control lanes. Charge its work to this pass and cap its slice so an expiry
+    // backlog cannot consume every reconciliation/retention opportunity.
+    let expiry_budget = config
+        .pass_budget
+        .saturating_sub(started.elapsed())
+        .min(Duration::from_secs(1));
+    if let Err(error) = crate::queue::expire_batch(client, 64, expiry_budget) {
+        tracing::warn!(
+            cause = safe_error(&error),
+            "bounded queue expiry pass failed; live control or next maintenance pass will retry"
+        );
+    }
     for task in &tasks {
         let task = task.as_str();
         if started.elapsed() >= config.pass_budget {
@@ -791,6 +838,7 @@ pub(crate) fn maintenance_pass(
     force: bool,
 ) -> Result<PassReport> {
     check_schema(client)?;
+
     let Some(lease) = claim_maintenance(client, owner, config)? else {
         return Ok(PassReport {
             acquired: false,

@@ -17,7 +17,10 @@
       "endpoints": [
         "http://worker-pool-interactive-0:8080"
       ],
-      "max_sessions_per_worker": 32
+      "max_sessions_per_worker": 32,
+      "admission": {
+        "max_running_queries": 4
+      }
     }
   }
 }

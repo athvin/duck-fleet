@@ -4,6 +4,7 @@ cd "$(dirname "$0")/.."
 mkdir -p artifacts
 # Only this Compose project is touched. Volumes deliberately survive the test.
 trap 'result=$?; if [ "$result" -ne 0 ]; then docker compose --profile "*" logs --no-color > artifacts/compose-failure.log 2>&1; fi; exit "$result"' EXIT
+python3 scripts/compute_lifecycle.py check compose
 docker compose --profile test build
 docker compose up -d --wait server
 
@@ -69,6 +70,7 @@ docker compose run --rm api
 docker compose run --rm dbt duckfleet-server --auth-continuity
 docker compose run --rm dbt duckfleet-server --request-identity
 docker compose run --rm dbt duckfleet-server --platform-maintenance
+docker compose run --rm dbt duckfleet-server --queue-storage
 docker compose run --rm dbt duckfleet-server --ownership-loss
 # Ownership loss is terminal for that worker process. Start a fresh owner before
 # the ordinary query/dbt workflow; the gateway's metadata reads stayed available.
@@ -143,6 +145,12 @@ docker compose run --rm --no-deps \
   -e DUCKFLEET_URL=http://server-pools:8080 \
   -e DUCKFLEET_POOL_TEST_FILE=/artifacts/pools-config/compose.json \
   dbt duckfleet-server --pools
+# Includes the single production-length disconnect test; Kind exercises a shorter
+# isolated/cap/recovery subset so CI does not pay for the same long wait twice.
+docker compose run --rm --no-deps \
+  -e DUCKFLEET_URL=http://server-pools:8080 \
+  -e DUCKFLEET_POOL_TEST_FILE=/artifacts/pools-config/compose.json \
+  dbt duckfleet-server --queue
 docker compose --profile pools stop server-pools worker-pool-interactive-0
 unset DUCKFLEET_POOLS_DIRECTORY
 

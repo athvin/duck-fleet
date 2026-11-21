@@ -12,9 +12,36 @@ from worker_resources import assert_worker_resources, quantity_bytes
 # Read from the server rather than restated here: this is the number the drain has to
 # outlast, and a copy of it would be one more thing to keep in step.
 MAX_STATEMENT_SECONDS = int(re.search(
-    r'!\(1\.\.=(\d+)\)\.contains\(&req\.timeout_seconds\)',
-    (Path(__file__).resolve().parents[1] / 'server/src/main.rs').read_text(),
+    r'!\(1\.\.=(\d+)\)\.contains\(&(?:req|self)\.timeout_seconds\)',
+    # Shared query validation replaces main's inline validation in schema 2.
+    '\n'.join(path.read_text() for path in
+              (Path(__file__).resolve().parents[1] / 'server/src').glob('*.rs')),
 ).group(1))
+
+PLATFORM_SCHEMA = re.search(r'SCHEMA_VERSION: i32 = (\d+)',
+    (Path(__file__).resolve().parents[1] / 'server/src/platform.rs').read_text()).group(1)
+
+
+def admission_limits(overrides, defaults=None):
+    merged = dict(defaults or {}, **overrides)
+    assert set(merged) <= {'max_queued_queries', 'max_running_queries',
+                           'max_queued_per_principal', 'max_running_per_principal'}
+    queued = merged.get('max_queued_queries', 256)
+    running = merged.get('max_running_queries', 16)
+    principal_queued = merged.get('max_queued_per_principal', 16)
+    principal_running = merged.get('max_running_per_principal', running)
+    assert all(type(value) is int for value in (queued, running, principal_queued, principal_running))
+    assert 1 <= queued <= 65535 and 1 <= running <= 1024
+    assert 1 <= principal_queued <= queued and 1 <= principal_running <= running
+
+
+def worker_queue_limits(env):
+    for key, minimum, maximum in (
+            ('DUCKFLEET_WORKER_MAX_QUEUED_QUERIES', 1, 4096),
+            ('DUCKFLEET_WORKER_MAX_QUEUED_BYTES', 1048576, 268435456)):
+        value = env[key]
+        assert isinstance(value, str) and value.isascii() and value.isdigit(), (key, value)
+        assert minimum <= int(value) <= maximum
 
 objects = list(yaml.safe_load_all(open(sys.argv[1])))
 by_name = {(o['kind'], o['metadata']['name']): o for o in objects}
@@ -36,6 +63,8 @@ for name, worker in persistent_workers.items():
     assert declared['DUCKFLEET_POOL'] == worker['spec']['template']['metadata']['labels']['duckfleet-pool']
     assert 1 <= int(declared['DUCKFLEET_WORKER_MAX_SESSIONS']) <= 1024
     assert 1 <= int(declared['DUCKFLEET_WORKER_QUEUE_CAPACITY']) <= 4096
+    worker_queue_limits(declared)
+    assert worker['spec']['template']['metadata']['annotations']['duckfleet.io/platform-schema'] == PLATFORM_SCHEMA
     tmp = next(volume['emptyDir'] for volume in pod['volumes'] if volume['name'] == 'tmp')
     assert quantity_bytes(tmp['sizeLimit']) == quantity_bytes(declared['DUCKFLEET_WORKER_DISK'])
     # The worker checks its cgroup against this declaration and refuses to start on a
@@ -132,6 +161,11 @@ assert by_name['Deployment', 'server']['spec']['template']['spec'][
 gateway = next(c for c in by_name['Deployment', 'server']['spec']['template']['spec']['containers']
                if c['name'] == 'gateway')
 gateway_env = {entry['name']: entry.get('value') for entry in gateway['env']}
+assert by_name['Deployment', 'server']['spec']['template']['metadata']['annotations']['duckfleet.io/platform-schema'] == PLATFORM_SCHEMA
+admission = json.loads(gateway_env['DUCKFLEET_ADMISSION_LIMITS_JSON'])
+assert set(admission) <= {'default', 'isolated'}
+for limits in admission.values():
+    admission_limits(limits)
 assert 1 <= int(gateway_env['DUCKFLEET_GATEWAY_MAX_SESSIONS']) <= 4096
 pool_config = by_name.get(('ConfigMap', 'duckfleet-pools'))
 if pool_config:
@@ -141,6 +175,7 @@ if pool_config:
     assert config['default_pool'] in config['pools']
     worker_urls = []
     for pool_name, pool in config['pools'].items():
+        admission_limits(pool.get('admission', {}), admission.get('default'))
         for url in pool['endpoints']:
             host = url.removeprefix('http://').split(':')[0]
             assert host in persistent_workers, f'pool {pool_name} points at missing worker {host}'
@@ -178,6 +213,8 @@ for kind, name in by_name:
             by_name[kind, name]['spec']['template']['spec']['containers'][0]['env'])
 if ('ConfigMap', 'duckfleet-isolated-pod') in by_name:
     session_pod = json.loads(by_name['ConfigMap', 'duckfleet-isolated-pod']['data']['pod.json'])
+    assert session_pod['metadata']['annotations']['duckfleet.io/platform-schema'] == PLATFORM_SCHEMA
+    worker_queue_limits({entry['name']: entry.get('value') for entry in session_pod['spec']['containers'][0]['env']})
     cards['isolated-pod'] = rate_pair(session_pod['spec']['containers'][0]['env'])
 assert len(set(cards.values())) == 1, f'rate cards disagree: {cards}'
 rate_version, rate_value = next(iter(cards.values()))
@@ -204,6 +241,7 @@ if server_deployment['spec']['replicas'] == 0:
 else:
     assert len(migrations) == 1 and migrations[0]['metadata']['name'] == migration_name
     migration = migrations[0]
+    assert migration['metadata']['annotations']['duckfleet.io/platform-schema'] == PLATFORM_SCHEMA
     assert 'helm.sh/hook' not in migration['metadata'].get('annotations', {}), 'migration hooks can deadlock fresh installs'
     pod = migration['spec']['template']['spec']
     assert pod['serviceAccountName'] == 'duckfleet-no-aws'

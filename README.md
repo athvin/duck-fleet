@@ -266,7 +266,7 @@ duckfleet pools
 duckfleet sql 'select 42' --mode persistent --pool interactive --memory 2Gi --placement
 ```
 
-`duckfleet history`, `query <id>`, `request <id>`, `usage`, `budget`, `workers` and `pools`
+`duckfleet history`, `query <id>`, `request <id>`, `cancel <request-id>`, `usage`, `budget`, `workers` and `pools`
 cover inspection. `request <id>` reads durable outcome metadata even after the
 diagnostic history has expired.
 A refusal exits non-zero and prints the server's own classification and `retry_safe`,
@@ -288,11 +288,12 @@ credential from the environment, or a credential it issued; see
 | POST | `/v1/sessions` | Select compute, open a pinned connection; returns `session_id` and placement |
 | GET | `/v1/pools` | Configured persistent pools, allocations, capacity limits and current eligible-worker observations |
 | POST | `/v1/pools/reload` | Validate and reload the operator-configured pool file; bootstrap only |
-| POST | `/v1/sessions/{id}/queries` | Execute SQL; returns an Arrow IPC stream and `x-query-id` |
+| POST | `/v1/sessions/{id}/queries` | Durably admit SQL and await Arrow; reports request ID, status URL and acceptance |
 | DELETE | `/v1/sessions/{id}` | Close connection and roll back any open transaction |
 | POST | `/v1/sessions/{id}/cancel` | Interrupt this session's currently executing statement |
 | GET | `/v1/queries` | Filtered history with cursor pagination; defaults to 500 records |
 | GET | `/v1/queries/{query_id}` | One durable record, metrics, and raw DuckDB profile when available |
+| POST | `/v1/requests/{request_id}/cancel` | Durably request cancellation independently of engine availability; owner or bootstrap |
 | GET | `/v1/requests/{request_id}` | Owner-scoped durable identity, attempt lineage, outcome, and diagnostic availability; bootstrap can inspect all |
 | GET | `/v1/workers` | Every configured worker's state and execution pressure, observed limits, and whether isolated compute is available |
 | GET | `/v1/usage` | Append-only usage events with cursor pagination |
@@ -469,8 +470,11 @@ credential. Session ownership
 stays with the principal; cleanup follows the last admitted credential. Tokens
 for other principals cannot claim that session. An idle session still held by
 the revoked token is closed, even if another token exists for its principal.
-Submitting a replacement-token statement that is still queued does not transfer
-the session yet; if cleanup wins that race, reopen the session after the refusal.
+Successful durable queue acceptance under the replacement token transfers cleanup
+authority immediately, even while SQL waits. Rejected requests do not rotate it.
+Cleanup compares the durable authority generation, so a stale old-token sweep
+cannot close newly accepted replacement-token work. If cleanup closes first, the
+new submission is refused. Execution still requires a fresh credential check.
 Pgwire clients reconnect with the replacement token because their password is
 fixed for the life of a connection.
 
@@ -550,7 +554,8 @@ A query request has this shape:
   "sql": "select ?::integer as answer",
   "parameters": [42],
   "context": {"workload": "example"},
-  "timeout_seconds": 30
+  "timeout_seconds": 30,
+  "queue_timeout_seconds": 10
 }
 ```
 
@@ -571,11 +576,11 @@ same payload returns HTTP 409 `duplicate_request`, including the original
 outcome and `diagnostics_available`; it never executes SQL again. Reusing it with
 a different payload returns 409 `request_id_mismatch`. Results are not cached.
 
-New attempts use the version-2 SHA-256 fingerprint covering exact SQL bytes,
-validated bound parameters (including number types), effective timeout,
+New attempts use the version-3 SHA-256 fingerprint covering exact SQL bytes,
+validated bound parameters (including number types), effective execution and queue timeouts,
 application context, original compute requirements and resolved pool/allocation.
-Version-1 records remain comparable using their historical encoding; a known
-version-1 budget refusal can produce an explicitly linked version-2 retry.
+Version-1 and version-2 records remain comparable using their frozen historical
+encodings; a known historical budget refusal can produce a linked version-3 retry.
 Stored hashes are never rewritten from a replay. JSON object key order is irrelevant;
 array order and value types matter. It excludes attempt IDs, credential IDs,
 worker identity, boot identity and pool-registry revision. It does not fingerprint ambient session or
@@ -596,9 +601,10 @@ retry a refused child by referring to that latest child. The lookup's `retry`
 object describes whether this controlled retry is allowed. Other kinds of
 failure do not become permission to retry through this mechanism.
 
-Identity, diagnostic acceptance, and budget reservation commit together before
-SQL. Terminal identity, diagnostic completion, and usage settlement also commit
-together. `outcome` distinguishes `not_executed`, `statement_result`, and
+Identity, diagnostic acceptance, bounded SQL payload and admission permits commit
+together before the submission becomes accepted. Budget preparation follows when
+the scheduler selects the request. Terminal identity, diagnostic completion, usage
+settlement, payload deletion and permit release commit together. `outcome` distinguishes `not_executed`, `statement_result`, and
 `unknown`. A statement result does not prove an enclosing transaction committed.
 A dropped connection or worker can leave an unknown outcome; inspect durable
 identity, diagnostics if present, and application state before deciding what to
@@ -625,14 +631,55 @@ writers while upgrading before relying on the new fingerprint/retry contract;
 older workers do not implement it. Keep identity records and the usage ledger
 when pruning diagnostic history.
 
-By default each worker queues at most 64 operations and serves at most 32
-sessions; the gateway permits 64 backend sessions across all protocols. These
-limits are configurable as described under persistent pools. Admission that
-exceeds an enforced queue or session limit returns HTTP 429
-with `failure_kind` `capacity`, which is retry-safe because the request is rejected
-before any SQL runs. Sessions idle for
-five minutes are closed by periodic worker housekeeping. Statement execution has a
-30-second default deadline (1–60 seconds allowed); queue time is additional.
+The durable query queue uses the existing platform PostgreSQL database. One
+accepted request may be outstanding per session, including budget preparation
+and settlement; a different simultaneous request receives `409 session_busy`.
+This preserves the actual DuckDB connection, transactions, temporary tables and
+settings. There is no connection migration or statement pipeline.
+
+Queue allowance defaults to 10 seconds (1–120); execution defaults to 30 seconds
+(1–60). Queue time includes scheduling, preparation and final authorization;
+execution time starts at engine entry. Use `--queue-timeout 60` with CLI `sql`
+to select a longer allowance. The synchronous HTTP transport waits at most 75
+seconds. A timeout or disconnect does not cancel accepted work. On an uncertain
+response, inspect `request <id>` or call `cancel <id>`; the CLI retains this ID
+and reports `acceptance: unknown`. Results are not retained for later download.
+
+Parsed query responses carry `x-query-id`, `x-query-status-url` and
+`x-query-acceptance` (`accepted`, `not_accepted`, or `unknown`). Classified JSON
+errors also include `request_id`, `status_url` and `acceptance`. A cancellation
+request is a durable latch; its acknowledgement is distinct from confirmed
+terminal cancellation. Queued cancellation or expiry executes no SQL. Active
+cancellation interrupts the engine and may leave an unknown write outcome.
+
+Defaults bound each worker to 64 queued queries and 16 MiB of payloads, each pool
+to 256 queued and 16 preparing/executing queries, and each principal within a
+pool to 16 queued and the pool's running allowance. PostgreSQL live permits
+coordinate these limits across workers. The worker operation channel remains a
+separate 64-operation bound; session defaults remain 32 per worker and 64 per
+gateway. The pool registry's optional `admission` object overrides
+`max_queued_queries`, `max_running_queries`, `max_queued_per_principal` and
+`max_running_per_principal`; omitted principal running limits inherit the pool
+limit. See [infrastructure configuration](infra/README.md) for environment and
+Helm settings. Queue/session refusals never authorize blind transaction replay.
+
+The scheduler gives continuously eligible principals on one worker equal turns,
+then chooses the oldest queued session request for that principal. Many sessions
+do not buy a principal extra turns. Active SQL is nonpreemptive; affinity and
+shared caps mean this is not a pool-wide latency guarantee. HTTP, pgwire and
+platform SQL use the same admission and scheduling path. The current pgwire
+ReadyForQuery `I` marker is a compatibility limitation, not reliable transaction
+state; native wire CancelRequest remains unsupported. Pgwire notices expose the
+request ID for authenticated HTTP cancellation and inspection.
+
+Shutdown stops admission and scheduling immediately. Queued/preparing requests
+become `queue_drained`, without execution and without replay permission. Only
+already active SQL may finish during the shutdown grace. After ownership-proven
+worker replacement, old queued/preparing work becomes `session_lost`, while
+old executing work retains an unknown interrupted outcome. Isolated recovery
+includes work with no budget reservation and requires confirmation that its pod
+is absent. No request is automatically replayed after a worker or gateway loss.
+
 Responses fail rather than silently truncate beyond 100,000 rows or 16 MiB.
 Each worker has a 1 GiB spill limit and the resource settings listed above.
 These are local resource limits, not billing budgets.
@@ -695,8 +742,10 @@ with no S3 archival yet. SQL, profiles, and errors can contain sensitive
 literals; inline `password=` values in error text are scrubbed before the error
 reaches the caller or the history row, because the engine quotes a caller's
 connection string back verbatim when it fails. This is a single-tenant operational history API, not a customer
-authorization boundary. A `running` record means the worker accepted and began
-the request; queued operations are not yet durable history records.
+authorization boundary. Accepted work has durable `queued`, `preparing`, `executing` and terminal states.
+Queue, selection, engine and terminal timestamps are distinct; historical or
+unobserved timings remain null. Gateway provisioning spans are separate from
+query queue time and are best-effort diagnostics when metadata is unavailable.
 
 History retention is configurable and off by default: `historyRetentionDays: 0`
 keeps everything. With a window set, the gateway coordinates hourly cleanup in
@@ -713,12 +762,12 @@ Workers validate the platform schema and recover only their own stable identity.
 They do not create global tables, aggregate the lifetime usage ledger, or prune
 history. Startup logs report the metadata recovery duration separately from
 DuckDB/catalog initialization. Both workers and the gateway wait up to
-`DUCKFLEET_PLATFORM_WAIT_SECONDS` (default 120) for a missing schema and reject
-unsupported versions with an actionable error.
+`DUCKFLEET_PLATFORM_WAIT_SECONDS` (default 120) for a missing or known older schema and reject
+unsupported future versions with an actionable error.
 
 Deployment runs `DUCKFLEET_ROLE=migrate` using the same binary and `PLATFORM_DSN`.
-This PostgreSQL-only command supports a fresh database and the preceding
-unversioned installation. It adopts existing credentials, request identities,
+This PostgreSQL-only command supports a fresh database, unversioned installations
+and the ordered schema-1 to schema-2 upgrade. It adopts existing credentials, request identities,
 reservations and usage without refilling the budget. Migrations commit their
 version atomically; repeats skip the baseline scans. Quiesce older writers for
 an upgrade and preserve the `platform` database along with the DuckLake catalog.
@@ -729,6 +778,12 @@ and compute can wait for a compatible schema. Deployment helpers check that the
 desired Job completed, including when old pods are still healthy. A failed Job
 prevents rollout success; inspect its logs before retrying. Suspended releases do
 not launch migrations.
+
+Schema-changing upgrades require stopping old gateways and every persistent and
+isolated worker before migration. The deployment guard refuses a live older
+schema; run `bash scripts/stop-compute.sh compose` (or `kube` with an explicit
+context/namespace), then deploy the new image. PostgreSQL, object storage and
+volumes remain available. Same-schema updates need no extra stop.
 
 After restoring or retargeting a database, explicitly rerun migration even when
 the image has not changed:
