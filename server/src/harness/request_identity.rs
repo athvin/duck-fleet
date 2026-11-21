@@ -1,6 +1,6 @@
 //! Durable identity is tested against live SQL, independent diagnostic pruning,
 //! budget changes, and separate workers sharing the same platform database.
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::Method;
@@ -285,6 +285,161 @@ pub(super) async fn checks(ctx: &Ctx) -> Result<()> {
     retained_outcome(ctx, &admin, &dsn).await?;
     budget_attempts(ctx, &admin).await?;
     super::request_upgrade::checks(ctx).await?;
+    Ok(())
+}
+
+/// Compose restarts the worker after this stage. Metadata reads must remain
+/// available through the gateway while the engine exits on lost ownership.
+pub(super) async fn ownership_loss(ctx: &Ctx) -> Result<()> {
+    let dsn = std::env::var("DUCKFLEET_PLATFORM_TEST_DSN")
+        .context("ownership loss checks require fixture metadata access")?;
+    let admin = ctx.client()?;
+    let connection = ctx.open_named("identity-ownership-loss", None).await?;
+    let worker_id = connection.placement["worker_id"]
+        .as_str()
+        .context("ownership fixture worker ID")?
+        .to_owned();
+    let id = uuid::Uuid::new_v4().to_string();
+    let payload = json!({
+        "request_id": id,
+        "sql": "SELECT sum(sqrt(i::DOUBLE)) FROM range(1000000000000) AS t(i)",
+        "timeout_seconds": 60,
+        "context": {"purpose": "live ownership connection loss"}
+    });
+    let path = connection.path();
+    let query_ctx = Ctx {
+        url: ctx.url.clone(),
+        token: ctx.token.clone(),
+    };
+    let query =
+        tokio::spawn(async move { submit(&query_ctx, &query_ctx.token, &path, &payload).await });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(record) = detail(&admin, &id).await
+            && record["state"] == "executing"
+        {
+            break;
+        }
+        require(
+            !query.is_finished(),
+            "ownership fixture SQL finished before termination",
+        )?;
+        require(
+            Instant::now() < deadline,
+            "ownership fixture never reached execution",
+        )?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Executing is persisted just before final auth and DuckDB admission. Give
+    // the aggregate time to enter the engine rather than testing a queued refusal.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    require(
+        !query.is_finished(),
+        "ownership fixture aggregate finished too early",
+    )?;
+    let application = format!("duckfleet-owner/{worker_id}");
+    let killed_pid = metadata(&dsn, move |client| {
+        let owners = client.query(
+            "SELECT pid FROM pg_stat_activity
+             WHERE application_name=$1 AND datname=current_database()
+               AND pid<>pg_backend_pid()",
+            &[&application],
+        )?;
+        require(
+            owners.len() == 1,
+            format!(
+                "expected one production ownership connection for {application}, got {}",
+                owners.len()
+            ),
+        )?;
+        let pid: i32 = owners[0].get(0);
+        let terminated: bool = client
+            .query_one("SELECT pg_terminate_backend($1)", &[&pid])?
+            .get(0);
+        require(
+            terminated,
+            "could not terminate production ownership backend",
+        )?;
+        Ok(pid)
+    })
+    .await?;
+    let response = tokio::time::timeout(Duration::from_secs(20), query)
+        .await
+        .context("ownership heartbeat did not interrupt SQL before its statement deadline")??;
+    println!(
+        "ownership-loss worker={worker_id} backend={killed_pid} request={id} response={response:?}"
+    );
+    let response = response?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let durable = loop {
+        let record = detail(&admin, &id).await?;
+        if record["state"] == "terminal" {
+            break record;
+        }
+        require(
+            Instant::now() < deadline,
+            format!("ownership loss remained nonterminal: {record}"),
+        )?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let usage = request_json(
+        &admin,
+        Method::GET,
+        &format!("/v1/usage?execution_id={id}"),
+        None,
+    )
+    .await?;
+    println!("ownership-loss durable={durable} usage={usage}");
+    require(
+        response.0 >= 400
+            && matches!(
+                response.1["failure_kind"].as_str(),
+                Some("interrupted" | "unavailable")
+            )
+            && response.1["retry_safe"] == false,
+        format!("ownership loss was not a non-retryable failure: {response:?}"),
+    )?;
+    require(
+        durable["status"] == "interrupted"
+            && durable["failure_kind"] == "interrupted"
+            && durable["outcome"] == "unknown"
+            && durable["retry_safe"] == false,
+        format!("live ownership loss invented a known or replay-safe outcome: {durable}"),
+    )?;
+    require(
+        usage["events"]
+            .as_array()
+            .is_some_and(|events| events.len() == 1)
+            && usage["events"][0]["source"] == "worker"
+            && usage["events"][0]["quantity"]
+                .as_i64()
+                .is_some_and(|elapsed| elapsed > 0),
+        format!("live ownership loss did not settle exactly once on the worker: {usage}"),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let fleet = request_json(&admin, Method::GET, "/v1/workers", None).await?;
+        let workers = fleet["workers"].as_array().context("worker inventory")?;
+        if workers
+            .iter()
+            .find(|worker| worker["worker_id"] == worker_id)
+            .is_none_or(|worker| worker["ready"] == false)
+        {
+            break;
+        }
+        require(
+            Instant::now() < deadline,
+            format!("worker remained ready after ownership loss: {fleet}"),
+        )?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    require(
+        event_count(&admin, &id).await? == 1,
+        "ownership loss created duplicate settlement",
+    )?;
+    println!(
+        "PASS: ownership heartbeat interrupts live SQL, stops worker readiness, and records one non-retryable unknown outcome"
+    );
     Ok(())
 }
 

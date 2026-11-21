@@ -52,8 +52,18 @@ pub(super) async fn checks(_ctx: &Ctx) -> Result<()> {
 
 fn ownership_checks(config: &postgres::Config, worker_id: &str) -> Result<()> {
     use crate::worker_ownership::Guard;
-    let owner =
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let mut owner =
         Guard::try_claim(config.connect(NoTls)?, worker_id)?.context("first worker owner")?;
+    let normal_callbacks = Arc::new(AtomicUsize::new(0));
+    let notified = normal_callbacks.clone();
+    owner.on_loss(move || {
+        notified.fetch_add(1, Ordering::SeqCst);
+    });
     require(
         Guard::try_claim(config.connect(NoTls)?, worker_id)?.is_none(),
         "replacement worker recovered while the previous process still owned its identity",
@@ -67,7 +77,19 @@ fn ownership_checks(config: &postgres::Config, worker_id: &str) -> Result<()> {
         !owner.is_closed(),
         "live worker ownership reported disconnected",
     )?;
+    // No calls to check while this thread is busy: the independent heartbeat
+    // must keep a healthy worker's lock alive beyond the server's 10s idle limit.
+    std::thread::sleep(Duration::from_secs(11));
+    require(owner.check(), "ownership expired while its worker was busy")?;
+    require(
+        Guard::try_claim(config.connect(NoTls)?, worker_id)?.is_none(),
+        "replacement acquired an identity whose independent heartbeat was healthy",
+    )?;
     drop(owner);
+    require(
+        normal_callbacks.load(Ordering::SeqCst) == 0,
+        "normal ownership drop invoked the terminal-loss callback",
+    )?;
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
         if Guard::try_claim(config.connect(NoTls)?, worker_id)?.is_some() {
@@ -83,6 +105,11 @@ fn ownership_checks(config: &postgres::Config, worker_id: &str) -> Result<()> {
     guarded_config.application_name(worker_id);
     let mut lost = Guard::try_claim(guarded_config.connect(NoTls)?, worker_id)?
         .context("worker owner before forced disconnect")?;
+    let loss_callbacks = Arc::new(AtomicUsize::new(0));
+    let notified = loss_callbacks.clone();
+    lost.on_loss(move || {
+        notified.fetch_add(1, Ordering::SeqCst);
+    });
     let mut admin = config.connect(NoTls)?;
     let pid: i32 = admin
         .query_one(
@@ -95,11 +122,86 @@ fn ownership_checks(config: &postgres::Config, worker_id: &str) -> Result<()> {
         !lost.check() && lost.is_closed() && !lost.check(),
         "disconnected ownership was not permanently refused",
     )?;
+    let callback_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while loss_callbacks.load(Ordering::SeqCst) == 0 {
+        require(
+            std::time::Instant::now() < callback_deadline,
+            "ownership loss did not notify the worker",
+        )?;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(lost);
+    require(
+        loss_callbacks.load(Ordering::SeqCst) == 1,
+        "ownership loss callback ran more than once",
+    )?;
     require(
         Guard::try_claim(config.connect(NoTls)?, worker_id)?.is_some(),
         "replacement could not acquire a terminated backend's identity",
     )?;
-    println!("PASS: overlapping worker identities cannot recover a live predecessor's requests");
+
+    // Expire a server session without dropping or polling its client object.
+    // This reproduces a dead pod whose TCP connection has not been reaped yet.
+    let orphan_id = format!("{worker_id}-orphan");
+    let mut orphan = config.connect(NoTls)?;
+    orphan.batch_execute("SET statement_timeout=3000; SET idle_session_timeout=500")?;
+    require(
+        orphan
+            .query_one(
+                "SELECT pg_try_advisory_lock(4283122,hashtext($1))",
+                &[&orphan_id],
+            )?
+            .get(0),
+        "orphan fixture could not claim its identity",
+    )?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let replacement = loop {
+        if let Some(guard) = Guard::try_claim(config.connect(NoTls)?, &orphan_id)? {
+            break guard;
+        }
+        require(
+            std::time::Instant::now() < deadline,
+            "server idle expiry did not release the orphaned advisory lock",
+        )?;
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    require(
+        orphan.query_one("SELECT 1", &[]).is_err(),
+        "orphan was replaced before its old server session expired",
+    )?;
+    drop(replacement);
+
+    // A connection can fail between acquiring ownership and installing the
+    // worker callback. Late registration must immediately observe sticky loss.
+    let late_id = format!("{worker_id}-late");
+    guarded_config.application_name(&late_id);
+    let mut late = Guard::try_claim(guarded_config.connect(NoTls)?, &late_id)?
+        .context("owner before late callback registration")?;
+    let pid: i32 = admin
+        .query_one(
+            "SELECT pid FROM pg_stat_activity WHERE application_name=$1",
+            &[&late_id],
+        )?
+        .get(0);
+    admin.query_one("SELECT pg_terminate_backend($1)", &[&pid])?;
+    require(!late.check(), "terminated owner passed a fresh probe")?;
+    let late_callbacks = Arc::new(AtomicUsize::new(0));
+    let notified = late_callbacks.clone();
+    late.on_loss(move || {
+        notified.fetch_add(1, Ordering::SeqCst);
+    });
+    require(
+        late_callbacks.load(Ordering::SeqCst) == 1 && !late.check(),
+        "already-lost ownership did not notify a late callback exactly once",
+    )?;
+    drop(late);
+    require(
+        late_callbacks.load(Ordering::SeqCst) == 1,
+        "dropping an already-lost owner repeated its notification",
+    )?;
+    println!(
+        "PASS: independent ownership heartbeats survive long work, orphan sessions expire, and loss callbacks fire exactly once"
+    );
     Ok(())
 }
 

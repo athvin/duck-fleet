@@ -75,6 +75,8 @@ pub async fn run(args: Vec<String>) -> i32 {
         request_identity::checks(&ctx).await
     } else if has("--request-identity-concurrent") {
         request_identity::concurrent(&ctx).await
+    } else if has("--ownership-loss") {
+        request_identity::ownership_loss(&ctx).await
     } else if has("--dbt-isolated") {
         dbt_isolated_checks(&ctx).await
     } else if has("--cold-start") {

@@ -503,8 +503,11 @@ uncertainty for that worker's unfinished attempts and leaves other workers alone
 Before recovery, each worker holds an exclusive PostgreSQL advisory lock for its
 stable identity on a dedicated connection. A replacement waits while its
 predecessor drains, including replacements caused by deleting a Kubernetes pod.
-Losing that ownership connection stops further admission and exits the worker;
-it is not silently reacquired. An in-flight write can still have an unknown
+A separate heartbeat runs every two seconds throughout SQL execution; PostgreSQL's
+ten-second idle-session timeout releases abandoned ownership connections even
+when a dead pod's socket is not promptly reaped. Losing ownership interrupts active
+SQL, stops further admission and exits the worker; it is not silently reacquired.
+An in-flight write can still have an unknown
 outcome when database connectivity or the process is lost. This lock does not
 provide distributed transaction fencing during a network partition.
 

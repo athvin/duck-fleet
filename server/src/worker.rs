@@ -13,7 +13,10 @@ use postgres::{Client, NoTls};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -38,11 +41,31 @@ pub(crate) fn interrupt(
         && session.is_none_or(|id| current.session == id)
         && query.is_none_or(|id| current.query == id)
     {
-        current.reason = Some(reason);
+        // Lost ownership is terminal even if a caller or deadline subsequently
+        // interrupts the same statement. Its commit outcome must stay unknown.
+        if current.reason != Some("ownership_lost") {
+            current.reason = Some(reason);
+        }
         current.handle.interrupt();
         return true;
     }
     false
+}
+
+fn lose_ownership(ready: &AtomicBool, lost: &AtomicBool, active: &ActiveSlot) {
+    lost.store(true, Ordering::Release);
+    ready.store(false, Ordering::Release);
+    interrupt(active, None, None, "ownership_lost");
+}
+
+fn execution_failure(error: Option<&str>, reason: Option<&str>) -> Option<failure::Failure> {
+    if reason == Some("ownership_lost") {
+        // Even an engine success racing with ownership loss is uncertain: a
+        // replacement may already have begun recovering this process's work.
+        Some(failure::INTERRUPTED)
+    } else {
+        error.map(|message| failure::classify(message, reason))
+    }
 }
 
 struct Session {
@@ -307,10 +330,23 @@ struct Ledger {
     /// so a worker that could execute nothing still answered 200 and kept receiving
     /// traffic that could only fail.
     ready: Arc<std::sync::atomic::AtomicBool>,
+    ownership_lost: Arc<AtomicBool>,
     redactor: Redactor,
 }
 
 impl Ledger {
+    fn restore_readiness(&self) {
+        if self.ownership_lost.load(Ordering::Acquire) {
+            return;
+        }
+        self.ready.store(true, Ordering::Release);
+        // A metadata reconnect cannot reverse the separate ownership connection's
+        // terminal loss. Recheck after publishing so a concurrent callback wins.
+        if self.ownership_lost.load(Ordering::Acquire) {
+            self.ready.store(false, Ordering::Release);
+        }
+    }
+
     /// Credential reads fail closed and reconnect once only for a lost socket.
     /// A statement timeout is already a complete bounded refusal, not a reason
     /// to retry a credential-table lock and double the admission delay.
@@ -344,7 +380,7 @@ impl Ledger {
                     &format!("{error:#}"),
                 )
             })?;
-        self.ready.store(true, std::sync::atomic::Ordering::Release);
+        self.restore_readiness();
         credentials::resolve_ids(&mut self.client, ids)
             .map_err(|error| self.credential_unavailable(&format!("{error:#}")))
     }
@@ -395,7 +431,7 @@ impl Ledger {
                 self.client = client;
                 // An earlier failure may have taken this worker out of service; a
                 // working connection is what makes it serviceable again.
-                self.ready.store(true, std::sync::atomic::Ordering::Release);
+                self.restore_readiness();
                 tracing::info!(step, "ledger connection replaced");
                 match self.client.execute(sql, params) {
                     Ok(rows) => Ok(rows),
@@ -622,7 +658,13 @@ impl Worker {
                 )
             },
         )?;
-        let ownership = crate::worker_ownership::Guard::acquire(&platform_dsn, &worker_id, wait)?;
+        let mut ownership =
+            crate::worker_ownership::Guard::acquire(&platform_dsn, &worker_id, wait)?;
+        let ownership_lost = Arc::new(AtomicBool::new(false));
+        let loss_ready = ready.clone();
+        let loss_active = active.clone();
+        let loss_latch = ownership_lost.clone();
+        ownership.on_loss(move || lose_ownership(&loss_ready, &loss_latch, &loss_active));
         let mut transaction = ledger.transaction()?;
         transaction.batch_execute("SELECT pg_advisory_xact_lock(4283121);
             CREATE TABLE IF NOT EXISTS query_history (
@@ -670,6 +712,10 @@ impl Worker {
         if recovered > 0 {
             tracing::warn!(recovered, "settled reservations abandoned by a restart");
         }
+        anyhow::ensure!(
+            ownership.check(),
+            "exclusive worker ownership was lost during startup"
+        );
         Ok(Self {
             root,
             worker_id,
@@ -686,6 +732,7 @@ impl Worker {
                 client: ledger,
                 dsn: platform_dsn,
                 ready,
+                ownership_lost,
                 redactor: redactor.clone(),
             },
             sessions: HashMap::new(),
@@ -710,6 +757,12 @@ impl Worker {
     }
 
     pub(crate) fn run(&mut self, mut receiver: mpsc::Receiver<Envelope>) {
+        // Main publishes readiness after construction. A heartbeat can fail in
+        // that narrow interval, so do not begin even maintenance after a loss.
+        if self.ownership.is_closed() {
+            self.ledger.ready.store(false, Ordering::Release);
+            return;
+        }
         // Startup drains any backlog the hourly sweeps missed while this worker was
         // down; afterwards one bounded batch per hour keeps up with new expiry
         // without ever holding the engine's queue behind a long delete.
@@ -729,6 +782,7 @@ impl Worker {
                 Err(_) => {
                     self.housekeeping();
                     if self.ownership.is_closed() {
+                        self.ledger.ready.store(false, Ordering::Release);
                         break;
                     }
                     last_housekeeping = Instant::now();
@@ -755,6 +809,7 @@ impl Worker {
             drop(query_guard);
             let _ = reply.send(response);
             if self.ownership.is_closed() {
+                self.ledger.ready.store(false, Ordering::Release);
                 break;
             }
             if last_housekeeping.elapsed() >= HOUSEKEEPING_INTERVAL {
@@ -1141,14 +1196,32 @@ impl Worker {
             .sessions
             .get_mut(&id)
             .expect("validated session remains on the sole worker thread");
+        let executing = {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            // Credential validation can wait too. Check the local loss latch while
+            // publishing Active: a concurrent loss either refuses admission here
+            // or sees this slot and interrupts it. No database wait follows auth.
+            if self.ownership.is_closed() {
+                false
+            } else {
+                *active = Some(Active {
+                    query: req.request_id,
+                    session: id,
+                    handle: session.conn.interrupt_handle(),
+                    reason: None,
+                });
+                true
+            }
+        };
+        if !executing {
+            let refusal = self.ledger.unserviceable(
+                "worker ownership",
+                "exclusive ownership connection lost before execution",
+            );
+            return self.abort_admission(&admission, &req.context, refusal);
+        }
         let cleared = session.profile.clear();
         let started = Instant::now();
-        *self.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(Active {
-            query: req.request_id,
-            session: id,
-            handle: session.conn.interrupt_handle(),
-            reason: None,
-        });
         let active = self.active.clone();
         // One timer enforces both limits, because a cost cap is just a shorter
         // deadline. Which limit bound it decides how the stop is reported.
@@ -1163,12 +1236,15 @@ impl Worker {
             interrupt(&active, None, Some(request_id), deadline_reason);
         });
         let result = execute(&session.conn, &req.sql, parameters);
-        let reason = self
+        let mut reason = self
             .active
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .and_then(|a| a.reason);
+        if self.ownership.is_closed() {
+            reason = Some("ownership_lost");
+        }
         deadline.abort();
         session.touched = Instant::now();
         let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -1179,15 +1255,18 @@ impl Worker {
         // masks the platform's own credentials; the generic pass masks the ones it
         // cannot know — a caller's connection string quoted back by the engine must
         // not put a live password into a durable history row.
-        let error = result
+        let mut error = result
             .as_ref()
             .err()
             .map(|e| crate::secrets::scrub_passwords(&self.redactor.scrub(&format!("{e:#}"))));
+        if reason == Some("ownership_lost") {
+            error = Some(
+                "worker ownership lost; commit outcome may be unknown, do not blindly retry".into(),
+            );
+        }
         // A timer racing with a completed statement must not imply the write rolled
         // back, so an interruption reason outranks whatever the engine reported.
-        let failure = error
-            .as_deref()
-            .map(|message| failure::classify(message, reason));
+        let failure = execution_failure(error.as_deref(), reason);
         let status = failure.and_then(|f| f.status).unwrap_or(if result.is_ok() {
             "succeeded"
         } else {
@@ -1229,6 +1308,12 @@ impl Worker {
             ));
         }
         tracing::info!(query_id, session_id = %id, status, elapsed_ms = elapsed, "query finished");
+        if reason == Some("ownership_lost") {
+            return Err(ApiError::new(
+                failure::INTERRUPTED,
+                error.unwrap_or_else(|| "worker ownership lost; commit outcome unknown".into()),
+            ));
+        }
         result
             .map(|(bytes, _)| Output::Arrow(bytes, req.request_id))
             // Reuses the scrubbed text, so the caller and history never disagree.
@@ -1285,6 +1370,35 @@ fn execute(conn: &Connection, sql: &str, parameters: Vec<SqlValue>) -> Result<(V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_loss_stops_readiness_and_outranks_later_interrupts() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        let ready = AtomicBool::new(true);
+        let lost = AtomicBool::new(false);
+        let active = Arc::new(Mutex::new(Some(Active {
+            query: Uuid::new_v4(),
+            session: Uuid::new_v4(),
+            handle: connection.interrupt_handle(),
+            reason: None,
+        })));
+        lose_ownership(&ready, &lost, &active);
+        assert!(!ready.load(Ordering::Acquire));
+        assert!(lost.load(Ordering::Acquire));
+        for reason in ["canceled", "timed_out", "budget_exceeded"] {
+            assert!(interrupt(&active, None, None, reason));
+        }
+        let reason = active.lock().unwrap().as_ref().unwrap().reason;
+        assert_eq!(reason, Some("ownership_lost"));
+        // Ownership loss racing with either a successful result or a conflict
+        // cannot become success or a retry-safe transaction conflict.
+        for error in [None, Some("Transaction conflict: concurrent write")] {
+            let failure = execution_failure(error, reason).unwrap();
+            assert_eq!(failure, failure::INTERRUPTED);
+            assert!(!failure.retry_safe);
+        }
+        Ok(())
+    }
 
     fn named_identity(principal: &str) -> Identity {
         Identity {
