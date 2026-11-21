@@ -1,33 +1,26 @@
 # DuckFleet AWS development harness
 
 Status: **tested on AWS.** The AWS development harness — publish, deploy, live
-dbt run, suspend — passed on main for `5808e99`, which required the
-[shared-platform bootstrap](https://github.com/athvin/entity-resolution-engine/issues/1082)
-to be applied first. Docker and mock-provider tests remain the credential-free
-pull-request gates; only main touches AWS.
+dbt run, suspend — passed on main for `5808e99` after the platform bootstrap.
+Docker and mock-provider tests remain the credential-free pull-request gates;
+only main touches AWS.
 
-The deploy target is configuration, named once in `scripts/aws/target.env` and read
-from there by the operator scripts and by CI, so moving it is a change to that file
-rather than to a script, a workflow and this runbook. A test fails the build if the
-cluster is named anywhere else.
+The deploy target is configuration in `scripts/aws/target.env`, read by operator
+scripts and CI. Set `DUCKFLEET_CLUSTER` and `DUCKFLEET_KUBE_CONTEXT` explicitly for
+local cluster operations; `KUBE_CONTEXT` is also accepted. Select an AWS profile
+with `AWS_PROFILE` or `DUCKFLEET_AWS_PROFILE`, or use the normal AWS credential chain.
+There is no default cluster, context, or operator profile. In GitHub Actions, set
+the repository variable `DUCKFLEET_CLUSTER`; CI creates its own explicit context.
+Missing cluster configuration fails before cluster operations. These settings
+select an existing cluster; they do not provision or migrate one.
 
-Today it resolves to the namespace `duckfleet-dev` on the shared entity-resolution
-development EKS Auto Mode cluster, in account `797781631727`, region `us-east-2`.
-This adds an AWS test lane alongside Docker Compose. DuckFleet owns its S3 bucket,
-image repositories, and now its **Terraform state bucket** (#12 moved the state out
-of the entity-resolution bucket it used to borrow a key within); the cluster,
-networking, node pools, and `gp3` StorageClass are owned by the ER platform. The AWS
-account, cluster capacity, and bill are shared.
-
-That sharing is a real constraint rather than a detail. Capacity is not ours to
-grant, and it has already blocked two capabilities: 2-CPU worker scheduling
-(entity-resolution-engine#1086) and the pod-create RBAC that isolated compute needs
-(#39, both now resolved — the ownership boundary grants the RBAC and a DuckFleet node
-pool provides the capacity). What remains shared is the cluster itself, which #12
-accepted rather than removed: DuckFleet owns a namespace on it, its own node pool,
-and now its own Terraform state, so ER can no longer block its RBAC, capacity, or
-state — the dependencies that mattered — without DuckFleet taking on a standing
-cluster bill for a lane that is idle most of the time.
+The development lane uses the namespace `duckfleet-dev`, account `797781631727`,
+and region `us-east-2`. DuckFleet owns its S3 bucket, image repositories, Terraform
+state bucket, and dedicated node pool. On a shared EKS Auto Mode cluster, the
+control plane, networking, NodeClass, and `gp3` StorageClass remain operator-owned.
+The ownership boundary supplies pod-create RBAC and capacity for 2-CPU workers
+(#39). Shared-cluster upgrades and outages still affect this lane; the dedicated
+cluster module below is an optional alternative.
 
 | Boundary | DuckFleet resource |
 | --- | --- |
@@ -43,7 +36,7 @@ The smallest test uses two **prestarted pods**, 1 CPU / 1 GiB and 2 CPU / 2 GiB,
 with DuckDB limits of 1 thread / 512 MiB and 2 threads / 1 GiB. The adapter routes
 whole model lifecycles to these workers. They may share an EC2 node. This does
 **not** test dynamic EC2 instance creation, dedicated nodes, or 32 CPU workers.
-PostgreSQL is separate from ER's Aurora databases for this disposable experiment.
+PostgreSQL is dedicated to this disposable experiment.
 This is not a production database/backup/HA design.
 
 The account, bucket, and region above are *this* lane's, not the chart's. The Helm
@@ -271,7 +264,7 @@ the cluster converges. Keep the plan output if it fails.
 
 ## Moving Terraform state to a bucket DuckFleet owns
 
-Done (#12): state lived under a key inside an entity-resolution bucket and now lives
+Done (#12): state lived under a key inside a shared bucket and now lives
 in `duckfleet-terraform-state-797781631727`, which DuckFleet owns outright. The
 location is configuration (`DUCKFLEET_STATE_BUCKET`, `DUCKFLEET_STATE_KEY`) taken
 through `-backend-config`, so the bucket is named in the same one place as the rest
@@ -319,16 +312,16 @@ These checks cannot establish EKS network-policy enforcement or IAM correctness.
 
 ## Bootstrap and CI deployment
 
-The shared-platform repository owns `duckfleet-ci-dev`, worker IAM and Pod
-Identity, EKS access, and the `duckfleet-dev` namespace, security labels, quota and
-RBAC. Its Terraform CI and cluster-objects workflow apply that bootstrap. These
-resources have never been in DuckFleet's remote state; moving their definitions
-before the first apply needs no state migration. Do not import them here later.
+Cluster operators provision `duckfleet-ci-dev`, worker IAM and Pod Identity,
+and EKS access. The operator-applied boundary in `infra/kubernetes/boundary`
+establishes the `duckfleet-dev` namespace, security labels, quota, RBAC, and
+node pool. The deployment identity cannot grant these permissions to itself.
+Keep operator-owned resources out of the deployment's Terraform state.
 
 The CI role trusts only the immutable `athvin/duck-fleet` repository identity on
 `main`. It can manage the dedicated bucket and two repositories, read/write only
 `duckfleet/dev.tfstate`, and delete only its lock file. It cannot write IAM/EKS,
-read ER state or secrets, change namespace security/quota/RBAC, or deploy into ER
+read unrelated state or secrets, change namespace security/quota/RBAC, or deploy into unrelated
 namespaces. Kubernetes application credentials remain privileged within the
 trusted DuckFleet development namespace; this is not customer SQL isolation.
 

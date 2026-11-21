@@ -17,7 +17,7 @@ python3 scripts/aws/check-dns-egress.py "$DUCKFLEET_CLUSTER" "$AWS_REGION"
 # rule written against the Service address matches nothing once kube-proxy has
 # rewritten the destination; see #32.
 python3 scripts/aws/check-api-egress.py "$KUBE_CONTEXT"
-# Require the existing EKS Auto Mode storage class, never change ER cluster objects.
+# Require the existing EKS Auto Mode storage class, never change shared cluster objects.
 [[ $("${KUBE[@]}" get storageclass gp3 -o jsonpath='{.provisioner}') == ebs.csi.eks.amazonaws.com ]] || {
   echo 'Expected Auto Mode gp3 storage class is unavailable' >&2; exit 1;
 }
