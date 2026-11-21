@@ -411,8 +411,15 @@ DUCKFLEET_KUBE_CONTEXT="$CONTEXT" DUCKFLEET_NAMESPACE="$NS" \
   bash scripts/backup-catalog.sh kube "$work/catalog-backup"
 for database in lake platform; do
   test -s "$work/catalog-backup/$database.dump"
-  "${KUBE[@]}" exec -i statefulset/duckfleet-postgres -- pg_restore --list \
-    < "$work/catalog-backup/$database.dump" > /dev/null
+  # pg_restore --list reads only the archive header/table of contents. With a
+  # larger scale fixture it can exit while kubectl is still streaming stdin,
+  # leaving exec blocked. Receive the full archive before inspecting it.
+  "${KUBE[@]}" exec -i statefulset/duckfleet-postgres -- sh -ec '
+    archive=$(mktemp)
+    trap "rm -f \"$archive\"" EXIT
+    cat > "$archive"
+    pg_restore --list "$archive"
+  ' < "$work/catalog-backup/$database.dump" > /dev/null
 done
 echo 'PASS: the kube backup produced restorable archives for both databases'
 
