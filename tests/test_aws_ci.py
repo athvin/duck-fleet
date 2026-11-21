@@ -1330,7 +1330,11 @@ class DatabaseRolePackagingTests(unittest.TestCase):
                 with self.assertRaises(subprocess.CalledProcessError) as error:
                     chart(['--set-json', key+'='+json.dumps(value)])
                 self.assertIn('schema', error.exception.stderr)
-                self.assertIn(error_path, error.exception.stderr)
+                # Helm validators render the same path as dotted properties or
+                # a JSON pointer, depending on the installed Helm version.
+                paths = (error_path, '/' + error_path.replace('.', '/'))
+                self.assertTrue(any(path in error.exception.stderr for path in paths),
+                                error.exception.stderr)
         chart(['--set-json', 'databaseRoles='+json.dumps({
             part: 'fixture_'+part for part in ('migrator','gateway','worker','maintainer','catalog')})])
 
