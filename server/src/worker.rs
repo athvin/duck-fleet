@@ -198,6 +198,23 @@ fn connection_pending(message: &str) -> bool {
     PENDING.iter().any(|pending| message.contains(pending))
 }
 
+/// The PostgreSQL catalog can race when multiple workers create a fresh lake.
+/// Only the observed metadata-table/type collision is retried, and only by the
+/// pre-readiness ATTACH caller. Other DDL, migrations, and user SQL stay fatal.
+fn catalog_attach_pending(message: &str) -> bool {
+    if connection_pending(message) {
+        return true;
+    }
+    let message = message.to_ascii_lowercase();
+    message.contains("failed to initialize ducklake:")
+        && message.contains(r#"failed to execute query "create table "#)
+        && message.contains(r#""."ducklake_metadata"("#)
+        && message.contains(
+            r#"duplicate key value violates unique constraint "pg_type_typname_nsp_index""#,
+        )
+        && message.contains("key (typname, typnamespace)=(ducklake_metadata,")
+}
+
 /// Retries an attempt that cannot succeed until a dependency is listening.
 ///
 /// DNS and PostgreSQL can both be unready when a pod starts. Exiting makes the
@@ -207,6 +224,16 @@ fn retrying<T>(
     what: &str,
     host: &str,
     budget: Duration,
+    attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    retrying_if(what, host, budget, connection_pending, attempt)
+}
+
+fn retrying_if<T>(
+    what: &str,
+    host: &str,
+    budget: Duration,
+    retryable: fn(&str) -> bool,
     mut attempt: impl FnMut() -> Result<T>,
 ) -> Result<T> {
     let deadline = Instant::now() + budget;
@@ -217,7 +244,7 @@ fn retrying<T>(
             Err(error) => error,
         };
         let cause = format!("{error:#}");
-        if !connection_pending(&cause) {
+        if !retryable(&cause) {
             return Err(error);
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -565,10 +592,11 @@ impl Worker {
             literal(&format!("ducklake:postgres:{catalog_dsn}")),
             literal(&required("S3_DATA_PATH")?)
         );
-        retrying(
+        retrying_if(
             "DuckLake catalog",
             &crate::secrets::dsn_host(&catalog_dsn),
             wait.saturating_sub(catalog_started.elapsed()),
+            catalog_attach_pending,
             || startup.run("attaching the DuckLake catalog", &attach),
         )?;
         // Keep real Parquet objects in the harness, even for tiny seed data.
@@ -1404,6 +1432,82 @@ mod tests {
         ] {
             assert!(!connection_pending(fatal), "should not wait: {fatal}");
         }
+    }
+
+    const CATALOG_INIT_COLLISION: &str = r#"attaching the DuckLake catalog: Invalid Error: Failed to initialize DuckLake: Failed to execute query "CREATE TABLE "public"."ducklake_metadata"("key" VARCHAR NOT NULL, "value" VARCHAR NOT NULL, "scope" VARCHAR, "scope_id" BIGINT);": ERROR: duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+DETAIL: Key (typname, typnamespace)=(ducklake_metadata, 2200) already exists."#;
+
+    #[test]
+    fn catalog_retry_requires_the_observed_initialization_collision() {
+        assert!(catalog_attach_pending(CATALOG_INIT_COLLISION));
+        assert!(!connection_pending(CATALOG_INIT_COLLISION));
+        for fatal in [
+            CATALOG_INIT_COLLISION.replace(
+                "Failed to initialize DuckLake:",
+                "Failed to commit DuckLake transaction:",
+            ),
+            CATALOG_INIT_COLLISION.replace("CREATE TABLE", "ALTER TABLE"),
+            CATALOG_INIT_COLLISION.replace("ducklake_metadata", "customer_data"),
+            CATALOG_INIT_COLLISION.replace("pg_type_typname_nsp_index", "customer_data_pkey"),
+            CATALOG_INIT_COLLISION.replace(
+                "duplicate key value violates unique constraint",
+                "permission denied for relation",
+            ),
+            "Failed to initialize DuckLake: password authentication failed".into(),
+            "Failed to initialize DuckLake: database lake does not exist".into(),
+            "Failed to initialize DuckLake: current transaction is aborted".into(),
+            "duplicate key value violates unique constraint pg_type_typname_nsp_index".into(),
+        ] {
+            assert!(!catalog_attach_pending(&fatal), "must not replay: {fatal}");
+        }
+    }
+
+    #[test]
+    fn only_startup_attach_retries_a_catalog_creation_collision() -> Result<()> {
+        let mut attempts = 0;
+        let ready = retrying_if(
+            "DuckLake catalog",
+            "postgres",
+            Duration::from_secs(2),
+            catalog_attach_pending,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    anyhow::bail!(CATALOG_INIT_COLLISION);
+                }
+                Ok("attached")
+            },
+        )?;
+        assert_eq!((ready, attempts), ("attached", 2));
+        let mut ordinary_attempts = 0;
+        let error = retrying(
+            "catalog connection",
+            "postgres",
+            Duration::from_secs(2),
+            || -> Result<()> {
+                ordinary_attempts += 1;
+                anyhow::bail!(CATALOG_INIT_COLLISION)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(ordinary_attempts, 1);
+        assert!(error.to_string().contains("Failed to initialize DuckLake"));
+        let mut expired_attempts = 0;
+        assert!(
+            retrying_if(
+                "DuckLake catalog",
+                "postgres",
+                Duration::ZERO,
+                catalog_attach_pending,
+                || -> Result<()> {
+                    expired_attempts += 1;
+                    anyhow::bail!(CATALOG_INIT_COLLISION)
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(expired_attempts, 1);
+        Ok(())
     }
 
     #[test]
