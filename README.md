@@ -577,6 +577,7 @@ stopped by a deadline may still have committed.
 | `unknown_session` | 404 | no | The session expired or was closed; open a new one |
 | `not_found` | 404 | no | No such history record |
 | `duplicate_request` | 409 | no | This `request_id` was already accepted; inspect its history record |
+| `no_ready_worker` | 503 | yes | Discovery could not find available compute; no session open was forwarded. New-session clients may wait for recovery |
 | `unavailable` | 503 | no | A worker or the history database was unreachable mid-request |
 | `interrupted` | — | no | Recorded at worker startup for its own unfinished records; never an HTTP response |
 

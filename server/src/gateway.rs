@@ -446,6 +446,7 @@ impl Gateway {
                 && report["memory_bytes"].as_u64() == Some(wanted.memory_bytes);
             let refusal = match report["state"].as_str() {
                 Some("draining") if matching => Some(failure::DRAINING),
+                Some("unavailable") if matching => Some(failure::NO_READY_WORKER),
                 Some("starting") if matching || report.get("cpu").is_none() => {
                     Some(failure::STARTING)
                 }
@@ -480,9 +481,9 @@ impl Gateway {
             )
         } else {
             ApiError::new(
-                failure::UNAVAILABLE,
+                failure::NO_READY_WORKER,
                 format!(
-                    "a worker serving cpu={}, memory={} is not reachable; no statement ran",
+                    "no reachable worker serves cpu={}, memory={}; no session was opened and no statement ran",
                     wanted.cpu,
                     wanted.memory()
                 ),
@@ -1729,6 +1730,20 @@ mod tests {
         assert!(error.0.retry_safe);
         assert_eq!(server.opens.load(Ordering::SeqCst), 0);
 
+        // A rollout can temporarily remove every Service endpoint between the
+        // draining process and its replacement. This is still pre-admission.
+        server.reply.lock().await.0 = StatusCode::SERVICE_UNAVAILABLE;
+        *app.fleet.lock().await = None;
+        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        assert_eq!(error.0.kind, "no_ready_worker");
+        assert!(error.0.retry_safe);
+        assert_eq!(server.opens.load(Ordering::SeqCst), 0);
+        *server.reply.lock().await = (StatusCode::OK, status("unavailable"));
+        *app.fleet.lock().await = None;
+        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        assert_eq!(error.0.kind, "no_ready_worker");
+        assert!(error.0.retry_safe);
+
         let mut starting = status("starting");
         starting.as_object_mut().unwrap().remove("cpu");
         starting.as_object_mut().unwrap().remove("memory_bytes");
@@ -1738,6 +1753,15 @@ mod tests {
         assert_eq!(error.0.kind, "starting");
         assert!(error.0.retry_safe);
         assert_eq!(server.opens.load(Ordering::SeqCst), 0);
+
+        server.reply.lock().await.1 = status("ready");
+        *app.fleet.lock().await = None;
+        assert_eq!(
+            app.endpoints_for(Resources::default()).await.unwrap(),
+            std::slice::from_ref(&server.endpoint)
+        );
+        // Unknown outcomes after forwarding retain their conservative meaning.
+        assert!(!ApiError::internal().0.retry_safe);
     }
 
     #[tokio::test]

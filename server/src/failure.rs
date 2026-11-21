@@ -193,6 +193,15 @@ pub(crate) const STARTING: Failure = Failure {
     http: StatusCode::SERVICE_UNAVAILABLE,
 };
 
+/// Discovery refused a new session before forwarding any open. Unlike an
+/// unavailable response after forwarding SQL, this has no unknown side effects.
+pub(crate) const NO_READY_WORKER: Failure = Failure {
+    status: None,
+    kind: "no_ready_worker",
+    retry_safe: true,
+    http: StatusCode::SERVICE_UNAVAILABLE,
+};
+
 /// A dependency failed or a worker disappeared mid-request. Whether the work
 /// committed is unknown, which is exactly when an automatic replay is unsafe.
 pub(crate) const UNAVAILABLE: Failure = Failure {
@@ -252,6 +261,7 @@ pub(crate) fn by_kind(kind: &str) -> Option<Failure> {
         DUPLICATE_REQUEST,
         CAPACITY,
         UNAVAILABLE,
+        NO_READY_WORKER,
     ]
     .into_iter()
     .find(|failure| failure.kind == kind)
