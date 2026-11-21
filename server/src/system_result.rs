@@ -38,6 +38,9 @@ pub(crate) enum Format {
 }
 
 pub(crate) struct SystemResult {
+    // Drop this before bytes/permit so a completed response cannot leave its
+    // timer armed while the HTTP connection starts another response.
+    _delivery: Option<crate::http_transport::DeliveryGuard>,
     bytes: Vec<u8>,
     format: Format,
     // Retained by Bytes::from_owner until the HTTP body is delivered/dropped, or
@@ -45,6 +48,11 @@ pub(crate) struct SystemResult {
     _permit: Option<OwnedSemaphorePermit>,
 }
 impl SystemResult {
+    pub fn with_http_delivery(mut self, connection: &crate::http_transport::Connection) -> Self {
+        self._delivery = Some(connection.delivery());
+        self
+    }
+
     pub fn arrow(&self) -> &[u8] {
         debug_assert_eq!(self.format, Format::Arrow);
         &self.bytes
@@ -52,6 +60,7 @@ impl SystemResult {
     #[cfg(test)]
     pub fn from_arrow_for_test(bytes: Vec<u8>, permit: Option<OwnedSemaphorePermit>) -> Self {
         Self {
+            _delivery: None,
             bytes,
             format: Format::Arrow,
             _permit: permit,
@@ -417,6 +426,7 @@ pub(crate) fn encode(
         return Err(timeout());
     }
     Ok(SystemResult {
+        _delivery: None,
         bytes: writer.bytes,
         format,
         _permit: Some(permit),

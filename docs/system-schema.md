@@ -137,6 +137,14 @@ most 256 KiB. Two admitted queries per gateway share no worker execution slot;
 their memory permit remains held until the response is delivered or dropped.
 Authentication has a separate bounded lane. The read deadline is three seconds
 including body collection, authentication, parsing, database work, and encoding.
+HTTP result delivery has a separate absolute five-second allowance. If response
+bytes remain held past that deadline, the gateway closes the HTTP connection
+and releases its buffered result and admission slot. This also closes other
+streams sharing that HTTP/2 connection; use a separate connection for system
+downloads when that matters. Completed delivery cancels the deadline, and other
+API responses retain their existing behavior. Pgwire result writes are likewise
+bounded to five seconds; password frames are limited before authentication to
+8,192 token bytes.
 Pgwire may perform a separate bounded authentication check after a permission
 denial to decide whether the connection can remain open. Database spill is
 limited to at most 16 MiB per gateway backend by administrator provisioning.

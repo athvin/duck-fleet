@@ -13,7 +13,7 @@ use crate::{
 use axum::{
     Extension, Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
@@ -384,17 +384,25 @@ fn system_token(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
 }
 async fn system_query(
     State(app): State<Gateway>,
+    ConnectInfo(connection): ConnectInfo<crate::http_transport::Connection>,
     request: axum::extract::Request,
 ) -> Result<crate::system_query::SystemResult, ApiError> {
     let token = system_token(request.headers())?;
-    app.system.http(&token, request.into_body()).await
+    app.system
+        .http(&token, request.into_body())
+        .await
+        .map(|result| result.with_http_delivery(&connection))
 }
 async fn system_schema(
     State(app): State<Gateway>,
+    ConnectInfo(connection): ConnectInfo<crate::http_transport::Connection>,
     headers: axum::http::HeaderMap,
 ) -> Result<crate::system_query::SystemResult, ApiError> {
     let token = system_token(&headers)?;
-    app.system.schema(&token).await
+    app.system
+        .schema(&token)
+        .await
+        .map(|result| result.with_http_delivery(&connection))
 }
 
 fn authenticated_request(
@@ -2669,23 +2677,26 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .with_state(app);
     let maintenance = crate::platform::spawn_maintenance(maintenance_dsn, maintenance_config);
     tracing::info!("DuckFleet gateway ready");
-    let served = axum::serve(tokio::net::TcpListener::bind("0.0.0.0:8080").await?, router)
-        .with_graceful_shutdown(async move {
-            crate::terminating().await;
-            // Marked first, and the server deliberately keeps serving afterwards —
-            // handing the signal straight to `with_graceful_shutdown` closes the
-            // listener at once, which is the trap the worker's drain documented: the
-            // probe would see a refused connection instead of "draining", and the
-            // classified refusal could never be returned.
-            draining.store(true, Ordering::Release);
-            tracing::info!(
-                "termination signal received; refusing new sessions and finishing \
+    let served = axum::serve(
+        crate::http_transport::Listener::new(tokio::net::TcpListener::bind("0.0.0.0:8080").await?),
+        router.into_make_service_with_connect_info::<crate::http_transport::Connection>(),
+    )
+    .with_graceful_shutdown(async move {
+        crate::terminating().await;
+        // Marked first, and the server deliberately keeps serving afterwards —
+        // handing the signal straight to `with_graceful_shutdown` closes the
+        // listener at once, which is the trap the worker's drain documented: the
+        // probe would see a refused connection instead of "draining", and the
+        // classified refusal could never be returned.
+        draining.store(true, Ordering::Release);
+        tracing::info!(
+            "termination signal received; refusing new sessions and finishing \
                  requests in flight"
-            );
-            crate::drain_until_idle(move || inflight.load(Ordering::Acquire) > 0).await;
-            tracing::info!("drain complete; shutting down");
-        })
-        .await;
+        );
+        crate::drain_until_idle(move || inflight.load(Ordering::Acquire) > 0).await;
+        tracing::info!("drain complete; shutting down");
+    })
+    .await;
     maintenance.abort();
     served?;
     Ok(())

@@ -12,6 +12,7 @@ mod failure;
 mod gateway;
 mod harness;
 mod history;
+mod http_transport;
 mod isolated;
 mod kube;
 mod metadata;

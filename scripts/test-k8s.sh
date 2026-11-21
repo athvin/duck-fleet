@@ -152,6 +152,10 @@ harness() { # harness <job-name> <command> [timeout]
   python3 scripts/kind/await_job.py --context "$CONTEXT" --namespace "$NS" \
     --job "$name" --timeout "$timeout"
   "${KUBE[@]}" logs "job/$name" -c dbt > "artifacts/kind/$name.log"
+  # Completed test pods still consume count/pods quota. Preserve their logs and
+  # shared PVC artifacts, then remove this exact successful fixture before the
+  # next stage needs isolated compute. Failed Jobs remain for failure evidence.
+  "${KUBE[@]}" delete "job/$name" --cascade=foreground --wait=true --timeout=60s
 }
 
 python3 scripts/kind/assert_role_posture.py --context "$CONTEXT" --namespace "$NS" > artifacts/kind/role-secret-posture.json

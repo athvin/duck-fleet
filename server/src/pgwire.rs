@@ -34,6 +34,9 @@ const MAX_CONNECTIONS: usize = 64;
 /// How long a connection has to get through the startup handshake. A peer that
 /// opens a socket and never speaks must not hold a connection slot indefinitely.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A cleartext password frame contains the token, its NUL terminator, and a
+/// four-byte length field. Check this before allocating unauthenticated input.
+const MAX_PASSWORD_MESSAGE_LENGTH: i32 = 8192 + 1 + 4;
 /// Revalidate idle connections too, including a client parked halfway through a
 /// message or waiting to Sync after an extended-protocol error.
 const AUTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -212,9 +215,12 @@ async fn established<P: Platform>(
     flush(stream).await?;
     // Bounded like the startup read above: a peer that is asked for a password and
     // never sends one must not hold its connection slot open indefinitely.
-    let (kind, body) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_message(stream))
-        .await
-        .context("pgwire password read timed out")??;
+    let (kind, body) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        read_message_limited(stream, MAX_PASSWORD_MESSAGE_LENGTH),
+    )
+    .await
+    .context("pgwire password read timed out")??;
     anyhow::ensure!(kind == b'p', "expected a password message");
     let token = match (|| {
         let mut fields = Fields(&body);
@@ -448,7 +454,7 @@ fn frontend(kind: u8, body: &[u8]) -> ProtocolResult<Frontend<'_>> {
                 || binary
             {
                 return Err(ProtocolError::unsupported(
-                    "only unnamed parameterless binds with text results are supported",
+                    "named portals, parameters, and non-text results are not supported",
                 ));
             }
             return Ok(Frontend::Bind);
@@ -1110,6 +1116,7 @@ async fn flush(stream: &mut BufStream<TcpStream>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn read_message(stream: &mut BufStream<TcpStream>) -> Result<(u8, Vec<u8>)> {
     read_message_limited(stream, 10_000_000).await
 }
@@ -1141,6 +1148,7 @@ mod tests {
     struct TestPlatform {
         // 0 valid, 1 rejected credential, 2 unavailable identity backend.
         access: AtomicU8,
+        expected_token: Option<String>,
         checks: AtomicUsize,
         opened: AtomicUsize,
         closed: AtomicUsize,
@@ -1171,7 +1179,10 @@ mod tests {
                     "no execution grant",
                 ));
             }
-            assert_eq!(token, "test-token");
+            assert_eq!(
+                token,
+                self.expected_token.as_deref().unwrap_or("test-token")
+            );
             Ok(Identity {
                 kind: crate::credentials::ActorKind::Named,
                 principal: "test-user".into(),
@@ -1295,6 +1306,19 @@ mod tests {
         platform: Arc<TestPlatform>,
         database: &str,
     ) -> (BufStream<TcpStream>, tokio::task::JoinHandle<Result<()>>) {
+        let (mut client, task) = password_challenge(platform, database).await;
+        write_message(&mut client, b'p', b"test-token\0")
+            .await
+            .unwrap();
+        flush(&mut client).await.unwrap();
+        successful_response(&mut client).await;
+        (client, task)
+    }
+
+    async fn password_challenge(
+        platform: Arc<TestPlatform>,
+        database: &str,
+    ) -> (BufStream<TcpStream>, tokio::task::JoinHandle<Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -1312,12 +1336,66 @@ mod tests {
         flush(&mut client).await.unwrap();
         let (kind, body) = response(&mut client).await;
         assert_eq!((kind, body), (b'R', 3_i32.to_be_bytes().to_vec()));
-        write_message(&mut client, b'p', b"test-token\0")
-            .await
-            .unwrap();
-        flush(&mut client).await.unwrap();
-        successful_response(&mut client).await;
         (client, task)
+    }
+
+    #[tokio::test]
+    async fn oversized_password_header_is_refused_without_reading_body_or_authenticating() {
+        for database in ["lake", "duckfleet_system"] {
+            for length in [MAX_PASSWORD_MESSAGE_LENGTH + 1, 10_000_000] {
+                let platform = Arc::new(TestPlatform::default());
+                let (mut client, task) = password_challenge(platform.clone(), database).await;
+                client.write_u8(b'p').await.unwrap();
+                client.write_i32(length).await.unwrap();
+                flush(&mut client).await.unwrap();
+                // Send no body and leave the client write side open. A body read
+                // would block for the ten-second handshake timeout instead of FIN.
+                let mut byte = [0_u8; 1];
+                let received = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+                    .await
+                    .expect("oversized password must be rejected from its length header")
+                    .unwrap();
+                assert_eq!(received, 0);
+                client.shutdown().await.unwrap();
+                let error = tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(error.to_string().contains("malformed message length"));
+                // authenticate records mode before inspecting or accepting a token.
+                assert!(platform.modes.lock().unwrap().is_empty());
+                assert_eq!(platform.opened.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn password_limit_accepts_bootstrap_issued_and_maximum_length_tokens() {
+        for token in [
+            "duckfleet-local-development-token".to_owned(),
+            format!("dfk_{}", "a".repeat(64)),
+            "b".repeat(8192),
+        ] {
+            let platform = Arc::new(TestPlatform {
+                expected_token: Some(token.clone()),
+                ..Default::default()
+            });
+            let (mut client, task) = password_challenge(platform.clone(), "lake").await;
+            let mut body = token.into_bytes();
+            body.push(0);
+            write_message(&mut client, b'p', &body).await.unwrap();
+            flush(&mut client).await.unwrap();
+            successful_response(&mut client).await;
+            assert_eq!(
+                *platform.modes.lock().unwrap(),
+                vec![ConnectionMode::Warehouse]
+            );
+            write_message(&mut client, b'X', &[]).await.unwrap();
+            flush(&mut client).await.unwrap();
+            client.shutdown().await.unwrap();
+            finished(task).await;
+        }
     }
 
     #[tokio::test]
