@@ -125,6 +125,7 @@ render --no-hooks \
   | python3 scripts/kind/localize.py \
   --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod \
   > "$work/release.yaml"
+python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release.yaml"
 
 # A fresh install creates PostgreSQL, the ordinary migration Job, and compute
@@ -433,12 +434,15 @@ render --no-hooks \
   | python3 scripts/kind/localize.py \
   --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod \
   > "$work/release-pools.yaml"
+python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release-pools.yaml"
 python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
 python3 scripts/kind/assert_limits.py --context "$CONTEXT" --namespace "$NS" \
   > artifacts/kind/pool-worker-limits.jsonl
 harness duckfleet-pools 'duckfleet-server --pools-isolated' 900
+harness duckfleet-queue 'duckfleet-server --queue-isolated' 900
 await_no_isolated_pods
+python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release.yaml"
 python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
 "${KUBE[@]}" delete deployment/worker-pool-interactive-0 service/worker-pool-interactive-0 configmap/duckfleet-pools
@@ -454,8 +458,11 @@ echo 'PASS: two persistent pools and isolated compute matched their declared all
 "${KUBE[@]}" rollout status deployment/external-postgres --timeout=240s
 # Quiesce every engine before changing the target of the shared Secret. Existing
 # process environments otherwise keep writing the old database during the switch.
-"${KUBE[@]}" scale deployment/worker-small deployment/server --replicas=0
-"${KUBE[@]}" wait --for=delete pod -l 'app in (duckfleet-worker,duckfleet-gateway)' --timeout=180s
+DUCKFLEET_KUBE_CONTEXT="$CONTEXT" DUCKFLEET_NAMESPACE="$NS" scripts/stop-compute.sh kube
+# The explicit stop keeps the old database and reusable migration Job alive.
+"${KUBE[@]}" get statefulset/duckfleet-postgres > /dev/null
+"${KUBE[@]}" get jobs -l app=duckfleet-platform-migrate -o name > artifacts/kind/stopped-migration-jobs.txt
+test -s artifacts/kind/stopped-migration-jobs.txt
 password=$("${KUBE[@]}" get secret duckfleet-dev -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)
 python3 - "$password" <<'PY' | "${KUBE[@]}" patch secret duckfleet-dev --type merge --patch-file /dev/stdin
 import json, sys
@@ -473,6 +480,7 @@ render --no-hooks \
   | python3 scripts/kind/localize.py \
   --expect image,cpu-request,s3-auth,s3-path,node-selector,object-store-port,isolated-pod \
   > "$work/release-external.yaml"
+python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release-external.yaml"
 # apply does not prune, so the bundled instance is removed by name — exactly what
 # an operator migrating to an external catalog does after restoring into it.

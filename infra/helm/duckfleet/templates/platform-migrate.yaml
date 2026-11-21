@@ -6,6 +6,8 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: {{ include "duckfleet.migrationJob" . }}
+  annotations:
+    duckfleet.io/platform-schema: {{ include "duckfleet.platformSchema" . | quote }}
   labels:
     app: duckfleet-platform-migrate
 spec:

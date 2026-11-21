@@ -13,10 +13,13 @@
 //! 2. the pod is owned by the gateway's own pod, so losing the gateway has the
 //!    garbage collector cascade the deletion;
 //! 3. `activeDeadlineSeconds` has the kubelet stop it even if both of those fail;
-//! 4. a startup sweep settles and removes anything a previous gateway left behind.
+//! 4. startup and retirement cleanup confirm absence before recovering durable work.
 use crate::{ApiError, compute::Resources, failure, kube::Kube};
 use serde_json::{Value, json};
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 
 /// Marks every pod this module creates, so a sweep can find them without inferring
 /// anything from names. Matches the label the chart puts on the template.
@@ -70,6 +73,36 @@ pub(crate) struct Isolation {
 pub(crate) struct Pod {
     pub name: String,
     pub endpoint: String,
+}
+
+pub(crate) struct SweepResult {
+    pub confirmed_absent: Vec<String>,
+    /// Includes labeled orphans with no reservation or queued work yet.
+    pub pending: Vec<String>,
+}
+
+const STOP_WAIT: Duration = Duration::from_secs(5);
+const SWEEP_WAIT: Duration = Duration::from_secs(15);
+
+async fn confirm_stopped(kube: &Kube, name: &str, wait: Duration) -> bool {
+    match kube.delete_pod_confirmed(name, wait).await {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(
+                pod = name,
+                "session pod termination is unconfirmed; retaining durable permits and holds"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                pod = name,
+                error = format!("{error:#}"),
+                "could not confirm session pod termination; retaining durable permits and holds"
+            );
+            false
+        }
+    }
 }
 
 impl Isolation {
@@ -144,7 +177,8 @@ impl Isolation {
         match self.await_ready(&name).await {
             Ok(endpoint) => Ok(Pod { name, endpoint }),
             Err(error) => {
-                // The pod exists and is not usable. It does not outlive this call.
+                // The pod is not usable. Request cleanup; owner/deadline backstops
+                // still apply if the API cannot acknowledge deletion now.
                 self.stop(&name).await;
                 Err(error)
             }
@@ -273,8 +307,8 @@ impl Isolation {
     }
 
     /// Best effort by design: layers 2 to 4 exist precisely because this can fail, so
-    /// a failure is logged rather than returned to a caller whose statement already
-    /// ran. The ledger is settled by the caller either way.
+    /// a failure is logged. Suitable for cleanup before any query was accepted;
+    /// callers recovering durable work must instead use stop_confirmed.
     pub async fn stop(&self, name: &str) {
         if let Err(error) = self.kube.delete_pod(name).await {
             tracing::error!(
@@ -285,39 +319,72 @@ impl Isolation {
         }
     }
 
+    pub async fn stop_confirmed(&self, name: &str) -> bool {
+        confirm_stopped(&self.kube, name, STOP_WAIT).await
+    }
+
     /// Removes session pods left behind by a previous gateway.
     ///
-    /// `holding` comes from the ledger rather than from the cluster, because the two
-    /// disagree in the direction that costs money: the owner reference may already
-    /// have had a pod collected, leaving funds held by a worker identity that will
-    /// never exist again. A persistent worker recovers its own on restart; an
-    /// isolated pod has no restart to recover on. The caller settles `holding` once
-    /// this returns, so a pod is always deleted before its funds are released.
-    pub async fn sweep(&self, holding: &[String]) {
-        for name in holding {
-            self.stop(name).await;
-        }
+    /// Input comes from durable work, including unreserved queued queries. Merge
+    /// it with labeled pods so a failed cleanup before admission can be retried.
+    /// Only confirmed_absent may release permits/funds; pending remains retired.
+    pub async fn sweep(&self, orphaned: &[String]) -> SweepResult {
+        self.sweep_bounded(orphaned, STOP_WAIT, SWEEP_WAIT).await
+    }
+
+    async fn sweep_bounded(
+        &self,
+        orphaned: &[String],
+        stop_wait: Duration,
+        sweep_wait: Duration,
+    ) -> SweepResult {
+        let deadline = tokio::time::Instant::now() + sweep_wait;
+        let mut names: BTreeSet<String> = orphaned.iter().cloned().collect();
         // Anything still labelled at startup is orphaned by definition: this gateway
         // holds no route to it, and the chart runs a single gateway with `Recreate`,
         // so there is no sibling that could still be using one.
-        match self.kube.pods_labelled(LABEL).await {
-            Ok(pods) => {
+        match tokio::time::timeout(stop_wait.min(sweep_wait), self.kube.pods_labelled(LABEL)).await
+        {
+            Ok(Ok(pods)) => {
                 for pod in &pods {
-                    if let Some(name) = pod["metadata"]["name"].as_str()
-                        && !holding.iter().any(|held| held == name)
-                    {
-                        tracing::warn!(
-                            pod = name,
-                            "removing a session pod left by a gateway that is gone"
-                        );
-                        self.stop(name).await;
+                    if let Some(name) = pod["metadata"]["name"].as_str() {
+                        names.insert(name.to_owned());
                     }
                 }
             }
-            Err(error) => tracing::error!(
+            Ok(Err(error)) => tracing::error!(
                 error = format!("{error:#}"),
                 "could not list session pods to sweep"
             ),
+            Err(_) => tracing::warn!("timed out listing session pods to sweep"),
+        }
+        let mut pending = names.clone();
+        let mut remaining = names.into_iter();
+        let mut checks = tokio::task::JoinSet::new();
+        let mut confirmed_absent = Vec::new();
+        loop {
+            while checks.len() < 4 && tokio::time::Instant::now() < deadline {
+                let Some(name) = remaining.next() else { break };
+                let kube = self.kube.clone();
+                checks.spawn(async move {
+                    let confirmed = confirm_stopped(&kube, &name, stop_wait).await;
+                    (name, confirmed)
+                });
+            }
+            match tokio::time::timeout_at(deadline, checks.join_next()).await {
+                Ok(Some(Ok((name, true)))) => {
+                    pending.remove(&name);
+                    confirmed_absent.push(name);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        // Dropping the set aborts unfinished API requests; none grants death proof.
+        confirmed_absent.sort();
+        SweepResult {
+            confirmed_absent,
+            pending: pending.into_iter().collect(),
         }
     }
 }
@@ -495,6 +562,67 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn sweep_returns_only_proven_deaths_and_retains_unreserved_labeled_orphans() {
+        use axum::{
+            Json,
+            extract::Path,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::{delete, get},
+        };
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/namespaces/test/pods",
+                get(|| async {
+                    Json(json!({"items":[
+                        {"metadata":{"name":"duckfleet-session-label-gone"}},
+                        {"metadata":{"name":"duckfleet-session-label-live"}}
+                    ]}))
+                }),
+            )
+            .route(
+                "/api/v1/namespaces/test/pods/{name}",
+                delete(|| async { StatusCode::INTERNAL_SERVER_ERROR }).get(
+                    |Path(name): Path<String>| async move {
+                        if name.ends_with("gone") {
+                            StatusCode::NOT_FOUND.into_response()
+                        } else {
+                            Json(json!({"metadata":{"deletionTimestamp":"pending"}}))
+                                .into_response()
+                        }
+                    },
+                ),
+            );
+        let api = crate::kube::test_support::FakeKube::serve(router).await;
+        let isolation = Isolation {
+            kube: api.kube.clone(),
+            template: template(),
+            owner: owner("server", "owner"),
+            ready: Duration::from_secs(1),
+            provisioning: Duration::ZERO,
+            quota_wait: Duration::ZERO,
+        };
+        let result = isolation
+            .sweep_bounded(
+                &[
+                    "duckfleet-session-held-gone".into(),
+                    "duckfleet-session-held-gone".into(),
+                ],
+                Duration::from_millis(100),
+                Duration::from_secs(2),
+            )
+            .await;
+        assert_eq!(
+            result.confirmed_absent,
+            [
+                "duckfleet-session-held-gone",
+                "duckfleet-session-label-gone"
+            ]
+        );
+        assert_eq!(result.pending, ["duckfleet-session-label-live"]);
+    }
 
     fn template() -> Value {
         json!({

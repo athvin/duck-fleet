@@ -172,6 +172,44 @@ pub(crate) const CAPACITY: Failure = Failure {
     http: StatusCode::TOO_MANY_REQUESTS,
 };
 
+/// Durable admission refusals never authorize replay of session-bound SQL.
+pub(crate) const QUEUE_CAPACITY: Failure = Failure {
+    status: Some("refused"),
+    kind: "queue_capacity",
+    retry_safe: false,
+    http: StatusCode::TOO_MANY_REQUESTS,
+};
+pub(crate) const SESSION_BUSY: Failure = Failure {
+    status: Some("refused"),
+    kind: "session_busy",
+    retry_safe: false,
+    http: StatusCode::CONFLICT,
+};
+pub(crate) const QUEUE_TIMEOUT: Failure = Failure {
+    status: Some("expired"),
+    kind: "queue_timeout",
+    retry_safe: false,
+    http: StatusCode::REQUEST_TIMEOUT,
+};
+pub(crate) const QUEUE_DRAINED: Failure = Failure {
+    status: Some("refused"),
+    kind: "queue_drained",
+    retry_safe: false,
+    http: StatusCode::SERVICE_UNAVAILABLE,
+};
+pub(crate) const SESSION_LOST: Failure = Failure {
+    status: Some("refused"),
+    kind: "session_lost",
+    retry_safe: false,
+    http: StatusCode::GONE,
+};
+pub(crate) const POLICY_UNAVAILABLE: Failure = Failure {
+    status: Some("refused"),
+    kind: "policy_unavailable",
+    retry_safe: false,
+    http: StatusCode::SERVICE_UNAVAILABLE,
+};
+
 /// A recognised compute mode that this deployment cannot run yet. Distinct from
 /// `INVALID_REQUEST` on purpose: the request is well formed and will become valid
 /// once the mode is implemented, so a client can tell "ask differently" apart from
@@ -278,14 +316,24 @@ pub(crate) fn by_kind(kind: &str) -> Option<Failure> {
         CAPACITY,
         UNAVAILABLE,
         NO_READY_WORKER,
+        QUEUE_CAPACITY,
+        SESSION_BUSY,
+        QUEUE_TIMEOUT,
+        QUEUE_DRAINED,
+        SESSION_LOST,
+        POLICY_UNAVAILABLE,
     ]
     .into_iter()
     .find(|failure| failure.kind == kind)
 }
 
-/// Terminal states a history record may hold, for filter validation.
-pub(crate) const STATUSES: [&str; 9] = [
+/// Lifecycle states a history record may hold, for filter validation.
+pub(crate) const STATUSES: [&str; 13] = [
     "running",
+    "queued",
+    "preparing",
+    "executing",
+    "expired",
     "succeeded",
     "failed",
     "conflict",
@@ -386,6 +434,12 @@ mod tests {
             BUDGET_EXHAUSTED,
             BUDGET_JOB_COST,
             BUDGET_EXCEEDED,
+            QUEUE_CAPACITY,
+            SESSION_BUSY,
+            QUEUE_TIMEOUT,
+            QUEUE_DRAINED,
+            SESSION_LOST,
+            POLICY_UNAVAILABLE,
         ] {
             assert_eq!(by_kind(failure.kind), Some(failure));
             assert!(STATUSES.contains(&failure.status.unwrap()));

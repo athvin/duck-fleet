@@ -48,7 +48,7 @@ impl Filter {
         if self
             .source
             .as_deref()
-            .is_some_and(|s| !["worker", "recovery"].contains(&s))
+            .is_some_and(|s| !["worker", "recovery", "queue"].contains(&s))
         {
             return Err(ApiError::bad("unknown usage source"));
         }
@@ -194,72 +194,6 @@ impl Reader {
         })
         .await
     }
-
-    /// Session-pod identities still holding funds, for the gateway to settle.
-    ///
-    /// Read from the ledger rather than from the cluster on purpose: a pod the
-    /// garbage collector already removed leaves no trace in Kubernetes but still
-    /// holds money here, and that is the direction of disagreement that costs.
-    pub async fn held_isolated(&self, prefix: &'static str) -> Result<Vec<String>, ApiError> {
-        let held = self
-            .run(false, move |client| {
-                let workers =
-                    metering::held_matching(client, prefix).map_err(|_| ApiError::internal())?;
-                Ok(json!(workers))
-            })
-            .await?;
-        Ok(held
-            .as_array()
-            .map(|workers| {
-                workers
-                    .iter()
-                    .filter_map(|worker| worker.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
-
-    /// Settles a session pod's abandoned reservations. Safe to call for a pod that
-    /// settled its own, because recovery only touches rows still held; that is what
-    /// lets every teardown path call it without first working out which one it is.
-    ///
-    /// The pod's `running` history rows become `interrupted` in the same
-    /// transaction, before recovery charges against the elapsed time they recorded —
-    /// the same order a persistent worker reconciles itself in at startup. Without
-    /// this, a pod identity that never recurs would leave its rows `running`
-    /// forever: unprunable, and claiming work is active on a worker that is gone.
-    pub async fn settle_isolated(&self, worker: String) -> Result<u64, ApiError> {
-        let rate = self.rate.clone();
-        let settled = self
-            .run(true, move |client| {
-                let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
-                metering::interrupt_abandoned_history(&mut transaction, &worker)
-                    .map_err(|_| ApiError::internal())?;
-                let settled = metering::recover(&mut transaction, &worker, &rate)
-                    .map_err(|_| ApiError::internal())?;
-                transaction.commit().map_err(|_| ApiError::internal())?;
-                Ok(json!(settled))
-            })
-            .await?;
-        Ok(settled.as_u64().unwrap_or(0))
-    }
-
-    /// The prefix-wide history pass behind the gateway's startup sweep: every
-    /// session pod is gone by then, so every `running` row under the prefix is
-    /// provably dead — including rows stranded by gateways that predate the
-    /// per-settle reconciliation above.
-    pub async fn reconcile_isolated_history(&self, prefix: &'static str) -> Result<u64, ApiError> {
-        let repaired = self
-            .run(true, move |client| {
-                let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
-                let repaired = metering::interrupt_abandoned_prefix(&mut transaction, prefix)
-                    .map_err(|_| ApiError::internal())?;
-                transaction.commit().map_err(|_| ApiError::internal())?;
-                Ok(json!(repaired))
-            })
-            .await?;
-        Ok(repaired.as_u64().unwrap_or(0))
-    }
 }
 
 #[cfg(test)]
@@ -283,6 +217,14 @@ mod tests {
             );
         }
         assert!(Filter::default().validate().is_ok());
+        for source in ["worker", "recovery", "queue"] {
+            assert!(
+                serde_json::from_value::<Filter>(json!({"source":source}))
+                    .unwrap()
+                    .validate()
+                    .is_ok()
+            );
+        }
         assert!(serde_json::from_value::<Filter>(json!({"unknown": true})).is_err());
     }
 

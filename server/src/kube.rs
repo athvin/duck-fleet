@@ -18,6 +18,7 @@ const ACCOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 /// session.
 const REQUIRED: [&str; 4] = ["create", "get", "list", "delete"];
 
+#[derive(Clone)]
 pub(crate) struct Kube {
     client: Client,
     /// Namespaced collection URL; every call this makes is a pod in one namespace.
@@ -191,6 +192,29 @@ impl Kube {
         Self::expect_success(status, body, "deleting a session pod").map(|_| ())
     }
 
+    /// A DELETE acknowledgement only requests termination. Release durable work
+    /// only after a separate GET proves absence; even a failed DELETE can race GC.
+    /// The deadline bounds response bodies and every poll, not just connect time.
+    pub async fn delete_pod_confirmed(&self, name: &str, wait: Duration) -> Result<bool> {
+        tokio::time::timeout(wait, async {
+            if let Err(error) = self.delete_pod(name).await {
+                tracing::warn!(
+                    pod = name,
+                    error = format!("{error:#}"),
+                    "pod deletion was not acknowledged; checking for independent collection"
+                );
+            }
+            loop {
+                if self.pod(name).await?.is_none() {
+                    return Ok(true);
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .unwrap_or(Ok(false))
+    }
+
     pub async fn pods_labelled(&self, selector: &str) -> Result<Vec<Value>> {
         let url = format!("{}?labelSelector={selector}", self.pods);
         let (status, body) = self.send(Method::GET, &url, None).await?;
@@ -318,8 +342,191 @@ fn allowed(review: &Value) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) struct FakeKube {
+        pub kube: Kube,
+        task: tokio::task::JoinHandle<()>,
+        account: PathBuf,
+    }
+
+    impl FakeKube {
+        pub fn at(endpoint: String, task: tokio::task::JoinHandle<()>) -> Self {
+            let account =
+                std::env::temp_dir().join(format!("duckfleet-kube-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&account).unwrap();
+            fs::write(account.join("token"), "fixture-token").unwrap();
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let kube = Kube {
+                client: Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(3))
+                    .build()
+                    .unwrap(),
+                pods: format!("{endpoint}/api/v1/namespaces/test/pods"),
+                reviews: format!("{endpoint}/reviews"),
+                namespace: "test".into(),
+                account: account.clone(),
+            };
+            Self {
+                kube,
+                task,
+                account,
+            }
+        }
+
+        pub async fn serve(router: axum::Router) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            Self::at(endpoint, task)
+        }
+    }
+
+    impl Drop for FakeKube {
+        fn drop(&mut self) {
+            self.task.abort();
+            let _ = fs::remove_dir_all(&self.account);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn deletion_acknowledgement_and_terminating_status_never_prove_death() {
+        for deleted in [
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let router = axum::Router::new().route(
+                "/api/v1/namespaces/test/pods/session",
+                axum::routing::delete(move || async move { deleted }).get(|| async {
+                    axum::Json(
+                        serde_json::json!({"metadata":{"deletionTimestamp":"2026-01-01T00:00:00Z"},
+                        "status":{"phase":"Running"}}),
+                    )
+                }),
+            );
+            let api = test_support::FakeKube::serve(router).await;
+            assert!(
+                !api.kube
+                    .delete_pod_confirmed("session", Duration::from_millis(80))
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_read_proving_absence_can_release_work_even_when_delete_failed() {
+        for deleted in [StatusCode::OK, StatusCode::NOT_FOUND, StatusCode::FORBIDDEN] {
+            let router = axum::Router::new().route(
+                "/api/v1/namespaces/test/pods/session",
+                axum::routing::delete(move || async move { deleted })
+                    .get(|| async { StatusCode::NOT_FOUND }),
+            );
+            let api = test_support::FakeKube::serve(router).await;
+            assert!(
+                api.kube
+                    .delete_pod_confirmed("session", Duration::from_secs(1))
+                    .await
+                    .unwrap()
+            );
+        }
+        let router = axum::Router::new().route(
+            "/api/v1/namespaces/test/pods/session",
+            axum::routing::delete(|| async { StatusCode::OK })
+                .get(|| async { StatusCode::FORBIDDEN }),
+        );
+        let api = test_support::FakeKube::serve(router).await;
+        assert!(
+            api.kube
+                .delete_pod_confirmed("session", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_waits_for_collection_and_bounds_a_stalled_response_body() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        let router = axum::Router::new().route(
+            "/api/v1/namespaces/test/pods/session",
+            axum::routing::delete(|| async { StatusCode::OK }).get(move || {
+                let reads = reads.clone();
+                async move {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    }
+                }
+            }),
+        );
+        let api = test_support::FakeKube::serve(router).await;
+        assert!(
+            api.kube
+                .delete_pod_confirmed("session", Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), 2);
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    if socket.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                if index == 0 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        let stalled = test_support::FakeKube::at(endpoint, task);
+        let started = tokio::time::Instant::now();
+        assert!(
+            !stalled
+                .kube
+                .delete_pod_confirmed("session", Duration::from_millis(100))
+                .await
+                .unwrap()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     /// A deployment mistake rather than a runtime condition, so it has to name what
     /// is missing: a gateway that started anyway would accept isolated sessions it

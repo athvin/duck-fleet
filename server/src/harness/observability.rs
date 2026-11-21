@@ -229,6 +229,11 @@ pub(super) async fn worker_status(ctx: &Ctx) -> anyhow::Result<()> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("worker has no endpoint"))?;
     let direct = Client::new(endpoint, &ctx.token)?;
+    // A session allows one outstanding accepted query. Open the second real
+    // connection before occupying the serial engine, pinned to the same worker.
+    let mut queued_session =
+        RemoteConnection::open(endpoint, &ctx.token, "worker-status-queued", None, None, 90)
+            .await?;
     let query_client = client.clone();
     let query_path = format!("{}/queries", session.path());
     let busy = tokio::spawn(async move {
@@ -252,11 +257,11 @@ pub(super) async fn worker_status(ctx: &Ctx) -> anyhow::Result<()> {
         let active = wait_worker(&client, &id, |w| w["active_queries"] == 1).await?;
         let boot = active["boot_id"].clone();
         require(
-            active["open_sessions"] == baseline_sessions + 1,
+            active["open_sessions"] == baseline_sessions + 2,
             format!("HTTP session missing from worker census: {active}"),
         )?;
-        let query_client = client.clone();
-        let query_path = format!("{}/queries", session.path());
+        let query_client = queued_session.client().clone();
+        let query_path = format!("{}/queries", queued_session.path());
         queued = Some(tokio::spawn(async move {
             query_client
                 .request(
@@ -265,6 +270,7 @@ pub(super) async fn worker_status(ctx: &Ctx) -> anyhow::Result<()> {
                     Some(&json!({
                         "request_id": uuid::Uuid::new_v4(),
                         "sql": "select 1",
+                        "queue_timeout_seconds": 30,
                     })),
                     crate::client::STATEMENT_TIMEOUT,
                 )
@@ -302,6 +308,7 @@ pub(super) async fn worker_status(ctx: &Ctx) -> anyhow::Result<()> {
         Some(query) => Some(query.await?),
         None => None,
     };
+    let queued_closed = queued_session.close().await;
     let closed = session.close().await;
     checked?;
     canceled?;
@@ -316,6 +323,7 @@ pub(super) async fn worker_status(ctx: &Ctx) -> anyhow::Result<()> {
         outcome?;
     }
     closed?;
+    queued_closed?;
     let idle = wait_worker(&client, &id, |w| {
         w["active_queries"] == 0
             && w["queued_queries"] == 0

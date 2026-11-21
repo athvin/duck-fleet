@@ -14,8 +14,9 @@ use std::{fmt::Write, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-const FINGERPRINT_VERSION: i32 = 2;
-const FINGERPRINT_DOMAIN: &[u8] = b"duckfleet-request-v2\0";
+const FINGERPRINT_VERSION: i32 = 3;
+const FINGERPRINT_DOMAIN: &[u8] = b"duckfleet-request-v3\0";
+const V2_FINGERPRINT_DOMAIN: &[u8] = b"duckfleet-request-v2\0";
 const LEGACY_FINGERPRINT_DOMAIN: &[u8] = b"duckfleet-request-v1\0";
 
 /// Inputs after parameter validation and the session-context merge. `compute`
@@ -28,6 +29,7 @@ pub(crate) struct Submission<'a> {
     pub parameters: &'a [Value],
     pub context: &'a Value,
     pub timeout_seconds: u64,
+    pub queue_timeout_seconds: u64,
     pub compute: &'a Value,
     pub worker_id: &'a str,
     pub placement: &'a Value,
@@ -97,7 +99,7 @@ fn requested(input: &Submission<'_>) -> Result<ComputeRequest, ApiError> {
     )
 }
 
-fn fingerprint(input: &Submission<'_>) -> Result<String, ApiError> {
+fn fingerprint_v2(input: &Submission<'_>) -> Result<String, ApiError> {
     let mut context = input.context.clone();
     if let Some(context) = context.as_object_mut() {
         context.remove("requested_compute");
@@ -114,7 +116,18 @@ fn fingerprint(input: &Submission<'_>) -> Result<String, ApiError> {
         "timeout_seconds": input.timeout_seconds,
         "compute": {"requested":requested(input)?.canonical_intent()?,"resolved":resolved},
     }));
-    hash_payload(FINGERPRINT_DOMAIN, &payload)
+    hash_payload(V2_FINGERPRINT_DOMAIN, &payload)
+}
+
+fn fingerprint(input: &Submission<'_>) -> Result<String, ApiError> {
+    // V2 stays byte-for-byte frozen. Domain separation and an explicit relative
+    // queue deadline add semantics without reinterpreting existing identities.
+    hash_payload(
+        FINGERPRINT_DOMAIN,
+        &json!({
+            "v2": fingerprint_v2(input)?, "queue_timeout_seconds": input.queue_timeout_seconds,
+        }),
+    )
 }
 
 /// V1 saw different reserved context on the direct and gateway ingress paths.
@@ -317,7 +330,7 @@ const COLUMNS: &str = "r.request_id,r.principal,r.logical_request_id,r.retry_of,
     r.fingerprint_version,r.payload_hash,r.state,r.status,r.outcome,r.failure_kind,
     r.retry_safe,r.worker_id,r.accepted_at::text,r.finished_at::text,r.elapsed_ms,r.result_rows,
     EXISTS(SELECT 1 FROM query_history h WHERE h.query_id=r.request_id) AS diagnostics_available,
-    (SELECT child.request_id FROM requests child WHERE child.retry_of=r.request_id) AS next_attempt_id";
+    (SELECT child.request_id FROM requests child WHERE child.retry_of=r.request_id) AS next_attempt_id, to_jsonb(r)::text AS queue_record";
 
 struct Stored {
     request_id: String,
@@ -338,6 +351,7 @@ struct Stored {
     result_rows: Option<i64>,
     diagnostics_available: bool,
     next_attempt_id: Option<String>,
+    queue_record: Value,
 }
 impl Stored {
     fn from_row(row: Row) -> Self {
@@ -360,6 +374,8 @@ impl Stored {
             result_rows: row.get("result_rows"),
             diagnostics_available: row.get("diagnostics_available"),
             next_attempt_id: row.get("next_attempt_id"),
+            queue_record: serde_json::from_str(row.get::<_, &str>("queue_record"))
+                .unwrap_or(Value::Null),
         }
     }
 
@@ -375,7 +391,7 @@ impl Stored {
             && self.outcome == Outcome::NotExecuted.name()
             && self.retry_safe == Some(true)
             && self.failure_kind.as_deref() == Some("budget_exhausted")
-            && matches!(self.fingerprint_version, Some(1 | 2))
+            && matches!(self.fingerprint_version, Some(1..=3))
             && self.payload_hash.is_some()
             && self.principal.is_some()
             && self.next_attempt_id.is_none()
@@ -393,13 +409,14 @@ impl Stored {
             Some(1) => Ok(legacy_fingerprints(input)?
                 .iter()
                 .any(|hash| hash == previous)),
+            Some(2) => Ok(previous == fingerprint_v2(input)?),
             Some(FINGERPRINT_VERSION) => Ok(previous == current_hash),
             _ => Ok(false),
         }
     }
 
     fn detail(&self) -> Value {
-        json!({
+        let mut detail = json!({
             "request_id": self.request_id,
             "logical_request_id": self.logical_request_id,
             "retry_of": self.retry_of,
@@ -417,7 +434,7 @@ impl Stored {
             "result_rows": self.result_rows,
             "fingerprint_version": self.fingerprint_version,
             "fingerprint_status": if self.payload_hash.is_none() { "legacy_unavailable" }
-                else if matches!(self.fingerprint_version, Some(1 | 2)) { "known" }
+                else if matches!(self.fingerprint_version, Some(1..=3)) { "known" }
                 else { "unsupported_version" },
             "diagnostics_available": self.diagnostics_available,
             "retry": {
@@ -425,7 +442,30 @@ impl Stored {
                 "new_request_id_required": true,
                 "retry_of": if self.retryable() { Some(&self.request_id) } else { None },
             },
-        })
+        });
+        for key in [
+            "session_id",
+            "session_sequence",
+            "worker_boot_id",
+            "pool_scope",
+            "protocol",
+            "actor_principal",
+            "credential_id",
+            "queued_at",
+            "selected_at",
+            "execution_granted_at",
+            "engine_started_at",
+            "queue_deadline_at",
+            "queue_timeout_seconds",
+            "policy_generation",
+            "state_version",
+            "delivery_state",
+        ] {
+            if let Some(value) = self.queue_record.get(key) {
+                detail[key] = value.clone();
+            }
+        }
+        detail
     }
 
     fn duplicate(&self, input: &Submission<'_>, hash: &str) -> Result<Value, ApiError> {
@@ -434,7 +474,7 @@ impl Stored {
         // is safe; asserting either equality or mismatch would invent evidence.
         if self.retry_of.as_deref() != input.retry_of
             || (self.payload_hash.is_some()
-                && matches!(self.fingerprint_version, Some(1 | 2))
+                && matches!(self.fingerprint_version, Some(1..=3))
                 && !self.matches_payload(input, hash)?)
         {
             return Err(ApiError::new(
@@ -499,21 +539,29 @@ fn legacy_collision(
         .duplicate(input, hash)
 }
 
-pub(crate) fn admit(
-    client: &mut Client,
-    input: Submission<'_>,
-    units: i64,
-    rate: &RateCard,
-) -> Result<AdmissionResult, ApiError> {
-    let hash = fingerprint(&input)?;
-    let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
+pub(crate) enum ClaimResult {
+    New,
+    Duplicate(Value),
+}
+
+/// Atomic identity/history claim, deliberately without execution-budget locks.
+pub(crate) fn claim_in(
+    transaction: &mut Transaction<'_>,
+    input: &Submission<'_>,
+    state: &str,
+) -> Result<ClaimResult, ApiError> {
+    let status = if state == "queued" {
+        "queued"
+    } else {
+        "running"
+    };
+    let hash = fingerprint(input)?;
     // Indexed fallback probes also recognize old evidence that was restored
     // after the one-time migration; these never scan all retained history.
-    backfill(&mut transaction, Some(input.request_id)).map_err(|_| ApiError::internal())?;
-    if let Some(stored) = load(&mut transaction, input.request_id)? {
-        let duplicate = stored.duplicate(&input, &hash);
-        transaction.commit().map_err(|_| ApiError::internal())?;
-        return duplicate.map(AdmissionResult::Duplicate);
+    backfill(transaction, Some(input.request_id)).map_err(|_| ApiError::internal())?;
+    if let Some(stored) = load(transaction, input.request_id)? {
+        let duplicate = stored.duplicate(input, &hash);
+        return duplicate.map(ClaimResult::Duplicate);
     }
     let logical_request_id = if let Some(parent_id) = input.retry_of {
         if parent_id == input.request_id {
@@ -522,8 +570,8 @@ pub(crate) fn admit(
                 "retry_of must name a prior attempt",
             ));
         }
-        backfill(&mut transaction, Some(parent_id)).map_err(|_| ApiError::internal())?;
-        let parent = load(&mut transaction, parent_id)?.ok_or_else(not_found)?;
+        backfill(transaction, Some(parent_id)).map_err(|_| ApiError::internal())?;
+        let parent = load(transaction, parent_id)?.ok_or_else(not_found)?;
         parent.authorize(input.principal, is_bootstrap(input.principal))?;
         if !parent.retryable() || parent.principal.as_deref() != Some(input.principal) {
             return Err(ApiError::new(
@@ -533,7 +581,7 @@ pub(crate) fn admit(
         }
         // The parent may predate the current policy schema. Verify its original
         // version, then give this new attempt its own current-version identity.
-        if !parent.matches_payload(&input, &hash)? {
+        if !parent.matches_payload(input, &hash)? {
             return Err(ApiError::new(
                 failure::REQUEST_ID_MISMATCH,
                 "retry payload differs from the refused attempt; no SQL ran",
@@ -547,7 +595,7 @@ pub(crate) fn admit(
         .execute(
             "INSERT INTO requests (request_id,principal,logical_request_id,retry_of,
             fingerprint_version,payload_hash,state,status,outcome,worker_id)
-         VALUES ($1,$2,$3,$4,$5,$6,'accepted','running','unknown',$7)
+         VALUES ($1,$2,$3,$4,$5,$6,$8,$9,'unknown',$7)
          ON CONFLICT DO NOTHING",
             &[
                 &input.request_id,
@@ -557,14 +605,14 @@ pub(crate) fn admit(
                 &FINGERPRINT_VERSION,
                 &hash,
                 &input.worker_id,
+                &state,
+                &status,
             ],
         )
         .map_err(|_| ApiError::internal())?;
     if claimed == 0 {
-        if let Some(stored) = load(&mut transaction, input.request_id)? {
-            return stored
-                .duplicate(&input, &hash)
-                .map(AdmissionResult::Duplicate);
+        if let Some(stored) = load(transaction, input.request_id)? {
+            return stored.duplicate(input, &hash).map(ClaimResult::Duplicate);
         }
         return Err(ApiError::new(
             failure::INVALID_RETRY,
@@ -573,15 +621,29 @@ pub(crate) fn admit(
     }
     let inserted_history = transaction.execute(
         "INSERT INTO query_history (query_id,session_id,sql,context,status,worker_id,placement,principal)
-         VALUES ($1,$2,$3,$4,'running',$5,$6,$7) ON CONFLICT DO NOTHING",
+         VALUES ($1,$2,$3,$4,$8,$5,$6,$7) ON CONFLICT DO NOTHING",
         &[&input.request_id, &input.session_id, &input.sql, &input.context.to_string(),
-          &input.worker_id, &input.placement.to_string(), &input.principal],
+          &input.worker_id, &input.placement.to_string(), &input.principal, &status],
     ).map_err(|_| ApiError::internal())?;
     if inserted_history == 0 {
-        let duplicate = legacy_collision(&mut transaction, &input, &hash, false);
-        transaction.commit().map_err(|_| ApiError::internal())?;
-        return duplicate.map(AdmissionResult::Duplicate);
+        let duplicate = legacy_collision(transaction, input, &hash, false);
+        return duplicate.map(ClaimResult::Duplicate);
     }
+    Ok(ClaimResult::New)
+}
+
+pub(crate) fn admit(
+    client: &mut Client,
+    input: Submission<'_>,
+    units: i64,
+    rate: &RateCard,
+) -> Result<AdmissionResult, ApiError> {
+    let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
+    if let ClaimResult::Duplicate(value) = claim_in(&mut transaction, &input, "accepted")? {
+        transaction.commit().map_err(|_| ApiError::internal())?;
+        return Ok(AdmissionResult::Duplicate(value));
+    }
+    let hash = fingerprint(&input)?;
     match metering::admit_in(
         &mut transaction,
         input.request_id,
@@ -687,7 +749,7 @@ pub(crate) fn interrupt_abandoned(
     Ok(transaction.execute(
         "UPDATE requests SET state='terminal',status='interrupted',outcome='unknown',
             failure_kind='interrupted',retry_safe=false,finished_at=now()
-         WHERE worker_id=$1 AND state <> 'terminal'",
+         WHERE worker_id=$1 AND state IN ('accepted','executing') AND to_jsonb(requests)->>'worker_boot_id' IS NULL",
         &[&worker_id],
     )?)
 }
@@ -699,7 +761,7 @@ pub(crate) fn interrupt_abandoned_prefix(
     Ok(transaction.execute(
         "UPDATE requests SET state='terminal',status='interrupted',outcome='unknown',
             failure_kind='interrupted',retry_safe=false,finished_at=now()
-         WHERE starts_with(worker_id,$1) AND state <> 'terminal'",
+         WHERE starts_with(worker_id,$1) AND state IN ('accepted','executing') AND to_jsonb(requests)->>'worker_boot_id' IS NULL",
         &[&prefix],
     )?)
 }
@@ -764,6 +826,7 @@ mod tests {
             parameters,
             context,
             timeout_seconds: 30,
+            queue_timeout_seconds: 10,
             compute,
             worker_id: "small",
             placement: compute,
@@ -791,7 +854,39 @@ mod tests {
             result_rows: Some(1),
             diagnostics_available: false,
             next_attempt_id: None,
+            queue_record: Value::Null,
         }
+    }
+
+    #[test]
+    fn v2_fingerprint_is_frozen_and_only_v3_adds_queue_timeout() {
+        let parameters = [json!(7)];
+        let context = json!({"suite":"queue-storage","requested_compute":{"pool":"fixture"}});
+        let compute = json!({"mode":"persistent","pool":"fixture","cpu":1,"memory_bytes":1073741824_u64,"disk_bytes":2147483648_u64});
+        let mut input = submission(&parameters, &context, &compute);
+        input.sql = "SELECT ?";
+        let frozen = "28721fd97f39352eadabfbf471615fe922c6b2ab769ac0ede3579bda694b11aa";
+        assert_eq!(fingerprint_v2(&input).unwrap(), frozen);
+        let first = fingerprint(&input).unwrap();
+        input.queue_timeout_seconds = 120;
+        assert_eq!(fingerprint_v2(&input).unwrap(), frozen);
+        assert_ne!(fingerprint(&input).unwrap(), first);
+        let mut retained = stored(Some(frozen.into()));
+        retained.fingerprint_version = Some(2);
+        assert!(
+            retained
+                .duplicate(&input, &fingerprint(&input).unwrap())
+                .is_ok()
+        );
+        retained.fingerprint_version = Some(3);
+        retained.payload_hash = Some(first);
+        assert_eq!(
+            retained
+                .duplicate(&input, &fingerprint(&input).unwrap())
+                .unwrap_err()
+                .0,
+            failure::REQUEST_ID_MISMATCH
+        );
     }
 
     #[test]

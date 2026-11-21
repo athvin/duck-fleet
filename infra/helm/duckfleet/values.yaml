@@ -131,7 +131,14 @@ persistentPools: {}
 workerReplicas: {}
 workerMaxSessions: 32
 workerQueueCapacity: 64
+# Durable waiting SQL bounds, separate from the operations channel above.
+workerMaxQueuedQueries: 64
+workerMaxQueuedBytes: 16777216
 gatewayMaxSessions: 64
+# Optional default/isolated policy overrides; named pools may also set admission.
+# Each object accepts maxQueuedQueries (256), maxRunningQueries (16),
+# maxQueuedPerPrincipal (16), and maxRunningPerPrincipal (inherits pool running).
+admissionLimits: {}
 
 # Where cluster DNS may be reached, by address, because it cannot be selected by pod
 # on every topology. Deliberately the service and VPC ranges rather than 0.0.0.0/0:

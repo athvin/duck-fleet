@@ -8,12 +8,14 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 case "$mode" in
   compose)
+    python3 scripts/compute_lifecycle.py check compose
     docker compose run --rm --no-deps platform-migrate
     ;;
   kube)
     context="${DUCKFLEET_KUBE_CONTEXT:?set DUCKFLEET_KUBE_CONTEXT}"
     namespace="${DUCKFLEET_NAMESPACE:?set DUCKFLEET_NAMESPACE}"
     kube=(kubectl --context "$context" -n "$namespace")
+    python3 scripts/compute_lifecycle.py check kube --context "$context" --namespace "$namespace"
     template=$("${kube[@]}" get deployment server \
       -o jsonpath='{.metadata.annotations.duckfleet\.io/migration-job}')
     [[ -n "$template" ]] || { echo 'No migration Job template: apply the current chart first' >&2; exit 1; }
@@ -24,6 +26,8 @@ case "$mode" in
     python3 - "$work/template.json" "$name" <<'PY' | "${kube[@]}" create -f -
 import json, sys
 source = json.load(open(sys.argv[1]))
+if source.get('metadata', {}).get('annotations', {}).get('duckfleet.io/platform-schema') != '2':
+    sys.exit('Current migration template predates schema 2; stop compute and apply the desired chart/image first')
 spec = source['spec']
 for field in ('selector', 'manualSelector'):
     spec.pop(field, None)
@@ -35,7 +39,8 @@ for label in ('controller-uid', 'job-name', 'batch.kubernetes.io/controller-uid'
 # Keep failure diagnostics for a day; this ad-hoc Job is not the desired release Job.
 spec['ttlSecondsAfterFinished'] = 86400
 print(json.dumps({'apiVersion': 'batch/v1', 'kind': 'Job',
-                  'metadata': {'name': sys.argv[2], 'labels': {'app': 'duckfleet-platform-migrate'}},
+                  'metadata': {'name': sys.argv[2], 'labels': {'app': 'duckfleet-platform-migrate'},
+                               'annotations': {'duckfleet.io/platform-schema': '2'}},
                   'spec': spec}))
 PY
     deadline=$(python3 - "$work/template.json" <<'PY'

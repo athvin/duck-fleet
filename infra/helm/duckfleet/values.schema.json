@@ -6,6 +6,17 @@
     "workerImage",
     "dbtImage"
   ],
+  "definitions": {
+    "admissionLimits": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "maxQueuedQueries": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "maxRunningQueries": {"type": "integer", "minimum": 1, "maximum": 1024},
+        "maxQueuedPerPrincipal": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "maxRunningPerPrincipal": {"type": "integer", "minimum": 1, "maximum": 1024}
+      }
+    }
+  },
   "properties": {
     "workerImage": {
       "type": "string",
@@ -96,12 +107,22 @@
           "memory": {"type": "string", "pattern": "^[1-9][0-9]{0,8}(Ki|Mi|Gi)$"},
           "disk": {"type": "string", "pattern": "^[1-9][0-9]{0,8}(Ki|Mi|Gi)$"},
           "workers": {"type": "integer", "minimum": 0, "maximum": 16},
-          "maxSessionsPerWorker": {"type": "integer", "minimum": 1, "maximum": 1024}
+          "maxSessionsPerWorker": {"type": "integer", "minimum": 1, "maximum": 1024},
+          "admission": {"$ref": "#/definitions/admissionLimits"}
         }
       }
     },
     "workerMaxSessions": {"type": "integer", "minimum": 1, "maximum": 1024},
     "workerQueueCapacity": {"type": "integer", "minimum": 1, "maximum": 4096},
+    "workerMaxQueuedQueries": {"type": "integer", "minimum": 1, "maximum": 4096},
+    "workerMaxQueuedBytes": {"type": "integer", "minimum": 1048576, "maximum": 268435456},
+    "admissionLimits": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "default": {"$ref": "#/definitions/admissionLimits"},
+        "isolated": {"$ref": "#/definitions/admissionLimits"}
+      }
+    },
     "gatewayMaxSessions": {"type": "integer", "minimum": 1, "maximum": 4096},
     "workerReplicas": {
       "type": "object",

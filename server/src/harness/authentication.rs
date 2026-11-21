@@ -237,11 +237,13 @@ async fn wait_running(admin: &Client, id: &str) -> Result<()> {
         if let Ok(record) =
             request_json(admin, Method::GET, &format!("/v1/queries/{id}"), None).await
         {
+            if record["status"] == "running" {
+                return Ok(());
+            }
             require(
-                record["status"] == "running",
+                matches!(record["status"].as_str(), Some("queued" | "preparing")),
                 format!("busy fixture ended too early: {record}"),
             )?;
-            return Ok(());
         }
         require(
             Instant::now() < deadline,
@@ -299,7 +301,7 @@ async fn queued_revocation(ctx: &Ctx, admin: &Client) -> Result<()> {
         let client = queued.client().clone();
         let path = format!("{}/queries", queued.path());
         let body =
-            json!({"request_id": queued_id, "sql": format!("insert into {table} values (1)")});
+            json!({"request_id": queued_id, "sql": format!("insert into {table} values (1)"), "queue_timeout_seconds": 120});
         let pending = tokio::spawn(async move {
             client
                 .request(Method::POST, &path, Some(&body), Duration::from_secs(70))
@@ -311,27 +313,20 @@ async fn queued_revocation(ctx: &Ctx, admin: &Client) -> Result<()> {
         .await?;
         revoke(admin, &credential).await?;
         active.await??;
-        let refused = expect_status(pending.await?, 401)?;
-        require(
-            refused.failure_kind.as_deref() == Some("unauthorized"),
-            format!("queued refusal: {refused}"),
-        )?;
+        let refused = pending.await?.expect_err("revoked queued query must not execute");
+        require(matches!(refused.failure_kind.as_deref(), Some("unauthorized" | "session_lost"))
+                && matches!(refused.status, Some(401 | 410)) && !refused.retry_safe,
+            format!("queued refusal: {refused}"))?;
         let completed =
             request_json(admin, Method::GET, &format!("/v1/queries/{run_id}"), None).await?;
         require(
             completed["status"] == "succeeded",
             format!("revocation interrupted active work: {completed}"),
         )?;
-        expect_status(
-            request_json(
-                admin,
-                Method::GET,
-                &format!("/v1/queries/{queued_id}"),
-                None,
-            )
-            .await,
-            404,
-        )?;
+        let refused_history = request_json(admin, Method::GET, &format!("/v1/queries/{queued_id}"), None).await?;
+        let retained = request_json(admin, Method::GET, &format!("/v1/requests/{queued_id}"), None).await?;
+        require(refused_history["status"] == "refused" && retained["outcome"] == "not_executed",
+            format!("durably accepted revoked query lost its known no-execution outcome: history={refused_history}, request={retained}"))?;
         require(
             rows_eq(
                 &sql(&operator, &format!("select count(*) from {table}")).await?,
@@ -483,7 +478,7 @@ async fn database_contention(ctx: &Ctx, admin: &Client, dsn: &str) -> Result<()>
     let lock = DatabaseLock::acquire(dsn, "SELECT budget_id FROM budget FOR UPDATE").await?;
     let client = connection.client().clone();
     let path = format!("{}/queries", connection.path());
-    let body = json!({"request_id": query_id, "sql": format!("insert into {table} values (1)")});
+    let body = json!({"request_id": query_id, "sql": format!("insert into {table} values (1)"), "queue_timeout_seconds": 30});
     let query = tokio::spawn(async move {
         client
             .request(Method::POST, &path, Some(&body), Duration::from_secs(30))

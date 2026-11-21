@@ -22,8 +22,7 @@ test -s "$src/lake.dump" && test -s "$src/platform.dump"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 case "$mode" in
   compose)
-    docker compose --profile scale-out --profile pools stop server server-pools \
-      worker-small worker-small-b worker-pool-interactive-0
+    bash "$ROOT/scripts/stop-compute.sh" compose
     ;;
   kube)
     kube=(kubectl --context "${DUCKFLEET_KUBE_CONTEXT:?set DUCKFLEET_KUBE_CONTEXT}"
@@ -33,22 +32,10 @@ case "$mode" in
     template=$("${kube[@]}" get deployment server \
       -o jsonpath='{.metadata.annotations.duckfleet\.io/migration-job}')
     [[ -n "$template" ]] || { echo 'Apply the current chart before restoring' >&2; exit 1; }
-    "${kube[@]}" get job "$template" > /dev/null
-    deployments=$("${kube[@]}" get deployments -o json | python3 -c '
-import json,sys
-for item in json.load(sys.stdin)["items"]:
-    if item["spec"]["template"]["metadata"].get("labels",{}).get("app") in ("duckfleet-worker","duckfleet-gateway"):
-        print(item["metadata"]["name"])
-')
-    while IFS= read -r deployment; do
-      [[ -z "$deployment" ]] || "${kube[@]}" scale "deployment/$deployment" --replicas=0
-    done <<< "$deployments"
-    # Isolated pods have no Deployment; stop them too before replacing the catalog.
-    "${kube[@]}" delete pods -l duckfleet-compute=isolated --wait=true --timeout=180s
-    pods=$("${kube[@]}" get pods -l 'app in (duckfleet-worker,duckfleet-gateway)' -o name)
-    if [[ -n "$pods" ]]; then
-      "${kube[@]}" wait --for=delete pod -l 'app in (duckfleet-worker,duckfleet-gateway)' --timeout=180s
-    fi
+    version=$("${kube[@]}" get job "$template" \
+      -o jsonpath='{.metadata.annotations.duckfleet\.io/platform-schema}')
+    [[ "$version" == 2 ]] || { echo 'Stop compute and apply the schema 2 chart/image before restoring' >&2; exit 1; }
+    bash "$ROOT/scripts/stop-compute.sh" kube
     ;;
   *) echo "unknown mode: $mode (compose or kube)" >&2; exit 64 ;;
 esac

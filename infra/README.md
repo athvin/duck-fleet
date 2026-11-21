@@ -126,6 +126,58 @@ it (1–1024). `workerQueueCapacity` defaults to 64 queued worker operations and
 not make one worker execute SQL in parallel. Isolated workers retain their
 one-session lifetime regardless of persistent-pool limits.
 
+Durable waiting SQL has separate bounds: `workerMaxQueuedQueries` defaults to 64
+(1–4096) and `workerMaxQueuedBytes` to 16777216 bytes (1–256MiB). These render
+`DUCKFLEET_WORKER_MAX_QUEUED_QUERIES` and `DUCKFLEET_WORKER_MAX_QUEUED_BYTES`;
+`workerQueueCapacity` still bounds ordinary worker operations. One worker executes
+one statement at a time. Queue count/bytes, session limits, and shared admission
+limits all apply; the first exhausted limit refuses further admission.
+
+Configure shared pool/principal admission through the gateway:
+
+```yaml
+admissionLimits:
+  default:
+    maxQueuedQueries: 256
+    maxRunningQueries: 16
+    maxQueuedPerPrincipal: 16
+  isolated:
+    maxRunningQueries: 4
+persistentPools:
+  small: {cpu: 1, memory: 1Gi, disk: 2Gi, workers: 1}
+  interactive:
+    cpu: 2
+    memory: 3Gi
+    disk: 4Gi
+    workers: 2
+    admission: {maxRunningQueries: 2, maxRunningPerPrincipal: 1}
+```
+
+Queued limits accept 1–65535, running limits 1–1024; principal limits cannot exceed
+their pool limits. An omitted `maxRunningPerPrincipal` inherits the pool's effective
+running limit. Explicit global defaults remain in effect unless a pool overrides
+them. The chart translates these fields into snake_case JSON under the gateway's
+`DUCKFLEET_ADMISSION_LIMITS_JSON` (`default`/`isolated`) and each named pool's
+optional `admission` object. Environment defaults load at process startup; registry
+file reload changes pool overrides. PostgreSQL enforces caps across workers and
+credentials for the same principal. Scope keys are `persistent:<pool>` and
+`isolated`; changing registry revision never creates another allowance.
+
+The gateway publishes validated policy before serving, without waiting for worker
+readiness. Named workers report unavailable until policy exists; they cannot invent
+defaults. Compose therefore starts gateways after workers start, without waiting
+for their health, while retaining migration completion dependencies. Lowering caps
+affects future admission/selection and preserves accepted work. Removed pools keep
+their policy while existing sessions may need it. Worker-local bounds require a
+worker rollout; shared policy changes use the existing explicit registry reload.
+
+Each request's `queue_timeout_seconds` defaults to 10 (1–120), independently of its
+1–60 second execution timeout. The synchronous transport still times out at 75 seconds;
+a timeout/disconnect does not cancel durable work. Inspect the same request ID.
+During drain, queued/preparing requests are refused as `queue_drained` without SQL
+and with `retry_safe=false`; only already executing work finishes within the
+existing grace. Cancellation and cleanup retain independent control capacity.
+
 Compose provides an optional two-pool example without changing its normal server:
 
 ```sh
@@ -158,9 +210,44 @@ The migration uses the `duckfleet-no-aws` service account, has no mounted API to
 and receives no object-store credentials. Failed Jobs prevent rollout success;
 inspect their logs to diagnose the schema or database problem.
 
-For this recovery flow, stop compute by scaling its Deployments to zero while
-retaining the release's migration Job. Setting `suspended: true` removes that Job
-from the Helm release, so the manual recovery helper cannot reuse its template.
+Schema 2 requires a quiesced upgrade from schema 1: all old gateways, persistent
+workers, isolated workers, and any separately managed direct workers must stop
+before migration. A per-Deployment Recreate rollout is not a fleet-wide barrier.
+The deploy/provision/manual migration helpers perform a read-only preflight and
+refuse a schema-changing apply while old compute remains. Fresh installations and
+same-schema rollouts continue normally. Runtime schema checks remain authoritative;
+the chart's schema annotations only identify deployment intent.
+
+Use the explicit reversible operator command:
+
+```sh
+DUCKFLEET_KUBE_CONTEXT=<context> DUCKFLEET_NAMESPACE=<namespace> \
+  scripts/stop-compute.sh kube
+# Or, for the current Compose project:
+scripts/stop-compute.sh compose
+```
+
+The command stops gateways first, then all named/sibling workers and isolated Pods,
+respecting execution grace. It preserves PostgreSQL, Secrets, volumes, object
+storage, Deployments and the current migration Job template. A timeout exits with
+an error and never migrates or restarts anything; complete shutdown before proceeding.
+Do not use
+`suspended:true` for this flow: suspension also stops bundled PostgreSQL and removes
+the migration Job.
+
+After the stop succeeds, apply the desired schema 2 chart/image with a fresh
+`platformMigration.runId` and wait for migration/rollout; new compute cannot become
+usable before schema 2 and its admission policy exist. For Compose, build/pull the
+desired image, run `scripts/migrate-platform.sh compose`, then explicitly start
+the desired services. Bare Helm/template-apply users must follow the same stop/apply
+sequence. Do not automatically roll back the binary after migration commits.
+
+Restore also uses this stop flow, restores both databases, runs a fresh migration,
+and leaves compute stopped for explicit restart. A schema 1 backup is upgraded to 2
+by the current image. `migrate-platform.sh kube` requires the current schema 2 Job
+template; cloning an old schema 1 image cannot perform this upgrade. Apply the
+desired chart only after old compute has stopped. Same-image DB reset/retarget
+still requires a fresh Job/runId; prior completion does not prove the new database.
 
 Successful deployment helpers prune superseded successful migration Jobs and their
 completed Pods only after the current migration and workloads are ready. They

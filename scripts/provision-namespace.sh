@@ -25,6 +25,9 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 kube=(kubectl --context "$context" -n "$ns")
 
+# A rerun can be an upgrade. Check before applying a Job that changes schema.
+python3 scripts/compute_lifecycle.py check kube --context "$context" --namespace "$ns"
+
 python3 scripts/aws/render_boundary.py "$ns" | kubectl --context "$context" apply -f -
 if ! "${kube[@]}" get secret duckfleet-dev > /dev/null 2>&1; then
   python3 - <<'PY' | "${kube[@]}" create -f -

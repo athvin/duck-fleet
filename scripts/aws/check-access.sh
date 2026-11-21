@@ -6,6 +6,11 @@ assert_cluster
 for target in deployments.apps statefulsets.apps jobs.batch secrets; do
   "${KUBE[@]}" auth can-i create "$target" --quiet || { echo "Missing deploy permission: $target" >&2; exit 1; }
 done
+for verb in update patch; do
+  "${KUBE[@]}" auth can-i "$verb" deployments.apps --subresource=scale --quiet || {
+    echo "Missing deploy permission: $verb deployments/scale (required for explicit stop-compute)" >&2; exit 1;
+  }
+done
 for target in roles.rbac.authorization.k8s.io rolebindings.rbac.authorization.k8s.io resourcequotas; do
   answer=$("${KUBE[@]}" auth can-i create "$target") || [[ "$?" == 1 && "$answer" == no ]]
   if [[ "$answer" != no ]]; then

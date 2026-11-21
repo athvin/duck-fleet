@@ -25,6 +25,7 @@ guard = load('plan_guard', 'scripts/aws/plan_guard.py')
 rollout = load('wait_rollout', 'scripts/aws/wait-rollout.py')
 dns = load('check_dns_egress', 'scripts/aws/check-dns-egress.py')
 resources = load('worker_resources', 'scripts/worker_resources.py')
+lifecycle = load('compute_lifecycle', 'scripts/compute_lifecycle.py')
 
 def pod(name, uid, unschedulable=None):
     conditions = []
@@ -679,6 +680,13 @@ class PlatformOperatorScriptsTests(unittest.TestCase):
 import json, os, sys
 with open(os.environ['CALL_LOG'], 'a') as handle:
     handle.write(json.dumps(sys.argv[1:]) + '\\n')
+if 'ps' in sys.argv:
+    print('fixture-worker')
+elif 'inspect' in sys.argv:
+    print(json.dumps([{'Id':'fixture-worker','Config':{'Env':['DUCKFLEET_WORKER_ID=small']},
+                      'State':{'Running':not os.path.exists(os.environ['STOPPED'])}}]))
+elif 'stop' in sys.argv:
+    open(os.environ['STOPPED'], 'w').close()
 if 'pg_restore' in sys.argv:
     sys.stdin.read()
     if os.environ.get('FAIL_PLATFORM') == 'yes' and sys.argv[-1] == 'platform':
@@ -687,12 +695,13 @@ if 'pg_restore' in sys.argv:
             docker.chmod(0o755)
             log = directory/'calls'
             env = dict(os.environ, PATH=str(directory)+os.pathsep+os.environ['PATH'],
-                       CALL_LOG=str(log), DUCKFLEET_CONFIRM_RESTORE='yes')
+                       CALL_LOG=str(log), STOPPED=str(directory/'stopped'), DUCKFLEET_CONFIRM_RESTORE='yes')
             command = ['bash', str(ROOT/'scripts/restore-catalog.sh'), 'compose', str(backup)]
             success = subprocess.run(command, env=env, capture_output=True, text=True)
             self.assertEqual(success.returncode, 0, success.stderr)
             calls = [json.loads(line) for line in log.read_text().splitlines()]
-            self.assertIn('stop', calls[0])
+            self.assertLess(next(i for i,c in enumerate(calls) if 'stop' in c),
+                            next(i for i,c in enumerate(calls) if 'pg_restore' in c))
             restores = [call for call in calls if 'pg_restore' in call]
             self.assertEqual([call[-1] for call in restores], ['lake', 'platform'])
             self.assertTrue(all('--exit-on-error' in call for call in restores))
@@ -709,7 +718,8 @@ if 'pg_restore' in sys.argv:
     def test_manual_kube_migration_clones_configuration_with_a_new_job_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            source = {'spec': {'selector': {'matchLabels': {'controller-uid': 'old'}},
+            source = {'metadata': {'annotations': {'duckfleet.io/platform-schema':'2'}},
+                      'spec': {'selector': {'matchLabels': {'controller-uid': 'old'}},
                                'manualSelector': False, 'activeDeadlineSeconds': 390,
                                'backoffLimit': 0,
                                'template': {'metadata': {'labels': {
@@ -728,7 +738,9 @@ if 'pg_restore' in sys.argv:
             kubectl.write_text("""#!/usr/bin/env python3
 import json,os,sys
 args=sys.argv[1:]
-if 'deployment' in args:
+if 'deployments' in args or 'pods' in args:
+    print(json.dumps({'items':[]}))
+elif 'deployment' in args:
     print('old-job')
 elif 'create' in args:
     open(os.environ['CREATED'], 'w').write(sys.stdin.read())
@@ -753,6 +765,126 @@ else:
             self.assertEqual(job['spec']['template']['metadata']['labels'],
                              {'app': 'duckfleet-platform-migrate'})
             self.assertEqual(job['spec']['template']['spec'], source['spec']['template']['spec'])
+
+
+class QueueDeploymentTests(unittest.TestCase):
+    def test_upgrade_guard_version_matches_binary_and_packaging(self):
+        expected = int(re.search(r'SCHEMA_VERSION: i32 = (\d+)',
+                                (ROOT/'server/src/platform.rs').read_text()).group(1))
+        self.assertEqual(lifecycle.PLATFORM_SCHEMA, expected)
+        services = yaml.safe_load((ROOT/'compose.yaml').read_text())['services']
+        for name in ('server','server-pools','worker-small','worker-small-b','worker-pool-interactive-0'):
+            self.assertEqual(services[name]['labels'][lifecycle.SCHEMA_MARKER], str(expected))
+            self.assertEqual(services[name]['stop_grace_period'], '90s')
+
+    def test_policy_overrides_preserve_omission_and_render_exact_worker_bounds(self):
+        objects = NamedPoolPackagingTests().render(None,
+            '--set', 'persistentPools.interactive.admission.maxRunningQueries=4',
+            '--set', 'admissionLimits.default.maxRunningPerPrincipal=1',
+            '--set', 'admissionLimits.isolated.maxRunningQueries=3')
+        registry = json.loads(objects['ConfigMap', 'duckfleet-pools']['data']['pools.json'])
+        self.assertEqual(registry['pools']['interactive']['admission'], {'max_running_queries':4})
+        gateway = objects['Deployment', 'server']['spec']['template']['spec']['containers'][0]
+        env = {item['name']:item.get('value') for item in gateway['env']}
+        self.assertEqual(json.loads(env['DUCKFLEET_ADMISSION_LIMITS_JSON']), {
+            'default':{'max_running_per_principal':1}, 'isolated':{'max_running_queries':3}})
+        worker = objects['Deployment', 'worker-small']['spec']['template']['spec']['containers'][0]
+        env = {item['name']:item.get('value') for item in worker['env']}
+        self.assertEqual(env['DUCKFLEET_WORKER_QUEUE_CAPACITY'], '64')
+        self.assertEqual(env['DUCKFLEET_WORKER_MAX_QUEUED_QUERIES'], '64')
+        self.assertEqual(env['DUCKFLEET_WORKER_MAX_QUEUED_BYTES'], '16777216')
+        self.assertNotIn('DUCKFLEET_ADMISSION_LIMITS_JSON', env)
+
+    def test_invalid_admission_and_byte_bounds_fail_before_deployment(self):
+        for setting in ('workerMaxQueuedQueries=0','workerMaxQueuedQueries=4097',
+                        'workerMaxQueuedBytes=1048575','workerMaxQueuedBytes=268435457',
+                        'admissionLimits.default.maxQueuedQueries=65536',
+                        'admissionLimits.default.maxRunningQueries=0',
+                        'admissionLimits.default.maxQueuedQueries=1',
+                        'admissionLimits.default.unknown=2',
+                        'persistentPools.interactive.admission.maxRunningQueries=1025',
+                        'persistentPools.interactive.admission.maxQueuedQueries=1'):
+            with self.subTest(setting=setting), self.assertRaises(subprocess.CalledProcessError):
+                NamedPoolPackagingTests().render(None, '--set', setting)
+        with self.assertRaises(subprocess.CalledProcessError):
+            NamedPoolPackagingTests().render(None,
+                '--set', 'admissionLimits.default.maxRunningPerPrincipal=4',
+                '--set', 'persistentPools.interactive.admission.maxRunningQueries=2')
+
+    def test_compose_gateway_start_does_not_wait_for_policy_dependent_worker_readiness(self):
+        services = yaml.safe_load((ROOT/'compose.yaml').read_text())['services']
+        for name in ('server','server-pools'):
+            dependencies = services[name]['depends_on']
+            self.assertEqual(dependencies['platform-migrate']['condition'], 'service_completed_successfully')
+            for worker, condition in dependencies.items():
+                if worker.startswith('worker-'):
+                    self.assertEqual(condition['condition'], 'service_started')
+
+    @staticmethod
+    def deployment(name, role, version=None, replicas=1):
+        metadata = {'labels':{'app':role}, 'annotations':{}}
+        if version is not None:
+            metadata['annotations'][lifecycle.SCHEMA_MARKER] = version
+        return {'metadata':{'name':name}, 'spec':{'replicas':replicas,'template':{'metadata':metadata}}}
+
+    @staticmethod
+    def pod(name, role, version=None):
+        metadata = {'name':name, 'labels':{'app':role},'annotations':{}}
+        if version is not None:
+            metadata['annotations'][lifecycle.SCHEMA_MARKER] = version
+        return {'metadata':metadata}
+
+    def test_upgrade_guard_allows_fresh_and_same_schema_but_requires_actual_quiescence(self):
+        lifecycle.check_kube_state([], [])
+        current = self.deployment('server', lifecycle.GATEWAY, '2')
+        lifecycle.check_kube_state([current], [self.pod('server-new', lifecycle.GATEWAY, '2')])
+        old = self.deployment('worker-pool-wide-0', lifecycle.WORKER)
+        with self.assertRaisesRegex(ValueError, 'stop-compute'):
+            lifecycle.check_kube_state([old], [])
+        old['spec']['replicas'] = 0
+        with self.assertRaisesRegex(ValueError, 'stop-compute'):
+            lifecycle.check_kube_state([old], [self.pod('terminating-old', lifecycle.WORKER)])
+        lifecycle.check_kube_state([old], [])
+        with self.assertRaisesRegex(ValueError, 'rollback is unsupported'):
+            lifecycle.check_kube_state([self.deployment('newer', lifecycle.GATEWAY, '3', 0)], [])
+
+    def test_stop_compute_orders_gateway_before_all_workers_and_preserves_database_and_jobs(self):
+        deployments = [self.deployment('worker-small', lifecycle.WORKER),
+                       self.deployment('server', lifecycle.GATEWAY),
+                       self.deployment('worker-pool-wide-0', lifecycle.WORKER),
+                       self.deployment('other', 'unrelated')]
+        stopped = json.loads(json.dumps(deployments))
+        for item in stopped[:3]:
+            item['spec']['replicas'] = 0
+        kube = ['kubectl','--context','fixture','--namespace','duckfleet-fixture']
+        with mock.patch.object(lifecycle, 'kube_objects', side_effect=[deployments,stopped,[]]), \
+             mock.patch.object(lifecycle, 'run') as command:
+            lifecycle.stop_kube(kube, 180)
+        calls = [call.args[0] for call in command.call_args_list]
+        self.assertEqual(calls[0], [*kube,'scale','deployment/server','--replicas=0'])
+        self.assertIn('app=duckfleet-gateway', calls[1])
+        self.assertTrue(all(call[:len(kube)] == kube for call in calls))
+        self.assertIn([*kube,'scale','deployment/worker-pool-wide-0','--replicas=0'], calls)
+        self.assertFalse(any(any(word in ('statefulset','jobs','secrets','pvc','deployment/other') for word in call) for call in calls))
+        with mock.patch.object(lifecycle, 'kube_objects', return_value=deployments), \
+             mock.patch.object(lifecycle, 'run', side_effect=[None,subprocess.CalledProcessError(1,['kubectl'])]) as command:
+            with self.assertRaises(subprocess.CalledProcessError):
+                lifecycle.stop_kube(kube, 180)
+            self.assertEqual(command.call_count, 2, 'a gateway-stop failure must not proceed to workers or migration')
+
+    def test_compose_stop_scopes_to_project_compute_and_waits_with_execution_grace(self):
+        def container(name, env):
+            return {'Id':name,'Config':{'Env':env},'State':{'Running':True}}
+        containers = [container('db',['POSTGRES_USER=duckfleet']),
+                      container('old-optional-worker',['DUCKFLEET_WORKER_ID=pool-wide-0']),
+                      container('gateway',['DUCKFLEET_ROLE=gateway'])]
+        with mock.patch.object(lifecycle,'compose_containers',side_effect=[containers,[]]), \
+             mock.patch.object(lifecycle,'run') as command:
+            lifecycle.stop_compose()
+        self.assertEqual([call.args[0] for call in command.call_args_list],
+                         [['docker','stop','-t','90','gateway'],['docker','stop','-t','90','old-optional-worker']])
+        with self.assertRaisesRegex(ValueError,'stop-compute'):
+            lifecycle.check_compose_state(containers)
 
 
 class ImagePublishingTests(unittest.TestCase):

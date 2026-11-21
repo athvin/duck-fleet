@@ -19,6 +19,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use uuid::Uuid;
 
 use crate::{ApiError, credentials::Identity};
 
@@ -61,6 +62,7 @@ pub(crate) trait Platform: Send + Sync + 'static {
         &self,
         identity: &Identity,
         session: &Session,
+        request_id: Uuid,
         sql: String,
     ) -> impl std::future::Future<Output = QueryOutcome> + Send;
     fn close_session(&self, session: Session) -> impl std::future::Future<Output = ()> + Send;
@@ -421,13 +423,22 @@ async fn run_statement<P: Platform>(
         return refuse_access(stream, error).await;
     }
     let open = session.as_ref().expect("session was just opened");
-    match platform.query(identity, open, sql.to_owned()).await {
+    let request_id = Uuid::new_v4();
+    // The caller must know the ID while this synchronous operation is waiting.
+    // A notice describes submission, never successful durable acceptance.
+    submitted_notice(stream, request_id).await?;
+    match platform
+        .query(identity, open, request_id, sql.to_owned())
+        .await
+    {
         QueryOutcome::Rows(arrow) => {
             tokio::time::timeout(WRITE_TIMEOUT, write_arrow(stream, sql, &arrow))
                 .await
                 .context("pgwire result write timed out")?
         }
         QueryOutcome::Refused { kind, message } => {
+            let message =
+                format!("{message}; request_id={request_id}; status=/v1/requests/{request_id}");
             if matches!(kind.as_str(), "unauthorized" | "forbidden") {
                 // A final gateway-side check may catch a revocation that raced
                 // this statement boundary. Close the session on this path too.
@@ -448,10 +459,13 @@ async fn run_statement<P: Platform>(
 fn sqlstate(kind: &str) -> &'static str {
     match kind {
         "sql_error" => "42601",
-        "timeout" | "canceled" | "budget_exceeded" => "57014",
+        "timeout" | "queue_timeout" | "canceled" | "budget_exceeded" => "57014",
         "unauthorized" | "forbidden" => "28P01",
-        "unknown_session" | "draining" | "starting" | "unavailable" => "57P01",
-        "capacity" | "budget_exhausted" | "budget_job_cost" => "53300",
+        "unknown_session" | "session_lost" | "queue_drained" | "draining" | "starting"
+        | "unavailable" => "57P01",
+        "capacity" | "queue_capacity" | "session_busy" | "budget_exhausted" | "budget_job_cost" => {
+            "53300"
+        }
         "transaction_conflict" => "40001",
         _ => "XX000",
     }
@@ -748,6 +762,21 @@ async fn refuse_access(stream: &mut BufStream<TcpStream>, error: ApiError) -> Re
     bail!("pgwire access refused [{}]", error.0.kind)
 }
 
+async fn submitted_notice(stream: &mut BufStream<TcpStream>, request_id: Uuid) -> Result<()> {
+    let message = format!(
+        "query submitted: request_id={request_id}; status=/v1/requests/{request_id}; acceptance pending"
+    );
+    let mut body = Vec::new();
+    for (field, value) in [(b'S', "NOTICE"), (b'C', "00000"), (b'M', message.as_str())] {
+        body.push(field);
+        body.extend_from_slice(value.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    write_message(stream, b'N', &body).await?;
+    flush(stream).await
+}
+
 async fn error_response(
     stream: &mut BufStream<TcpStream>,
     code: &str,
@@ -814,6 +843,7 @@ mod tests {
         opened: AtomicUsize,
         closed: AtomicUsize,
         statements: Mutex<Vec<String>>,
+        request_ids: Mutex<Vec<Uuid>>,
         hold_open: bool,
         hold_query: bool,
         entered: Notify,
@@ -866,8 +896,10 @@ mod tests {
             &self,
             _identity: &Identity,
             _session: &Session,
+            request_id: Uuid,
             sql: String,
         ) -> QueryOutcome {
+            self.request_ids.lock().unwrap().push(request_id);
             self.statements.lock().unwrap().push(sql);
             if self.hold_query {
                 self.entered.notify_one();
@@ -996,6 +1028,32 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_notice_exposes_same_request_id_before_backend_finishes() {
+        let platform = Arc::new(TestPlatform {
+            hold_query: true,
+            ..Default::default()
+        });
+        let (mut client, task) = test_connection(platform.clone()).await;
+        statement(&mut client, "select 1").await;
+        let (kind, body) = response(&mut client).await;
+        assert_eq!(kind, b'N');
+        tokio::time::timeout(Duration::from_secs(2), platform.entered.notified())
+            .await
+            .unwrap();
+        let id = platform.request_ids.lock().unwrap()[0];
+        let notice = String::from_utf8(body).unwrap();
+        assert!(notice.contains(&format!("request_id={id}")));
+        assert!(notice.contains(&format!("status=/v1/requests/{id}")));
+        assert!(notice.contains("acceptance pending"));
+        assert!(!task.is_finished());
+        platform.resume.notify_one();
+        successful_response(&mut client).await;
+        write_message(&mut client, b'X', &[]).await.unwrap();
+        flush(&mut client).await.unwrap();
+        finished(task).await;
     }
 
     #[tokio::test]

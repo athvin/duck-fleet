@@ -87,12 +87,12 @@ impl Filter {
     }
 }
 
-const COLUMNS: &str = "query_id,session_id,sql,context,status,accepted_at::text,finished_at::text,elapsed_ms,result_rows,error,placement,history_id,worker_id,profile_status,metrics,failure_kind,retry_safe,principal";
+const COLUMNS: &str = "query_id,session_id,sql,context,status,accepted_at::text,finished_at::text,elapsed_ms,result_rows,error,placement,history_id,worker_id,profile_status,metrics,failure_kind,retry_safe,principal,to_jsonb(query_history)::text";
 fn record(row: &Row) -> Value {
     fn json_column(row: &Row, column: usize) -> Value {
         serde_json::from_str(row.get::<_, &str>(column)).unwrap_or(Value::Null)
     }
-    json!({
+    let mut value = json!({
         "query_id":row.get::<_, String>(0), "session_id":row.get::<_, String>(1),
         "sql":row.get::<_, String>(2), "context":json_column(row,3),
         "status":row.get::<_, String>(4), "accepted_at":row.get::<_, String>(5),
@@ -107,7 +107,27 @@ fn record(row: &Row) -> Value {
         // Who the gateway authenticated for the session; `direct` for a worker
         // addressed without one, and for records older than the column.
         "principal":row.get::<_, String>(17)
-    })
+    });
+    queue_metadata(&mut value, &json_column(row, 18));
+    value
+}
+fn queue_metadata(value: &mut Value, stored: &Value) {
+    // Explicit projection is legacy-safe and never exposes the raw storage row.
+    // accepted_at is durable admission; engine_started_at alone denotes SQL entry.
+    for key in [
+        "queued_at",
+        "selected_at",
+        "execution_granted_at",
+        "engine_started_at",
+        "queue_deadline_at",
+        "session_sequence",
+        "worker_boot_id",
+        "pool_scope",
+        "protocol",
+        "open_span_id",
+    ] {
+        value[key] = stored.get(key).cloned().unwrap_or(Value::Null);
+    }
 }
 impl Reader {
     pub fn new(dsn: String) -> Self {
@@ -204,6 +224,24 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queue_timing_is_nullable_for_legacy_and_does_not_infer_engine_entry() {
+        let mut history = json!({"accepted_at":"2026-11-20T00:00:00Z"});
+        queue_metadata(
+            &mut history,
+            &json!({"queued_at":"2026-11-20T00:00:00Z","protocol":"pgwire","private_payload":"secret"}),
+        );
+        assert_eq!(history["protocol"], "pgwire");
+        assert!(history["engine_started_at"].is_null());
+        assert!(history["session_sequence"].is_null());
+        assert!(history.get("private_payload").is_none());
+        queue_metadata(
+            &mut history,
+            &json!({"engine_started_at":"2026-11-20T00:00:02Z","session_sequence":3}),
+        );
+        assert_eq!(history["session_sequence"], 3);
+        assert_eq!(history["engine_started_at"], "2026-11-20T00:00:02Z");
+    }
     #[test]
     fn bounded_filters_reject_invalid_values() {
         for input in [

@@ -59,6 +59,21 @@ pub async fn run(args: Vec<String>) -> i32 {
                 return 2;
             }
         },
+        "cancel" => match parsed.positionals.first() {
+            Some(id) => {
+                request(
+                    &url,
+                    &token,
+                    reqwest::Method::POST,
+                    &format!("/v1/requests/{id}/cancel"),
+                )
+                .await
+            }
+            None => {
+                eprintln!("cancel needs a request id");
+                return 2;
+            }
+        },
         "usage" => {
             get(
                 &url,
@@ -72,7 +87,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "pools" => get(&url, &token, "/v1/pools").await,
         other => {
             eprintln!(
-                "unknown command: {other} (sql|history|query|request|usage|budget|workers|pools)"
+                "unknown command: {other} (sql|history|query|request|cancel|usage|budget|workers|pools)"
             );
             return 2;
         }
@@ -91,6 +106,15 @@ pub async fn run(args: Vec<String>) -> i32 {
             let kind = error.failure_kind.as_deref().unwrap_or("error");
             eprintln!("{kind} (HTTP {status}): {error}");
             eprintln!("retry_safe: {}", error.retry_safe);
+            if let Some(id) = &error.request_id {
+                eprintln!(
+                    "request_id: {id}; acceptance: {}",
+                    error.acceptance.as_deref().unwrap_or("unknown")
+                );
+                if let Some(url) = &error.status_url {
+                    eprintln!("status: {url}");
+                }
+            }
             1
         }
     }
@@ -98,6 +122,9 @@ pub async fn run(args: Vec<String>) -> i32 {
 
 async fn run_sql(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
     let compute = parsed.compute().map_err(|message| RemoteError {
+        request_id: None,
+        acceptance: None,
+        status_url: None,
         status: None,
         failure_kind: Some("invalid_request".into()),
         retry_safe: true,
@@ -118,27 +145,45 @@ async fn run_sql(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteEr
     // so close in both the success and the error path.
     let mut outcome = Ok(());
     for statement in &parsed.positionals {
-        match connection.execute(statement, parameters.clone()).await {
-            Ok(result) => emit(&result, format),
+        match connection
+            .execute_with_queue_timeout(
+                statement,
+                parameters.clone(),
+                parsed.queue_timeout().expect("validated arguments"),
+            )
+            .await
+        {
+            Ok((_, result)) => emit(&result, format),
             Err(error) => {
                 outcome = Err(error);
                 break;
             }
         }
     }
-    let _ = connection.close().await;
+    // An unknown transport outcome must not turn into an implicit queued cancel
+    // through close. The worker expires this connection after its work ends.
+    if !outcome
+        .as_ref()
+        .is_err_and(|error| error.acceptance.as_deref() == Some("unknown"))
+    {
+        let _ = connection.close().await;
+    }
     outcome
 }
 
 async fn get(url: &str, token: &str, path: &str) -> Result<(), RemoteError> {
+    request(url, token, reqwest::Method::GET, path).await
+}
+
+async fn request(
+    url: &str,
+    token: &str,
+    method: reqwest::Method,
+    path: &str,
+) -> Result<(), RemoteError> {
     let client = Client::new(url, token)?;
     let bytes = client
-        .request(
-            reqwest::Method::GET,
-            path,
-            None,
-            std::time::Duration::from_secs(75),
-        )
+        .request(method, path, None, std::time::Duration::from_secs(75))
         .await?;
     let value: Value = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
@@ -285,8 +330,17 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 9] = [
-        "url", "token", "cpu", "memory", "disk", "mode", "pool", "format", "limit",
+    const VALUE_FLAGS: [&'static str; 10] = [
+        "url",
+        "token",
+        "cpu",
+        "memory",
+        "disk",
+        "mode",
+        "pool",
+        "format",
+        "limit",
+        "queue-timeout",
     ];
     const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
@@ -331,8 +385,9 @@ impl Parsed {
             }
         }
         let parsed = Parsed {
-            command: command
-                .ok_or("usage: <sql|history|query|request|usage|budget|workers|pools> ...")?,
+            command: command.ok_or(
+                "usage: <sql|history|query|request|cancel|usage|budget|workers|pools> ...",
+            )?,
             positionals,
             values,
             params,
@@ -346,6 +401,10 @@ impl Parsed {
         {
             return Err("compute selection flags apply only to the sql command".into());
         }
+        if parsed.command != "sql" && parsed.value("queue-timeout").is_some() {
+            return Err("--queue-timeout applies only to the sql command".into());
+        }
+        parsed.queue_timeout()?;
         parsed.compute()?;
         Ok(parsed)
     }
@@ -355,6 +414,18 @@ impl Parsed {
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
+    }
+
+    fn queue_timeout(&self) -> Result<u64, String> {
+        self.value("queue-timeout")
+            .map_or(Ok(crate::query::DEFAULT_QUEUE_TIMEOUT), |text| {
+                text.parse::<u64>()
+                    .ok()
+                    .filter(|n| (1..=120).contains(n))
+                    .ok_or_else(|| {
+                        "--queue-timeout must be a whole number from 1 to 120 seconds".into()
+                    })
+            })
     }
 
     fn limit(&self, default: u32) -> u32 {
@@ -398,6 +469,29 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Parsed, String> {
         Parsed::from_args(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn queue_allowance_is_validated_before_opening_sql() {
+        assert_eq!(
+            parse(&["sql", "SELECT 1"])
+                .unwrap()
+                .queue_timeout()
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            parse(&["sql", "--queue-timeout", "120", "SELECT 1"])
+                .unwrap()
+                .queue_timeout()
+                .unwrap(),
+            120
+        );
+        for value in ["0", "121", "1.5", "many"] {
+            assert!(parse(&["sql", "--queue-timeout", value, "SELECT 1"]).is_err());
+        }
+        assert!(parse(&["request", "id", "--queue-timeout", "5"]).is_err());
+        assert_eq!(parse(&["cancel", "id"]).unwrap().command, "cancel");
     }
 
     #[test]
