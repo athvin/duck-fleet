@@ -439,6 +439,28 @@ impl Gateway {
         if !candidates.is_empty() {
             return Ok(candidates);
         }
+        // Excluding a worker from placement must preserve the classified open
+        // refusal clients wait out during a rollout. No open was forwarded here.
+        for report in &fleet.reported {
+            let matching = report["cpu"].as_u64() == Some(u64::from(wanted.cpu))
+                && report["memory_bytes"].as_u64() == Some(wanted.memory_bytes);
+            let refusal = match report["state"].as_str() {
+                Some("draining") if matching => Some(failure::DRAINING),
+                Some("starting") if matching || report.get("cpu").is_none() => {
+                    Some(failure::STARTING)
+                }
+                _ => None,
+            };
+            if let Some(refusal) = refusal {
+                return Err(ApiError::new(
+                    refusal,
+                    format!(
+                        "a worker serving the requested resources is {}; no session was opened and no statement ran",
+                        refusal.kind
+                    ),
+                ));
+            }
+        }
         Err(if fleet.unreachable.is_empty() {
             ApiError::new(
                 failure::UNAVAILABLE,
@@ -1696,6 +1718,26 @@ mod tests {
         let Json(report) = workers(State(app)).await.unwrap();
         // Local tie-breaker adjustments must not pretend to be worker samples.
         assert_eq!(report["workers"], json!(initial.reported));
+    }
+
+    #[tokio::test]
+    async fn excluding_a_transient_worker_preserves_the_waitable_open_refusal() {
+        let server = status_server(status("draining")).await;
+        let app = test_gateway(vec![server.endpoint.clone()]);
+        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        assert_eq!(error.0.kind, "draining");
+        assert!(error.0.retry_safe);
+        assert_eq!(server.opens.load(Ordering::SeqCst), 0);
+
+        let mut starting = status("starting");
+        starting.as_object_mut().unwrap().remove("cpu");
+        starting.as_object_mut().unwrap().remove("memory_bytes");
+        server.reply.lock().await.1 = starting;
+        *app.fleet.lock().await = None;
+        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        assert_eq!(error.0.kind, "starting");
+        assert!(error.0.retry_safe);
+        assert_eq!(server.opens.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
