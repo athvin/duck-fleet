@@ -29,6 +29,25 @@ services:
       dockerfile: docker/s3.Dockerfile
     depends_on: [object-store]
 
+  # Explicit schema changes run once before compute, without DuckDB, S3, or a token.
+  # After restoring/resetting platform, rerun: scripts/migrate-platform.sh compose
+  platform-migrate:
+    image: duckfleet-worker:local
+    build:
+      context: .
+      dockerfile: docker/server.Dockerfile
+    environment:
+      DUCKFLEET_ROLE: migrate
+      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
+      DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
+      DUCKFLEET_MIGRATION_TIMEOUT_SECONDS: "240"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 256m
+    cpus: 0.5
+    restart: "no"
+
   # The single persistent worker tier (the default size). Sizing a model now
   # derives an isolated pod, which needs Kubernetes, so Compose runs one shared
   # persistent worker; a sized request is refused here with compute_unavailable.
@@ -47,9 +66,7 @@ services:
       # Pinned to the defaults so the harness's pricing evidence is deterministic.
       DUCKFLEET_RATE_CARD_VERSION: local-dev-1
       DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR: "100000"
-      # A year, so the retention stage can age rows past it while every row the
-      # harness itself writes stays comfortably inside it.
-      DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
+      DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       CATALOG_DSN: host=postgres port=5432 dbname=lake user=duckfleet password=local-catalog-password
       PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
       S3_ENDPOINT: object-store:9000
@@ -57,8 +74,8 @@ services:
       S3_SECRET_KEY: local-object-store-password
       S3_DATA_PATH: s3://duckfleet/lake/
     depends_on:
-      postgres:
-        condition: service_healthy
+      platform-migrate:
+        condition: service_completed_successfully
       bucket-init:
         condition: service_completed_successfully
     healthcheck: &worker-health
@@ -92,6 +109,9 @@ services:
     image: duckfleet-worker:local
     environment:
       DUCKFLEET_ROLE: gateway
+      DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
+      # The gateway coordinates bounded history retention for the whole fleet.
+      DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
       # The wire front is exercised by the harness; the port stays internal.
       DUCKFLEET_PGWIRE: "true"
       PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
@@ -106,6 +126,8 @@ services:
     ports:
       - '127.0.0.1:${DUCKFLEET_PORT:-18080}:8080'
     depends_on:
+      platform-migrate:
+        condition: service_completed_successfully
       worker-small:
         condition: service_healthy
     healthcheck: *worker-health

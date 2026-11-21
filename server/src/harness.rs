@@ -24,6 +24,7 @@ mod aws_harness;
 mod concurrency;
 mod metering;
 mod observability;
+mod platform;
 mod request_identity;
 mod request_upgrade;
 
@@ -41,7 +42,9 @@ pub async fn run(args: Vec<String>) -> i32 {
     let ctx = Ctx { url, token };
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
-    let result: anyhow::Result<()> = if has("--spread") {
+    let result: anyhow::Result<()> = if has("--platform-maintenance") {
+        platform::checks().await
+    } else if has("--spread") {
         spread_checks(&ctx).await
     } else if has("--spread-failover") {
         spread_failover_checks(&ctx).await

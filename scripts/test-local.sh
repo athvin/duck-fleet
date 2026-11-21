@@ -41,6 +41,7 @@ grep -q 'catalog-does-not-resolve' artifacts/worker-boot-failure.log
 # A deleted pod's replacement can overlap its draining predecessor even under
 # Deployment Recreate. Startup recovery must wait for the stable identity owner.
 if docker compose run --rm --no-deps -T -e DUCKFLEET_CATALOG_WAIT_SECONDS=1 \
+  -e DUCKFLEET_PLATFORM_WAIT_SECONDS=1 \
   worker-small > artifacts/worker-overlap-refusal.log 2>&1; then
   echo 'a second live process acquired the same worker recovery identity' >&2
   exit 1
@@ -67,6 +68,7 @@ echo 'PASS: a worker addressed directly refuses isolation it cannot provide'
 docker compose run --rm api
 docker compose run --rm dbt duckfleet-server --auth-continuity
 docker compose run --rm dbt duckfleet-server --request-identity
+docker compose run --rm dbt duckfleet-server --platform-maintenance
 docker compose run --rm dbt duckfleet-server --ownership-loss
 # Ownership loss is terminal for that worker process. Start a fresh owner before
 # the ordinary query/dbt workflow; the gateway's metadata reads stayed available.
@@ -132,7 +134,7 @@ docker compose --profile scale-out stop worker-small-b
 # PENDING MIGRATION (tracked for a dedicated follow-up — these stages are deeply
 # coupled to the pre-rework 2-worker fleet and the Python client, and need
 # re-expressing against the single persistent tier + the Rust harness/cli:
-#   - retention sweep, worker late-catalog wait, worker ledger-reconnect
+#   - worker late-catalog wait, worker ledger-reconnect
 #   - SIGTERM drain of the worker and of the gateway (--drain-inflight /
 #     --gateway-drain-inflight harness stages + docker kill)
 #   - the Phase-1 scale sweep (--scale) and maintenance (--maintenance)

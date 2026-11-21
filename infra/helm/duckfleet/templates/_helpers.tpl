@@ -79,6 +79,9 @@ template and the code that patches it from drifting silently.
 */}}
 {{- define "duckfleet.workerEnv" -}}
 {{- $ := .root -}}
+{{- if gt (add $.Values.catalogWaitSeconds $.Values.platformWaitSeconds) 600 -}}
+{{- fail "catalogWaitSeconds + platformWaitSeconds must fit the 600-second startup probe budget" -}}
+{{- end -}}
 - {name: DUCKFLEET_WORKER_ID, value: {{ .id | quote }}}
 # Declared from the same values as the limits. The worker refuses to start if the
 # container it actually got disagrees.
@@ -91,12 +94,12 @@ template and the code that patches it from drifting silently.
 - {name: S3_AUTH_MODE, value: pod_identity}
 - {name: DUCKFLEET_PROFILING, value: {{ $.Values.profiling | quote }}}
 - {name: DUCKFLEET_CATALOG_WAIT_SECONDS, value: {{ $.Values.catalogWaitSeconds | quote }}}
+- {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ $.Values.platformWaitSeconds | quote }}}
 # The rate card rides with every role that prices work: workers admit and settle
 # with it, and each reservation copies it so recovery never reprices old work.
 # check-chart.py asserts the gateway carries the same pair.
 - {name: DUCKFLEET_RATE_CARD_VERSION, value: {{ $.Values.rateCard.version | quote }}}
 - {name: DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR, value: {{ $.Values.rateCard.computeMicroUsdPerUnitHour | quote }}}
-- {name: DUCKFLEET_HISTORY_RETENTION_DAYS, value: {{ $.Values.historyRetentionDays | quote }}}
 - {name: S3_DATA_PATH, value: {{ printf "s3://%s/%s/" $.Values.bucket $.Values.lakePrefix | quote }}}
 - {name: AWS_REGION, value: {{ $.Values.region }}}
 - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
@@ -187,4 +190,11 @@ startupProbe:
   httpGet: {path: /healthz, port: 8080}
   periodSeconds: 5
   failureThreshold: 120
+{{- end -}}
+
+{{/* The values hash changes whenever the immutable Job template could change.
+     runId also lets an operator rerun against a restored or retargeted database;
+     Release.Revision is insufficient for helm template/kubectl apply installs. */}}
+{{- define "duckfleet.migrationJob" -}}
+{{- printf "duckfleet-platform-migrate-%s" (toJson .Values | sha256sum | trunc 12) -}}
 {{- end -}}

@@ -8,6 +8,7 @@ import fnmatch
 import subprocess
 import re
 import unittest
+from unittest import mock
 from pathlib import Path
 import yaml
 
@@ -34,7 +35,7 @@ def pod(name, uid, unschedulable=None):
         conditions.append({'type': 'PodScheduled', 'status': 'True'})
     return {'metadata': {'name': name, 'uid': uid}, 'status': {'conditions': conditions}}
 
-def chart():
+def chart(extra=()):
     """The release with isolated compute on, which is the fullest render."""
     return subprocess.run(
         ['helm', 'template', 'duckfleet', str(ROOT/'infra/helm/duckfleet'),
@@ -42,13 +43,13 @@ def chart():
          '--set', f'workerImage={IMAGE.format(kind="worker")}',
          '--set', f'dbtImage={IMAGE.format(kind="dbt")}',
          '--set', 'isolatedCompute.enabled=true',
-         '--set', 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32'],
+         '--set', 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32', *extra],
         check=True, capture_output=True, text=True).stdout
 
 
 def deployment(name, desired, ready):
     return {'metadata': {'name': name}, 'spec': {'replicas': desired},
-            'status': {'readyReplicas': ready}}
+            'status': {'readyReplicas': ready, 'updatedReplicas': ready, 'replicas': desired}}
 
 class AwsCiTests(unittest.TestCase):
     def plan(self, actions, address='aws_s3_bucket.lake'):
@@ -176,6 +177,118 @@ class RolloutWaitTests(unittest.TestCase):
             observed = {'metadata': {'name': 'p', 'uid': 'u'},
                         'status': {'conditions': [condition]}}
             self.assertIsNone(rollout.unschedulable_reason(observed), str(condition))
+
+    def test_old_ready_replicas_do_not_complete_a_new_rollout(self):
+        observed = deployment('server', 1, 1)
+        observed['metadata']['generation'] = 3
+        observed['status']['observedGeneration'] = 2
+        self.assertEqual(self.evaluate([observed], [], {}, 0)[0], 'waiting')
+        observed['status']['observedGeneration'] = 3
+        observed['status']['updatedReplicas'] = 0
+        self.assertEqual(self.evaluate([observed], [], {}, 0)[0], 'waiting')
+        observed['status']['updatedReplicas'] = 1
+        self.assertEqual(self.evaluate([observed], [], {}, 0)[0], 'ready')
+
+    def test_only_the_current_migration_can_complete_the_rollout(self):
+        server = deployment('server', 1, 1)
+        server['metadata']['annotations'] = {'duckfleet.io/migration-job': 'current'}
+        old = {'metadata': {'name': 'old'}, 'status': {'conditions': [
+            {'type': 'Complete', 'status': 'True'}]}}
+        current = {'metadata': {'name': 'current'}, 'status': {}}
+        for jobs in [[], [old], [old, current]]:
+            state, message = rollout.evaluate([server], [], {}, 0, self.GRACE, jobs=jobs)
+            self.assertEqual(state, 'waiting')
+            self.assertIn('current', message)
+        current['status']['conditions'] = [{'type': 'Complete', 'status': 'True'}]
+        self.assertEqual(rollout.evaluate([server], [], {}, 0, self.GRACE,
+                                         jobs=[old, current])[0], 'ready')
+        current['status']['conditions'] = [
+            {'type': 'Failed', 'status': 'True', 'reason': 'DeadlineExceeded'}]
+        state, message = rollout.evaluate([server], [], {}, 0, self.GRACE, jobs=[current])
+        self.assertEqual(state, 'failed')
+        self.assertIn('DeadlineExceeded', message)
+        server['spec']['replicas'] = 0
+        server['status'] = {}
+        self.assertEqual(rollout.evaluate([server], [], {}, 0, self.GRACE,
+                                         jobs=[current])[0], 'ready')
+
+    def test_bundled_postgres_must_be_ready(self):
+        database = {'metadata': {'name': 'duckfleet-postgres'},
+                    'spec': {'replicas': 1}, 'status': {'readyReplicas': 0}}
+        self.assertEqual(rollout.evaluate([deployment('server', 1, 1)], [], {}, 0,
+                                         self.GRACE, statefulsets=[database])[0], 'waiting')
+        database['status']['readyReplicas'] = 1
+        self.assertEqual(rollout.evaluate([deployment('server', 1, 1)], [], {}, 0,
+                                         self.GRACE, statefulsets=[database])[0], 'ready')
+
+    def test_migration_pruning_preserves_current_pending_running_and_failed_jobs(self):
+        server = deployment('server', 1, 1)
+        server['metadata']['annotations'] = {'duckfleet.io/migration-job': 'current'}
+        paused = deployment('paused-worker', 0, 0)
+        paused['metadata']['annotations'] = {'duckfleet.io/migration-job': 'paused-current'}
+
+        def job(name, condition=None, active=0, label='duckfleet-platform-migrate'):
+            return {'metadata': {'name': name, 'labels': {'app': label}}, 'status': {
+                'active': active, 'conditions': [] if condition is None else [
+                    {'type': condition, 'status': 'True'}]}}
+
+        jobs = [job('current', 'Complete'), job('paused-current', 'Complete'),
+                job('old-success', 'Complete'), job('pending'), job('running', active=1),
+                job('failed', 'Failed'), job('not-yet-stopped', 'Complete', active=1),
+                job('harness', 'Complete', label='duckfleet-harness')]
+        self.assertEqual(rollout.completed_migrations_to_prune([server, paused], jobs),
+                         ['old-success'])
+        # No successful current run means no permission to discard earlier evidence.
+        for current_condition in (None, 'Failed'):
+            jobs[0] = job('current', current_condition)
+            self.assertEqual(rollout.completed_migrations_to_prune([server, paused], jobs), [])
+        jobs[0] = job('current', 'Complete')
+        self.assertEqual(rollout.completed_migrations_to_prune([paused], jobs), [])
+        self.assertEqual(rollout.completed_migrations_to_prune([], jobs), [])
+
+    def test_pruning_deletes_only_selected_jobs_in_the_observed_namespace(self):
+        server = deployment('server', 1, 1)
+        server['metadata']['annotations'] = {'duckfleet.io/migration-job': 'current'}
+        jobs = [{'metadata': {'name': name, 'labels': {'app': 'duckfleet-platform-migrate'}},
+                 'status': {'conditions': [{'type': 'Complete', 'status': 'True'}]}}
+                for name in ('current', 'old-success')]
+        kube = ['kubectl', '--context', 'fixture-context', '-n', 'duckfleet-fixture']
+        with mock.patch.object(rollout.subprocess, 'run') as run:
+            run.return_value = subprocess.CompletedProcess([], 0, '', '')
+            rollout.prune_migrations(kube, [server], jobs)
+            self.assertEqual(run.call_args.args[0],
+                [*kube, 'delete', 'job', 'old-success', '--ignore-not-found',
+                 '--wait=false', '--cascade=background'])
+            self.assertEqual(run.call_args.kwargs['timeout'], 30)
+            run.reset_mock()
+            rollout.prune_migrations(kube, [server], jobs[:1])
+            run.assert_not_called()
+            run.return_value = subprocess.CompletedProcess([], 1, '', 'Forbidden')
+            with self.assertRaisesRegex(RuntimeError, 'Forbidden'):
+                rollout.prune_migrations(kube, [server], jobs)
+
+    def test_pruning_requires_opt_in_and_a_successful_rollout(self):
+        server = deployment('server', 1, 1)
+        server['metadata']['annotations'] = {'duckfleet.io/migration-job': 'current'}
+        job = {'metadata': {'name': 'current'}, 'status': {'conditions': [
+            {'type': 'Complete', 'status': 'True'}]}}
+        observed = {'deployments': [server], 'jobs': [job], 'pods': [], 'statefulsets': []}
+        base = ['wait-rollout.py', '--namespace', 'duckfleet-fixture', '--context', 'fixture']
+        with mock.patch.object(rollout, 'observe', side_effect=lambda _, kind: observed[kind]), \
+                mock.patch.object(rollout, 'prune_migrations') as prune:
+            with mock.patch.object(rollout.sys, 'argv', base):
+                self.assertEqual(rollout.main(), 0)
+            prune.assert_not_called()
+            with mock.patch.object(rollout.sys, 'argv', [*base, '--prune-migrations']):
+                self.assertEqual(rollout.main(), 0)
+            prune.assert_called_once()
+            prune.reset_mock()
+            # A failed rollout must not erase successful prior migration evidence.
+            server['status']['readyReplicas'] = 0
+            with mock.patch.object(rollout.sys, 'argv',
+                                   [*base, '--prune-migrations', '--timeout-seconds', '0']):
+                self.assertEqual(rollout.main(), 1)
+            prune.assert_not_called()
 
     def test_deploy_waits_separately_from_helm(self):
         deploy = (ROOT/'scripts/aws/deploy.sh').read_text()
@@ -405,6 +518,139 @@ class RolloutWaitTests(unittest.TestCase):
         # And the deploy no longer asks a question it is not permitted to answer.
         self.assertNotIn('can-i create roles',
                          (ROOT/'scripts/aws/deploy.sh').read_text())
+
+
+class PlatformPackagingTests(unittest.TestCase):
+    def migration(self, *args):
+        objects = [item for item in yaml.safe_load_all(chart(args)) if item]
+        jobs = [item for item in objects if item['kind'] == 'Job'
+                and item['metadata'].get('labels', {}).get('app') == 'duckfleet-platform-migrate']
+        return objects, jobs
+
+    def test_fresh_install_job_has_no_hook_or_compute_credentials(self):
+        objects, jobs = self.migration()
+        self.assertEqual(len(jobs), 1)
+        job = jobs[0]
+        self.assertNotIn('helm.sh/hook', job['metadata'].get('annotations', {}))
+        pod = job['spec']['template']['spec']
+        self.assertEqual(pod['serviceAccountName'], 'duckfleet-no-aws')
+        self.assertFalse(pod['automountServiceAccountToken'])
+        env = {item['name'] for item in pod['containers'][0]['env']}
+        self.assertIn('PLATFORM_DSN', env)
+        self.assertFalse({'CATALOG_DSN', 'DUCKFLEET_TOKEN', 'S3_AUTH_MODE'} & env)
+        gateway = next(item for item in objects if item['kind'] == 'Deployment'
+                       and item['metadata']['name'] == 'server')
+        self.assertEqual(gateway['metadata']['annotations']['duckfleet.io/migration-job'],
+                         job['metadata']['name'])
+
+    def test_reset_run_id_recreates_job_even_with_the_same_image_and_secret(self):
+        _, original = self.migration()
+        _, reset = self.migration('--set-string', 'platformMigration.runId=after-restore')
+        _, repeat = self.migration('--set-string', 'platformMigration.runId=after-restore')
+        self.assertNotEqual(original[0]['metadata']['name'], reset[0]['metadata']['name'])
+        self.assertEqual(reset, repeat, 'template/apply must converge for a fixed run identity')
+        _, changed_timeout = self.migration('--set', 'platformMigration.timeoutSeconds=241')
+        self.assertNotEqual(original[0]['metadata']['name'], changed_timeout[0]['metadata']['name'],
+                            'a Job template change must not patch an immutable Job')
+
+    def test_suspended_release_starts_no_migration_and_external_db_still_does(self):
+        objects, jobs = self.migration('--set', 'suspended=true')
+        self.assertFalse(jobs)
+        gateway = next(item for item in objects if item['kind'] == 'Deployment'
+                       and item['metadata']['name'] == 'server')
+        self.assertNotIn('duckfleet.io/migration-job', gateway['metadata'].get('annotations') or {})
+        objects, jobs = self.migration('--set', 'postgres.bundled=false')
+        self.assertEqual(len(jobs), 1)
+        self.assertFalse(any(item['kind'] == 'StatefulSet' for item in objects))
+
+
+class PlatformOperatorScriptsTests(unittest.TestCase):
+    def test_restore_stops_compute_and_migrates_only_after_both_restores_succeed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            backup = directory/'backup'
+            backup.mkdir()
+            for database in ('lake', 'platform'):
+                (backup/f'{database}.dump').write_text('fixture archive')
+            docker = directory/'docker'
+            docker.write_text("""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['CALL_LOG'], 'a') as handle:
+    handle.write(json.dumps(sys.argv[1:]) + '\\n')
+if 'pg_restore' in sys.argv:
+    sys.stdin.read()
+    if os.environ.get('FAIL_PLATFORM') == 'yes' and sys.argv[-1] == 'platform':
+        sys.exit(42)
+""")
+            docker.chmod(0o755)
+            log = directory/'calls'
+            env = dict(os.environ, PATH=str(directory)+os.pathsep+os.environ['PATH'],
+                       CALL_LOG=str(log), DUCKFLEET_CONFIRM_RESTORE='yes')
+            command = ['bash', str(ROOT/'scripts/restore-catalog.sh'), 'compose', str(backup)]
+            success = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(success.returncode, 0, success.stderr)
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertIn('stop', calls[0])
+            restores = [call for call in calls if 'pg_restore' in call]
+            self.assertEqual([call[-1] for call in restores], ['lake', 'platform'])
+            self.assertTrue(all('--exit-on-error' in call for call in restores))
+            self.assertEqual(calls[-1], ['compose', 'run', '--rm', '--no-deps', 'platform-migrate'])
+            self.assertIn('compute remains stopped', success.stdout)
+            log.unlink()
+            failed = subprocess.run(command, env=dict(env, FAIL_PLATFORM='yes'),
+                                    capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 42)
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertFalse(any('run' in call or 'up' in call for call in calls),
+                             'a partial restore must not migrate or restart compute')
+
+    def test_manual_kube_migration_clones_configuration_with_a_new_job_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source = {'spec': {'selector': {'matchLabels': {'controller-uid': 'old'}},
+                               'manualSelector': False, 'activeDeadlineSeconds': 390,
+                               'backoffLimit': 0,
+                               'template': {'metadata': {'labels': {
+                                   'app': 'duckfleet-platform-migrate',
+                                   'controller-uid': 'old', 'job-name': 'old',
+                                   'batch.kubernetes.io/controller-uid': 'old',
+                                   'batch.kubernetes.io/job-name': 'old'}},
+                                   'spec': {'restartPolicy': 'Never', 'containers': [
+                                       {'name': 'migrate', 'image': 'same-image', 'env': [
+                                           {'name': 'PLATFORM_DSN', 'valueFrom': {
+                                               'secretKeyRef': {'name': 'same-secret', 'key': 'PLATFORM_DSN'}}}]}]}}}}
+            fixture = directory/'fixture.json'
+            fixture.write_text(json.dumps(source))
+            created = directory/'created.json'
+            kubectl = directory/'kubectl'
+            kubectl.write_text("""#!/usr/bin/env python3
+import json,os,sys
+args=sys.argv[1:]
+if 'deployment' in args:
+    print('old-job')
+elif 'create' in args:
+    open(os.environ['CREATED'], 'w').write(sys.stdin.read())
+elif 'old-job' in args:
+    print(open(os.environ['FIXTURE']).read())
+elif 'get' in args and 'job' in args:
+    print(json.dumps({'status': {'conditions': [{'type':'Complete','status':'True'}]}}))
+else:
+    sys.exit('unexpected kubectl arguments: '+repr(args))
+""")
+            kubectl.chmod(0o755)
+            result = subprocess.run(['bash', str(ROOT/'scripts/migrate-platform.sh'), 'kube'],
+                env=dict(os.environ, PATH=str(directory)+os.pathsep+os.environ['PATH'],
+                         CREATED=str(created), FIXTURE=str(fixture),
+                         DUCKFLEET_KUBE_CONTEXT='fixture', DUCKFLEET_NAMESPACE='duckfleet-fixture'),
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            job = json.loads(created.read_text())
+            self.assertNotEqual(job['metadata']['name'], 'old-job')
+            self.assertNotIn('selector', job['spec'])
+            self.assertNotIn('manualSelector', job['spec'])
+            self.assertEqual(job['spec']['template']['metadata']['labels'],
+                             {'app': 'duckfleet-platform-migrate'})
+            self.assertEqual(job['spec']['template']['spec'], source['spec']['template']['spec'])
 
 
 class ImagePublishingTests(unittest.TestCase):

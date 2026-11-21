@@ -14,6 +14,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: server
+  {{- if not .Values.suspended }}
+  annotations:
+    duckfleet.io/migration-job: {{ include "duckfleet.migrationJob" . | quote }}
+  {{- end }}
 spec:
   replicas: {{ ternary 0 1 .Values.suspended }}
   strategy: {type: Recreate}
@@ -43,6 +47,8 @@ spec:
             limits: {cpu: 500m, memory: 256Mi}
           env:
             - {name: DUCKFLEET_ROLE, value: gateway}
+            - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ .Values.platformWaitSeconds | quote }}}
+            - {name: DUCKFLEET_HISTORY_RETENTION_DAYS, value: {{ .Values.historyRetentionDays | quote }}}
             - {name: DUCKFLEET_PGWIRE, value: {{ .Values.pgwire.enabled | quote }}}
             # The same card the workers price with: the gateway reports it on the
             # budget position and settles abandoned session-pod reservations.
