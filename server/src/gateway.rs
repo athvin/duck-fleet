@@ -1164,8 +1164,7 @@ impl Gateway {
     }
 
     /// Retire a route only after a close acknowledgment or durable closed marker.
-    /// Pair the
-    /// cached increment on open with a decrement so rapid session churn cannot
+    /// Pair the cached increment on open with a decrement so session churn cannot
     /// exhaust the sampled capacity while the worker itself is idle.
     async fn retire_route(&self, id: Uuid) -> Option<String> {
         let route = self.routes.lock().await.remove(&id)?;
@@ -2872,7 +2871,7 @@ mod tests {
         );
         let response = close(
             State(app.clone()),
-            Extension(Principal::from_identity(&identity)),
+            Extension(identity.clone()),
             Path(ids[1]),
         )
         .await

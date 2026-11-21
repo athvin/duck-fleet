@@ -63,6 +63,8 @@ pub async fn run(args: Vec<String>) -> i32 {
         spread_checks(&ctx).await
     } else if has("--spread-failover") {
         spread_failover_checks(&ctx).await
+    } else if has("--observability") {
+        observability::checks(&ctx).await
     } else if has("--history-without-workers") {
         observability::history_without_workers(&ctx).await
     } else if has("--worker-status") {
