@@ -125,7 +125,7 @@ services:
       retries: 40
     mem_limit: 1g
     cpus: 1
-    stop_grace_period: 90s
+    stop_grace_period: 630s
 
   # A second worker of the same size, for the scale-out stage: same resources, its
   # own identity. Behind a profile so the default run keeps exactly one worker and
@@ -145,7 +145,7 @@ services:
     healthcheck: *worker-health
     mem_limit: 1g
     cpus: 1
-    stop_grace_period: 90s
+    stop_grace_period: 630s
 
   server:
     labels:
@@ -182,7 +182,7 @@ services:
     healthcheck: *worker-health
     mem_limit: 256m
     cpus: 0.5
-    stop_grace_period: 90s
+    stop_grace_period: 630s
 
   # An optional second allocation, independent of the legacy default and of
   # isolation. Start with: docker compose --profile pools up -d --wait server-pools
@@ -206,7 +206,7 @@ services:
     healthcheck: *worker-health
     mem_limit: 3g
     cpus: 2
-    stop_grace_period: 90s
+    stop_grace_period: 630s
 
   server-pools:
     labels:
@@ -243,7 +243,7 @@ services:
     healthcheck: *worker-health
     mem_limit: 256m
     cpus: 0.5
-    stop_grace_period: 90s
+    stop_grace_period: 630s
 
   dbt:
     profiles: [test]

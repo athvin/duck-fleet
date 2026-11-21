@@ -784,7 +784,7 @@ class QueueDeploymentTests(unittest.TestCase):
         services = yaml.safe_load((ROOT/'compose.yaml').read_text())['services']
         for name in ('server','server-pools','worker-small','worker-small-b','worker-pool-interactive-0'):
             self.assertEqual(services[name]['labels'][lifecycle.SCHEMA_MARKER], str(expected))
-            self.assertEqual(services[name]['stop_grace_period'], '90s')
+            self.assertEqual(services[name]['stop_grace_period'], '630s')
 
     def test_policy_overrides_preserve_omission_and_render_exact_worker_bounds(self):
         objects = NamedPoolPackagingTests().render(None,

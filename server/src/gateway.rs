@@ -1058,12 +1058,21 @@ impl Gateway {
         execution: (Protocol, &TrustedOperation),
     ) -> Result<reqwest::Response, ApiError> {
         let (protocol, operation) = execution;
+        let timeout = if method == Method::POST && path.ends_with("/queries") {
+            let request: crate::QueryRequest = serde_json::from_slice(&body)
+                .map_err(|_| ApiError::bad("invalid query request"))?;
+            request.validate()?;
+            request.transport_timeout()
+        } else {
+            Duration::from_secs(75)
+        };
         // Middleware ran before body extraction and route/provisioning waits.
         // Recheck here; the worker also checks at dequeue, before any SQL runs.
         self.authn.revalidate(identity).await?;
         authenticated_request(
             self.client
                 .request(method, format!("{endpoint}{path}"))
+                .timeout(timeout)
                 .bearer_auth(&self.token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-duckfleet-protocol", protocol.name())

@@ -266,14 +266,14 @@ spec:
 {{/*
 How long the kubelet waits after SIGTERM before killing a worker.
 
-It must exceed the longest statement a caller may ask for, which the API caps at 60
+It must exceed the longest statement a caller may ask for, which the API caps at 600
 seconds. Unset it defaults to 30, so a query in its second half could never finish
 however well the drain was written — the two numbers are coupled, and check-chart.py
 asserts it so a later change to either fails rather than silently truncating drains.
 The margin covers the engine rolling back and the final history write.
 */}}
 {{- define "duckfleet.termination" -}}
-terminationGracePeriodSeconds: 90
+terminationGracePeriodSeconds: 630
 {{- end -}}
 {{- define "duckfleet.health" -}}
 readinessProbe:

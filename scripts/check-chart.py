@@ -12,10 +12,8 @@ from worker_resources import assert_worker_resources, quantity_bytes
 # Read from the server rather than restated here: this is the number the drain has to
 # outlast, and a copy of it would be one more thing to keep in step.
 MAX_STATEMENT_SECONDS = int(re.search(
-    r'!\(1\.\.=(\d+)\)\.contains\(&(?:req|self)\.timeout_seconds\)',
-    # Shared query validation replaces main's inline validation in schema 2.
-    '\n'.join(path.read_text() for path in
-              (Path(__file__).resolve().parents[1] / 'server/src').glob('*.rs')),
+    r'MAX_EXECUTION_TIMEOUT: u64 = (\d+)',
+    (Path(__file__).resolve().parents[1] / 'server/src/query.rs').read_text(),
 ).group(1))
 
 PLATFORM_SCHEMA = re.search(r'SCHEMA_VERSION: i32 = (\d+)',
@@ -86,7 +84,7 @@ for name, worker in persistent_workers.items():
     # pod: that claim is what lets a worker admit an isolated session at all.
     assert 'DUCKFLEET_ISOLATED' not in env
     # A drain has to outlast the longest statement a caller may ask for. The API caps
-    # timeout_seconds at 60; unset, Kubernetes defaults this to 30, so a query in its
+    # timeout_seconds at 600; unset, Kubernetes defaults this to 30, so a query in its
     # second half could never finish however well the drain was written. The two are
     # coupled, so changing either must fail here rather than quietly truncate drains.
     assert pod['terminationGracePeriodSeconds'] > MAX_STATEMENT_SECONDS, (
@@ -144,7 +142,7 @@ assert pinned == tolerated, (
     f'the DuckFleet node pool is {"pinned" if pinned else "not pinned"} but '
     f'{"tolerated" if tolerated else "not tolerated"}: {selector} / {tolerations}')
 # The gateway drains like a worker: a statement it is proxying runs under the same
-# 60-second cap, so its grace period is coupled to the same number. Unset it defaults
+# 600-second cap, so its grace period is coupled to the same number. Unset it defaults
 # to 30, which would SIGKILL the drain partway however well it was written.
 #
 # Deliberately coupled to the statement cap, NOT to isolatedCompute.readySeconds: a
