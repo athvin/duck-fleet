@@ -50,10 +50,16 @@ with TemporaryDirectory() as directory:
     os.environ['AWS_EC2_METADATA_DISABLED'] = 'true'
     try:
         connection = duckdb.connect()
-        connection.execute("SET extension_directory='/opt/duckdb/extensions'; LOAD httpfs; LOAD aws")
+        connection.execute("SET extension_directory='/opt/duckdb/extensions'; LOAD icu; LOAD httpfs; LOAD postgres; LOAD ducklake; LOAD aws")
         connection.execute("CREATE SECRET aws_s3 (TYPE S3, PROVIDER credential_chain, REFRESH auto, REGION 'us-east-2', SCOPE 's3://test/lake/')")
         assert requests and all(value == 'test-pod-identity-token' for value in requests)
         assert connection.execute("SELECT provider FROM duckdb_secrets() WHERE name='aws_s3'").fetchone() == ('credential_chain',)
+        extensions = connection.execute(
+            "SELECT extension_name, extension_version FROM duckdb_extensions() "
+            "WHERE extension_name IN ('httpfs', 'postgres_scanner', 'ducklake', 'aws', 'icu') AND loaded"
+        ).fetchall()
+        assert {row[0] for row in extensions} == {'httpfs', 'postgres_scanner', 'ducklake', 'aws', 'icu'}
+        assert all(version for _, version in extensions)
         connection.close()
         print('PASS: pinned DuckDB extension fetched container credentials using the authorization token file')
     finally:

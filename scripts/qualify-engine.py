@@ -194,6 +194,25 @@ def pgwire_checks(base, env, directory):
     (directory / "pgwire.json").write_text(json.dumps({"passed": True, "typed_results": 4, "error_classification": "sql_error"}) + "\n")
 
 
+def validate_extensions(report):
+    required = {"httpfs", "postgres_scanner", "ducklake", "aws", "icu"}
+    extensions = report.get("extensions", [])
+    by_name = {item.get("extension_name"): item for item in extensions}
+    if set(by_name) != required:
+        raise RuntimeError(f"extension manifest mismatch: {extensions}")
+    for name, item in by_name.items():
+        if item.get("installed") != "true":
+            raise RuntimeError(f"extension {name} is not installed: {item}")
+        if item.get("loaded") == "true" and not item.get("extension_version"):
+            raise RuntimeError(f"loaded extension {name} has no version: {item}")
+        path = item.get("install_path")
+        if path != "(BUILT-IN)" and "/v" + report["engine_version"].lstrip("v") + "/" not in path:
+            raise RuntimeError(f"extension {name} has an unexpected path: {path}")
+        if (name != "aws" or report["engine_version"].startswith("v2.")) and item.get("loaded") != "true":
+            raise RuntimeError(f"required runtime extension {name} is not loaded: {item}")
+    return extensions
+
+
 def run_lane(name, project, tag, version, directory, override, corpus_tag, skip_dbt):
     directory.mkdir(parents=True, exist_ok=True)
     artifacts = directory / "artifacts"
@@ -234,9 +253,15 @@ def run_lane(name, project, tag, version, directory, override, corpus_tag, skip_
                     stage_env["DUCKFLEET_API_IMAGE_TAG"] = corpus_tag
                 run(base + command, env=stage_env, log=directory / f"{stage}.log")
             summary["stages"][stage] = "passed"
+        if name == "candidate":
+            stage_env = env.copy()
+            stage_env["DUCKFLEET_API_IMAGE_TAG"] = corpus_tag
+            run(base + ["run", "--rm", "api", "duckfleet-server", "--extension-security"], env=stage_env, log=directory / "extension-security.log")
+            summary["stages"]["extension-security"] = "passed"
         summary["resources"] = resource_evidence(project)
         report = json.loads((artifacts / "engine-qualification.json").read_text())
         summary["actual_engine"] = report.get("engine_version")
+        summary["extensions"] = validate_extensions(report)
         summary["passed"] = summary["actual_engine"] == version
         if not summary["passed"]:
             raise RuntimeError(f"{name} expected {version}, got {summary['actual_engine']}")

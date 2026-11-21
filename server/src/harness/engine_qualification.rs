@@ -80,6 +80,16 @@ fn cases() -> Vec<Case> {
             parameters: vec![],
         },
         Case {
+            id: "calendar_timezone",
+            sql: "SELECT timezone('America/New_York', TIMESTAMPTZ '2026-07-01 12:00:00+00') AS local_time, date_part('isodow', DATE '2026-11-21') AS weekday",
+            parameters: vec![],
+        },
+        Case {
+            id: "collation",
+            sql: "SELECT 'a' COLLATE NOCASE = 'A' AS case_insensitive, 'a' COLLATE NOACCENT = 'á' AS accent_insensitive",
+            parameters: vec![],
+        },
+        Case {
             id: "profile_aggregate",
             sql: "SELECT sum(i)::BIGINT AS total, max(i)::BIGINT AS maximum FROM range(100000) source(i)",
             parameters: vec![],
@@ -117,6 +127,46 @@ fn engine_version(value: &Value) -> Option<&str> {
         Value::Array(values) => values.iter().find_map(engine_version),
         _ => None,
     }
+}
+
+pub(super) async fn security(ctx: &Ctx) -> anyhow::Result<()> {
+    let mut connection = ctx.open_named("extension-security", None).await?;
+    let settings = connection.execute(
+        "SELECT current_setting('allow_extension_repositories'), current_setting('pg_enable_remote_pushdown')",
+        Vec::new(),
+    ).await?;
+    anyhow::ensure!(
+        settings.rows == vec![vec![Some("forbidden".into()), Some("true".into())]],
+        "unexpected extension or PostgreSQL policy: {:?}",
+        settings.rows
+    );
+    let error = match connection
+        .execute(
+            "CREATE EXTENSION REPOSITORY duckfleet_forbidden",
+            Vec::new(),
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => anyhow::bail!("custom extension repository creation succeeded"),
+    };
+    anyhow::ensure!(
+        error.failure_kind.as_deref() == Some("sql_error"),
+        "repository refusal lost its classification: {error}"
+    );
+    connection.close().await?;
+    super::write_artifact(
+        "extension-security.json",
+        &serde_json::to_string_pretty(&json!({
+            "allow_extension_repositories": "forbidden",
+            "custom_repository_rejected": true,
+            "pg_enable_remote_pushdown": true,
+        }))?,
+    );
+    println!(
+        "PASS: workers forbid custom extension repositories and retain reviewed PostgreSQL pushdown"
+    );
+    Ok(())
 }
 
 pub(super) async fn checks(ctx: &Ctx) -> anyhow::Result<()> {
@@ -159,6 +209,23 @@ pub(super) async fn checks(ctx: &Ctx) -> anyhow::Result<()> {
             "profile": profile,
         }));
     }
+    let extension_rows = connection.execute(
+        "SELECT extension_name, loaded, installed, install_path, extension_version FROM duckdb_extensions() WHERE extension_name IN ('httpfs', 'postgres_scanner', 'ducklake', 'aws', 'icu') ORDER BY extension_name",
+        Vec::new(),
+    ).await?;
+    let extensions = extension_rows
+        .rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "extension_name": row[0].clone(),
+                "loaded": row[1].clone(),
+                "installed": row[2].clone(),
+                "install_path": row[3].clone(),
+                "extension_version": row[4].clone(),
+            })
+        })
+        .collect::<Vec<_>>();
     let workers = request_json(&ctx.client()?, Method::GET, "/v1/workers", None).await?;
     connection.close().await?;
     let report = json!({
@@ -166,6 +233,7 @@ pub(super) async fn checks(ctx: &Ctx) -> anyhow::Result<()> {
         "suite": "duckfleet-engine-qualification",
         "engine_version": version,
         "placement": placement,
+        "extensions": extensions,
         "workers": workers,
         "queries": results,
     });

@@ -92,6 +92,31 @@ class EngineQualificationLaneTest(unittest.TestCase):
         worker = re.split(r"\n  (?=\S)", text.split("  worker-small:\n", 1)[1], maxsplit=1)[0]
         self.assertIn("S3_DATA_PATH", worker)
 
+    def test_native_extension_manifest_is_versioned_and_complete(self):
+        spec = importlib.util.spec_from_file_location("qualify_engine", ROOT / "scripts/qualify-engine.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        extensions = [{
+            "extension_name": name,
+            "loaded": "true",
+            "installed": "true",
+            "install_path": f"/opt/duckdb/extensions/v2.0.1/linux_arm64/{name}.duckdb_extension",
+            "extension_version": "fixture-version",
+        } for name in ["httpfs", "postgres_scanner", "ducklake", "aws", "icu"]]
+        report = {"engine_version": "v2.0.1", "extensions": extensions}
+        self.assertEqual(module.validate_extensions(report), extensions)
+        baseline = json.loads(json.dumps(report))
+        baseline["engine_version"] = "v1.5.4"
+        for extension in baseline["extensions"]:
+            extension["install_path"] = extension["install_path"].replace("/v2.0.1/", "/v1.5.4/")
+        baseline["extensions"][3]["loaded"] = "false"
+        baseline["extensions"][3]["extension_version"] = ""
+        baseline["extensions"][3]["install_path"] = "/opt/duckdb/extensions/v1.5.4/linux_arm64/aws.duckdb_extension"
+        module.validate_extensions(baseline)
+        extensions[0]["install_path"] = "/opt/duckdb/extensions/v1.5.4/linux_arm64/httpfs.duckdb_extension"
+        with self.assertRaisesRegex(RuntimeError, "unexpected path"):
+            module.validate_extensions(report)
+
 
 if __name__ == "__main__":
     unittest.main()
