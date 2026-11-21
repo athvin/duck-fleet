@@ -1,22 +1,21 @@
 # DuckFleet's additive streaming patch
 
-Base: crates.io `duckdb` 1.10504.0. The original license and source are retained.
-Native `libduckdb-sys` / DuckDB remain pinned at 1.10504.0 / 1.5.4.
-The package records upstream commit `452fc0b6650edd8c8aac5c83a98d320bc31cb5bc`.
-Its repository-root LICENSE and rustfmt.toml are included from that exact commit
-because the published crate omits them.
+Base: crates.io `duckdb` 1.20001.0. The original license and source are retained.
+Native `libduckdb-sys` / DuckDB are pinned at 1.20001.0 / 2.0.1.
+The package records upstream commit `e3b2d244c90e9074db5e4af635bad58ab469b672`.
+Its repository-root LICENSE and rustfmt.toml are retained from that commit.
 
 Additions only:
 
 - `Connection::prepare_single` rejects scripts before normal prepare can execute
   their preceding statements.
-- `Statement::statement_type` exposes the public C category, including INVALID
-  for categories such as MERGE that 1.5.4 does not map.
+- `Statement::statement_type` exposes the public C category. DuckDB 2.0.1 maps
+  MERGE to MERGE_INTO; DuckFleet's separate allowlist continues to reject it.
 - `Statement::start_arrow_stream` returns a fallible result owner with separate
   engine completion, executed-result schema, and error-checked EOF.
 
-The stream uses only public C APIs and Arrow C Data Interface layouts. It does
-not cast private Rust handles, run SQL to discover schema, or execute twice.
+The stream uses the stable C API v1 and public Arrow C Data Interface layouts. It
+does not cast private Rust handles, run SQL to discover schema, or execute twice.
 Existing interactive APIs are unchanged. Native engine/operator memory and
 oversized individual values still require the worker's resource limits.
 

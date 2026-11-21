@@ -56,8 +56,8 @@ pub(crate) struct Stream<'stmt> {
 
 pub(crate) fn prepare<'conn>(conn: &'conn Connection, sql: &str) -> Result<Prepared<'conn>, Error> {
     let statement = conn.prepare_single(sql).map_err(Error::Preparation)?;
-    // Native 1.5.4 maps MERGE (and other unmapped categories) to INVALID. Do not
-    // infer that category from a SQL prefix or allow every unknown statement.
+    // Use the native statement category rather than a SQL prefix or a blanket
+    // acceptance of categories added by a future engine.
     if !matches!(
         statement.statement_type(),
         ffi::duckdb_statement_type_DUCKDB_STATEMENT_TYPE_SELECT
@@ -180,7 +180,7 @@ mod tests {
                      WHEN NOT MATCHED THEN INSERT(id,value) VALUES(s.id,s.value)";
         let native = connection.prepare_single(merge)?;
         ensure!(
-            native.statement_type() == ffi::duckdb_statement_type_DUCKDB_STATEMENT_TYPE_INVALID
+            native.statement_type() == ffi::duckdb_statement_type_DUCKDB_STATEMENT_TYPE_MERGE_INTO
         );
         ensure!(matches!(
             prepare(&connection, merge),

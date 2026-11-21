@@ -5,6 +5,8 @@ use std::{
 
 use crate::ffi::*;
 
+use super::RawLogicalTypeId;
+
 /// Logical Type Id
 /// <https://duckdb.org/docs/api/c/types>
 #[repr(u32)]
@@ -12,99 +14,101 @@ use crate::ffi::*;
 #[non_exhaustive]
 pub enum LogicalTypeId {
     /// Invalid
-    Invalid = DUCKDB_TYPE_DUCKDB_TYPE_INVALID,
+    Invalid = DUCKDB_TYPE_DUCKDB_TYPE_INVALID as RawLogicalTypeId,
     /// Boolean
-    Boolean = DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
+    Boolean = DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN as RawLogicalTypeId,
     /// Tinyint
-    Tinyint = DUCKDB_TYPE_DUCKDB_TYPE_TINYINT,
+    Tinyint = DUCKDB_TYPE_DUCKDB_TYPE_TINYINT as RawLogicalTypeId,
     /// Smallint
-    Smallint = DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT,
+    Smallint = DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as RawLogicalTypeId,
     /// Integer
-    Integer = DUCKDB_TYPE_DUCKDB_TYPE_INTEGER,
+    Integer = DUCKDB_TYPE_DUCKDB_TYPE_INTEGER as RawLogicalTypeId,
     /// Bigint
-    Bigint = DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
+    Bigint = DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as RawLogicalTypeId,
     /// Unsigned Tinyint
-    UTinyint = DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT,
+    UTinyint = DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT as RawLogicalTypeId,
     /// Unsigned Smallint
-    USmallint = DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT,
+    USmallint = DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT as RawLogicalTypeId,
     /// Unsigned Integer
-    UInteger = DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER,
+    UInteger = DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER as RawLogicalTypeId,
     /// Unsigned Bigint
-    UBigint = DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT,
+    UBigint = DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT as RawLogicalTypeId,
     /// Float
-    Float = DUCKDB_TYPE_DUCKDB_TYPE_FLOAT,
+    Float = DUCKDB_TYPE_DUCKDB_TYPE_FLOAT as RawLogicalTypeId,
     /// Double
-    Double = DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE,
+    Double = DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE as RawLogicalTypeId,
     /// Timestamp
-    Timestamp = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP,
+    Timestamp = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP as RawLogicalTypeId,
     /// Date
-    Date = DUCKDB_TYPE_DUCKDB_TYPE_DATE,
+    Date = DUCKDB_TYPE_DUCKDB_TYPE_DATE as RawLogicalTypeId,
     /// Time
-    Time = DUCKDB_TYPE_DUCKDB_TYPE_TIME,
+    Time = DUCKDB_TYPE_DUCKDB_TYPE_TIME as RawLogicalTypeId,
     /// Interval
-    Interval = DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL,
+    Interval = DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL as RawLogicalTypeId,
     /// Hugeint
-    Hugeint = DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT,
+    Hugeint = DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT as RawLogicalTypeId,
     /// Varchar
-    Varchar = DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+    Varchar = DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR as RawLogicalTypeId,
     /// Blob
-    Blob = DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+    Blob = DUCKDB_TYPE_DUCKDB_TYPE_BLOB as RawLogicalTypeId,
     /// Decimal
-    Decimal = DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL,
+    Decimal = DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL as RawLogicalTypeId,
     /// Timestamp S
-    TimestampS = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S,
+    TimestampS = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S as RawLogicalTypeId,
     /// Timestamp MS
-    TimestampMs = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS,
+    TimestampMs = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS as RawLogicalTypeId,
     /// Timestamp NS
-    TimestampNs = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS,
+    TimestampNs = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS as RawLogicalTypeId,
     /// Enum
-    Enum = DUCKDB_TYPE_DUCKDB_TYPE_ENUM,
+    Enum = DUCKDB_TYPE_DUCKDB_TYPE_ENUM as RawLogicalTypeId,
     /// List
-    List = DUCKDB_TYPE_DUCKDB_TYPE_LIST,
+    List = DUCKDB_TYPE_DUCKDB_TYPE_LIST as RawLogicalTypeId,
     /// Struct
-    Struct = DUCKDB_TYPE_DUCKDB_TYPE_STRUCT,
+    Struct = DUCKDB_TYPE_DUCKDB_TYPE_STRUCT as RawLogicalTypeId,
     /// Map
-    Map = DUCKDB_TYPE_DUCKDB_TYPE_MAP,
+    Map = DUCKDB_TYPE_DUCKDB_TYPE_MAP as RawLogicalTypeId,
     /// Uuid
-    Uuid = DUCKDB_TYPE_DUCKDB_TYPE_UUID,
+    Uuid = DUCKDB_TYPE_DUCKDB_TYPE_UUID as RawLogicalTypeId,
     /// Union
-    Union = DUCKDB_TYPE_DUCKDB_TYPE_UNION,
+    Union = DUCKDB_TYPE_DUCKDB_TYPE_UNION as RawLogicalTypeId,
     /// Bit
-    Bit = DUCKDB_TYPE_DUCKDB_TYPE_BIT,
+    Bit = DUCKDB_TYPE_DUCKDB_TYPE_BIT as RawLogicalTypeId,
     /// Time TZ
-    TimeTZ = DUCKDB_TYPE_DUCKDB_TYPE_TIME_TZ,
+    TimeTZ = DUCKDB_TYPE_DUCKDB_TYPE_TIME_TZ as RawLogicalTypeId,
     /// Timestamp TZ
-    TimestampTZ = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ,
+    TimestampTZ = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ as RawLogicalTypeId,
     /// Unsigned Hugeint
-    UHugeint = DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT,
+    UHugeint = DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT as RawLogicalTypeId,
     /// Array
-    Array = DUCKDB_TYPE_DUCKDB_TYPE_ARRAY,
+    Array = DUCKDB_TYPE_DUCKDB_TYPE_ARRAY as RawLogicalTypeId,
     /// Any
-    Any = DUCKDB_TYPE_DUCKDB_TYPE_ANY,
+    Any = DUCKDB_TYPE_DUCKDB_TYPE_ANY as RawLogicalTypeId,
     /// Bignum
-    Bignum = DUCKDB_TYPE_DUCKDB_TYPE_BIGNUM,
+    Bignum = DUCKDB_TYPE_DUCKDB_TYPE_BIGNUM as RawLogicalTypeId,
     /// SqlNull
-    SqlNull = DUCKDB_TYPE_DUCKDB_TYPE_SQLNULL,
+    SqlNull = DUCKDB_TYPE_DUCKDB_TYPE_SQLNULL as RawLogicalTypeId,
     /// String Literal
-    StringLiteral = DUCKDB_TYPE_DUCKDB_TYPE_STRING_LITERAL,
+    StringLiteral = DUCKDB_TYPE_DUCKDB_TYPE_STRING_LITERAL as RawLogicalTypeId,
     /// Integer Literal
-    IntegerLiteral = DUCKDB_TYPE_DUCKDB_TYPE_INTEGER_LITERAL,
+    IntegerLiteral = DUCKDB_TYPE_DUCKDB_TYPE_INTEGER_LITERAL as RawLogicalTypeId,
     /// Time NS
-    TimeNs = DUCKDB_TYPE_DUCKDB_TYPE_TIME_NS,
+    TimeNs = DUCKDB_TYPE_DUCKDB_TYPE_TIME_NS as RawLogicalTypeId,
+    /// Geometry
+    Geometry = DUCKDB_TYPE_DUCKDB_TYPE_GEOMETRY as RawLogicalTypeId,
     /// VARIANT.
     ///
     /// This type is exposed for metadata. Decoding VARIANT result columns is
     /// not supported because DuckDB does not expose C API helpers for decoding
     /// VARIANT values.
-    Variant = DUCKDB_TYPE_DUCKDB_TYPE_VARIANT,
+    Variant = DUCKDB_TYPE_DUCKDB_TYPE_VARIANT as RawLogicalTypeId,
     /// DuckDB returned a type that this wrapper does not yet recognize
-    Unsupported = u32::MAX,
+    Unsupported = RawLogicalTypeId::MAX,
 }
 
 impl From<u32> for LogicalTypeId {
     /// Convert from u32 to LogicalTypeId
     fn from(value: u32) -> Self {
-        match value {
+        match value as duckdb_type {
             DUCKDB_TYPE_DUCKDB_TYPE_INVALID => Self::Invalid,
             DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN => Self::Boolean,
             DUCKDB_TYPE_DUCKDB_TYPE_TINYINT => Self::Tinyint,
@@ -145,6 +149,7 @@ impl From<u32> for LogicalTypeId {
             DUCKDB_TYPE_DUCKDB_TYPE_STRING_LITERAL => Self::StringLiteral,
             DUCKDB_TYPE_DUCKDB_TYPE_INTEGER_LITERAL => Self::IntegerLiteral,
             DUCKDB_TYPE_DUCKDB_TYPE_TIME_NS => Self::TimeNs,
+            DUCKDB_TYPE_DUCKDB_TYPE_GEOMETRY => Self::Geometry,
             DUCKDB_TYPE_DUCKDB_TYPE_VARIANT => Self::Variant,
             // Unknown / forward compatible types
             _ => Self::Unsupported,
@@ -211,7 +216,7 @@ impl From<LogicalTypeId> for LogicalTypeHandle {
         );
         unsafe {
             Self {
-                ptr: duckdb_create_logical_type(id as u32),
+                ptr: duckdb_create_logical_type(id as duckdb_type),
             }
         }
     }
@@ -271,6 +276,17 @@ impl LogicalTypeHandle {
         unsafe { duckdb_decimal_scale(self.ptr) }
     }
 
+    /// Returns the CRS metadata for a `GEOMETRY` logical type.
+    ///
+    /// Returns `None` when this logical type is not `GEOMETRY` or DuckDB does
+    /// not carry CRS metadata for the geometry type.
+    pub fn geometry_crs(&self) -> Option<String> {
+        unsafe {
+            DuckDbString::from_nullable_ptr(duckdb_geometry_type_get_crs(self.ptr))
+                .map(|c_str| c_str.to_string_lossy().into_owned())
+        }
+    }
+
     /// Make a `LogicalType` for `struct`
     pub fn struct_type(fields: &[(&str, Self)]) -> Self {
         let keys: Vec<CString> = fields.iter().map(|f| CString::new(f.0).unwrap()).collect();
@@ -325,7 +341,7 @@ impl LogicalTypeHandle {
 
     /// Raw logical type id returned by DuckDB C API
     pub fn raw_id(&self) -> u32 {
-        unsafe { duckdb_get_type_id(self.ptr) }
+        unsafe { duckdb_get_type_id(self.ptr) as RawLogicalTypeId }
     }
 
     /// Logical type children num
@@ -342,8 +358,22 @@ impl LogicalTypeHandle {
 
     /// Logical type child name by idx
     ///
+    /// Invalid UTF-8 bytes are replaced with the Unicode replacement character.
+    ///
     /// Panics if the logical type is not a struct or union, or if `idx` is out of range.
     pub fn child_name(&self, idx: usize) -> String {
+        self.child_name_string(idx).to_string_lossy().into_owned()
+    }
+
+    /// Logical type child name by idx, rejecting invalid UTF-8.
+    ///
+    /// Panics if the logical type is not a struct or union, or if `idx` is out
+    /// of range.
+    pub fn try_child_name(&self, idx: usize) -> crate::Result<String> {
+        Ok(self.child_name_string(idx).to_str()?.to_owned())
+    }
+
+    fn child_name_string(&self, idx: usize) -> DuckDbString {
         unsafe {
             let child_name_ptr = match self.id() {
                 LogicalTypeId::Struct => duckdb_struct_type_child_name(self.ptr, idx as u64),
@@ -354,9 +384,7 @@ impl LogicalTypeHandle {
             if child_name_ptr.is_null() {
                 panic!("child index {idx} out of range");
             }
-            let c_str = DuckDbString::from_ptr(child_name_ptr);
-            let name = c_str.to_str().unwrap();
-            name.to_string()
+            DuckDbString::from_ptr(child_name_ptr)
         }
     }
 
@@ -422,7 +450,10 @@ impl LogicalTypeHandle {
 
 #[cfg(test)]
 mod test {
-    use crate::core::{LogicalTypeHandle, LogicalTypeId};
+    use std::ffi::CString;
+
+    use crate::core::{LogicalTypeHandle, LogicalTypeId, RawLogicalTypeId};
+    use crate::ffi::duckdb_create_struct_type;
 
     #[test]
     fn test_struct() {
@@ -432,6 +463,19 @@ mod test {
         assert_eq!(typ.num_children(), 1);
         assert_eq!(typ.child_name(0), "hello");
         assert_eq!(typ.child(0).id(), LogicalTypeId::Boolean);
+    }
+
+    #[test]
+    fn test_struct_child_name_handles_invalid_utf8() {
+        let child = LogicalTypeHandle::from(LogicalTypeId::Integer);
+        let name = CString::from_vec_with_nul(vec![b'f', 0x80, 0]).unwrap();
+        let mut child_types = [child.ptr];
+        let mut child_names = [name.as_ptr()];
+        let ptr = unsafe { duckdb_create_struct_type(child_types.as_mut_ptr(), child_names.as_mut_ptr(), 1) };
+        let typ = unsafe { LogicalTypeHandle::new(ptr) };
+
+        assert_eq!(typ.child_name(0), "f\u{fffd}");
+        assert!(typ.try_child_name(0).is_err());
     }
 
     #[test]
@@ -484,11 +528,34 @@ mod test {
     }
 
     #[test]
+    fn test_geometry_type() {
+        let typ = LogicalTypeHandle::from(LogicalTypeId::Geometry);
+
+        assert_eq!(typ.id(), LogicalTypeId::Geometry);
+        assert_eq!(
+            typ.raw_id(),
+            crate::ffi::DUCKDB_TYPE_DUCKDB_TYPE_GEOMETRY as RawLogicalTypeId
+        );
+        assert_eq!(typ.geometry_crs(), None);
+        assert_eq!(format!("{typ:?}"), "Geometry");
+    }
+
+    #[test]
+    fn test_geometry_crs_returns_none_for_non_geometry_type() {
+        let typ = LogicalTypeHandle::from(LogicalTypeId::Varchar);
+
+        assert_eq!(typ.geometry_crs(), None);
+    }
+
+    #[test]
     fn test_variant_type() {
         let typ = LogicalTypeHandle::from(LogicalTypeId::Variant);
 
         assert_eq!(typ.id(), LogicalTypeId::Variant);
-        assert_eq!(typ.raw_id(), crate::ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARIANT);
+        assert_eq!(
+            typ.raw_id(),
+            crate::ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARIANT as RawLogicalTypeId
+        );
         assert_eq!(typ.num_children(), 0);
         assert!(typ.contains_type_id(LogicalTypeId::Variant));
         assert_eq!(format!("{typ:?}"), "Variant");
@@ -544,7 +611,10 @@ mod test {
 
         assert_eq!(invalid_type.id(), LogicalTypeId::Invalid);
         assert_eq!(invalid_type.try_id().unwrap(), LogicalTypeId::Invalid);
-        assert_eq!(invalid_type.raw_id(), DUCKDB_TYPE_DUCKDB_TYPE_INVALID);
+        assert_eq!(
+            invalid_type.raw_id(),
+            DUCKDB_TYPE_DUCKDB_TYPE_INVALID as RawLogicalTypeId
+        );
 
         let debug_str = format!("{invalid_type:?}");
         assert_eq!(debug_str, "Invalid");
