@@ -290,6 +290,15 @@ impl Access {
         }
         scope
     }
+    /// System-mode entry needs metadata visibility, including an own-only scope.
+    /// Exact relation and sensitive-column checks happen in the shared reader.
+    pub fn require_metadata_access(&self) -> Result<(), ApiError> {
+        if self.scope(Action::HistoryRead).is_some() || self.scope(Action::UsageRead).is_some() {
+            Ok(())
+        } else {
+            Err(denied("metadata access is required"))
+        }
+    }
     /// Owner is an immutable principal UUID, never a display name.
     pub fn require(&self, action: Action, owner: Option<&str>) -> Result<(), ApiError> {
         let allowed = match self.scope(action) {
@@ -501,59 +510,121 @@ pub(crate) fn owner_id_in(
 ) -> Result<Option<String>, ApiError> {
     Ok(tx.query_opt("SELECT principal_id FROM principals WHERE name=$1 AND namespace_id=(SELECT id FROM platform_namespace WHERE singleton)",&[&name]).map_err(unavailable)?.map(|r|r.get(0)))
 }
+const NAMESPACE_SQL: &str = "SELECT id FROM platform_namespace WHERE singleton";
+// One statement observes credential, principal version, and every grant from
+// one PostgreSQL snapshot, including caller-owned READ COMMITTED transactions.
+const RESOLVE_POLICY_SQL: &str = "SELECT p.principal_id,p.policy_version,c.expires_at,
+    COALESCE((SELECT json_agg(role::json ORDER BY role)::text FROM principal_roles WHERE principal_id=p.principal_id),'[]'),
+    COALESCE((SELECT json_agg(json_build_object('action',action::json,'scope',scope::json) ORDER BY action,scope)::text FROM permission_grants WHERE principal_id=p.principal_id),'[]'),
+    COALESCE((SELECT json_agg(grant_json::json ORDER BY grant_number)::text FROM compute_grants WHERE principal_id=p.principal_id),'[]')
+    FROM credentials c JOIN principals p USING(principal_id) WHERE c.credential_id=$1 AND c.principal=$2 AND p.name=$2 AND p.namespace_id=$3 AND NOT p.disabled AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at>clock_timestamp())";
+
 pub(crate) fn resolve_in(
     tx: &mut Transaction<'_>,
     identity: &Identity,
 ) -> Result<Access, ApiError> {
     let namespace: String = tx
-        .query_one("SELECT id FROM platform_namespace WHERE singleton", &[])
+        .query_one(NAMESPACE_SQL, &[])
         .map_err(unavailable)?
-        .get(0);
-    if identity.kind != ActorKind::Named {
-        if identity.credential_id.is_some()
-            || (identity.kind == ActorKind::Bootstrap
-                && identity.principal != credentials::BOOTSTRAP_PRINCIPAL)
-        {
-            return Err(ApiError::new(
-                failure::UNAUTHORIZED,
-                "invalid authenticated actor",
-            ));
-        }
-        return Ok(Access {
-            actor: Actor {
-                namespace_id: namespace,
-                principal_id: None,
-                principal: identity.principal.clone(),
-                credential_id: None,
-                kind: identity.kind,
-            },
-            policy_version: 0,
-            roles: vec![],
-            permissions: vec![],
-            compute: vec![],
+        .try_get(0)
+        .map_err(unavailable)?;
+    let Some(credential) = policy_credential(identity)? else {
+        return Ok(privileged_access(namespace, identity));
+    };
+    let row = tx
+        .query_opt(
+            RESOLVE_POLICY_SQL,
+            &[&credential, &identity.principal, &namespace],
+        )
+        .map_err(unavailable)?;
+    policy_access(namespace, identity, row)
+}
+
+/// Async system reads share the exact policy snapshot and decoder with ordinary
+/// authorization. The caller owns its read-only snapshot, timeout and audit.
+pub(crate) async fn resolve_async_in(
+    tx: &tokio_postgres::Transaction<'_>,
+    identity: &Identity,
+) -> Result<Access, ApiError> {
+    let namespace: String = tx
+        .query_one(NAMESPACE_SQL, &[])
+        .await
+        .map_err(unavailable)?
+        .try_get(0)
+        .map_err(unavailable)?;
+    let Some(credential) = policy_credential(identity)? else {
+        return Ok(privileged_access(namespace, identity));
+    };
+    let row = tx
+        .query_opt(
+            RESOLVE_POLICY_SQL,
+            &[&credential, &identity.principal, &namespace],
+        )
+        .await
+        .map_err(unavailable)?;
+    policy_access(namespace, identity, row)
+}
+
+fn policy_credential(identity: &Identity) -> Result<Option<&str>, ApiError> {
+    if identity.kind == ActorKind::Named {
+        return identity.credential_id.as_deref().map(Some).ok_or_else(|| {
+            ApiError::new(failure::UNAUTHORIZED, "named actor requires a credential")
         });
     }
-    let credential = identity
-        .credential_id
-        .as_deref()
-        .ok_or_else(|| ApiError::new(failure::UNAUTHORIZED, "named actor requires a credential"))?;
-    // One statement observes credential, principal version, and every grant from
-    // one PostgreSQL snapshot even inside a caller-owned READ COMMITTED tx.
-    let row=tx.query_opt("SELECT p.principal_id,p.policy_version,c.expires_at,
-        COALESCE((SELECT json_agg(role::json ORDER BY role)::text FROM principal_roles WHERE principal_id=p.principal_id),'[]'),
-        COALESCE((SELECT json_agg(json_build_object('action',action::json,'scope',scope::json) ORDER BY action,scope)::text FROM permission_grants WHERE principal_id=p.principal_id),'[]'),
-        COALESCE((SELECT json_agg(grant_json::json ORDER BY grant_number)::text FROM compute_grants WHERE principal_id=p.principal_id),'[]')
-        FROM credentials c JOIN principals p USING(principal_id) WHERE c.credential_id=$1 AND c.principal=$2 AND p.name=$2 AND p.namespace_id=$3 AND NOT p.disabled AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at>clock_timestamp())",&[&credential,&identity.principal,&namespace]).map_err(unavailable)?.ok_or_else(||ApiError::new(failure::UNAUTHORIZED,"credential expired, revoked, or principal disabled"))?;
+    if identity.credential_id.is_some()
+        || (identity.kind == ActorKind::Bootstrap
+            && identity.principal != credentials::BOOTSTRAP_PRINCIPAL)
+    {
+        return Err(ApiError::new(
+            failure::UNAUTHORIZED,
+            "invalid authenticated actor",
+        ));
+    }
+    Ok(None)
+}
+
+fn privileged_access(namespace: String, identity: &Identity) -> Access {
+    Access {
+        actor: Actor {
+            namespace_id: namespace,
+            principal_id: None,
+            principal: identity.principal.clone(),
+            credential_id: None,
+            kind: identity.kind,
+        },
+        policy_version: 0,
+        roles: vec![],
+        permissions: vec![],
+        compute: vec![],
+    }
+}
+
+fn policy_access(
+    namespace: String,
+    identity: &Identity,
+    row: Option<postgres::Row>,
+) -> Result<Access, ApiError> {
+    let row = row.ok_or_else(|| {
+        ApiError::new(
+            failure::UNAUTHORIZED,
+            "credential expired, revoked, or principal disabled",
+        )
+    })?;
+    // The response may arrive after the SQL expiry predicate was evaluated.
     if row
-        .get::<_, Option<std::time::SystemTime>>(2)
+        .try_get::<_, Option<std::time::SystemTime>>(2)
+        .map_err(unavailable)?
         .is_some_and(|at| at <= std::time::SystemTime::now())
     {
         return Err(ApiError::new(failure::UNAUTHORIZED, "credential expired"));
     }
-    let id: String = row.get(0);
-    let roles = serde_json::from_str(row.get::<_, &str>(3)).map_err(unavailable)?;
-    let permissions = serde_json::from_str(row.get::<_, &str>(4)).map_err(unavailable)?;
-    let compute = serde_json::from_str(row.get::<_, &str>(5)).map_err(unavailable)?;
+    let id: String = row.try_get(0).map_err(unavailable)?;
+    let roles = serde_json::from_str(row.try_get::<_, &str>(3).map_err(unavailable)?)
+        .map_err(unavailable)?;
+    let permissions = serde_json::from_str(row.try_get::<_, &str>(4).map_err(unavailable)?)
+        .map_err(unavailable)?;
+    let compute = serde_json::from_str(row.try_get::<_, &str>(5).map_err(unavailable)?)
+        .map_err(unavailable)?;
     Ok(Access {
         actor: Actor {
             namespace_id: namespace,
@@ -562,7 +633,7 @@ pub(crate) fn resolve_in(
             credential_id: identity.credential_id.clone(),
             kind: ActorKind::Named,
         },
-        policy_version: row.get(1),
+        policy_version: row.try_get(1).map_err(unavailable)?,
         roles,
         permissions,
         compute,
@@ -915,6 +986,28 @@ mod tests {
             compute: vec![],
         }
     }
+    #[test]
+    fn system_entry_accepts_own_metadata_without_execution_or_compute() {
+        let viewer = access(Role::Viewer);
+        assert!(viewer.require_metadata_access().is_ok());
+        assert!(viewer.require(Action::HistoryRead, None).is_err());
+        assert!(viewer.require(Action::QueryExecute, Some("owner")).is_err());
+        assert!(viewer.compute.is_empty());
+        let mut custom = access(Role::Viewer);
+        custom.roles.clear();
+        assert!(custom.require_metadata_access().is_err());
+        custom.permissions.push(PermissionGrant {
+            action: Action::SqlRead,
+            scope: Scope::All,
+        });
+        assert!(custom.require_metadata_access().is_err());
+        custom.permissions.push(PermissionGrant {
+            action: Action::UsageRead,
+            scope: Scope::Own,
+        });
+        assert!(custom.require_metadata_access().is_ok());
+    }
+
     #[test]
     fn presets_keep_observation_and_execution_separate() {
         let operator = access(Role::Operator);

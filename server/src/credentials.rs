@@ -200,16 +200,34 @@ pub(crate) fn issue_in(
 
 /// The principal a presented token authenticates, or None: unknown, revoked and
 /// expired all answer alike, so a probe learns nothing about which it was.
+const RESOLVE_TOKEN_SQL: &str = "SELECT credential_id, principal, expires_at FROM credentials
+    WHERE token_sha256 = $1 AND revoked_at IS NULL
+      AND (expires_at IS NULL OR expires_at > clock_timestamp())";
+
 pub(crate) fn resolve(client: &mut Client, token_sha256: &str) -> Result<Option<Identity>> {
-    Ok(read_identities(
-        client,
-        "SELECT credential_id, principal, expires_at FROM credentials
-             WHERE token_sha256 = $1 AND revoked_at IS NULL
-               AND (expires_at IS NULL OR expires_at > clock_timestamp())",
-        &[&token_sha256],
-    )?
-    .into_iter()
-    .next())
+    Ok(
+        read_identities(client, RESOLVE_TOKEN_SQL, &[&token_sha256])?
+            .into_iter()
+            .next(),
+    )
+}
+
+/// The system-query caller owns the transaction, deadline and connection driver.
+/// Share the token predicate and row decoder with foreground authentication; do
+/// not cache, commit, or change the caller's read-only transaction settings here.
+pub(crate) async fn resolve_async_in(
+    transaction: &tokio_postgres::Transaction<'_>,
+    token_sha256: &str,
+) -> Result<Option<Identity>, crate::ApiError> {
+    let row = transaction
+        .query_opt(RESOLVE_TOKEN_SQL, &[&token_sha256])
+        .await
+        .map_err(api_error)?;
+    Ok(row
+        .map(identity)
+        .transpose()
+        .map_err(api_error)?
+        .filter(|identity| !identity.expired()))
 }
 
 /// Authoritative admission check for an already authenticated connection/request.
@@ -248,16 +266,22 @@ fn read_identities(
     transaction.batch_execute("SET LOCAL statement_timeout = 3000")?;
     let rows = transaction.query(sql, parameters)?;
     transaction.commit()?;
-    Ok(rows.into_iter().map(identity).collect())
+    Ok(rows
+        .into_iter()
+        .map(identity)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|identity| !identity.expired())
+        .collect())
 }
 
-fn identity(row: postgres::Row) -> Identity {
-    Identity {
+fn identity(row: postgres::Row) -> Result<Identity> {
+    Ok(Identity {
         kind: ActorKind::Named,
-        credential_id: Some(row.get(0)),
-        principal: row.get(1),
-        expires_at: row.get(2),
-    }
+        credential_id: Some(row.try_get(0)?),
+        principal: row.try_get(1)?,
+        expires_at: row.try_get(2)?,
+    })
 }
 
 fn api_error(_: impl std::fmt::Display) -> crate::ApiError {

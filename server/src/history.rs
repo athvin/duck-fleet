@@ -90,15 +90,36 @@ impl Filter {
     }
 }
 
-const OWNER: &str = "COALESCE(h.owner_principal_id,l.principal_id)";
-fn columns() -> String {
-    let sql = format!("($4 OR ($5 AND {OWNER}=$2))");
-    format!("h.query_id,h.session_id,CASE WHEN {sql} THEN h.sql ELSE NULL END,h.context,h.status,h.accepted_at::text,h.finished_at::text,h.elapsed_ms,h.result_rows,CASE WHEN {sql} THEN h.error ELSE NULL END,h.placement,h.history_id,h.worker_id,h.profile_status,h.metrics,h.failure_kind,h.retry_safe,h.principal,
-        jsonb_build_object('queued_at',h.queued_at,'selected_at',h.selected_at,'execution_granted_at',h.execution_granted_at,'engine_started_at',h.engine_started_at,'queue_deadline_at',h.queue_deadline_at,'session_sequence',h.session_sequence,'worker_boot_id',h.worker_boot_id,'pool_scope',h.pool_scope,'protocol',h.protocol,'open_span_id',h.open_span_id,'namespace_id',COALESCE(h.namespace_id,$1),'owner_principal_id',{OWNER},'actor_principal_id',h.actor_principal_id,'actor_kind',h.actor_kind,'actor_principal',h.actor_principal,'actor_credential_id',h.actor_credential_id)::text,{OWNER}").replace("h.context,",&format!("CASE WHEN {sql} THEN h.context ELSE 'null' END,"))
+fn policy(profile: bool) -> metadata::PrivacySql {
+    let mut policy = metadata::privacy_sql(
+        Relation::History,
+        "h",
+        None,
+        metadata::PrivacyBindings {
+            namespace: 1,
+            principal: 2,
+            all: "$3",
+            sql_all: "$4",
+            sql_own: "$5",
+            profile_all: if profile { "$6" } else { "false" },
+            profile_own: if profile { "$7" } else { "false" },
+        },
+    );
+    policy.from.push_str(&metadata::history_enrichment(
+        None,
+        "h",
+        "d",
+        1,
+        &policy.owner,
+    ));
+    policy
 }
-const FROM: &str = "FROM query_history h LEFT JOIN authz_legacy_owners l ON h.owner_principal_id IS NULL AND h.namespace_id IS NULL AND l.namespace_id=$1 AND l.legacy_name=h.principal";
-fn visible() -> String {
-    format!("COALESCE(h.namespace_id,$1)=$1 AND ($3 OR {OWNER}=$2)")
+fn columns(policy: &metadata::PrivacySql) -> String {
+    let sql = &policy.sql_visible;
+    let owner = &policy.owner;
+    let captured = metadata::history_capture_json(sql);
+    format!("h.query_id,h.session_id,CASE WHEN {sql} THEN h.sql ELSE NULL END,h.context,h.status,h.accepted_at::text,h.finished_at::text,h.elapsed_ms,h.result_rows,CASE WHEN {sql} THEN h.error ELSE NULL END,h.placement,h.history_id,h.worker_id,h.profile_status,h.metrics,h.failure_kind,h.retry_safe,h.principal,
+        jsonb_build_object('queued_at',h.queued_at,'selected_at',h.selected_at,'execution_granted_at',h.execution_granted_at,'engine_started_at',h.engine_started_at,'queue_deadline_at',h.queue_deadline_at,'session_sequence',h.session_sequence,'worker_boot_id',h.worker_boot_id,'pool_scope',h.pool_scope,'protocol',h.protocol,'open_span_id',h.open_span_id,'namespace_id',COALESCE(h.namespace_id,$1),'owner_principal_id',{owner},'actor_principal_id',h.actor_principal_id,'actor_kind',h.actor_kind,'actor_principal',h.actor_principal,'actor_credential_id',h.actor_credential_id)::text,{owner},{captured}").replace("h.context,",&format!("CASE WHEN {sql} THEN h.context ELSE 'null' END,"))
 }
 fn record(row: &Row, plan: &RelationPlan) -> Value {
     let json_column =
@@ -115,6 +136,12 @@ fn record(row: &Row, plan: &RelationPlan) -> Value {
         "principal":row.get::<_,String>(17)
     });
     queue_metadata(&mut value, &json_column(18));
+    if let Some(captured) = json_column(20).as_object() {
+        value
+            .as_object_mut()
+            .expect("history object")
+            .extend(captured.clone());
+    }
     value
 }
 fn queue_metadata(value: &mut Value, stored: &Value) {
@@ -152,17 +179,19 @@ pub(crate) fn list_in(
     {
         plan.sensitive_filter()?;
     }
+    let policy = policy(false);
+    let from = &policy.from;
+    let visible = &policy.visible;
     let rows = tx
         .query(
             &format!(
-                "SELECT {} {FROM} WHERE {} AND ($6::bigint IS NULL OR h.history_id<$6)
+                "SELECT {} FROM {from} WHERE {visible} AND ($6::bigint IS NULL OR h.history_id<$6)
         AND ($7::text IS NULL OR h.status=$7) AND ($8::text IS NULL OR h.worker_id=$8)
         AND ($9::text IS NULL OR h.context::jsonb #>> '{{dbt,node_id}}'=$9)
         AND ($10::text IS NULL OR h.context::jsonb #>> '{{dbt,invocation_id}}'=$10)
         AND ($11::text IS NULL OR h.context::jsonb ->> 'model_run_id'=$11)
         AND ($12::text IS NULL OR h.failure_kind=$12) ORDER BY h.history_id DESC LIMIT $13",
-                columns(),
-                visible()
+                columns(&policy)
             ),
             &[
                 &plan.namespace_id,
@@ -197,7 +226,8 @@ pub(crate) fn detail_in(
     id: Uuid,
 ) -> Result<Value, ApiError> {
     let plan = metadata::relation_plan(access, Relation::History)?;
-    let row=tx.query_opt(&format!("SELECT {},CASE WHEN ($4 OR ($5 AND {OWNER}=$2)) AND ($6 OR ($7 AND {OWNER}=$2)) THEN h.profile ELSE NULL END {FROM} WHERE {} AND h.query_id=$8",columns(),visible()),
+    let policy = policy(true);
+    let row=tx.query_opt(&format!("SELECT {},CASE WHEN {} THEN h.profile ELSE NULL END FROM {} WHERE {} AND h.query_id=$8",columns(&policy),policy.profile_visible,policy.from,policy.visible),
         &[&plan.namespace_id,&plan.principal_id,&plan.all,&plan.sql_all,&plan.sql_own,&plan.profile_all,&plan.profile_own,&id.to_string()])
         .map_err(|_|ApiError::internal())?.ok_or_else(||ApiError::new(failure::NOT_FOUND,"query not found"))?;
     let mut value = record(&row, &plan);

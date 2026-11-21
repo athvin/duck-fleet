@@ -296,6 +296,8 @@ credential from the environment, or a credential it issued; see
 | GET | `/v1/requests/{request_id}` | Authorized own/all durable identity, attempt lineage, outcome, and diagnostic availability |
 | GET | `/v1/workers` | Every configured worker's state and execution pressure, observed limits, and whether isolated compute is available |
 | GET | `/v1/usage` | Append-only usage events with cursor pagination |
+| POST | `/v1/system/query` | Bounded SQL over authorized history, attempts and usage; JSON or Arrow |
+| GET | `/v1/system/schema` | Versioned column catalog with the caller's visibility and masking |
 | GET | `/v1/budget` | Prepaid balance, held reservations, spend, caps, rate card |
 | PUT | `/v1/budget` | Set the prepaid balance and per-job cost cap |
 | GET | `/v1/lake/snapshots` | DuckLake snapshots, as an Arrow stream |
@@ -459,7 +461,7 @@ placement, timestamps, cost, and curated numeric metrics. Hidden payload fields
 are absent or null; filtering on a hidden sensitive field is refused. Invisible
 history/request IDs use the same not-found response as absent IDs. Row scopes
 are applied in PostgreSQL before pagination, and HTTP metadata remains available
-while execution workers are stopped. SQL system relations follow in #104.
+while execution workers are stopped. The same policy protects the [SQL system relations](docs/system-schema.md).
 
 Manage a whole principal policy with
 `GET/PUT /v1/principals/{principal}/policy`. A PUT replaces its roles, explicit
@@ -758,6 +760,15 @@ is absent. No request is automatically replayed after a worker or gateway loss.
 Responses fail rather than silently truncate beyond 100,000 rows or 16 MiB.
 Each worker has a 1 GiB spill limit and the resource settings listed above.
 These are local resource limits, not billing budgets.
+
+## SQL system tables
+
+Use `duckfleet system tables`, `duckfleet system describe query_history`, or
+`duckfleet system sql '<query>'` to inspect `duckfleet_system.query_history`,
+`query_attempts`, and `usage`. HTTP serves `/v1/system/query` and `/v1/system/schema`;
+pgwire selects this mode with database `duckfleet_system`. These bounded,
+authenticated reads work with every execution worker stopped and require no
+additional service. See the [SQL examples, permissions, and limits](docs/system-schema.md).
 
 ## Query history and profiling
 

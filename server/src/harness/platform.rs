@@ -226,7 +226,46 @@ fn migration_failure(client: &mut Client) -> Result<()> {
 /// This generated-schema fixture reconstructs the real schema-1 surface before
 /// testing upgrades. Merely deleting version markers leaves schema-2 DDL behind
 /// and does not represent any supported historical installation.
+pub(super) fn remove_system_fixture_schema(client: &mut Client) -> Result<()> {
+    let current: i32 = client
+        .query_one("SELECT MAX(version) FROM platform_schema_migrations", &[])?
+        .get(0);
+    if current < 4 {
+        return Ok(());
+    }
+    client.batch_execute("DROP INDEX history_system_window,history_system_own_window,requests_system_window,usage_system_window,usage_system_own_window")?;
+    for (table, columns) in [
+        ("queue_sessions", "system_dimensions"),
+        (
+            "requests",
+            "open_span_id execution_timeout_seconds requested_mode requested_pool requested_cpu requested_memory_bytes requested_disk_bytes selected_mode selected_pool selected_cpu selected_memory_bytes selected_disk_bytes engine_version registry_revision query_fingerprint query_fingerprint_version normalization_status model_id invocation_id model_run_id",
+        ),
+        (
+            "query_history",
+            "profile_capture_version profile_latency_seconds profile_cpu_seconds profile_rows_returned profile_rows_scanned peak_buffer_memory_bytes peak_temp_dir_bytes bytes_read bytes_written",
+        ),
+        (
+            "reservations",
+            "selected_mode selected_pool owner_principal_name model_id invocation_id model_run_id",
+        ),
+        (
+            "usage_events",
+            "selected_mode selected_pool owner_principal_name model_id invocation_id model_run_id rate_micro_usd_per_unit_hour",
+        ),
+    ] {
+        for column in columns.split_whitespace() {
+            client.batch_execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"))?;
+        }
+    }
+    client.execute(
+        "DELETE FROM platform_schema_migrations WHERE version=4",
+        &[],
+    )?;
+    Ok(())
+}
+
 pub(super) fn remove_authz_fixture_schema(client: &mut Client) -> Result<()> {
+    remove_system_fixture_schema(client)?;
     for table in [
         "requests",
         "query_history",

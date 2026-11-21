@@ -85,7 +85,7 @@ services:
   # needs Kubernetes; explicit persistent pools are available via the pools profile.
   worker-small:
     labels:
-      duckfleet.io/platform-schema: "3"
+      duckfleet.io/platform-schema: "4"
     image: duckfleet-worker:local
     build:
       context: .
@@ -133,7 +133,7 @@ services:
   # the gateway at it via DUCKFLEET_WORKER_URLS.
   worker-small-b:
     labels:
-      duckfleet.io/platform-schema: "3"
+      duckfleet.io/platform-schema: "4"
     profiles: [scale-out]
     image: duckfleet-worker:local
     environment:
@@ -149,7 +149,7 @@ services:
 
   server:
     labels:
-      duckfleet.io/platform-schema: "3"
+      duckfleet.io/platform-schema: "4"
     image: duckfleet-worker:local
     environment:
       DUCKFLEET_ROLE: gateway
@@ -188,7 +188,7 @@ services:
   # isolation. Start with: docker compose --profile pools up -d --wait server-pools
   worker-pool-interactive-0:
     labels:
-      duckfleet.io/platform-schema: "3"
+      duckfleet.io/platform-schema: "4"
     profiles: [pools]
     image: duckfleet-worker:local
     environment:
@@ -210,7 +210,7 @@ services:
 
   server-pools:
     labels:
-      duckfleet.io/platform-schema: "3"
+      duckfleet.io/platform-schema: "4"
     profiles: [pools]
     image: duckfleet-worker:local
     environment:

@@ -372,6 +372,10 @@ pub(crate) fn admit_in(
         transaction.execute("UPDATE reservations SET namespace_id=$2,owner_principal_id=$3,actor_principal_id=$4,actor_kind=$5,actor_principal=$6,actor_credential_id=$7 WHERE execution_id=$1",
             &[&execution_id,&attribution["namespace_id"].as_str(),&attribution["owner_principal_id"].as_str(),&attribution["actor_principal_id"].as_str(),&attribution["actor_kind"].as_str(),&attribution["actor_principal"].as_str(),&attribution["actor_credential_id"].as_str()]).map_err(|_|ApiError::internal())?;
     }
+    if attribution.get("selected_mode").is_some() {
+        transaction.execute("UPDATE reservations SET selected_mode=$2,selected_pool=$3,owner_principal_name=$4,model_id=$5,invocation_id=$6,model_run_id=$7 WHERE execution_id=$1",
+        &[&execution_id,&attribution["selected_mode"].as_str(),&attribution["selected_pool"].as_str(),&attribution["principal"].as_str(),&attribution["model_id"].as_str(),&attribution["invocation_id"].as_str(),&attribution["model_run_id"].as_str()]).map_err(|_|ApiError::internal())?;
+    }
     apply_deltas(transaction, 0, reserved_micro_usd).map_err(|_| ApiError::internal())?;
     Ok(Admission {
         execution_id: execution_id.to_owned(),
@@ -443,8 +447,35 @@ fn record(
             &credential,
         ]);
     }
-    let inserted=transaction.execute(&format!("INSERT INTO usage_events(event_id,execution_id,meter_name,quantity,unit,resource_units,amount_micro_usd,rate_card_version,worker_id,context,source,started_at,ended_at{actor_columns})
-        VALUES($1,$2,$3,$4,'millisecond',$5,$6,$7,$8,$9,$10,now()-($4::BIGINT*interval '1 millisecond'),now(){actor_values}) ON CONFLICT(event_id) DO NOTHING"),&params)?;
+    let selected_mode = attribution["selected_mode"].as_str();
+    let selected_pool = attribution["selected_pool"].as_str();
+    let owner_name = attribution["owner_principal_name"].as_str();
+    let model = attribution["model_id"].as_str();
+    let invocation = attribution["invocation_id"].as_str();
+    let model_run = attribution["model_run_id"].as_str();
+    let saved_rate = attribution["rate_micro_usd_per_unit_hour"].as_i64();
+    let (dimension_columns, dimension_values) = if attribution.get("selected_mode").is_some() {
+        let first = params.len() + 1;
+        params.extend([
+            &selected_mode as &(dyn postgres::types::ToSql + Sync),
+            &selected_pool,
+            &owner_name,
+            &model,
+            &invocation,
+            &model_run,
+            &saved_rate,
+        ]);
+        (
+            ",selected_mode,selected_pool,owner_principal_name,model_id,invocation_id,model_run_id,rate_micro_usd_per_unit_hour",
+            (first..first + 7)
+                .map(|i| format!(",${i}"))
+                .collect::<String>(),
+        )
+    } else {
+        ("", String::new())
+    };
+    let inserted=transaction.execute(&format!("INSERT INTO usage_events(event_id,execution_id,meter_name,quantity,unit,resource_units,amount_micro_usd,rate_card_version,worker_id,context,source,started_at,ended_at{actor_columns}{dimension_columns})
+        VALUES($1,$2,$3,$4,'millisecond',$5,$6,$7,$8,$9,$10,now()-($4::BIGINT*interval '1 millisecond'),now(){actor_values}{dimension_values}) ON CONFLICT(event_id) DO NOTHING"),&params)?;
     Ok(inserted)
 }
 

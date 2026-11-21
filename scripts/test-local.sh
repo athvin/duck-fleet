@@ -66,6 +66,8 @@ echo 'PASS: public bootstrap cannot authenticate directly to a worker'
 docker compose run --rm api
 docker compose run --rm dbt duckfleet-server --rbac-storage
 docker compose run --rm dbt duckfleet-server --rbac
+docker compose run --rm dbt duckfleet-server --system-storage
+docker compose run --rm dbt duckfleet-server --system
 docker compose run --rm dbt duckfleet-server --auth-continuity
 docker compose run --rm dbt duckfleet-server --request-identity
 docker compose run --rm dbt duckfleet-server --platform-maintenance
@@ -103,11 +105,13 @@ if docker compose exec -T -e PGPASSWORD=not-a-credential postgres \
   psql -h server -p 5432 -U operator -d lake -c 'select 1' > /dev/null 2>&1; then
   echo 'the wire front accepted a bad credential' >&2; exit 1
 fi
-# pgwire attribution lands in history. Read it back through the gateway (no client
-# package needed — the harness observability stage covers the general case; this is
-# the pgwire-operation slice).
-docker compose run --rm dbt duckfleet-server --history-without-workers >/dev/null 2>&1 || true
 echo 'PASS: psql spoke to the warehouse through the wire front — typed results, classified errors, clean refusals'
+
+# Every execution worker is stopped; metadata SQL and existing HTTP diagnostics
+# must still work. --no-deps prevents the harness from restarting compute.
+docker compose stop worker-small
+docker compose run --rm --no-deps dbt duckfleet-server --system-without-workers
+docker compose up -d --wait worker-small server
 
 # The usage ledger must reject edits in the database, not merely in application code.
 for statement in 'UPDATE usage_events SET amount_micro_usd = 0' 'DELETE FROM usage_events'; do

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{credentials, metering, pricing::RateCard, requests};
 
-pub(crate) const SCHEMA_VERSION: i32 = 3;
+pub(crate) const SCHEMA_VERSION: i32 = 4;
 const MIGRATION_LOCK: i64 = 4_283_121;
 const POLL: Duration = Duration::from_millis(250);
 const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
@@ -206,7 +206,7 @@ pub(crate) fn wait_schema(dsn: &str, wait: Duration) -> Result<Client> {
         })();
         match attempt {
             Ok((client, Some(current))) if current == SCHEMA_VERSION => return Ok(client),
-            Ok((_, Some(1 | 2))) => {}
+            Ok((_, Some(1..=3))) => {}
             Ok((_, Some(current))) => {
                 supported(current)?;
             }
@@ -296,7 +296,7 @@ fn migrate_with_roles(
             });
         }
         anyhow::ensure!(
-            matches!(current, 1 | 2),
+            matches!(current, 1..=3),
             "unsupported migration source version {current}"
         );
     }
@@ -315,7 +315,7 @@ fn migrate_with_roles(
         });
     }
     anyhow::ensure!(
-        current.is_none() || matches!(current, Some(1 | 2)),
+        current.is_none() || matches!(current, Some(1..=3)),
         "unsupported migration source version"
     );
     if current.is_none() {
@@ -352,11 +352,18 @@ fn migrate_with_roles(
             &[],
         )?;
     }
-    crate::authz::migrate(&mut transaction, &crate::authz::Seed::from_env()?)?;
-    crate::audit::migrate(&mut transaction)?;
-    crate::metadata::migrate(&mut transaction)?;
-    transaction.execute(
+    if current.is_none() || current.is_some_and(|v| v < 3) {
+        crate::authz::migrate(&mut transaction, &crate::authz::Seed::from_env()?)?;
+        crate::audit::migrate(&mut transaction)?;
+        crate::metadata::migrate(&mut transaction)?;
+        transaction.execute(
         "INSERT INTO platform_schema_migrations(version,name) VALUES(3,'platform-authorization')",
+        &[],
+    )?;
+    }
+    crate::metadata::migrate_system(&mut transaction)?;
+    transaction.execute(
+        "INSERT INTO platform_schema_migrations(version,name) VALUES(4,'typed-system-metadata')",
         &[],
     )?;
     if let Some(roles) = roles {

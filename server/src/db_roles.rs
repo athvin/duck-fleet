@@ -288,6 +288,16 @@ pub(crate) fn validate_runtime(client: &mut Client, role: RuntimeRole) -> Result
             hash_access,
             "gateway database role requires credential authentication privileges"
         );
+        let spill_kib: i64 = client
+            .query_one(
+                "SELECT setting::bigint FROM pg_settings WHERE name='temp_file_limit'",
+                &[],
+            )?
+            .get(0);
+        ensure!(
+            (1..=16_384).contains(&spill_kib),
+            "gateway requires a finite temp_file_limit of at most 16MB; rerun administrator database provisioning before starting schema 4 compute"
+        );
     }
     let expected = match role {
         RuntimeRole::Gateway => ("credentials", "INSERT"),

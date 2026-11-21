@@ -32,6 +32,8 @@ mod rbac;
 mod rbac_storage;
 mod request_identity;
 mod request_upgrade;
+mod system_api;
+mod system_storage;
 
 const ARTIFACTS: &str = "/artifacts";
 
@@ -47,7 +49,13 @@ pub async fn run(args: Vec<String>) -> i32 {
     let ctx = Ctx { url, token };
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
-    let result: anyhow::Result<()> = if has("--rbac") {
+    let result: anyhow::Result<()> = if has("--system") {
+        system_api::checks(&ctx).await
+    } else if has("--system-storage") {
+        system_storage::checks().await
+    } else if has("--system-without-workers") {
+        system_api::workers_down(&ctx).await
+    } else if has("--rbac") {
         rbac::checks(&ctx).await
     } else if has("--rbac-storage") {
         rbac_storage::checks().await

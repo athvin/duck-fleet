@@ -45,13 +45,18 @@ pub(crate) fn migrate(tx: &mut Transaction<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) enum Relation {
+    #[serde(rename = "query_history")]
     History,
+    #[serde(rename = "query_attempts")]
     Attempts,
+    #[serde(rename = "usage")]
     Usage,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct RelationPlan {
     pub namespace_id: String,
     pub principal_id: Option<String>,
@@ -223,3 +228,11 @@ impl Reader {
         .map_err(|_| ApiError::internal())?
     }
 }
+
+#[path = "metadata_system.rs"]
+mod system;
+pub(crate) use system::*;
+
+#[path = "metadata_capture.rs"]
+mod capture;
+pub(crate) use capture::*;
