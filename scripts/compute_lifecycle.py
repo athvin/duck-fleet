@@ -66,7 +66,8 @@ def stop_kube(kube, timeout):
             if item['spec']['template']['metadata']['labels']['app'] == role:
                 name = item['metadata']['name']
                 print(f'stopping deployment/{name} (replicas={item["spec"].get("replicas", 1)})', flush=True)
-                run([*kube, 'scale', 'deployment/' + name, '--replicas=0'])
+                run([*kube, 'patch', 'deployment/' + name, '--type=strategic',
+                     '--patch={"spec":{"replicas":0}}'])
         # Also collect standalone/failed compute pods. Respect their normal grace.
         run([*kube, 'delete', 'pods', '-l', 'app=' + role, '--ignore-not-found',
              '--wait=true', '--timeout=' + str(timeout) + 's'], timeout=timeout+30)

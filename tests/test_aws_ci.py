@@ -870,10 +870,10 @@ class QueueDeploymentTests(unittest.TestCase):
              mock.patch.object(lifecycle, 'run') as command:
             lifecycle.stop_kube(kube, 180)
         calls = [call.args[0] for call in command.call_args_list]
-        self.assertEqual(calls[0], [*kube,'scale','deployment/server','--replicas=0'])
+        self.assertEqual(calls[0], [*kube,'patch','deployment/server','--type=strategic','--patch={"spec":{"replicas":0}}'])
         self.assertIn('app=duckfleet-gateway', calls[1])
         self.assertTrue(all(call[:len(kube)] == kube for call in calls))
-        self.assertIn([*kube,'scale','deployment/worker-pool-wide-0','--replicas=0'], calls)
+        self.assertIn([*kube,'patch','deployment/worker-pool-wide-0','--type=strategic','--patch={"spec":{"replicas":0}}'], calls)
         self.assertFalse(any(any(word in ('statefulset','jobs','secrets','pvc','deployment/other') for word in call) for call in calls))
         with mock.patch.object(lifecycle, 'kube_objects', return_value=deployments), \
              mock.patch.object(lifecycle, 'run', side_effect=[None,subprocess.CalledProcessError(1,['kubectl'])]) as command:
@@ -1356,6 +1356,9 @@ class OwnershipBoundaryTests(unittest.TestCase):
         workflow = (ROOT/'.github/workflows/aws-dev.yml').read_text()
         self.assertNotIn('apply-boundary', workflow)
         self.assertIn('check-access.sh', workflow)
+        access = (ROOT/'scripts/aws/check-access.sh').read_text()
+        self.assertIn('auth can-i patch deployments.apps', access)
+        self.assertNotIn('subresource=scale', access)
 
 
 class DatabaseRolePackagingTests(unittest.TestCase):
