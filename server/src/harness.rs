@@ -22,6 +22,7 @@ mod api_workflow;
 mod authentication;
 mod aws_harness;
 mod concurrency;
+mod engine_qualification;
 mod jobs;
 mod jobs_storage;
 mod metering;
@@ -51,7 +52,9 @@ pub async fn run(args: Vec<String>) -> i32 {
     let ctx = Ctx { url, token };
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
-    let result: anyhow::Result<()> = if has("--jobs-storage") {
+    let result: anyhow::Result<()> = if has("--engine-qualification") {
+        engine_qualification::checks(&ctx).await
+    } else if has("--jobs-storage") {
         jobs_storage::checks().await
     } else if has("--jobs-long") {
         jobs::long_running(&ctx).await
