@@ -1,8 +1,10 @@
 //! History availability, pagination, profile identity, and auth on the read
 //! endpoints. Ported from `tests/observability.py`.
 
+use std::time::{Duration, Instant};
+
 use reqwest::Method;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{Ctx, request_json, require, write_artifact};
 use crate::client::{Client, RemoteConnection};
@@ -137,7 +139,368 @@ pub(super) async fn checks(ctx: &Ctx) -> anyhow::Result<()> {
     write_artifact("profile-query-id.txt", &first_id);
     let mut connection = connection;
     connection.close().await?;
+    worker_status(ctx).await?;
     println!("PASS: independent history, cursor pagination, filters, auth, and profile identity");
+    Ok(())
+}
+
+// A streaming aggregate: long enough to cancel deliberately, without allocating
+// a huge result or a hash table. Real engine execution, not a test-only sleep.
+const BUSY_SQL: &str = "select sum(range % 7) from range(1000000000000)";
+const STATUS_TIMEOUT: Duration = Duration::from_secs(4);
+
+async fn fleet(client: &Client) -> anyhow::Result<Value> {
+    let bytes = client
+        .request(Method::GET, "/v1/workers", None, STATUS_TIMEOUT)
+        .await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn worker<'a>(report: &'a Value, id: &str) -> anyhow::Result<&'a Value> {
+    report["workers"]
+        .as_array()
+        .and_then(|workers| workers.iter().find(|worker| worker["worker_id"] == id))
+        .ok_or_else(|| anyhow::anyhow!("worker {id} missing from fleet report: {report}"))
+}
+
+fn valid_snapshot(snapshot: &Value) -> anyhow::Result<()> {
+    require(
+        snapshot["boot_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        format!("worker has no boot identity: {snapshot}"),
+    )?;
+    for key in ["active_queries", "queued_queries", "open_sessions"] {
+        require(
+            snapshot[key].as_u64().is_some(),
+            format!("worker has no nonnegative {key}: {snapshot}"),
+        )?;
+    }
+    require(
+        snapshot["ready"] == true && snapshot["draining"] == false,
+        format!("fixture worker is not ready: {snapshot}"),
+    )?;
+    require(
+        if snapshot["queued_queries"] == 0 {
+            snapshot["oldest_queued_ms"].is_null()
+        } else {
+            snapshot["oldest_queued_ms"].as_u64().is_some()
+        },
+        format!("queue age does not match queue depth: {snapshot}"),
+    )
+}
+
+async fn wait_worker(
+    client: &Client,
+    id: &str,
+    matches: impl Fn(&Value) -> bool,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let report = fleet(client).await?;
+        let snapshot = worker(&report, id)?;
+        valid_snapshot(snapshot)?;
+        if matches(snapshot) {
+            return Ok(snapshot.clone());
+        }
+        require(
+            Instant::now() < deadline,
+            format!("worker state did not converge: {snapshot}"),
+        )?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A query remains active longer than the five-second discovery timeout while
+/// both worker and fleet status keep responding. A queued query is counted too.
+pub(super) async fn worker_status(ctx: &Ctx) -> anyhow::Result<()> {
+    let client = ctx.client()?;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let baseline = fleet(&client).await?;
+    let mut session = ctx.open_named("worker-status", None).await?;
+    let id = session.placement["worker_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("session has no worker identity"))?
+        .to_owned();
+    let baseline_sessions = worker(&baseline, &id)?["open_sessions"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("worker has no session count"))?;
+    let endpoint = worker(&baseline, &id)?["endpoint"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("worker has no endpoint"))?;
+    let direct = Client::new(endpoint, &ctx.token)?;
+    let query_client = client.clone();
+    let query_path = format!("{}/queries", session.path());
+    let busy = tokio::spawn(async move {
+        query_client
+            .request(
+                Method::POST,
+                &query_path,
+                Some(&json!({
+                    "request_id": uuid::Uuid::new_v4(),
+                    "sql": BUSY_SQL,
+                    "timeout_seconds": 30,
+                })),
+                crate::client::STATEMENT_TIMEOUT,
+            )
+            .await
+    });
+    let mut queued = None;
+    // Always cancel/join below, including when an assertion fails: a broken
+    // status endpoint must not leave expensive fixture work behind.
+    let checked = async {
+        let active = wait_worker(&client, &id, |w| w["active_queries"] == 1).await?;
+        let boot = active["boot_id"].clone();
+        require(
+            active["open_sessions"] == baseline_sessions + 1,
+            format!("HTTP session missing from worker census: {active}"),
+        )?;
+        let query_client = client.clone();
+        let query_path = format!("{}/queries", session.path());
+        queued = Some(tokio::spawn(async move {
+            query_client
+                .request(
+                    Method::POST,
+                    &query_path,
+                    Some(&json!({
+                        "request_id": uuid::Uuid::new_v4(),
+                        "sql": "select 1",
+                    })),
+                    crate::client::STATEMENT_TIMEOUT,
+                )
+                .await
+        }));
+        wait_worker(&client, &id, |w| w["queued_queries"] == 1).await?;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(6) {
+            let bytes = direct
+                .request(Method::GET, "/v1/worker", None, STATUS_TIMEOUT)
+                .await?;
+            let snapshot: Value = serde_json::from_slice(&bytes)?;
+            valid_snapshot(&snapshot)?;
+            require(
+                snapshot["state"] == "busy"
+                    && snapshot["active_queries"] == 1
+                    && snapshot["queued_queries"] == 1
+                    && snapshot["boot_id"] == boot,
+                format!("busy worker status is inconsistent: {snapshot}"),
+            )?;
+            let report = fleet(&client).await?;
+            let observed = worker(&report, &id)?;
+            require(
+                observed["state"] == "busy" && observed["active_queries"] == 1,
+                format!("healthy busy worker disappeared from discovery: {report}"),
+            )?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let canceled = session.cancel().await;
+    let outcome = busy.await?;
+    let queued_outcome = match queued {
+        Some(query) => Some(query.await?),
+        None => None,
+    };
+    let closed = session.close().await;
+    checked?;
+    canceled?;
+    require(
+        outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.failure_kind.as_deref() == Some("canceled")),
+        "fixture's long query was not canceled",
+    )?;
+    if let Some(outcome) = queued_outcome {
+        outcome?;
+    }
+    closed?;
+    let idle = wait_worker(&client, &id, |w| {
+        w["active_queries"] == 0
+            && w["queued_queries"] == 0
+            && w["open_sessions"] == baseline_sessions
+    })
+    .await?;
+    require(idle["state"] == "ready", format!("{idle}"))?;
+    write_artifact("worker-status.json", &serde_json::to_string_pretty(&idle)?);
+    println!(
+        "PASS: worker and fleet status stay responsive during >5s SQL, with queue/session counters cleaned up"
+    );
+    Ok(())
+}
+
+/// Requires two configured persistent workers and the gateway's pgwire listener.
+/// A real pgwire query must influence placement of a new HTTP session.
+pub(super) async fn mixed_protocol_status(ctx: &Ctx) -> anyhow::Result<()> {
+    let client = ctx.client()?;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let baseline = fleet(&client).await?;
+    require(
+        baseline["workers"].as_array().is_some_and(|w| w.len() == 2),
+        "mixed-protocol placement fixture needs exactly two workers",
+    )?;
+    let host = reqwest::Url::parse(&ctx.url)?
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("gateway URL has no host"))?
+        .to_owned();
+    let token = ctx.token.clone();
+    let marker = format!("worker-status-pgwire-{}", uuid::Uuid::new_v4());
+    let statement = format!("/* {marker} */ {BUSY_SQL}");
+    let busy = tokio::task::spawn_blocking(move || {
+        let mut pg = postgres::Config::new()
+            .host(&host)
+            .port(5432)
+            .user("operator")
+            .dbname("lake")
+            .password(token)
+            .connect_timeout(Duration::from_secs(5))
+            .connect(postgres::NoTls)?;
+        pg.simple_query(&statement)
+    });
+    let mut active_session = None;
+    let checked = async {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let record = loop {
+            let history = request_json(
+                &client,
+                Method::GET,
+                "/v1/queries?status=running&limit=100",
+                None,
+            )
+            .await?;
+            if let Some(record) = history["queries"].as_array().and_then(|queries| {
+                queries
+                    .iter()
+                    .find(|q| q["sql"].as_str().is_some_and(|s| s.contains(&marker)))
+            }) {
+                break record.clone();
+            }
+            require(Instant::now() < deadline, "pgwire query did not start")?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let id = record["worker_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("pgwire history has no worker"))?;
+        let endpoint = worker(&baseline, id)?["endpoint"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("worker has no endpoint"))?;
+        let session_id = record["session_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("pgwire history has no session"))?;
+        active_session = Some((Client::new(endpoint, &ctx.token)?, session_id.to_owned()));
+        let active = wait_worker(&client, id, |w| w["active_queries"] == 1).await?;
+        require(
+            active["open_sessions"].as_u64()
+                == worker(&baseline, id)?["open_sessions"]
+                    .as_u64()
+                    .map(|n| n + 1),
+            format!("pgwire session absent from the worker census: {active}"),
+        )?;
+        let mut http = tokio::time::timeout(
+            Duration::from_secs(5),
+            ctx.open_named("http-alongside-pgwire", None),
+        )
+        .await??;
+        let placed_elsewhere = http.placement["worker_id"] != id;
+        let answered = super::sql(&http, "select 42").await;
+        let closed = http.close().await;
+        require(
+            placed_elsewhere,
+            "HTTP session was routed to a worker busy with pgwire SQL",
+        )?;
+        require(
+            super::rows_eq(&answered?, &[&["42"]]),
+            "HTTP sibling did not answer",
+        )?;
+        closed?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    // Cancel through the worker's authenticated internal endpoint: pgwire does
+    // not implement CancelRequest and its session is not an HTTP gateway route.
+    if let Some((direct, id)) = active_session {
+        let _ = request_json(
+            &direct,
+            Method::POST,
+            &format!("/v1/sessions/{id}/cancel"),
+            None,
+        )
+        .await;
+    }
+    let outcome = busy.await?;
+    checked?;
+    require(
+        outcome
+            .as_ref()
+            .err()
+            .and_then(postgres::Error::code)
+            .is_some_and(|code| code.code() == "57014"),
+        "pgwire query did not finish with classified cancellation",
+    )?;
+    for original in baseline["workers"].as_array().unwrap() {
+        let id = original["worker_id"].as_str().unwrap_or_default();
+        wait_worker(&client, id, |w| {
+            w["active_queries"] == 0
+                && w["queued_queries"] == 0
+                && w["open_sessions"] == original["open_sessions"]
+        })
+        .await?;
+    }
+    println!("PASS: pgwire load is visible and new HTTP sessions use the idle sibling");
+    Ok(())
+}
+
+/// Run after a previously observed sibling has stopped, without restarting the
+/// gateway, so the unavailable entry must preserve its last observation time.
+pub(super) async fn partial_outage(ctx: &Ctx) -> anyhow::Result<()> {
+    // Let the one-second load cache expire after the script stops the sibling.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let client = ctx.client()?;
+    let bytes = client
+        .request(Method::GET, "/v1/workers", None, Duration::from_secs(7))
+        .await?;
+    let report: Value = serde_json::from_slice(&bytes)?;
+    let workers = report["workers"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing fleet: {report}"))?;
+    require(
+        workers.len() == 2,
+        format!("partial report lost a configured worker: {report}"),
+    )?;
+    let missing = workers
+        .iter()
+        .find(|w| w["state"] == "unreachable")
+        .ok_or_else(|| anyhow::anyhow!("no unreachable entry: {report}"))?;
+    require(
+        missing["last_success_at"].as_u64().is_some(),
+        format!("last successful observation was lost: {missing}"),
+    )?;
+    require(
+        missing["endpoint"].as_str().is_some(),
+        format!("unreachable endpoint was lost: {missing}"),
+    )?;
+    require(
+        missing.get("active_queries").is_none(),
+        format!("stale pressure looks current: {missing}"),
+    )?;
+    require(
+        workers.iter().any(|w| w["state"] == "ready"),
+        format!("healthy sibling disappeared: {report}"),
+    )?;
+    let mut connection = ctx.open_named("partial-outage", None).await?;
+    let outcome = super::sql(&connection, "select 42").await;
+    let closed = connection.close().await;
+    require(
+        super::rows_eq(&outcome?, &[&["42"]]),
+        "healthy sibling did not execute",
+    )?;
+    closed?;
+    write_artifact(
+        "worker-partial-outage.json",
+        &serde_json::to_string_pretty(&report)?,
+    );
+    println!("PASS: a stopped worker remains visible alongside the serving sibling");
     Ok(())
 }
 

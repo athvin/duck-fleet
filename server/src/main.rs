@@ -18,6 +18,7 @@ mod profiling;
 mod secrets;
 mod usage;
 mod worker;
+mod worker_status;
 use compute::SessionRequest;
 
 use axum::{
@@ -41,6 +42,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct App {
     sender: mpsc::Sender<Envelope>,
+    status: worker_status::Status,
     active: Arc<Mutex<Option<worker::Active>>>,
     token: Arc<str>,
     history: history::Reader,
@@ -61,12 +63,12 @@ type Reply = Result<Output, ApiError>;
 struct Envelope {
     op: Operation,
     reply: oneshot::Sender<Reply>,
+    query_guard: Option<worker_status::QueryGuard>,
 }
 enum Operation {
     /// The string is the principal the gateway authenticated, or `direct` for a
     /// worker addressed without one.
     Open(SessionRequest, String),
-    Info,
     Close(Uuid),
     Query(Uuid, QueryRequest),
 }
@@ -249,9 +251,14 @@ async fn dispatch(app: App, op: Operation) -> Reply {
         ));
     }
     let (reply, receiver) = oneshot::channel();
+    let query_guard = matches!(&op, Operation::Query(..)).then(|| app.status.enqueue());
     // A rejected send never reached the engine, so this request may be sent again.
     app.sender
-        .try_send(Envelope { op, reply })
+        .try_send(Envelope {
+            op,
+            reply,
+            query_guard,
+        })
         .map_err(|_| ApiError::new(failure::CAPACITY, "worker queue full or closed"))?;
     receiver.await.map_err(|_| ApiError::internal())?
 }
@@ -291,7 +298,7 @@ async fn open(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Reply 
     dispatch(app, Operation::Open(request, principal)).await
 }
 async fn info(State(app): State<App>) -> Reply {
-    dispatch(app, Operation::Info).await
+    Ok(Output::Json(app.status.snapshot()))
 }
 async fn close(State(app): State<App>, Path(id): Path<Uuid>) -> Reply {
     dispatch(app, Operation::Close(id)).await
@@ -380,9 +387,16 @@ async fn main() -> anyhow::Result<()> {
     let (sender, receiver) = mpsc::channel(64);
     let (failed_tx, failed_rx) = oneshot::channel();
     let ready = Arc::new(AtomicBool::new(false));
+    let draining = Arc::new(AtomicBool::new(false));
+    let status = worker_status::Status::new(
+        std::env::var("DUCKFLEET_WORKER_ID").unwrap_or_default(),
+        ready.clone(),
+        draining.clone(),
+    );
     let worker_active = active.clone();
-    let active_for_drain = active.clone();
+    let status_for_drain = status.clone();
     let worker_ready = ready.clone();
+    let worker_status = status.clone();
     // Startup waits for the catalog on a bounded budget, so reaching the error arm
     // means waiting will not help. Hand the failure back to `main` so the exit code
     // and the message still reflect it.
@@ -391,9 +405,15 @@ async fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Handle::current();
     std::thread::Builder::new()
         .name("duckfleet-worker".into())
-        .spawn(
-            move || match worker::Worker::new(worker_active, runtime, worker_ready.clone()) {
+        .spawn(move || {
+            match worker::Worker::new(
+                worker_active,
+                runtime,
+                worker_ready.clone(),
+                worker_status.clone(),
+            ) {
                 Ok(mut worker) => {
+                    worker_status.initialize(worker.placement().clone());
                     worker_ready.store(true, Ordering::Release);
                     worker.run(receiver);
                 }
@@ -401,11 +421,11 @@ async fn main() -> anyhow::Result<()> {
                     *failure_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
                     let _ = failed_tx.send(());
                 }
-            },
-        )?;
-    let draining = Arc::new(AtomicBool::new(false));
+            }
+        })?;
     let app = App {
         sender,
+        status,
         active,
         token: token.into(),
         history: history::Reader::new(std::env::var("PLATFORM_DSN")?),
@@ -437,7 +457,6 @@ async fn main() -> anyhow::Result<()> {
         port = 8080,
         "DuckFleet local server listening; worker starting"
     );
-    let drain_active = active_for_drain;
     tokio::select! {
         served = axum::serve(listener, router).with_graceful_shutdown(async move {
             terminating().await;
@@ -453,14 +472,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(
                 "termination signal received; refusing new sessions and finishing open work"
             );
-            // A statement runs serially on the worker, so an empty slot means the
-            // engine is idle.
-            drain_until_idle(move || {
-                drain_active
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_some()
-            })
+            // Include queued SQL and admission/settlement, which remain work even
+            // before or after the DuckDB interrupt slot is occupied.
+            drain_until_idle(move || status_for_drain.has_queries())
             .await;
             tracing::info!("drain complete; shutting down");
         }) => served?,
@@ -481,6 +495,101 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    fn status_test_app() -> (App, mpsc::Receiver<Envelope>) {
+        let (sender, receiver) = mpsc::channel(1);
+        let ready = Arc::new(AtomicBool::new(true));
+        let draining = Arc::new(AtomicBool::new(false));
+        let status = worker_status::Status::new("small".into(), ready.clone(), draining.clone());
+        status.initialize(json!({"worker_id":"small", "cpu":1}));
+        (
+            App {
+                sender,
+                status,
+                active: Arc::new(Mutex::new(None)),
+                token: "test-token".into(),
+                history: history::Reader::new("postgres://unused".into()),
+                usage: usage::Reader::new("postgres://unused".into(), pricing::dev()),
+                ready,
+                draining,
+            },
+            receiver,
+        )
+    }
+
+    fn status_test_query() -> Operation {
+        Operation::Query(
+            Uuid::new_v4(),
+            QueryRequest {
+                request_id: Uuid::new_v4(),
+                sql: "select 1".into(),
+                parameters: vec![],
+                context: json!({}),
+                timeout_seconds: 30,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn status_bypasses_a_full_queue_and_disconnect_preserves_work() {
+        let (app, mut receiver) = status_test_app();
+        let request = tokio::spawn(dispatch(app.clone(), status_test_query()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while app.status.snapshot()["queued_queries"] != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // No worker is reading the channel: this is the full/blocked queue that
+        // formerly prevented the information handler from replying.
+        let Output::Json(snapshot) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            info(State(app.clone())),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("expected JSON")
+        };
+        assert_eq!(snapshot["queued_queries"], 1);
+        assert!(matches!(dispatch(app.clone(), status_test_query()).await,
+            Err(ApiError(failure, _)) if failure.kind == "capacity"));
+        assert_eq!(app.status.snapshot()["queued_queries"], 1);
+        request.abort();
+        assert!(matches!(request.await, Err(error) if error.is_cancelled()));
+        assert_eq!(app.status.snapshot()["queued_queries"], 1);
+        let envelope = receiver.recv().await.unwrap();
+        let active = envelope.query_guard.unwrap().start();
+        assert_eq!(app.status.snapshot()["queued_queries"], 0);
+        assert_eq!(app.status.snapshot()["active_queries"], 1);
+        assert!(envelope.reply.send(Ok(Output::Json(json!({})))).is_err());
+        assert_eq!(app.status.snapshot()["active_queries"], 1);
+        drop(active);
+        assert!(!app.status.has_queries());
+    }
+
+    #[tokio::test]
+    async fn a_lost_worker_queue_releases_admitted_and_refused_queries() {
+        let (app, receiver) = status_test_app();
+        let request = tokio::spawn(dispatch(app.clone(), status_test_query()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while app.status.snapshot()["queued_queries"] != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(receiver);
+        assert!(request.await.unwrap().is_err());
+        assert!(!app.status.has_queries());
+        assert!(dispatch(app.clone(), status_test_query()).await.is_err());
+        assert!(!app.status.has_queries());
+        app.ready.store(false, Ordering::Release);
+        assert!(matches!(dispatch(app.clone(), status_test_query()).await,
+            Err(ApiError(failure, _)) if failure.kind == "starting"));
+        assert!(!app.status.has_queries());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn an_idle_drain_ends_at_the_settle_window_not_the_deadline() {

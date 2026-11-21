@@ -275,7 +275,7 @@ credential from the environment, or a credential it issued; see
 | POST | `/v1/sessions/{id}/cancel` | Interrupt this session's currently executing statement |
 | GET | `/v1/queries` | Filtered history with cursor pagination; defaults to 500 records |
 | GET | `/v1/queries/{query_id}` | One durable record, metrics, and raw DuckDB profile when available |
-| GET | `/v1/workers` | Worker IDs, engine settings, observed cgroup limits, and whether isolated compute is available |
+| GET | `/v1/workers` | Every configured worker's state and execution pressure, observed limits, and whether isolated compute is available |
 | GET | `/v1/usage` | Append-only usage events with cursor pagination |
 | GET | `/v1/budget` | Prepaid balance, held reservations, spend, caps, rate card |
 | PUT | `/v1/budget` | Set the prepaid balance and per-job cost cap |
@@ -284,6 +284,38 @@ credential from the environment, or a credential it issued; see
 | POST | `/v1/credentials` | Issue a credential for a principal; the token appears only in this response (bootstrap only) |
 | GET | `/v1/credentials` | List credentials without any secret material (bootstrap only) |
 | DELETE | `/v1/credentials/{id}` | Revoke one credential immediately (bootstrap only) |
+
+`GET /v1/workers` remains available while SQL runs. Each reachable worker reports
+its `worker_id`, per-process `boot_id`, `state`, `ready`, `draining`,
+`active_queries`, `queued_queries`, `open_sessions`, and `oldest_queued_ms`, along
+with its existing placement and engine settings. `oldest_queued_ms` is null when
+no query is waiting. States are `starting`, `ready`, `busy`, `draining`, and
+`unavailable`; startup may precede availability of placement details. Status reads
+bypass the execution queue. The counters include HTTP, pgwire, and platform
+operations, so a pgwire query competes for capacity just as an HTTP query does.
+Active queries include admission, engine execution, and settlement. Session
+counts include idle connections until the worker's next idle-expiry sweep.
+
+The gateway probes workers concurrently and shares observations between discovery
+and the fleet report for at most one second. `observation_age_ms` describes the
+age since the fleet refresh completed, not the age of every sample: a successful
+sample may be older while another probe times out. `last_success_at` on each
+entry is its actual successful observation time as a Unix timestamp in
+milliseconds, or null if the gateway has never observed that endpoint.
+An unreachable worker remains in the report as `state: "unreachable"`, with its
+`endpoint` and last successful observation time. Any retained `last_observation`
+is historical; stale pressure is not presented as current counters. One failed
+probe does not hide the healthy workers.
+
+New persistent sessions prefer eligible workers with fewer active plus queued
+queries, then fewer open sessions, with configured endpoint order breaking ties.
+Successful opens adjust the cached session count used for ranking without
+re-probing an unreachable sibling; reported counters remain the last sampled
+values. These are recent observations, not reservations of execution capacity: concurrent opens may see the same snapshot, and workers still enforce
+their own admission limits. Existing sessions stay pinned to their worker, and
+SQL is never replayed or moved as part of placement. The local harness verifies
+status during a query running longer than five seconds, mixed HTTP/pgwire
+placement, and a stopped sibling that remains visible in the fleet report.
 
 ## Credentials
 
@@ -545,6 +577,7 @@ stopped by a deadline may still have committed.
 | `unknown_session` | 404 | no | The session expired or was closed; open a new one |
 | `not_found` | 404 | no | No such history record |
 | `duplicate_request` | 409 | no | This `request_id` was already accepted; inspect its history record |
+| `no_ready_worker` | 503 | yes | Discovery could not find available compute; no session open was forwarded. New-session clients may wait for recovery |
 | `unavailable` | 503 | no | A worker or the history database was unreachable mid-request |
 | `interrupted` | — | no | Recorded at worker startup for its own unfinished records; never an HTTP response |
 

@@ -31,10 +31,16 @@ pub const OPEN_TIMEOUT: Duration = Duration::from_secs(450);
 /// Refusals a new session may simply wait out: a rollout drains the old gateway
 /// (`draining`), replaces it (transport failures, or an unclassified 5xx from a
 /// Service with no ready endpoint), and a worker may still be attaching its
-/// catalog (`starting`). Opening a session runs no SQL, so waiting costs nothing
+/// catalog (`starting`), or discovery has no eligible worker yet
+/// (`no_ready_worker`). Opening a session runs no SQL, so waiting costs nothing
 /// but time. Statements are never retried by this client under any
 /// classification.
-const OPEN_WAITABLE_KINDS: [&str; 3] = ["draining", "starting", "transport_failure"];
+const OPEN_WAITABLE_KINDS: [&str; 4] = [
+    "draining",
+    "starting",
+    "no_ready_worker",
+    "transport_failure",
+];
 
 /// A failure the server classified — or one the transport could not deliver.
 ///

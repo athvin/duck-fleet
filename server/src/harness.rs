@@ -44,6 +44,12 @@ pub async fn run(args: Vec<String>) -> i32 {
         spread_failover_checks(&ctx).await
     } else if has("--history-without-workers") {
         observability::history_without_workers(&ctx).await
+    } else if has("--worker-status") {
+        observability::worker_status(&ctx).await
+    } else if has("--worker-status-pgwire") {
+        observability::mixed_protocol_status(&ctx).await
+    } else if has("--worker-status-partial-outage") {
+        observability::partial_outage(&ctx).await
     } else if has("--concurrency") {
         concurrency::checks(&ctx).await
     } else if has("--metering") {

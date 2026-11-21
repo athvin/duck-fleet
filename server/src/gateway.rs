@@ -24,7 +24,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -49,6 +49,10 @@ struct WorkerInfo {
     endpoint: String,
     cpu: u16,
     memory_bytes: u64,
+    ready: bool,
+    active_queries: u64,
+    queued_queries: u64,
+    open_sessions: u64,
 }
 impl WorkerInfo {
     fn serves(&self, wanted: Resources) -> bool {
@@ -67,6 +71,7 @@ struct Fleet {
     workers: Vec<WorkerInfo>,
     unreachable: Vec<String>,
     discovered: Instant,
+    reported: Vec<Value>,
 }
 
 /// How an attempt to open a persistent session ended: on a worker, or with the last
@@ -93,16 +98,33 @@ fn failover_worthy(status: StatusCode, refusal: &Value) -> bool {
         )
 }
 
-/// Every worker providing the size, least-loaded first; the configured order breaks
-/// ties, so a deployment with one worker per size behaves exactly as before.
-fn ranked_endpoints(
-    workers: &[WorkerInfo],
-    wanted: Resources,
-    census: &HashMap<String, usize>,
-) -> Vec<String> {
-    let mut matches: Vec<&WorkerInfo> = workers.iter().filter(|w| w.serves(wanted)).collect();
-    matches.sort_by_key(|w| census.get(&w.endpoint).copied().unwrap_or(0));
+/// Prefer the least execution pressure, then fewer open sessions. Stable sorting
+/// preserves configured order on ties. Counts come from workers, so pgwire and
+/// platform operations have exactly the same weight as HTTP clients.
+fn ranked_endpoints(workers: &[WorkerInfo], wanted: Resources) -> Vec<String> {
+    let mut matches: Vec<&WorkerInfo> = workers
+        .iter()
+        .filter(|w| w.ready && w.serves(wanted))
+        .collect();
+    matches.sort_by_key(|w| {
+        (
+            w.active_queries.saturating_add(w.queued_queries),
+            w.open_sessions,
+        )
+    });
     matches.iter().map(|w| w.endpoint.clone()).collect()
+}
+
+const FLEET_FRESH: Duration = Duration::from_secs(1);
+
+fn observed_at() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Who a request authenticated as, attached by `authenticate` so handlers read a
@@ -247,8 +269,10 @@ struct Gateway {
     /// grant itself RBAC, so the workers are the only available authority.
     endpoints: Arc<Vec<String>>,
     fleet: Arc<Mutex<Option<Fleet>>>,
+    /// Last successful observations remain available for diagnosis, never routing.
+    observations: Arc<Mutex<HashMap<String, Value>>>,
     /// Held for the duration of one `discover`, so concurrent cache misses collapse
-    /// into a single fleet probe instead of each running the sequential scan.
+    /// into a single concurrent fleet probe.
     discovering: Arc<Mutex<()>>,
     routes: Arc<Mutex<HashMap<Uuid, Route>>>,
     capacity: Arc<Semaphore>,
@@ -299,38 +323,81 @@ fn draining_refusal() -> ApiError {
     )
 }
 impl Gateway {
-    async fn worker_info(&self, endpoint: &str) -> Result<WorkerInfo, ApiError> {
-        // Short relative to the statement timeout: discovery must not inherit the
-        // deadline of the query it is about to route.
-        let reported: Value = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.send(endpoint, Method::GET, "/v1/worker", Bytes::new()),
-        )
-        .await
-        .map_err(|_| ApiError::internal())??
-        .error_for_status()
-        .map_err(|_| ApiError::internal())?
-        .json()
-        .await
-        .map_err(|_| ApiError::internal())?;
-        let cpu = reported["cpu"].as_u64().ok_or_else(ApiError::internal)?;
-        let memory_bytes = reported["memory_bytes"]
-            .as_u64()
-            .ok_or_else(ApiError::internal)?;
-        Ok(WorkerInfo {
-            endpoint: endpoint.to_owned(),
-            cpu: u16::try_from(cpu).map_err(|_| ApiError::internal())?,
-            memory_bytes,
+    async fn worker_info(&self, endpoint: &str) -> Result<Value, ApiError> {
+        // Bound the entire response, including decoding: headers alone are not a
+        // successful observation when a broken worker stalls its response body.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            self.send(endpoint, Method::GET, "/v1/worker", Bytes::new())
+                .await?
+                .error_for_status()
+                .map_err(|_| ApiError::internal())?
+                .json::<Value>()
+                .await
+                .map_err(|_| ApiError::internal())
         })
+        .await
+        .map_err(|_| ApiError::internal())?
     }
 
     async fn discover(&self) -> Fleet {
+        let mut probes = tokio::task::JoinSet::new();
+        for (index, endpoint) in self.endpoints.iter().cloned().enumerate() {
+            let app = self.clone();
+            probes.spawn(async move {
+                let result = app.worker_info(&endpoint).await;
+                (index, result, observed_at())
+            });
+        }
+        let mut ordered: Vec<Option<(Value, u64)>> = vec![None; self.endpoints.len()];
+        while let Some(joined) = probes.join_next().await {
+            if let Ok((index, Ok(value), observed)) = joined {
+                // A starting worker has no observed cgroup placement yet. It is
+                // still reachable and should be shown as starting, not missing.
+                if value.is_object() {
+                    ordered[index] = Some((value, observed));
+                }
+            }
+        }
         let mut workers = Vec::new();
         let mut unreachable = Vec::new();
-        for endpoint in self.endpoints.iter() {
-            match self.worker_info(endpoint).await {
-                Ok(info) => workers.push(info),
-                Err(_) => unreachable.push(endpoint.clone()),
+        let mut reported = Vec::new();
+        let mut observations = self.observations.lock().await;
+        for (endpoint, value) in self.endpoints.iter().zip(ordered) {
+            match value {
+                Some((mut value, observed)) => {
+                    value["endpoint"] = json!(endpoint);
+                    value["last_success_at"] = json!(observed);
+                    let cpu = value["cpu"].as_u64().and_then(|n| u16::try_from(n).ok());
+                    if let (Some(cpu), Some(memory_bytes)) = (cpu, value["memory_bytes"].as_u64()) {
+                        workers.push(WorkerInfo {
+                            endpoint: endpoint.clone(),
+                            cpu,
+                            memory_bytes,
+                            ready: value["ready"] == true
+                                && value["draining"] == false
+                                && matches!(value["state"].as_str(), Some("ready" | "busy"))
+                                && ["active_queries", "queued_queries", "open_sessions"]
+                                    .iter()
+                                    .all(|key| value[key].as_u64().is_some()),
+                            active_queries: value["active_queries"].as_u64().unwrap_or(0),
+                            queued_queries: value["queued_queries"].as_u64().unwrap_or(0),
+                            open_sessions: value["open_sessions"].as_u64().unwrap_or(0),
+                        });
+                    }
+                    observations.insert(endpoint.clone(), value.clone());
+                    reported.push(value);
+                }
+                None => {
+                    unreachable.push(endpoint.clone());
+                    let previous = observations.get(endpoint);
+                    reported.push(json!({
+                        "endpoint": endpoint,
+                        "state": "unreachable",
+                        "ready": false,
+                        "last_success_at": previous.and_then(|v| v.get("last_success_at")),
+                        "last_observation": previous,
+                    }));
+                }
             }
         }
         if !unreachable.is_empty() {
@@ -339,89 +406,84 @@ impl Gateway {
         Fleet {
             workers,
             unreachable,
+            reported,
             discovered: Instant::now(),
         }
     }
 
-    /// Routes by requested resources, not by a configured class name.
-    ///
-    /// Discovery is lazy and cached rather than done at startup: requiring a worker
-    /// to answer before the gateway can serve would reintroduce the startup coupling
-    /// the catalog wait removed. A miss refreshes once, so a worker that was still
-    /// starting when the table was built is not reported as a class that does not
-    /// exist.
-    ///
-    /// Every worker providing the size is returned, least-loaded first, so running a
-    /// second worker with the same resources adds capacity rather than dead weight —
-    /// which is the fleet's whole scaling claim. The load measure is this gateway's
-    /// own routed-session census; sessions opened outside the route table (platform
-    /// statements, pgwire) are short-lived and uncounted, an approximation that
-    /// self-corrects as counted sessions close.
-    async fn endpoints_for(&self, wanted: Resources) -> Result<Vec<String>, ApiError> {
-        const FRESH: Duration = Duration::from_secs(30);
-        let census: HashMap<String, usize> = {
-            let routes = self.routes.lock().await;
-            let mut census = HashMap::new();
-            for route in routes.values() {
-                *census.entry(route.endpoint.clone()).or_insert(0) += 1;
-            }
-            census
+    /// Shared by placement and inspection, with short-lived load observations.
+    /// Unreachable workers do not discard healthy siblings' observations.
+    async fn fleet_snapshot(&self) -> Fleet {
+        let fresh = |fleet: &Option<Fleet>| {
+            fleet
+                .clone()
+                .filter(|f| f.discovered.elapsed() < FLEET_FRESH)
         };
-        // The cache is usable whether or not some endpoints were unreachable when it
-        // was built: a worker being down does not make the workers that answered
-        // stale. The old `unreachable.is_empty()` gate meant one down worker forced
-        // every request to re-probe the whole fleet at 5s per endpoint — so a partial
-        // outage became a gateway-wide slowdown. A size the cache cannot serve still
-        // refreshes below, which re-probes the down endpoint lazily.
-        let fresh =
-            |fleet: &Option<Fleet>| fleet.clone().filter(|f| f.discovered.elapsed() < FRESH);
         if let Some(fleet) = fresh(&*self.fleet.lock().await) {
-            let candidates = ranked_endpoints(&fleet.workers, wanted, &census);
-            if !candidates.is_empty() {
-                return Ok(candidates);
-            }
+            return fleet;
         }
-        // Single-flight: hold the discovery lock, then re-check the cache a concurrent
-        // discovery may have just filled. Without this, N simultaneous misses each run
-        // the full sequential probe; with it, the first probes and the rest read its
-        // result. The request path never holds this across anything but one discover.
-        let fleet = {
-            let _flight = self.discovering.lock().await;
-            if let Some(fleet) = fresh(&*self.fleet.lock().await)
-                && !ranked_endpoints(&fleet.workers, wanted, &census).is_empty()
-            {
-                fleet
-            } else {
-                let discovered = self.discover().await;
-                *self.fleet.lock().await = Some(discovered.clone());
-                discovered
-            }
-        };
-        let candidates = ranked_endpoints(&fleet.workers, wanted, &census);
+        let _flight = self.discovering.lock().await;
+        if let Some(fleet) = fresh(&*self.fleet.lock().await) {
+            return fleet;
+        }
+        let discovered = self.discover().await;
+        *self.fleet.lock().await = Some(discovered.clone());
+        discovered
+    }
+
+    /// New sessions use worker-observed pressure from every protocol. Existing
+    /// sessions remain pinned even if another worker subsequently becomes idle.
+    async fn endpoints_for(&self, wanted: Resources) -> Result<Vec<String>, ApiError> {
+        let fleet = self.fleet_snapshot().await;
+        let candidates = ranked_endpoints(&fleet.workers, wanted);
         if !candidates.is_empty() {
             return Ok(candidates);
         }
-        // Never falls back to a different size. Which failure it is matters: a
-        // degraded fleet is worth retrying, a missing class is not.
+        // Excluding a worker from placement must preserve the classified open
+        // refusal clients wait out during a rollout. No open was forwarded here.
+        for report in &fleet.reported {
+            let matching = report["cpu"].as_u64() == Some(u64::from(wanted.cpu))
+                && report["memory_bytes"].as_u64() == Some(wanted.memory_bytes);
+            let refusal = match report["state"].as_str() {
+                Some("draining") if matching => Some(failure::DRAINING),
+                Some("unavailable") if matching => Some(failure::NO_READY_WORKER),
+                Some("starting") if matching || report.get("cpu").is_none() => {
+                    Some(failure::STARTING)
+                }
+                _ => None,
+            };
+            if let Some(refusal) = refusal {
+                return Err(ApiError::new(
+                    refusal,
+                    format!(
+                        "a worker serving the requested resources is {}; no session was opened and no statement ran",
+                        refusal.kind
+                    ),
+                ));
+            }
+        }
         Err(if fleet.unreachable.is_empty() {
             ApiError::new(
                 failure::UNAVAILABLE,
                 format!(
-                    "no worker provides cpu={}, memory={}; this deployment runs {:?}",
+                    "no ready worker provides cpu={}, memory={}; this deployment reports {:?}",
                     wanted.cpu,
                     wanted.memory(),
                     fleet
                         .workers
                         .iter()
-                        .map(|w| format!("cpu={} memory_bytes={}", w.cpu, w.memory_bytes))
+                        .map(|w| format!(
+                            "cpu={} memory_bytes={} ready={}",
+                            w.cpu, w.memory_bytes, w.ready
+                        ))
                         .collect::<Vec<_>>()
                 ),
             )
         } else {
             ApiError::new(
-                failure::UNAVAILABLE,
+                failure::NO_READY_WORKER,
                 format!(
-                    "a worker serving cpu={}, memory={} is not reachable; no statement ran",
+                    "no reachable worker serves cpu={}, memory={}; no session was opened and no statement ran",
                     wanted.cpu,
                     wanted.memory()
                 ),
@@ -470,6 +532,14 @@ impl Gateway {
                 Err(_) => return Err(ApiError::internal()),
             };
             if upstream.status().is_success() {
+                // Account for the known open without discarding other observations:
+                // otherwise every open would re-probe an unreachable sibling. The
+                // report remains the last sampled data; only ranking is adjusted.
+                if let Some(fleet) = self.fleet.lock().await.as_mut()
+                    && let Some(worker) = fleet.workers.iter_mut().find(|w| w.endpoint == endpoint)
+                {
+                    worker.open_sessions = worker.open_sessions.saturating_add(1);
+                }
                 return Ok(OpenOutcome::Opened { endpoint, upstream });
             }
             let status = upstream.status();
@@ -1164,42 +1234,11 @@ async fn health(State(app): State<Gateway>) -> Response {
 }
 
 async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
-    async fn info(app: &Gateway, endpoint: &str) -> Result<Value, ApiError> {
-        // The 5s bound discovery uses, not the client's 75s statement timeout: one
-        // hung worker must not hold this report for over a minute, let alone that
-        // per endpoint, which is what sequential un-timed probing did.
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            app.send(endpoint, Method::GET, "/v1/worker", Bytes::new()),
-        )
-        .await
-        .map_err(|_| ApiError::internal())??
-        .error_for_status()
-        .map_err(|_| ApiError::internal())?
-        .json()
-        .await
-        .map_err(|_| ApiError::internal())
-    }
-    // Every configured worker must answer: this endpoint reports the fleet, and a
-    // silently short list would read as a deployment that is smaller than it is. Asked
-    // concurrently so the report takes one slow worker's time, not the sum of all.
-    let mut probes = tokio::task::JoinSet::new();
-    for (index, endpoint) in app.endpoints.iter().cloned().enumerate() {
-        let app = app.clone();
-        probes.spawn(async move { (index, info(&app, &endpoint).await) });
-    }
-    let mut ordered: Vec<Option<Value>> = vec![None; app.endpoints.len()];
-    while let Some(joined) = probes.join_next().await {
-        let (index, result) = joined.map_err(|_| ApiError::internal())?;
-        ordered[index] = Some(result?);
-    }
-    let reported: Vec<Value> = ordered.into_iter().flatten().collect();
-    // Reported rather than left to be discovered by being refused. Whether this
-    // deployment can create pods is a property of the deployment, and a caller
-    // deciding whether to ask for isolation should not have to learn it from a 501.
+    let fleet = app.fleet_snapshot().await;
     Ok(Json(json!({
-        "workers": reported,
+        "workers": fleet.reported,
         "isolated_compute": app.isolation.is_some(),
+        "observation_age_ms": u64::try_from(fleet.discovered.elapsed().as_millis()).unwrap_or(u64::MAX),
     })))
 }
 
@@ -1254,6 +1293,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         token,
         endpoints: Arc::new(worker_endpoints()?),
         fleet: Arc::new(Mutex::new(None)),
+        observations: Arc::new(Mutex::new(HashMap::new())),
         discovering: Arc::new(Mutex::new(())),
         routes: Arc::new(Mutex::new(HashMap::new())),
         capacity: Arc::new(Semaphore::new(64)),
@@ -1384,6 +1424,387 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    struct StatusServer {
+        endpoint: String,
+        reply: Arc<Mutex<(StatusCode, Value)>>,
+        requests: Arc<AtomicUsize>,
+        opens: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for StatusServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn status_server(value: Value) -> StatusServer {
+        let reply = Arc::new(Mutex::new((StatusCode::OK, value)));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let opens = Arc::new(AtomicUsize::new(0));
+        let handler_reply = reply.clone();
+        let handler_requests = requests.clone();
+        let handler_opens = opens.clone();
+        let router = Router::new()
+            .route(
+                "/v1/worker",
+                get(move || {
+                    let reply = handler_reply.clone();
+                    let requests = handler_requests.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let (status, value) = reply.lock().await.clone();
+                        (status, Json(value))
+                    }
+                }),
+            )
+            .route(
+                "/v1/sessions",
+                post(move || {
+                    let opens = handler_opens.clone();
+                    async move {
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"session_id": Uuid::new_v4()}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        StatusServer {
+            endpoint,
+            reply,
+            requests,
+            opens,
+            task,
+        }
+    }
+
+    fn status(state: &str) -> Value {
+        let resources = Resources::default();
+        json!({
+            "worker_id": "test-worker",
+            "worker_boot_id": "first-boot",
+            "state": state,
+            "ready": state == "ready",
+            "draining": state == "draining",
+            "cpu": resources.cpu,
+            "memory_bytes": resources.memory_bytes,
+            "active_queries": 0,
+            "queued_queries": 0,
+            "open_sessions": 0,
+        })
+    }
+
+    fn test_gateway(endpoints: Vec<String>) -> Gateway {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token: Arc<str> = "test-gateway-token".into();
+        let dsn = "host=unused";
+        Gateway {
+            client: Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(75))
+                .retry(reqwest::retry::never())
+                .build()
+                .unwrap(),
+            authn: Authn::new(token.clone(), dsn.into()),
+            token,
+            endpoints: Arc::new(endpoints),
+            fleet: Arc::new(Mutex::new(None)),
+            observations: Arc::new(Mutex::new(HashMap::new())),
+            discovering: Arc::new(Mutex::new(())),
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            capacity: Arc::new(Semaphore::new(64)),
+            history: crate::history::Reader::new(dsn.into()),
+            usage: crate::usage::Reader::new(
+                dsn.into(),
+                crate::pricing::RateCard {
+                    version: "test".into(),
+                    compute_micro_usd_per_unit_hour: 100_000,
+                },
+            ),
+            isolation: None,
+            draining: Arc::new(AtomicBool::new(false)),
+            inflight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_partial_fleet_failure_preserves_the_last_successful_observation() {
+        let healthy = status_server(status("ready")).await;
+        let failing = status_server(status("ready")).await;
+        let app = test_gateway(vec![healthy.endpoint.clone(), failing.endpoint.clone()]);
+        let first = app.fleet_snapshot().await;
+        let previous = first.reported[1].clone();
+        assert!(previous["last_success_at"].as_u64().unwrap() > 0);
+
+        failing.reply.lock().await.0 = StatusCode::SERVICE_UNAVAILABLE;
+        *app.fleet.lock().await = None;
+        let Json(report) = workers(State(app.clone())).await.unwrap();
+        assert_eq!(report["workers"].as_array().unwrap().len(), 2);
+        assert_eq!(report["workers"][0]["state"], "ready");
+        let unavailable = &report["workers"][1];
+        assert_eq!(unavailable["state"], "unreachable");
+        assert_eq!(unavailable["ready"], false);
+        assert_eq!(unavailable["last_success_at"], previous["last_success_at"]);
+        assert_eq!(unavailable["last_observation"], previous);
+        assert_eq!(
+            app.endpoints_for(Resources::default()).await.unwrap(),
+            std::slice::from_ref(&healthy.endpoint)
+        );
+
+        // Consecutive failures retain the successful observation, not a nested
+        // history of earlier failures or counters eligible for placement.
+        *app.fleet.lock().await = None;
+        let again = app.fleet_snapshot().await;
+        assert_eq!(again.reported[1]["last_observation"], previous);
+        assert_eq!(again.unreachable, std::slice::from_ref(&failing.endpoint));
+
+        let mut restarted = status("ready");
+        restarted["worker_boot_id"] = json!("second-boot");
+        *failing.reply.lock().await = (StatusCode::OK, restarted);
+        *app.fleet.lock().await = None;
+        let recovered = app.fleet_snapshot().await;
+        assert!(recovered.unreachable.is_empty());
+        assert_eq!(recovered.reported[1]["worker_boot_id"], "second-boot");
+        assert_eq!(recovered.reported[1]["worker_id"], previous["worker_id"]);
+        assert!(recovered.reported[1].get("last_observation").is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_negative_discovery_and_missing_sizes_are_cached() {
+        let failing = status_server(status("ready")).await;
+        failing.reply.lock().await.0 = StatusCode::SERVICE_UNAVAILABLE;
+        let app = test_gateway(vec![failing.endpoint.clone()]);
+        let initial = app.fleet_snapshot().await;
+        assert_eq!(initial.reported[0]["state"], "unreachable");
+        assert!(initial.reported[0]["last_success_at"].is_null());
+        assert!(initial.reported[0]["last_observation"].is_null());
+        for _ in 0..3 {
+            assert!(app.endpoints_for(Resources::default()).await.is_err());
+        }
+        assert_eq!(failing.requests.load(Ordering::SeqCst), 1);
+
+        let healthy = status_server(status("ready")).await;
+        let app = test_gateway(vec![healthy.endpoint.clone()]);
+        let absent = Resources {
+            cpu: 4,
+            ..Resources::default()
+        };
+        for _ in 0..3 {
+            assert!(app.endpoints_for(absent).await.is_err());
+        }
+        assert_eq!(healthy.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reachable_starting_and_draining_workers_are_reported_but_not_selected() {
+        let starting = status_server(status("starting")).await;
+        let mut draining_status = status("draining");
+        // Readiness may still reflect completed startup while drain is active.
+        draining_status["ready"] = json!(true);
+        let draining = status_server(draining_status).await;
+        let mut busy = status("ready");
+        busy["active_queries"] = json!(1);
+        busy["queued_queries"] = json!(4);
+        let healthy = status_server(busy).await;
+        let app = test_gateway(vec![
+            starting.endpoint.clone(),
+            draining.endpoint.clone(),
+            healthy.endpoint.clone(),
+        ]);
+        let snapshot = app.fleet_snapshot().await;
+        assert!(snapshot.unreachable.is_empty());
+        assert_eq!(snapshot.reported[0]["state"], "starting");
+        assert_eq!(snapshot.reported[1]["state"], "draining");
+        assert_eq!(
+            app.endpoints_for(Resources::default()).await.unwrap(),
+            std::slice::from_ref(&healthy.endpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_malformed_ready_reports_cannot_receive_sessions() {
+        let malformed = status_server(status("ready")).await;
+        let mut busy = status("ready");
+        busy["state"] = json!("busy");
+        busy["active_queries"] = json!(1);
+        let healthy = status_server(busy).await;
+        let app = test_gateway(vec![malformed.endpoint.clone(), healthy.endpoint.clone()]);
+        let mut cases = Vec::new();
+        for key in [
+            "ready",
+            "draining",
+            "state",
+            "active_queries",
+            "queued_queries",
+            "open_sessions",
+        ] {
+            let mut missing = status("ready");
+            missing.as_object_mut().unwrap().remove(key);
+            cases.push((format!("missing {key}"), missing));
+        }
+        for (key, value) in [
+            ("ready", json!("true")),
+            ("draining", json!("false")),
+            ("state", json!("unknown")),
+            ("state", json!("starting")),
+            ("active_queries", json!(-1)),
+            ("queued_queries", json!("0")),
+            ("open_sessions", json!(null)),
+        ] {
+            let mut invalid = status("ready");
+            invalid[key] = value;
+            cases.push((format!("invalid {key}: {}", invalid[key]), invalid));
+        }
+        for (description, value) in cases {
+            malformed.reply.lock().await.1 = value;
+            *app.fleet.lock().await = None;
+            assert_eq!(
+                app.endpoints_for(Resources::default()).await.unwrap(),
+                std::slice::from_ref(&healthy.endpoint),
+                "{description} was treated as eligible idle capacity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_opens_spread_without_reprobing_a_failed_sibling() {
+        let first = status_server(status("ready")).await;
+        let second = status_server(status("ready")).await;
+        let failed = status_server(status("ready")).await;
+        failed.reply.lock().await.0 = StatusCode::SERVICE_UNAVAILABLE;
+        let app = test_gateway(vec![
+            first.endpoint.clone(),
+            second.endpoint.clone(),
+            failed.endpoint.clone(),
+        ]);
+        let initial = app.fleet_snapshot().await;
+        assert_eq!(initial.unreachable, std::slice::from_ref(&failed.endpoint));
+        // Keep this test within one cache generation independently of machine
+        // scheduling. Discarding the cache after an open still triggers a probe.
+        app.fleet.lock().await.as_mut().unwrap().discovered =
+            Instant::now() + Duration::from_secs(60);
+        let mut placements = Vec::new();
+        for _ in 0..4 {
+            match app
+                .open_persistent(Resources::default(), b"{}".to_vec(), "analyst")
+                .await
+                .unwrap()
+            {
+                OpenOutcome::Opened { endpoint, upstream } => {
+                    placements.push(endpoint);
+                    assert!(upstream.json::<Value>().await.unwrap()["session_id"].is_string());
+                }
+                OpenOutcome::Refused(_) => panic!("healthy workers refused an open"),
+            }
+        }
+        assert_eq!(
+            placements,
+            [
+                first.endpoint.as_str(),
+                second.endpoint.as_str(),
+                first.endpoint.as_str(),
+                second.endpoint.as_str(),
+            ]
+        );
+        for server in [&first, &second, &failed] {
+            assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(first.opens.load(Ordering::SeqCst), 2);
+        assert_eq!(second.opens.load(Ordering::SeqCst), 2);
+        assert_eq!(failed.opens.load(Ordering::SeqCst), 0);
+        let Json(report) = workers(State(app)).await.unwrap();
+        // Local tie-breaker adjustments must not pretend to be worker samples.
+        assert_eq!(report["workers"], json!(initial.reported));
+    }
+
+    #[tokio::test]
+    async fn excluding_a_transient_worker_preserves_the_waitable_open_refusal() {
+        let server = status_server(status("draining")).await;
+        let app = test_gateway(vec![server.endpoint.clone()]);
+        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        assert_eq!(error.0.kind, "draining");
+        assert!(error.0.retry_safe);
+        assert_eq!(server.opens.load(Ordering::SeqCst), 0);
+
+        // A rollout can temporarily remove every Service endpoint between the
+        // draining process and its replacement. This is still pre-admission.
+        server.reply.lock().await.0 = StatusCode::SERVICE_UNAVAILABLE;
+        *app.fleet.lock().await = None;
+        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        assert_eq!(error.0.kind, "no_ready_worker");
+        assert!(error.0.retry_safe);
+        assert_eq!(server.opens.load(Ordering::SeqCst), 0);
+        *server.reply.lock().await = (StatusCode::OK, status("unavailable"));
+        *app.fleet.lock().await = None;
+        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        assert_eq!(error.0.kind, "no_ready_worker");
+        assert!(error.0.retry_safe);
+
+        let mut starting = status("starting");
+        starting.as_object_mut().unwrap().remove("cpu");
+        starting.as_object_mut().unwrap().remove("memory_bytes");
+        server.reply.lock().await.1 = starting;
+        *app.fleet.lock().await = None;
+        let error = app.endpoints_for(Resources::default()).await.unwrap_err();
+        assert_eq!(error.0.kind, "starting");
+        assert!(error.0.retry_safe);
+        assert_eq!(server.opens.load(Ordering::SeqCst), 0);
+
+        server.reply.lock().await.1 = status("ready");
+        *app.fleet.lock().await = None;
+        assert_eq!(
+            app.endpoints_for(Resources::default()).await.unwrap(),
+            std::slice::from_ref(&server.endpoint)
+        );
+        // Unknown outcomes after forwarding retain their conservative meaning.
+        assert!(!ApiError::internal().0.retry_safe);
+    }
+
+    #[tokio::test]
+    async fn discovery_deadline_includes_a_stalled_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A raw peer intentionally sends valid headers and an incomplete body.
+        // This distinguishes the discovery bound from reqwest's 75-second bound.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            let _ = sent.send(());
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let app = test_gateway(vec![endpoint.clone()]);
+        let probe = tokio::spawn(async move { app.worker_info(&endpoint).await });
+        received.await.unwrap();
+        // Allow the local socket to deliver its headers before advancing time;
+        // the test spends milliseconds rather than the discovery deadline.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!probe.is_finished());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(1), probe).await;
+        server.abort();
+        assert!(
+            outcome
+                .expect("discovery waited beyond its deadline")
+                .unwrap()
+                .is_err()
+        );
+    }
+
     /// The harness greps for each of these three, so the contract lives here too:
     /// weakening any one of them turns "open a session elsewhere now" into
     /// "something is wrong with this deployment".
@@ -1456,59 +1877,41 @@ mod tests {
     }
 
     #[test]
-    fn same_size_workers_rank_least_loaded_first_and_other_sizes_never_appear() {
-        let small = Resources {
-            cpu: 1,
-            memory_bytes: 1024 * 1024 * 1024,
-            disk_bytes: 2 * 1024 * 1024 * 1024,
+    fn routing_uses_execution_pressure_before_sessions_and_excludes_unready_workers() {
+        let small = Resources::default();
+        let make = |endpoint: &str| WorkerInfo {
+            endpoint: endpoint.into(),
+            cpu: small.cpu,
+            memory_bytes: small.memory_bytes,
+            ready: true,
+            active_queries: 0,
+            queued_queries: 0,
+            open_sessions: 0,
         };
-        let workers = vec![
-            WorkerInfo {
-                endpoint: "http://worker-small:8080".into(),
-                cpu: 1,
-                memory_bytes: small.memory_bytes,
-            },
-            WorkerInfo {
-                endpoint: "http://worker-small-b:8080".into(),
-                cpu: 1,
-                memory_bytes: small.memory_bytes,
-            },
-            WorkerInfo {
-                endpoint: "http://worker-medium:8080".into(),
-                cpu: 2,
-                memory_bytes: 2 * small.memory_bytes,
-            },
+        let mut workers = vec![
+            make("first"),
+            make("second"),
+            make("other-size"),
+            make("draining"),
         ];
-        // Empty census: the configured order breaks the tie, so a one-worker-per-size
-        // deployment routes exactly as it always has.
-        let ranked = ranked_endpoints(&workers, small, &HashMap::new());
-        assert_eq!(
-            ranked,
-            ["http://worker-small:8080", "http://worker-small-b:8080"]
-        );
-        // Three sessions on the first worker, one on the second: the sibling leads.
-        let census = HashMap::from([
-            ("http://worker-small:8080".to_owned(), 3),
-            ("http://worker-small-b:8080".to_owned(), 1),
-        ]);
-        let ranked = ranked_endpoints(&workers, small, &census);
-        assert_eq!(
-            ranked,
-            ["http://worker-small-b:8080", "http://worker-small:8080"]
-        );
-        // A size nobody provides ranks nobody.
-        assert!(
-            ranked_endpoints(
-                &workers,
-                Resources {
-                    cpu: 4,
-                    memory_bytes: 8 * small.memory_bytes,
-                    disk_bytes: small.disk_bytes,
-                },
-                &census
-            )
-            .is_empty()
-        );
+        workers[2].cpu = 4;
+        workers[3].ready = false;
+        assert_eq!(ranked_endpoints(&workers, small), ["first", "second"]);
+        // An idle pool with many sessions beats a busy worker with one session.
+        workers[0].active_queries = 1;
+        workers[0].open_sessions = 1;
+        workers[1].open_sessions = 20;
+        assert_eq!(ranked_endpoints(&workers, small), ["second", "first"]);
+        // Queued work counts even between statements; open sessions break ties.
+        workers[0].active_queries = 0;
+        workers[0].queued_queries = 2;
+        workers[1].active_queries = 1;
+        assert_eq!(ranked_endpoints(&workers, small), ["second", "first"]);
+        workers[0].queued_queries = 1;
+        assert_eq!(ranked_endpoints(&workers, small), ["first", "second"]);
+        workers[0].ready = false;
+        workers[1].ready = false;
+        assert!(ranked_endpoints(&workers, small).is_empty());
     }
 
     #[test]
