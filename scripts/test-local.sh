@@ -96,6 +96,21 @@ for statement in 'UPDATE usage_events SET amount_micro_usd = 0' 'DELETE FROM usa
 done
 echo 'PASS: the usage ledger refuses edits in the database'
 
+# Two persistent siblings exercise worker-reported placement across protocols.
+# --no-deps keeps later harness invocations from bringing the deliberately stopped
+# sibling back, or recreating the gateway with its default single-worker list.
+docker compose --profile scale-out up -d --wait worker-small-b
+DUCKFLEET_WORKER_URLS=http://worker-small:8080,http://worker-small-b:8080 \
+  docker compose up -d --no-deps --wait server
+docker compose run --rm --no-deps dbt duckfleet-server --spread
+docker compose run --rm --no-deps dbt duckfleet-server --worker-status-pgwire
+docker compose stop worker-small
+docker compose run --rm --no-deps dbt duckfleet-server --worker-status-partial-outage
+docker compose run --rm --no-deps dbt duckfleet-server --spread-failover
+# Restore the normal topology for inspection and the next local run.
+docker compose up -d --wait worker-small server
+docker compose --profile scale-out stop worker-small-b
+
 # ---------------------------------------------------------------------------
 # PENDING MIGRATION (tracked for a dedicated follow-up — these stages are deeply
 # coupled to the pre-rework 2-worker fleet and the Python client, and need
@@ -103,12 +118,10 @@ echo 'PASS: the usage ledger refuses edits in the database'
 #   - retention sweep, worker late-catalog wait, worker ledger-reconnect
 #   - SIGTERM drain of the worker and of the gateway (--drain-inflight /
 #     --gateway-drain-inflight harness stages + docker kill)
-#   - scale-out + failover (worker-small + worker-small-b via DUCKFLEET_WORKER_URLS;
-#     the --spread / --spread-failover harness stages)
 #   - the Phase-1 scale sweep (--scale) and maintenance (--maintenance)
 #   - the backup/restore drill (scripts/backup-catalog.sh / restore-catalog.sh,
 #     with the post-backup write + restore verification now via `duckfleet-server cli`)
 # The isolated-pod path (a sized model -> dedicated pod) is Kubernetes-only and is
 # exercised by scripts/test-k8s.sh, not here.
 # ---------------------------------------------------------------------------
-echo 'PASS: compose core path (worker limits, secret scrub, direct-worker isolation refusal, dbt-free api proof, dbt lifecycle, concurrency, metering, pgwire, ledger immutability)'
+echo 'PASS: compose core path (worker limits, secret scrub, direct-worker isolation refusal, dbt-free api proof, dbt lifecycle, concurrency, metering, pgwire, ledger immutability, busy-worker status, mixed-protocol routing, partial outage)'

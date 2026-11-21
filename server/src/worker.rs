@@ -85,6 +85,7 @@ pub(crate) struct Worker {
     runtime: tokio::runtime::Handle,
     profiling_enabled: bool,
     redactor: Redactor,
+    status: crate::worker_status::Status,
 }
 
 fn literal(value: &str) -> String {
@@ -349,6 +350,7 @@ impl Worker {
         active: ActiveSlot,
         runtime: tokio::runtime::Handle,
         ready: Arc<std::sync::atomic::AtomicBool>,
+        status: crate::worker_status::Status,
     ) -> Result<Self> {
         // Identity, not size. Reservation recovery keys on this, so it has to stay
         // stable even if the worker is later given different resources.
@@ -401,7 +403,7 @@ impl Worker {
         placement["cgroup_memory_max"] = json!(observed.memory_bytes);
         placement["cgroup_cpu_quota"] = json!(observed.cpu_quota);
         placement["cgroup_cpu_period"] = json!(observed.cpu_period);
-        placement["worker_boot_id"] = json!(Uuid::new_v4());
+        placement["worker_boot_id"] = json!(status.boot_id());
         let redactor = Redactor::from_env();
         let startup = Startup::new(Connection::open_in_memory()?, redactor.clone());
         startup.run(
@@ -553,7 +555,12 @@ impl Worker {
                 _ => anyhow::bail!("DUCKFLEET_PROFILING must be true or false"),
             },
             redactor,
+            status,
         })
+    }
+
+    pub(crate) fn placement(&self) -> &Value {
+        &self.placement
     }
 
     pub(crate) fn run(&mut self, mut receiver: mpsc::Receiver<Envelope>) {
@@ -563,15 +570,24 @@ impl Worker {
         self.prune_history(1000);
         self.last_prune = Instant::now();
         while let Some(envelope) = receiver.blocking_recv() {
+            let Envelope {
+                op,
+                reply,
+                query_guard,
+            } = envelope;
+            let query_guard = query_guard.map(crate::worker_status::QueryGuard::start);
             // Dropping a connection rolls back an abandoned transaction.
             self.sessions
                 .retain(|_, s| s.touched.elapsed() < Duration::from_secs(300));
+            self.status.set_sessions(self.sessions.len());
             if self.last_prune.elapsed() >= Duration::from_secs(3600) {
                 self.prune_history(1);
                 self.last_prune = Instant::now();
             }
-            let response = self.handle(envelope.op);
-            let _ = envelope.reply.send(response);
+            let response = self.handle(op);
+            self.status.set_sessions(self.sessions.len());
+            drop(query_guard);
+            let _ = reply.send(response);
         }
     }
 
@@ -631,7 +647,6 @@ impl Worker {
 
     fn handle(&mut self, op: Operation) -> Reply {
         match op {
-            Operation::Info => Ok(Output::Json(self.placement.clone())),
             Operation::Open(mut request, principal) => {
                 // The gateway already routed by mode and size; this is the worker
                 // refusing to serve a placement that is not its own.
