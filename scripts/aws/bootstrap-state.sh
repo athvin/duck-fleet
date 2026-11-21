@@ -26,7 +26,7 @@ account=$(aws sts get-caller-identity --query Account --output text)
 # override would apply a policy to somebody else's bucket.
 [[ "$bucket" == duckfleet-* ]] || {
   echo "Refusing to bootstrap $bucket: DuckFleet's state bucket must be named duckfleet-*" >&2
-  echo "The entity-resolution bucket is not ours to configure; see #12." >&2
+  echo "Buckets outside DuckFleet are not ours to configure; see #12." >&2
   exit 1
 }
 
@@ -58,7 +58,7 @@ aws s3api put-bucket-ownership-controls --bucket "$bucket" \
 # CI deploy identity reaches the state through the bucket's own policy: same account,
 # so a resource-policy allow is enough, and it keeps the grant on a bucket DuckFleet
 # owns rather than on a role the shared platform does — which is what let the state
-# move without an entity-resolution change (#12). Scoped to the one state key and its
+# move without changing the shared platform (#12). Scoped to the one state key and its
 # lock, mirroring the access the role used to hold on the borrowed bucket.
 aws s3api put-bucket-policy --bucket "$bucket" --policy "$(
   cat <<JSON

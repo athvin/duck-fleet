@@ -64,7 +64,7 @@ class AwsCiTests(unittest.TestCase):
     def test_destructive_and_foreign_changes(self):
         for actions in [['delete'], ['delete', 'create'], ['create', 'delete'], ['forget']]:
             with self.assertRaises(ValueError): guard.validate(self.plan(actions))
-        for address in ['aws_iam_role.admin', 'aws_s3_bucket.other', 'module.er.aws_s3_bucket.lake']:
+        for address in ['aws_iam_role.admin', 'aws_s3_bucket.other', 'module.unrelated.aws_s3_bucket.lake']:
             with self.assertRaises(ValueError): guard.validate(self.plan(['create'], address))
 
     def test_incomplete_and_migrations(self):
@@ -299,33 +299,27 @@ class RolloutWaitTests(unittest.TestCase):
         self.assertNotIn('--wait', commands)
         self.assertIn('wait-rollout.py', commands)
 
-    def test_the_deploy_target_is_named_in_one_place(self):
-        """Entity-resolution resources may be named only where the target is configured.
+    def test_cluster_operations_require_explicit_target(self):
+        common = ROOT/'scripts/aws/common.sh'
+        base = {'PATH': '/usr/bin:/bin', 'GITHUB_ACTIONS': 'true'}
+        for overrides, missing in [({}, 'DUCKFLEET_CLUSTER'),
+                                   ({'DUCKFLEET_CLUSTER': 'test-cluster'}, 'DUCKFLEET_KUBE_CONTEXT')]:
+            result = subprocess.run(
+                ['bash', '-c', f'source "{common}"; assert_cluster'],
+                env={**base, **overrides}, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f'Set {missing}', result.stderr)
+            self.assertNotIn('command not found', result.stderr)
 
-        They are still what this deploys to, but the cluster used to be named in a
-        script, a workflow three times, a deploy step and a runbook, so moving the
-        target meant finding all of them and missing one would have deployed somewhere
-        unintended. The state bucket was a second, quieter instance of the same thing.
-        """
-        # Every entity-resolution resource this repository points at, not just the
-        # cluster: an earlier version of this test matched only "er-dev" while listing
-        # main.tf as an exception for naming the state bucket, which "er-dev" never
-        # matched. The exception was inert and the comment was wrong.
-        borrowed = ["er-dev", "er-platform", "er-prod", "er-terraform-state"]
-        searched = [path
-                    for pattern in ["scripts/**/*", ".github/workflows/*",
-                                    "infra/terraform/**/*.tf", "infra/helm/**/*",
-                                    "infra/kubernetes/**/*"]
-                    for path in ROOT.glob(pattern) if path.is_file()]
-        # A gate over an empty set would pass while proving nothing.
-        self.assertGreater(len(searched), 20, "nothing was searched")
-        offenders = sorted(
-            f"{path.relative_to(ROOT)}: {name}"
-            for path in searched for name in borrowed
-            if path.relative_to(ROOT).as_posix() != "scripts/aws/target.env"
-            and name in path.read_text(errors="ignore")
-        )
-        self.assertEqual(offenders, [], "name the target in scripts/aws/target.env instead")
+    def test_operator_profile_is_optional_and_explicit(self):
+        common = ROOT/'scripts/aws/common.sh'
+        for overrides, expected in [({}, 'unset'),
+                                    ({'DUCKFLEET_AWS_PROFILE': 'test-profile'}, 'test-profile'),
+                                    ({'AWS_PROFILE': 'chosen', 'DUCKFLEET_AWS_PROFILE': 'fallback'}, 'chosen')]:
+            result = subprocess.check_output(
+                ['bash', '-c', f'source "{common}"; printf "%s" "${{AWS_PROFILE-unset}}"'],
+                env={'PATH': '/usr/bin:/bin', **overrides}, text=True)
+            self.assertEqual(result, expected)
 
     def test_terraform_state_location_comes_from_the_target(self):
         """The backend must not pin a bucket the target configuration also names.

@@ -22,6 +22,7 @@ concurrency:
   group: duckfleet-aws-dev
   cancel-in-progress: false
 env:
+  DUCKFLEET_CLUSTER: ${{ vars.DUCKFLEET_CLUSTER }}
   AWS_REGION: us-east-2
   KUBE_CONTEXT: duckfleet-ci-dev
   TF_IN_AUTOMATION: 'true'
@@ -54,6 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/aws/target.env
+          : "${DUCKFLEET_CLUSTER:?Set the DUCKFLEET_CLUSTER repository variable}"
           echo "DUCKFLEET_CLUSTER=$DUCKFLEET_CLUSTER" >> "$GITHUB_ENV"
       - run: aws eks update-kubeconfig --name "$DUCKFLEET_CLUSTER" --alias "$KUBE_CONTEXT" --region "$AWS_REGION"
       - run: bash scripts/aws/check-access.sh
@@ -107,6 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/aws/target.env
+          : "${DUCKFLEET_CLUSTER:?Set the DUCKFLEET_CLUSTER repository variable}"
           echo "DUCKFLEET_CLUSTER=$DUCKFLEET_CLUSTER" >> "$GITHUB_ENV"
       - run: aws eks update-kubeconfig --name "$DUCKFLEET_CLUSTER" --alias "$KUBE_CONTEXT" --region "$AWS_REGION"
       - id: start
@@ -150,6 +153,7 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/aws/target.env
+          : "${DUCKFLEET_CLUSTER:?Set the DUCKFLEET_CLUSTER repository variable}"
           echo "DUCKFLEET_CLUSTER=$DUCKFLEET_CLUSTER" >> "$GITHUB_ENV"
       - run: aws eks update-kubeconfig --name "$DUCKFLEET_CLUSTER" --alias "$KUBE_CONTEXT" --region "$AWS_REGION"
       - run: bash scripts/aws/suspend.sh

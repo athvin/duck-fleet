@@ -7,7 +7,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # shellcheck source=scripts/aws/target.env
 source "$ROOT/scripts/aws/target.env"
 # GitHub OIDC supplies short-lived environment credentials, not an SSO profile.
-if [[ "${GITHUB_ACTIONS:-false}" != true ]]; then
+if [[ "${GITHUB_ACTIONS:-false}" != true && -n "${DUCKFLEET_AWS_PROFILE}" ]]; then
   export AWS_PROFILE=${AWS_PROFILE:-$DUCKFLEET_AWS_PROFILE}
 fi
 export AWS_REGION=$DUCKFLEET_REGION
@@ -23,6 +23,8 @@ assert_account() {
   [[ "$account" == "$DUCKFLEET_ACCOUNT" ]] || { echo 'Wrong AWS account' >&2; exit 1; }
 }
 assert_cluster() {
+  : "${DUCKFLEET_CLUSTER:?Set DUCKFLEET_CLUSTER to the deployment cluster}"
+  : "${KUBE_CONTEXT:?Set DUCKFLEET_KUBE_CONTEXT or KUBE_CONTEXT explicitly}"
   assert_account
   local expected actual
   expected=$(aws eks describe-cluster --name "$DUCKFLEET_CLUSTER" --query cluster.endpoint --output text)
