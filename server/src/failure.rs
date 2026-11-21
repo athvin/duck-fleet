@@ -262,6 +262,38 @@ pub(crate) const UNAVAILABLE: Failure = Failure {
     retry_safe: false,
     http: StatusCode::SERVICE_UNAVAILABLE,
 };
+
+/// Control-plane SQL is read-only and never enters a worker or its query ledger.
+pub(crate) const SYSTEM_QUERY_UNSUPPORTED: Failure = Failure {
+    status: None,
+    kind: "system_query_unsupported",
+    retry_safe: false,
+    http: StatusCode::BAD_REQUEST,
+};
+pub(crate) const SYSTEM_QUERY_TOO_WIDE: Failure = Failure {
+    status: None,
+    kind: "system_query_too_wide",
+    retry_safe: false,
+    http: StatusCode::BAD_REQUEST,
+};
+pub(crate) const SYSTEM_QUERY_TIMEOUT: Failure = Failure {
+    status: None,
+    kind: "system_query_timeout",
+    retry_safe: true,
+    http: StatusCode::REQUEST_TIMEOUT,
+};
+pub(crate) const SYSTEM_QUERY_UNAVAILABLE: Failure = Failure {
+    status: None,
+    kind: "system_query_unavailable",
+    retry_safe: true,
+    http: StatusCode::SERVICE_UNAVAILABLE,
+};
+pub(crate) const SYSTEM_QUERY_RESULT: Failure = Failure {
+    status: None,
+    kind: "system_query_result",
+    retry_safe: false,
+    http: StatusCode::INTERNAL_SERVER_ERROR,
+};
 /// A well-formed isolated request that nothing could hold: no node fits it, or the
 /// pod never became ready.
 ///
@@ -322,6 +354,11 @@ pub(crate) fn by_kind(kind: &str) -> Option<Failure> {
         QUEUE_DRAINED,
         SESSION_LOST,
         POLICY_UNAVAILABLE,
+        SYSTEM_QUERY_UNSUPPORTED,
+        SYSTEM_QUERY_TOO_WIDE,
+        SYSTEM_QUERY_TIMEOUT,
+        SYSTEM_QUERY_UNAVAILABLE,
+        SYSTEM_QUERY_RESULT,
     ]
     .into_iter()
     .find(|failure| failure.kind == kind)

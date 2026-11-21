@@ -940,6 +940,15 @@ impl Worker {
                 let profile = crate::profiling::Profile::new(id, self.profiling_enabled, &conn)
                     .map_err(|_| ApiError::internal())?;
                 let resources = placement.resources;
+                let system_dimensions = crate::metadata::capture_session(
+                    &request.compute,
+                    &placement,
+                    self.placement
+                        .get("duckdb_version")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    revision.as_deref(),
+                )?;
                 let registration = queue::SessionRegistration {
                     session_id: id,
                     epoch: self.queue.epoch.clone(),
@@ -957,8 +966,11 @@ impl Worker {
                     open_span_id,
                     operation,
                 };
-                if let Err(error) = queue::register_session(&mut self.ledger.client, &registration)
-                {
+                if let Err(error) = queue::register_session_captured(
+                    &mut self.ledger.client,
+                    &registration,
+                    &system_dimensions,
+                ) {
                     // A definitive authorization refusal happens before registration
                     // commits. Only an uncertain metadata result requires recovery.
                     if !matches!(error.0.kind, "unauthorized" | "forbidden") {

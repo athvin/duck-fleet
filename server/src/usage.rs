@@ -92,18 +92,28 @@ impl BudgetUpdate {
     }
 }
 
-const COLUMNS:&str="event_id,execution_id,meter_name,quantity,unit,resource_units,amount_micro_usd,rate_card_version,worker_id,
-    CASE WHEN $4 OR ($5 AND owner_principal_id=$2) THEN context ELSE 'null' END,
-    source,corrects,started_at::text,ended_at::text,observed_at::text,ledger_id,namespace_id,owner_principal_id,actor_principal_id,actor_kind,actor_principal,actor_credential_id";
+fn columns(policy: &metadata::PrivacySql) -> String {
+    let captured = metadata::usage_capture_json(&policy.sql_visible);
+    format!("event_id,execution_id,meter_name,quantity,unit,resource_units,amount_micro_usd,rate_card_version,worker_id,
+    CASE WHEN {} THEN context ELSE 'null' END,
+    source,corrects,started_at::text,ended_at::text,observed_at::text,ledger_id,namespace_id,owner_principal_id,actor_principal_id,actor_kind,actor_principal,actor_credential_id,{captured}",policy.sql_visible)
+}
 fn record(row: &Row) -> Value {
-    json!({
+    let mut value = json!({
         "event_id":row.get::<_,String>(0),"execution_id":row.get::<_,String>(1),"meter_name":row.get::<_,String>(2),"quantity":row.get::<_,i64>(3),
         "unit":row.get::<_,String>(4),"resource_units":row.get::<_,i64>(5),"amount_micro_usd":row.get::<_,i64>(6),"rate_card_version":row.get::<_,String>(7),"worker_id":row.get::<_,String>(8),
         "context":serde_json::from_str::<Value>(row.get::<_,&str>(9)).unwrap_or(Value::Null),"source":row.get::<_,String>(10),"corrects":row.get::<_,Option<String>>(11),
         "started_at":row.get::<_,String>(12),"ended_at":row.get::<_,String>(13),"observed_at":row.get::<_,String>(14),"ledger_id":row.get::<_,i64>(15),
         "namespace_id":row.get::<_,Option<String>>(16),"owner_principal_id":row.get::<_,Option<String>>(17),"actor_principal_id":row.get::<_,Option<String>>(18),
         "actor_kind":row.get::<_,Option<String>>(19),"actor_principal":row.get::<_,Option<String>>(20),"actor_credential_id":row.get::<_,Option<String>>(21)
-    })
+    });
+    if let Ok(Value::Object(captured)) = serde_json::from_str::<Value>(row.get::<_, &str>(22)) {
+        value
+            .as_object_mut()
+            .expect("usage object")
+            .extend(captured);
+    }
+    value
 }
 pub(crate) fn events_in(
     tx: &mut Transaction<'_>,
@@ -112,8 +122,22 @@ pub(crate) fn events_in(
 ) -> Result<Value, ApiError> {
     filter.validate()?;
     let plan = metadata::relation_plan(access, Relation::Usage)?;
-    let rows=tx.query(&format!("SELECT {COLUMNS} FROM usage_events WHERE COALESCE(namespace_id,$1)=$1 AND ($3 OR owner_principal_id=$2)
-        AND ($6::BIGINT IS NULL OR ledger_id<$6) AND ($7::TEXT IS NULL OR execution_id=$7) AND ($8::TEXT IS NULL OR source=$8) ORDER BY ledger_id DESC LIMIT $9"),
+    let policy = metadata::privacy_sql(
+        Relation::Usage,
+        "u",
+        None,
+        metadata::PrivacyBindings {
+            namespace: 1,
+            principal: 2,
+            all: "$3",
+            sql_all: "$4",
+            sql_own: "$5",
+            profile_all: "false",
+            profile_own: "false",
+        },
+    );
+    let rows=tx.query(&format!("SELECT {} FROM {} WHERE {}
+        AND ($6::BIGINT IS NULL OR ledger_id<$6) AND ($7::TEXT IS NULL OR execution_id=$7) AND ($8::TEXT IS NULL OR source=$8) ORDER BY ledger_id DESC LIMIT $9",columns(&policy),policy.from,policy.visible),
         &[&plan.namespace_id,&plan.principal_id,&plan.all,&plan.sql_all,&plan.sql_own,&filter.before,&filter.execution_id,&filter.source,&(filter.limit+1)])
         .map_err(|_|ApiError::internal())?;
     let mut events: Vec<_> = rows.iter().map(record).collect();

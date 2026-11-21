@@ -838,11 +838,43 @@ pub(crate) fn detail_in(
     id: Uuid,
 ) -> Result<Value, ApiError> {
     let plan = metadata::relation_plan(access, Relation::Attempts)?;
-    let row=tx.query_opt(&format!("SELECT {COLUMNS} FROM requests r LEFT JOIN authz_legacy_owners l
-        ON r.owner_principal_id IS NULL AND r.namespace_id IS NULL AND l.namespace_id=$2 AND l.legacy_name=r.principal
-        WHERE r.request_id=$1 AND COALESCE(r.namespace_id,$2)=$2 AND ($4 OR COALESCE(r.owner_principal_id,l.principal_id)=$3)"),
-        &[&id.to_string(),&plan.namespace_id,&plan.principal_id,&plan.all]).map_err(|_|ApiError::internal())?.ok_or_else(not_found)?;
-    Ok(Stored::from_row(row).detail())
+    let policy = metadata::privacy_sql(
+        Relation::Attempts,
+        "r",
+        None,
+        metadata::PrivacyBindings {
+            namespace: 2,
+            principal: 3,
+            all: "$4",
+            sql_all: "false",
+            sql_own: "false",
+            profile_all: "false",
+            profile_own: "false",
+        },
+    );
+    let row = tx
+        .query_opt(
+            &format!(
+                "SELECT {COLUMNS} FROM {} WHERE r.request_id=$1 AND {}",
+                policy.from, policy.visible
+            ),
+            &[
+                &id.to_string(),
+                &plan.namespace_id,
+                &plan.principal_id,
+                &plan.all,
+            ],
+        )
+        .map_err(|_| ApiError::internal())?
+        .ok_or_else(not_found)?;
+    let stored = Stored::from_row(row);
+    let mut result = stored.detail();
+    metadata::append_dimensions(
+        &mut result,
+        &stored.queue_record,
+        plan.sql_visible(stored.queue_record["owner_principal_id"].as_str()),
+    );
+    Ok(result)
 }
 #[derive(Clone)]
 pub(crate) struct Reader {

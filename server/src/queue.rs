@@ -286,6 +286,20 @@ pub(crate) fn register_session(
     client: &mut Client,
     s: &SessionRegistration,
 ) -> Result<(), ApiError> {
+    register_session_dimensions(client, s, None)
+}
+pub(crate) fn register_session_captured(
+    client: &mut Client,
+    s: &SessionRegistration,
+    dimensions: &crate::metadata::SessionDimensions,
+) -> Result<(), ApiError> {
+    register_session_dimensions(client, s, Some(dimensions))
+}
+fn register_session_dimensions(
+    client: &mut Client,
+    s: &SessionRegistration,
+    dimensions: Option<&crate::metadata::SessionDimensions>,
+) -> Result<(), ApiError> {
     let mut tx = api(client.transaction())?;
     api(bounded(&mut tx))?;
     let canonical = authz::resolve_in(&mut tx, &s.authority)?;
@@ -332,6 +346,15 @@ pub(crate) fn register_session(
         &[&s.session_id.to_string(),&access.actor.namespace_id,&owner_id,&access.actor.principal_id,&access.actor.kind.name(),&access.actor.principal,&access.actor.credential_id,&access.policy_version,&api(serde_json::to_string(&s.operation))?]))?;
     api(tx.execute("INSERT INTO session_events(open_span_id,session_id,principal,worker_id,boot_id,scope,opened_at) VALUES($1,$2,$3,$4,$5,$6,clock_timestamp()) ON CONFLICT(open_span_id) DO UPDATE SET session_id=EXCLUDED.session_id,worker_id=EXCLUDED.worker_id,boot_id=EXCLUDED.boot_id,opened_at=EXCLUDED.opened_at",
         &[&s.open_span_id.to_string(),&s.session_id.to_string(),&s.principal,&s.epoch.worker_id,&s.epoch.boot_id.to_string(),&s.scope]))?;
+    if let Some(dimensions) = dimensions {
+        api(tx.execute(
+            "UPDATE queue_sessions SET system_dimensions=$2 WHERE session_id=$1",
+            &[
+                &s.session_id.to_string(),
+                &api(serde_json::to_string(dimensions))?,
+            ],
+        ))?;
+    }
     api(tx.commit())?;
     Ok(())
 }
@@ -399,6 +422,7 @@ pub(crate) fn submit(
     protocol: Protocol,
 ) -> Result<SubmitResult, ApiError> {
     request.validate()?;
+    let shape = crate::query_shape::capture(&request.sql, &request.parameters);
     let session_id = session.to_string();
     let boot = epoch.boot_id.to_string();
     let mut tx = api(client.transaction())?;
@@ -479,6 +503,19 @@ pub(crate) fn submit(
         api(tx.commit())?;
         return Ok(SubmitResult::Duplicate(value));
     }
+    let dimensions: crate::metadata::SessionDimensions = s
+        .get::<_, Option<&str>>("system_dimensions")
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    api(crate::metadata::record_dimensions(
+        &mut tx,
+        &id_text,
+        &dimensions,
+        &shape,
+        &request.context,
+        request.timeout_seconds,
+        s.get::<_, &str>("open_span_id"),
+    ))?;
     // Metadata exists before a possible terminal admission refusal, but neither
     // identity nor history becomes visible until this short transaction commits.
     api(tx.execute("UPDATE requests SET session_id=$2,worker_boot_id=$3,pool_scope=$4,protocol=$5,actor_principal=$6,credential_id=$7,
@@ -961,6 +998,7 @@ pub(crate) fn finish_in(tx: &mut Transaction<'_>, finish: &Finish<'_>) -> Result
         engine_started_at=$8,profile=$9,profile_status=$10,metrics=$11 WHERE query_id=$1 RETURNING context",
         &[&id,&finish.status,&finish.elapsed_ms,&finish.result_rows,&finish.error,&finish.failure.map(|f|f.kind),&finish.failure.map(|f|f.retry_safe),
           &finish.engine_started_at,&finish.profile,&finish.profile_status,&finish.metrics.to_string()])?.get::<_,String>(0);
+    crate::metadata::record_metrics(tx, &id, finish.metrics, finish.profile_status == "captured")?;
     metering::settle_saved_in(
         tx,
         &id,

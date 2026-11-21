@@ -156,6 +156,7 @@ harness() { # harness <job-name> <command> [timeout]
 
 python3 scripts/kind/assert_role_posture.py --context "$CONTEXT" --namespace "$NS" > artifacts/kind/role-secret-posture.json
 harness duckfleet-rbac 'duckfleet-server --rbac' 900
+harness duckfleet-system 'duckfleet-server --system' 300
 harness duckfleet-harness 'duckfleet-server'
 grep -q 'PASS: protocol checks and dbt lifecycle' artifacts/kind/duckfleet-harness.log
 grep -q 'PASS: resource/sizing routing refuses what it cannot serve' artifacts/kind/duckfleet-harness.log

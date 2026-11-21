@@ -68,6 +68,9 @@ BEGIN;
 ALTER DATABASE :"platform_db" OWNER TO :"migrator";
 REVOKE ALL ON DATABASE :"platform_db" FROM PUBLIC,:"catalog";
 GRANT CONNECT ON DATABASE :"platform_db" TO :"gateway",:"worker",:"maintainer";
+-- System SQL can aggregate only bounded sources; bound external-sort spill too.
+-- This setting requires the administrator and cannot be raised by the gateway.
+ALTER ROLE :"gateway" IN DATABASE :"platform_db" SET temp_file_limit = '16MB';
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 ALTER SCHEMA public OWNER TO :"migrator";
 -- Transfer only objects in this dedicated database/schema. REASSIGN OWNED is

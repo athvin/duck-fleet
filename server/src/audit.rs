@@ -49,7 +49,7 @@ CREATE FUNCTION immutable_audit_event() RETURNS trigger LANGUAGE plpgsql AS $$ B
 CREATE TRIGGER immutable_audit BEFORE UPDATE OR DELETE ON audit_events FOR EACH ROW EXECUTE FUNCTION immutable_audit_event();")?;
     Ok(())
 }
-pub(crate) fn append_in(tx: &mut Transaction<'_>, event: &Event) -> Result<()> {
+fn validate_event(event: &Event) -> Result<()> {
     anyhow::ensure!(
         event.target_type.len() <= 64
             && event.target_id.as_ref().is_none_or(|s| s.len() <= 128)
@@ -69,7 +69,55 @@ pub(crate) fn append_in(tx: &mut Transaction<'_>, event: &Event) -> Result<()> {
         .contains(&event.decision.as_str()),
         "invalid audit decision"
     );
-    tx.execute("INSERT INTO audit_events(event_id,namespace_id,actor_principal_id,actor_kind,actor_principal,credential_id,action,target_type,target_id,decision,reason,policy_version,correlation_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",&[&Uuid::new_v4().to_string(),&event.actor.namespace_id,&event.actor.principal_id,&event.actor.kind.name(),&event.actor.principal,&event.actor.credential_id,&event.action.name(),&event.target_type,&event.target_id,&event.decision,&event.reason,&event.policy_version,&event.correlation_id])?;
+    Ok(())
+}
+const APPEND_SQL: &str = "INSERT INTO audit_events(event_id,namespace_id,actor_principal_id,actor_kind,actor_principal,credential_id,action,target_type,target_id,decision,reason,policy_version,correlation_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)";
+pub(crate) fn append_in(tx: &mut Transaction<'_>, event: &Event) -> Result<()> {
+    validate_event(event)?;
+    tx.execute(
+        APPEND_SQL,
+        &[
+            &Uuid::new_v4().to_string(),
+            &event.actor.namespace_id,
+            &event.actor.principal_id,
+            &event.actor.kind.name(),
+            &event.actor.principal,
+            &event.actor.credential_id,
+            &event.action.name(),
+            &event.target_type,
+            &event.target_id,
+            &event.decision,
+            &event.reason,
+            &event.policy_version,
+            &event.correlation_id,
+        ],
+    )?;
+    Ok(())
+}
+pub(crate) async fn append_async_in(
+    tx: &tokio_postgres::Transaction<'_>,
+    event: &Event,
+) -> Result<()> {
+    validate_event(event)?;
+    tx.execute(
+        APPEND_SQL,
+        &[
+            &Uuid::new_v4().to_string(),
+            &event.actor.namespace_id,
+            &event.actor.principal_id,
+            &event.actor.kind.name(),
+            &event.actor.principal,
+            &event.actor.credential_id,
+            &event.action.name(),
+            &event.target_type,
+            &event.target_id,
+            &event.decision,
+            &event.reason,
+            &event.policy_version,
+            &event.correlation_id,
+        ],
+    )
+    .await?;
     Ok(())
 }
 /// Accepted work already carries canonical attribution even when the credential

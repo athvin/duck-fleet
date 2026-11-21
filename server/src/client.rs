@@ -111,6 +111,25 @@ pub struct Client {
 }
 
 impl Client {
+    /// Queries only the bounded metadata SQL service, without opening compute.
+    /// BIGINT/DECIMAL cells remain JSON strings, preserving exact usage totals.
+    pub async fn system_sql(
+        &self,
+        sql: &str,
+        parameters: &[Value],
+        bounds: Option<&Value>,
+    ) -> Result<Value, RemoteError> {
+        let bytes = self.request(Method::POST,"/v1/system/query",Some(&json!({"sql":sql,"parameters":parameters,"bounds":bounds,"contract_version":1,"format":"json"})),Duration::from_secs(5)).await.map_err(|mut error| {
+            if error.status.is_none() && error.failure_kind.as_deref() == Some("transport_failure") {
+                error.message = "system metadata request failed in transport; no warehouse SQL was submitted".into();
+                error.retry_safe = true;
+            }
+            error
+        })?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| RemoteError::decode("invalid system query response"))
+    }
+
     /// Builds the client. The process-wide rustls crypto provider must already be
     /// installed (it is, in `main` before any role runs); without it reqwest
     /// panics on build.

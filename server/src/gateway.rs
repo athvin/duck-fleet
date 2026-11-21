@@ -373,6 +373,30 @@ fn invalid_credential() -> ApiError {
     ApiError::new(failure::UNAUTHORIZED, "invalid platform credential")
 }
 
+fn system_token(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty() && v.len() <= 8192)
+        .map(str::to_owned)
+        .ok_or_else(invalid_credential)
+}
+async fn system_query(
+    State(app): State<Gateway>,
+    request: axum::extract::Request,
+) -> Result<crate::system_query::SystemResult, ApiError> {
+    let token = system_token(request.headers())?;
+    app.system.http(&token, request.into_body()).await
+}
+async fn system_schema(
+    State(app): State<Gateway>,
+    headers: axum::http::HeaderMap,
+) -> Result<crate::system_query::SystemResult, ApiError> {
+    let token = system_token(&headers)?;
+    app.system.schema(&token).await
+}
+
 fn authenticated_request(
     request: reqwest::RequestBuilder,
     identity: &Identity,
@@ -439,6 +463,7 @@ struct Gateway {
     history: crate::history::Reader,
     requests: crate::requests::Reader,
     usage: crate::usage::Reader,
+    system: crate::system_query::Service,
     /// `None` where this deployment cannot create pods, which is most of them. The
     /// capability is absent rather than disabled: there is no code path that would
     /// serve an isolated request from a shared worker if it were off.
@@ -1913,11 +1938,25 @@ async fn lake_snapshots(
 /// compatibility layer over machinery that neither knows nor cares it exists.
 struct PgPlatform(Gateway);
 impl crate::pgwire::Platform for PgPlatform {
-    async fn authenticate(&self, token: String) -> Result<Identity, ApiError> {
-        self.0.authn.authenticate(&token).await
+    async fn authenticate(
+        &self,
+        token: String,
+        mode: crate::pgwire::ConnectionMode,
+    ) -> Result<Identity, ApiError> {
+        match mode {
+            crate::pgwire::ConnectionMode::Warehouse => self.0.authn.authenticate(&token).await,
+            crate::pgwire::ConnectionMode::System => self.0.system.authenticate(&token).await,
+        }
     }
 
-    async fn revalidate(&self, identity: &Identity) -> Result<(), ApiError> {
+    async fn revalidate(
+        &self,
+        identity: &Identity,
+        mode: crate::pgwire::ConnectionMode,
+    ) -> Result<(), ApiError> {
+        if mode == crate::pgwire::ConnectionMode::System {
+            return self.0.system.revalidate(identity).await;
+        }
         let placement = self
             .0
             .registry()
@@ -1931,6 +1970,15 @@ impl crate::pgwire::Platform for PgPlatform {
             )
             .await?;
         Ok(())
+    }
+
+    async fn query_system(
+        &self,
+        identity: &Identity,
+        request: crate::system_query::Request,
+    ) -> Result<crate::system_query::SystemResult, ApiError> {
+        let _inflight = InFlight::enter(&self.0.inflight);
+        self.0.system.query(identity, request).await
     }
 
     async fn open_session(&self, identity: &Identity) -> Result<crate::pgwire::Session, ApiError> {
@@ -2429,7 +2477,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
     let schema_wait = crate::platform::schema_wait()?;
     let schema_dsn = platform_dsn.clone();
     let maintenance_schema_dsn = maintenance_dsn.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let storage_schema = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         let mut db = crate::platform::wait_schema(&schema_dsn, schema_wait)?;
         crate::db_roles::validate_runtime(&mut db, crate::db_roles::RuntimeRole::Gateway)?;
         authz::validate_namespace(&mut db)?;
@@ -2440,7 +2488,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             crate::db_roles::RuntimeRole::Maintainer,
         )?;
         authz::validate_namespace(&mut maintenance_db)?;
-        Ok(())
+        Ok(db.query_one("SELECT current_schema()", &[])?.get(0))
     })
     .await??;
     // Configured and permitted are different questions, and only the API server can
@@ -2477,12 +2525,20 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         "DUCKFLEET_INTERNAL_TOKEN must be nonempty and different from DUCKFLEET_TOKEN"
     );
     let token: Arc<str> = internal.into();
+    let system = crate::system_query::Service::new(
+        &platform_dsn,
+        bootstrap.clone(),
+        crate::metadata::StorageSchema::validated(&storage_schema)
+            .map_err(|e| anyhow::anyhow!("{}", e.1))?,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e.1))?;
     let app = Gateway {
         client: Client::builder()
             .timeout(Duration::from_secs(75))
             .retry(reqwest::retry::never())
             .build()?,
         authn: Authn::new(bootstrap, platform_dsn.clone()),
+        system,
         token,
         pools: Arc::new(RwLock::new(Arc::new(registry))),
         pools_file: pools_file.map(Arc::new),
@@ -2575,6 +2631,15 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             (app.draining.clone(), app.inflight.clone()),
             track_inflight,
         ));
+    // This lane authenticates inside its owned read snapshot and absolute
+    // deadline. It intentionally bypasses the warehouse authentication cache.
+    let system_api = Router::new()
+        .route("/v1/system/query", post(system_query))
+        .route("/v1/system/schema", get(system_schema))
+        .route_layer(middleware::from_fn_with_state(
+            (app.draining.clone(), app.inflight.clone()),
+            track_inflight,
+        ));
     // The pgwire front, where the deployment asked for one: a compatibility
     // listener over the same sessions, principals, and meters as everything else.
     if std::env::var("DUCKFLEET_PGWIRE").as_deref() == Ok("true") {
@@ -2599,6 +2664,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
     let router = Router::new()
         .route("/healthz", get(health))
         .merge(api)
+        .merge(system_api)
         .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(app);
     let maintenance = crate::platform::spawn_maintenance(maintenance_dsn, maintenance_config);
@@ -2757,6 +2823,12 @@ mod tests {
                 .build()
                 .unwrap(),
             authn: Authn::new(token.clone(), dsn.into()),
+            system: crate::system_query::Service::new(
+                dsn,
+                token.clone(),
+                crate::metadata::StorageSchema::validated("public").unwrap(),
+            )
+            .unwrap(),
             token,
             pools: Arc::new(RwLock::new(Arc::new(
                 PoolRegistry::from_json(

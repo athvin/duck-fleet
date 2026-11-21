@@ -151,7 +151,7 @@ seccompProfile:
 {{- toJson $config -}}
 {{- end -}}
 {{/* Runtime exact-version checks remain authoritative; this marks rollout intent. */}}
-{{- define "duckfleet.platformSchema" -}}3{{- end -}}
+{{- define "duckfleet.platformSchema" -}}4{{- end -}}
 {{/*
 The worker container's environment, defined once. The persistent Deployments and the
 isolated pod template both render from this, so they cannot drift apart on secret

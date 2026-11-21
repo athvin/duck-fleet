@@ -38,6 +38,7 @@ pub async fn run(args: Vec<String>) -> i32 {
 
     let result = match parsed.command.as_str() {
         "sql" => run_sql(&url, &token, &parsed).await,
+        "system" => run_system(&url, &token, &parsed).await,
         "history" => {
             let mut path = format!("/v1/queries?limit={}", parsed.limit(20));
             if let Some(worker) = parsed.value("worker-id") {
@@ -100,7 +101,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (sql|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (sql|system|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -131,6 +132,57 @@ pub async fn run(args: Vec<String>) -> i32 {
             1
         }
     }
+}
+
+async fn run_system(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
+    let sql = match parsed.positionals[0].as_str() {
+        "tables" => "SHOW TABLES FROM duckfleet_system".into(),
+        "describe" => format!("DESCRIBE duckfleet_system.{}", parsed.positionals[1]),
+        "sql" => parsed.positionals[1].clone(),
+        _ => unreachable!("validated system command"),
+    };
+    let parameters = parsed
+        .params
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    let result = Client::new(url, token)?
+        .system_sql(&sql, &parameters, None)
+        .await?;
+    if parsed.value("format") == Some("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    } else {
+        if let Some(columns) = result["columns"].as_array() {
+            println!(
+                "{}",
+                columns
+                    .iter()
+                    .map(|c| c["name"].as_str().unwrap_or("?"))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            );
+        }
+        if let Some(rows) = result["rows"].as_array() {
+            for row in rows.iter().filter_map(Value::as_array) {
+                println!(
+                    "{}",
+                    row.iter()
+                        .map(|v| match v {
+                            Value::Null => "NULL".into(),
+                            Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run_policy(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
@@ -449,7 +501,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <sql|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <sql|system|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -463,6 +515,27 @@ impl Parsed {
                 .any(|(name, _)| Self::COMPUTE_FLAGS.contains(&name.as_str()))
         {
             return Err("compute selection flags apply only to the sql command".into());
+        }
+        if parsed.command == "system" {
+            let valid = match parsed.positionals.first().map(String::as_str) {
+                Some("tables") => parsed.positionals.len() == 1 && parsed.params.is_empty(),
+                Some("describe") => {
+                    parsed.positionals.len() == 2
+                        && parsed.params.is_empty()
+                        && crate::metadata::find_relation(&parsed.positionals[1]).is_some()
+                }
+                Some("sql") => parsed.positionals.len() == 2,
+                _ => false,
+            };
+            if !valid {
+                return Err("system needs tables, describe <query_history|query_attempts|usage>, or sql <one SQL statement>".into());
+            }
+            if parsed
+                .value("format")
+                .is_some_and(|v| !["table", "json"].contains(&v))
+            {
+                return Err("system --format must be table or json".into());
+            }
         }
         if parsed.command != "sql" && parsed.value("queue-timeout").is_some() {
             return Err("--queue-timeout applies only to the sql command".into());

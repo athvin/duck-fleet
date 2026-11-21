@@ -1,0 +1,1274 @@
+{
+  "system_contract_version": 1,
+  "relations": [
+    {
+      "name": "query_history",
+      "description": "Retained query diagnostics; one row per request.",
+      "time_column": "accepted_at",
+      "columns": [
+        {
+          "name": "request_id",
+          "type": "VARCHAR",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Durable request identifier."
+        },
+        {
+          "name": "logical_request_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Root request identifier in explicit retry lineage."
+        },
+        {
+          "name": "retry_of",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Previous attempt, when this is an explicit retry."
+        },
+        {
+          "name": "session_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Engine session identifier."
+        },
+        {
+          "name": "history_id",
+          "type": "BIGINT",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "History pagination identifier."
+        },
+        {
+          "name": "namespace_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Authenticated platform namespace identifier."
+        },
+        {
+          "name": "owner_principal_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Immutable workload owner identifier; unknown legacy owners remain NULL."
+        },
+        {
+          "name": "owner_principal_name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded workload owner name."
+        },
+        {
+          "name": "actor_principal_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Authenticated acting principal identifier."
+        },
+        {
+          "name": "actor_principal_name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded actor name."
+        },
+        {
+          "name": "actor_kind",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Named, bootstrap, or internal actor kind."
+        },
+        {
+          "name": "actor_credential_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Acting credential identifier, never the bearer secret."
+        },
+        {
+          "name": "worker_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded execution worker identifier."
+        },
+        {
+          "name": "worker_boot_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded worker process epoch."
+        },
+        {
+          "name": "protocol",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Authenticated ingress protocol."
+        },
+        {
+          "name": "pool_scope",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Stable admission scope."
+        },
+        {
+          "name": "state",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Durable request lifecycle state."
+        },
+        {
+          "name": "status",
+          "type": "VARCHAR",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded execution status."
+        },
+        {
+          "name": "outcome",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Known nonexecution, statement result, or unknown outcome; not transaction commit proof."
+        },
+        {
+          "name": "failure_kind",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Stable classified failure kind."
+        },
+        {
+          "name": "retry_safe",
+          "type": "BOOLEAN",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded retry safety guidance; not authorization to take over an attempt."
+        },
+        {
+          "name": "accepted_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database-observed durable admission time."
+        },
+        {
+          "name": "queued_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database-observed queue admission time."
+        },
+        {
+          "name": "selected_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database-observed scheduler selection time."
+        },
+        {
+          "name": "execution_granted_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database-observed execution grant; not proof of engine entry."
+        },
+        {
+          "name": "engine_started_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Worker-observed engine entry, persisted on completion when available."
+        },
+        {
+          "name": "finished_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database-observed terminal persistence time."
+        },
+        {
+          "name": "queue_deadline_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Durable queue deadline."
+        },
+        {
+          "name": "execution_timeout_seconds",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "seconds",
+          "description": "Requested execution time bound."
+        },
+        {
+          "name": "queue_timeout_seconds",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "seconds",
+          "description": "Requested queue time bound."
+        },
+        {
+          "name": "engine_elapsed_ms",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "milliseconds",
+          "description": "Worker monotonic execution and Arrow serialization interval, excluding later profiling and settlement."
+        },
+        {
+          "name": "queue_wait_ms",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "milliseconds",
+          "description": "Selected minus queued database timestamps."
+        },
+        {
+          "name": "preparation_ms",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "milliseconds",
+          "description": "Grant minus selected database timestamps."
+        },
+        {
+          "name": "lifecycle_ms",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "milliseconds",
+          "description": "Finished minus accepted database timestamps; excludes client delivery."
+        },
+        {
+          "name": "result_rows",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "rows",
+          "description": "Recorded result row count."
+        },
+        {
+          "name": "session_sequence",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Per-session accepted query sequence."
+        },
+        {
+          "name": "open_span_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Gateway/worker session-open correlation identifier."
+        },
+        {
+          "name": "requested_mode",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Explicit original mode; omissions stay NULL."
+        },
+        {
+          "name": "requested_pool",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Explicit original persistent pool; omissions stay NULL."
+        },
+        {
+          "name": "requested_cpu",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "vCPU",
+          "description": "Explicit requested CPU requirement."
+        },
+        {
+          "name": "requested_memory_bytes",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "Explicit requested memory requirement."
+        },
+        {
+          "name": "requested_disk_bytes",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "Explicit requested disk requirement."
+        },
+        {
+          "name": "selected_mode",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Resolved execution mode."
+        },
+        {
+          "name": "selected_pool",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Resolved persistent pool, if applicable."
+        },
+        {
+          "name": "selected_cpu",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "vCPU",
+          "description": "Resolved container CPU allocation."
+        },
+        {
+          "name": "selected_memory_bytes",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "Resolved container memory allocation, not measured RSS."
+        },
+        {
+          "name": "selected_disk_bytes",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "Resolved ephemeral disk allocation, not observed disk consumption."
+        },
+        {
+          "name": "engine_version",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Worker-observed DuckDB version."
+        },
+        {
+          "name": "registry_revision",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Compute registry revision pinned at session open."
+        },
+        {
+          "name": "policy_generation",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Durable admission policy generation."
+        },
+        {
+          "name": "authorization_policy_version",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Authorization policy observed at admission."
+        },
+        {
+          "name": "query_fingerprint",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Versioned query-shape grouping hash; not the private idempotency hash."
+        },
+        {
+          "name": "query_fingerprint_version",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Attempted query-shape algorithm version."
+        },
+        {
+          "name": "normalization_status",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Captured, unsupported, too_large, or parse_error; legacy unknown stays NULL."
+        },
+        {
+          "name": "model_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application model label; not authenticated identity."
+        },
+        {
+          "name": "invocation_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application invocation label."
+        },
+        {
+          "name": "model_run_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application run label."
+        },
+        {
+          "name": "sql_text",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Original SQL text, subject to SQL-read scope and retention."
+        },
+        {
+          "name": "error_text",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded sanitized engine error; still SQL-sensitive."
+        },
+        {
+          "name": "application_context",
+          "type": "JSON_TEXT",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application JSON context, subject to SQL-read scope."
+        },
+        {
+          "name": "profile_status",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Profile capture availability/status."
+        },
+        {
+          "name": "profile_capture_version",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Version of DuckFleet numeric profile extraction, not DuckDB JSON schema."
+        },
+        {
+          "name": "profile_json",
+          "type": "JSON_TEXT",
+          "nullable": true,
+          "sensitivity": "RawProfile",
+          "units": null,
+          "description": "Bounded raw profile; both SQL-read and profile-read are required."
+        },
+        {
+          "name": "profile_latency_seconds",
+          "type": "DOUBLE",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "seconds",
+          "description": "DuckDB-reported profile latency."
+        },
+        {
+          "name": "profile_cpu_seconds",
+          "type": "DOUBLE",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "seconds",
+          "description": "DuckDB-reported operator CPU time, not container accounting."
+        },
+        {
+          "name": "profile_rows_returned",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "rows",
+          "description": "DuckDB-reported returned rows."
+        },
+        {
+          "name": "profile_rows_scanned",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "rows",
+          "description": "DuckDB-reported cumulative scanned rows."
+        },
+        {
+          "name": "peak_buffer_memory_bytes",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "DuckDB peak buffer memory, not container RSS."
+        },
+        {
+          "name": "peak_temp_dir_bytes",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "DuckDB peak temporary-directory size."
+        },
+        {
+          "name": "bytes_read",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "DuckDB-reported bytes read, not provider billable traffic."
+        },
+        {
+          "name": "bytes_written",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "DuckDB-reported bytes written."
+        }
+      ]
+    },
+    {
+      "name": "query_attempts",
+      "description": "Durable attempt identity and lifecycle, retained independently of history.",
+      "time_column": "accepted_at",
+      "columns": [
+        {
+          "name": "request_id",
+          "type": "VARCHAR",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Durable request identifier."
+        },
+        {
+          "name": "logical_request_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Root request identifier in explicit retry lineage."
+        },
+        {
+          "name": "retry_of",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Previous attempt, when this is an explicit retry."
+        },
+        {
+          "name": "session_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Engine session identifier."
+        },
+        {
+          "name": "namespace_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Authenticated platform namespace identifier."
+        },
+        {
+          "name": "owner_principal_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Immutable workload owner identifier; unknown legacy owners remain NULL."
+        },
+        {
+          "name": "owner_principal_name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded workload owner name."
+        },
+        {
+          "name": "actor_principal_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Authenticated acting principal identifier."
+        },
+        {
+          "name": "actor_principal_name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded actor name."
+        },
+        {
+          "name": "actor_kind",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Named, bootstrap, or internal actor kind."
+        },
+        {
+          "name": "actor_credential_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Acting credential identifier, never the bearer secret."
+        },
+        {
+          "name": "worker_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded execution worker identifier."
+        },
+        {
+          "name": "worker_boot_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded worker process epoch."
+        },
+        {
+          "name": "protocol",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Authenticated ingress protocol."
+        },
+        {
+          "name": "pool_scope",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Stable admission scope."
+        },
+        {
+          "name": "state",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Durable request lifecycle state."
+        },
+        {
+          "name": "status",
+          "type": "VARCHAR",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded execution status."
+        },
+        {
+          "name": "outcome",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Known nonexecution, statement result, or unknown outcome; not transaction commit proof."
+        },
+        {
+          "name": "failure_kind",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Stable classified failure kind."
+        },
+        {
+          "name": "retry_safe",
+          "type": "BOOLEAN",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded retry safety guidance; not authorization to take over an attempt."
+        },
+        {
+          "name": "accepted_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database-observed durable admission time."
+        },
+        {
+          "name": "queued_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database-observed queue admission time."
+        },
+        {
+          "name": "selected_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database-observed scheduler selection time."
+        },
+        {
+          "name": "execution_granted_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database-observed execution grant; not proof of engine entry."
+        },
+        {
+          "name": "engine_started_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Worker-observed engine entry, persisted on completion when available."
+        },
+        {
+          "name": "finished_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database-observed terminal persistence time."
+        },
+        {
+          "name": "queue_deadline_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Durable queue deadline."
+        },
+        {
+          "name": "execution_timeout_seconds",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "seconds",
+          "description": "Requested execution time bound."
+        },
+        {
+          "name": "queue_timeout_seconds",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "seconds",
+          "description": "Requested queue time bound."
+        },
+        {
+          "name": "engine_elapsed_ms",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "milliseconds",
+          "description": "Worker monotonic execution and Arrow serialization interval, excluding later profiling and settlement."
+        },
+        {
+          "name": "queue_wait_ms",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "milliseconds",
+          "description": "Selected minus queued database timestamps."
+        },
+        {
+          "name": "preparation_ms",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "milliseconds",
+          "description": "Grant minus selected database timestamps."
+        },
+        {
+          "name": "lifecycle_ms",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "milliseconds",
+          "description": "Finished minus accepted database timestamps; excludes client delivery."
+        },
+        {
+          "name": "result_rows",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "rows",
+          "description": "Recorded result row count."
+        },
+        {
+          "name": "session_sequence",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Per-session accepted query sequence."
+        },
+        {
+          "name": "open_span_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Gateway/worker session-open correlation identifier."
+        },
+        {
+          "name": "requested_mode",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Explicit original mode; omissions stay NULL."
+        },
+        {
+          "name": "requested_pool",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Explicit original persistent pool; omissions stay NULL."
+        },
+        {
+          "name": "requested_cpu",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "vCPU",
+          "description": "Explicit requested CPU requirement."
+        },
+        {
+          "name": "requested_memory_bytes",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "Explicit requested memory requirement."
+        },
+        {
+          "name": "requested_disk_bytes",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "Explicit requested disk requirement."
+        },
+        {
+          "name": "selected_mode",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Resolved execution mode."
+        },
+        {
+          "name": "selected_pool",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Resolved persistent pool, if applicable."
+        },
+        {
+          "name": "selected_cpu",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "vCPU",
+          "description": "Resolved container CPU allocation."
+        },
+        {
+          "name": "selected_memory_bytes",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "Resolved container memory allocation, not measured RSS."
+        },
+        {
+          "name": "selected_disk_bytes",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "bytes",
+          "description": "Resolved ephemeral disk allocation, not observed disk consumption."
+        },
+        {
+          "name": "engine_version",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Worker-observed DuckDB version."
+        },
+        {
+          "name": "registry_revision",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Compute registry revision pinned at session open."
+        },
+        {
+          "name": "policy_generation",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Durable admission policy generation."
+        },
+        {
+          "name": "authorization_policy_version",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Authorization policy observed at admission."
+        },
+        {
+          "name": "query_fingerprint",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Versioned query-shape grouping hash; not the private idempotency hash."
+        },
+        {
+          "name": "query_fingerprint_version",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Attempted query-shape algorithm version."
+        },
+        {
+          "name": "normalization_status",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Captured, unsupported, too_large, or parse_error; legacy unknown stays NULL."
+        },
+        {
+          "name": "model_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application model label; not authenticated identity."
+        },
+        {
+          "name": "invocation_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application invocation label."
+        },
+        {
+          "name": "model_run_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application run label."
+        }
+      ]
+    },
+    {
+      "name": "usage",
+      "description": "Append-only usage events; a request may have multiple events.",
+      "time_column": "observed_at",
+      "columns": [
+        {
+          "name": "request_id",
+          "type": "VARCHAR",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Durable request identifier."
+        },
+        {
+          "name": "namespace_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Authenticated platform namespace identifier."
+        },
+        {
+          "name": "owner_principal_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Immutable workload owner identifier; unknown legacy owners remain NULL."
+        },
+        {
+          "name": "owner_principal_name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded workload owner name."
+        },
+        {
+          "name": "actor_principal_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Authenticated acting principal identifier."
+        },
+        {
+          "name": "actor_principal_name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded actor name."
+        },
+        {
+          "name": "actor_kind",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Named, bootstrap, or internal actor kind."
+        },
+        {
+          "name": "actor_credential_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Acting credential identifier, never the bearer secret."
+        },
+        {
+          "name": "worker_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Recorded execution worker identifier."
+        },
+        {
+          "name": "selected_mode",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Resolved execution mode."
+        },
+        {
+          "name": "selected_pool",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Resolved persistent pool, if applicable."
+        },
+        {
+          "name": "model_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application model label; not authenticated identity."
+        },
+        {
+          "name": "invocation_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application invocation label."
+        },
+        {
+          "name": "model_run_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application run label."
+        },
+        {
+          "name": "application_context",
+          "type": "JSON_TEXT",
+          "nullable": true,
+          "sensitivity": "Sql",
+          "units": null,
+          "description": "Recorded application JSON context, subject to SQL-read scope."
+        },
+        {
+          "name": "ledger_id",
+          "type": "BIGINT",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Append-only usage ledger sequence."
+        },
+        {
+          "name": "event_id",
+          "type": "VARCHAR",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Idempotent usage event identifier."
+        },
+        {
+          "name": "meter_name",
+          "type": "VARCHAR",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Meter name."
+        },
+        {
+          "name": "quantity",
+          "type": "BIGINT",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Meter quantity in the separately recorded unit."
+        },
+        {
+          "name": "unit",
+          "type": "VARCHAR",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Meter quantity unit."
+        },
+        {
+          "name": "resource_units",
+          "type": "BIGINT",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Saved normalized resource multiplier."
+        },
+        {
+          "name": "amount_micro_usd",
+          "type": "BIGINT",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": "microUSD",
+          "description": "Exact recorded amount, including signed corrections."
+        },
+        {
+          "name": "rate_card_version",
+          "type": "VARCHAR",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Rate-card version saved for this event."
+        },
+        {
+          "name": "rate_micro_usd_per_unit_hour",
+          "type": "BIGINT",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": "microUSD/unit-hour",
+          "description": "Saved rate, never inferred from today's configuration."
+        },
+        {
+          "name": "source",
+          "type": "VARCHAR",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Worker, queue, recovery, or correction source."
+        },
+        {
+          "name": "corrects_event_id",
+          "type": "VARCHAR",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Corrected event identifier when applicable."
+        },
+        {
+          "name": "observed_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": false,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Database observation time of the ledger event."
+        },
+        {
+          "name": "accounting_started_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Settlement-derived accounting interval start, not observed engine start."
+        },
+        {
+          "name": "accounting_ended_at",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "sensitivity": "Metadata",
+          "units": null,
+          "description": "Settlement-derived accounting interval end, not observed engine end."
+        }
+      ]
+    }
+  ]
+}

@@ -12,6 +12,7 @@ COPY server/Cargo.toml server/Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=duckfleet-target-${TARGETARCH},target=/app/server/target cargo build --locked && cp target/debug/duckfleet-server /tmp/duckfleet-server
 COPY server/src ./src
+COPY docs/system-schema-v1.json /app/docs/system-schema-v1.json
 RUN touch src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=duckfleet-target-${TARGETARCH},target=/app/server/target cargo build --locked && cp target/debug/duckfleet-server /tmp/duckfleet-server
 

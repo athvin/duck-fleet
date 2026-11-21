@@ -6,7 +6,8 @@
 //! simple-protocol path every driver and BI tool is built on. Each connection
 //! authenticates with a platform credential as its password and is pinned to one
 //! ordinary worker session, so history, principal attribution, metering, and
-//! failure classification all hold with no code of their own here.
+//! failure classification share the normal data path. The reserved database
+//! `duckfleet_system` instead performs bounded metadata reads without a worker.
 //!
 //! The unsupported surface refuses rather than misbehaves: COPY, LISTEN/NOTIFY,
 //! cursors, CancelRequest, and extended-protocol bind parameters (interpolate
@@ -21,7 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::{ApiError, credentials::Identity};
+use crate::{ApiError, credentials::Identity, system_query};
 
 /// Separate bound on wire sockets, including unauthenticated and idle clients.
 /// Backend sessions also acquire the gateway's shared HTTP/pgwire/platform permit.
@@ -43,16 +44,24 @@ const PROTOCOL_V3: i32 = 196_608;
 const SSL_REQUEST: i32 = 80_877_103;
 const CANCEL_REQUEST: i32 = 80_877_102;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionMode {
+    Warehouse,
+    System,
+}
+
 /// What the gateway hands this module: just enough to authenticate a token and
 /// run statements through a worker session under a named principal.
 pub(crate) trait Platform: Send + Sync + 'static {
     fn authenticate(
         &self,
         token: String,
+        mode: ConnectionMode,
     ) -> impl std::future::Future<Output = std::result::Result<Identity, ApiError>> + Send;
     fn revalidate(
         &self,
         identity: &Identity,
+        mode: ConnectionMode,
     ) -> impl std::future::Future<Output = std::result::Result<(), ApiError>> + Send;
     fn open_session(
         &self,
@@ -65,6 +74,12 @@ pub(crate) trait Platform: Send + Sync + 'static {
         request_id: Uuid,
         sql: String,
     ) -> impl std::future::Future<Output = QueryOutcome> + Send;
+    fn query_system(
+        &self,
+        identity: &Identity,
+        request: system_query::Request,
+    ) -> impl std::future::Future<Output = std::result::Result<system_query::SystemResult, ApiError>>
+    + Send;
     fn close_session(&self, session: Session) -> impl std::future::Future<Output = ()> + Send;
     fn draining(&self) -> bool;
 }
@@ -179,25 +194,13 @@ async fn established<P: Platform>(
     stream: &mut BufStream<TcpStream>,
     startup: &[u8],
 ) -> Result<()> {
-    let mut user = String::new();
-    for pair in startup.split(|b| *b == 0).collect::<Vec<_>>().chunks(2) {
-        if let [key, _] = pair
-            && matches!(*key, b"pool" | b"duckfleet_pool")
-        {
-            error_response(
-                stream,
-                "0A000",
-                "pgwire uses the configured default pool; explicit pool selection is unsupported",
-            )
-            .await?;
+    let (user, mode) = match startup_mode(startup) {
+        Ok(startup) => startup,
+        Err(error) => {
+            error_response(stream, error.code, error.message).await?;
             return Ok(());
         }
-        if let [key, value] = pair
-            && *key == b"user"
-        {
-            user = String::from_utf8_lossy(value).into_owned();
-        }
-    }
+    };
     if platform.draining() {
         error_response(stream, "57P01", "the gateway is shutting down").await?;
         return Ok(());
@@ -213,8 +216,19 @@ async fn established<P: Platform>(
         .await
         .context("pgwire password read timed out")??;
     anyhow::ensure!(kind == b'p', "expected a password message");
-    let token = String::from_utf8_lossy(body.split(|b| *b == 0).next().unwrap_or(&[])).into_owned();
-    let identity = match platform.authenticate(token).await {
+    let token = match (|| {
+        let mut fields = Fields(&body);
+        let token = fields.string()?.to_owned();
+        fields.finish()?;
+        Ok::<_, ProtocolError>(token)
+    })() {
+        Ok(token) => token,
+        Err(error) => {
+            error_response(stream, error.code, error.message).await?;
+            return Ok(());
+        }
+    };
+    let identity = match platform.authenticate(token, mode).await {
         Ok(identity) => identity,
         Err(error) => {
             return refuse_access(stream, error).await;
@@ -257,6 +271,7 @@ async fn established<P: Platform>(
         platform.as_ref(),
         stream,
         &identity,
+        mode,
         &mut session,
         &mut prepared,
     )
@@ -267,10 +282,223 @@ async fn established<P: Platform>(
     outcome
 }
 
+#[derive(Debug)]
+struct ProtocolError {
+    code: &'static str,
+    message: &'static str,
+}
+impl ProtocolError {
+    fn malformed() -> Self {
+        Self {
+            code: "08P01",
+            message: "malformed protocol message",
+        }
+    }
+    fn unsupported(message: &'static str) -> Self {
+        Self {
+            code: "0A000",
+            message,
+        }
+    }
+}
+type ProtocolResult<T> = std::result::Result<T, ProtocolError>;
+
+struct Fields<'a>(&'a [u8]);
+impl<'a> Fields<'a> {
+    fn take(&mut self, len: usize) -> ProtocolResult<&'a [u8]> {
+        if len > self.0.len() {
+            return Err(ProtocolError::malformed());
+        }
+        let (part, rest) = self.0.split_at(len);
+        self.0 = rest;
+        Ok(part)
+    }
+    fn string(&mut self) -> ProtocolResult<&'a str> {
+        let end = self
+            .0
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(ProtocolError::malformed)?;
+        let bytes = self.take(end + 1)?;
+        std::str::from_utf8(&bytes[..end]).map_err(|_| ProtocolError::malformed())
+    }
+    fn i16(&mut self) -> ProtocolResult<i16> {
+        Ok(i16::from_be_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| ProtocolError::malformed())?,
+        ))
+    }
+    fn i32(&mut self) -> ProtocolResult<i32> {
+        Ok(i32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| ProtocolError::malformed())?,
+        ))
+    }
+    fn count(&mut self) -> ProtocolResult<usize> {
+        usize::try_from(self.i16()?).map_err(|_| ProtocolError::malformed())
+    }
+    fn finish(self) -> ProtocolResult<()> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(ProtocolError::malformed())
+        }
+    }
+}
+
+fn startup_mode(body: &[u8]) -> ProtocolResult<(String, ConnectionMode)> {
+    let mut fields = Fields(body);
+    let mut options = std::collections::BTreeMap::new();
+    loop {
+        let key = fields.string()?;
+        if key.is_empty() {
+            break;
+        }
+        let value = fields.string()?;
+        if options
+            .insert(key, value)
+            .is_some_and(|prior| prior != value)
+        {
+            return Err(ProtocolError {
+                code: "08P01",
+                message: "conflicting startup parameters",
+            });
+        }
+        if matches!(key, "pool" | "duckfleet_pool") {
+            return Err(ProtocolError::unsupported(
+                "pgwire uses the configured default pool; explicit pool selection is unsupported",
+            ));
+        }
+    }
+    fields.finish()?;
+    let mode = if options.get("database") == Some(&"duckfleet_system") {
+        ConnectionMode::System
+    } else {
+        // Existing arbitrary database aliases remain warehouse connections.
+        ConnectionMode::Warehouse
+    };
+    Ok((options.get("user").copied().unwrap_or("").to_owned(), mode))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Frontend<'a> {
+    Query(&'a str),
+    Parse(&'a str),
+    Bind,
+    Describe(u8),
+    Execute,
+    Close(u8),
+    Sync,
+    Flush,
+    Terminate,
+}
+fn frontend(kind: u8, body: &[u8]) -> ProtocolResult<Frontend<'_>> {
+    let mut f = Fields(body);
+    let message = match kind {
+        b'Q' => Frontend::Query(f.string()?),
+        b'P' => {
+            let name = f.string()?;
+            let sql = f.string()?;
+            let count = f.count()?;
+            f.take(count.checked_mul(4).ok_or_else(ProtocolError::malformed)?)?;
+            f.finish()?;
+            if !name.is_empty() || count != 0 {
+                return Err(ProtocolError::unsupported(
+                    "only unnamed parameterless prepared statements are supported",
+                ));
+            }
+            return Ok(Frontend::Parse(sql));
+        }
+        b'B' => {
+            let portal = f.string()?;
+            let statement = f.string()?;
+            let formats = f.count()?;
+            for _ in 0..formats {
+                if !matches!(f.i16()?, 0 | 1) {
+                    return Err(ProtocolError::malformed());
+                }
+            }
+            let parameters = f.count()?;
+            for _ in 0..parameters {
+                let len = f.i32()?;
+                if len < -1 {
+                    return Err(ProtocolError::malformed());
+                }
+                if len >= 0 {
+                    f.take(usize::try_from(len).map_err(|_| ProtocolError::malformed())?)?;
+                }
+            }
+            let result_formats = f.count()?;
+            let mut binary = false;
+            for _ in 0..result_formats {
+                match f.i16()? {
+                    0 => {}
+                    1 => binary = true,
+                    _ => return Err(ProtocolError::malformed()),
+                }
+            }
+            f.finish()?;
+            if !portal.is_empty()
+                || !statement.is_empty()
+                || parameters != 0
+                || formats != 0
+                || result_formats > 1
+                || binary
+            {
+                return Err(ProtocolError::unsupported(
+                    "only unnamed parameterless binds with text results are supported",
+                ));
+            }
+            return Ok(Frontend::Bind);
+        }
+        b'D' | b'C' => {
+            let target = f.take(1)?[0];
+            let name = f.string()?;
+            if !matches!(target, b'S' | b'P') {
+                return Err(ProtocolError::malformed());
+            }
+            f.finish()?;
+            if !name.is_empty() {
+                return Err(ProtocolError::unsupported(
+                    "named statements and portals are not supported",
+                ));
+            }
+            return Ok(if kind == b'D' {
+                Frontend::Describe(target)
+            } else {
+                Frontend::Close(target)
+            });
+        }
+        b'E' => {
+            let portal = f.string()?;
+            let max_rows = f.i32()?;
+            f.finish()?;
+            if max_rows < 0 {
+                return Err(ProtocolError::malformed());
+            }
+            if !portal.is_empty() || max_rows != 0 {
+                return Err(ProtocolError::unsupported(
+                    "named or suspended portals are not supported",
+                ));
+            }
+            return Ok(Frontend::Execute);
+        }
+        b'S' => Frontend::Sync,
+        b'H' => Frontend::Flush,
+        b'X' => Frontend::Terminate,
+        _ => return Err(ProtocolError::unsupported("unsupported protocol message")),
+    };
+    f.finish()?;
+    Ok(message)
+}
+
 async fn connection_loop<P: Platform>(
     platform: &P,
     stream: &mut BufStream<TcpStream>,
     identity: &Identity,
+    mode: ConnectionMode,
     session: &mut Option<Session>,
     prepared: &mut Option<String>,
 ) -> Result<()> {
@@ -279,125 +507,122 @@ async fn connection_loop<P: Platform>(
         AUTH_CHECK_INTERVAL,
     );
     auth_checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut bound = false;
     loop {
         let Some((kind, body)) =
-            read_authenticated(platform, stream, identity, &mut auth_checks).await?
+            read_authenticated(platform, stream, identity, mode, &mut auth_checks).await?
         else {
             return Ok(());
         };
-        match kind {
-            b'X' => return Ok(()),
-            b'Q' => {
-                let sql = String::from_utf8_lossy(body.split(|b| *b == 0).next().unwrap_or(&[]))
-                    .into_owned();
+        let message = match frontend(kind, &body) {
+            Ok(message) => message,
+            Err(error) => {
+                bound = false;
+                error_response(stream, error.code, error.message).await?;
+                if kind == b'X' {
+                    return Ok(());
+                }
+                if kind == b'Q' {
+                    ready(stream).await?;
+                } else {
+                    sync_to_ready(platform, stream, identity, mode, &mut auth_checks).await?;
+                }
+                continue;
+            }
+        };
+        match message {
+            Frontend::Terminate => return Ok(()),
+            Frontend::Query(sql) => {
+                *prepared = None;
+                bound = false;
                 if sql.trim().is_empty() {
                     write_message(stream, b'I', &[]).await?;
                 } else {
-                    run_statement(platform, stream, identity, session, &sql).await?;
+                    run_statement(platform, stream, identity, mode, session, sql).await?;
                 }
                 ready(stream).await?;
             }
-            b'P' => {
-                // Parse: name, query, parameter type count. Only the unnamed
-                // statement, only without parameters.
-                let mut parts = body.split(|b| *b == 0);
-                let name = parts.next().unwrap_or(&[]);
-                let query = String::from_utf8_lossy(parts.next().unwrap_or(&[])).into_owned();
-                if !name.is_empty() {
-                    error_response(
-                        stream,
-                        "0A000",
-                        "named prepared statements are not supported",
-                    )
-                    .await?;
-                    sync_to_ready(platform, stream, identity, &mut auth_checks).await?;
-                    continue;
-                }
-                *prepared = Some(query);
+            Frontend::Parse(sql) => {
+                *prepared = Some(sql.to_owned());
+                bound = false;
                 write_message(stream, b'1', &[]).await?;
             }
-            b'B' => {
-                // Bind: refuse actual parameters; a zero-parameter bind completes.
-                if bind_has_parameters(&body) {
-                    error_response(
-                        stream,
-                        "0A000",
-                        "bind parameters are not supported; interpolate client-side \
-                         as psql and psycopg2 do",
-                    )
-                    .await?;
-                    sync_to_ready(platform, stream, identity, &mut auth_checks).await?;
-                    continue;
-                }
-                write_message(stream, b'2', &[]).await?;
-            }
-            b'D' => {
-                // Describe: the row shape is only known after execution here, and
-                // NoData keeps simple drivers moving; the real RowDescription
-                // precedes the rows at Execute.
-                write_message(stream, b'n', &[]).await?;
-            }
-            b'E' => match prepared.take() {
-                Some(sql) if !sql.trim().is_empty() => {
-                    run_statement(platform, stream, identity, session, &sql).await?;
-                }
-                Some(_) => write_message(stream, b'I', &[]).await?,
-                None => {
+            Frontend::Bind => {
+                if prepared.is_none() {
                     error_response(stream, "26000", "no statement has been parsed").await?;
+                    sync_to_ready(platform, stream, identity, mode, &mut auth_checks).await?;
+                } else {
+                    bound = true;
+                    write_message(stream, b'2', &[]).await?;
                 }
-            },
-            b'S' => ready(stream).await?,
-            b'H' => flush(stream).await?,
-            b'd' | b'c' | b'f' => {
-                error_response(stream, "0A000", "COPY is not supported").await?;
+            }
+            Frontend::Describe(target) => {
+                if (target == b'S' && prepared.is_none()) || (target == b'P' && !bound) {
+                    error_response(stream, "26000", "no unnamed statement or portal exists")
+                        .await?;
+                    sync_to_ready(platform, stream, identity, mode, &mut auth_checks).await?;
+                } else {
+                    if target == b'S' {
+                        write_message(stream, b't', &0_i16.to_be_bytes()).await?;
+                    }
+                    // The actual result description precedes Execute's data rows.
+                    write_message(stream, b'n', &[]).await?;
+                }
+            }
+            Frontend::Execute => {
+                let ok = if !bound {
+                    error_response(stream, "26000", "no unnamed portal has been bound").await?;
+                    false
+                } else if let Some(sql) = prepared.as_deref() {
+                    if sql.trim().is_empty() {
+                        write_message(stream, b'I', &[]).await?;
+                        true
+                    } else {
+                        run_statement(platform, stream, identity, mode, session, sql).await?
+                    }
+                } else {
+                    false
+                };
+                bound = false;
+                if !ok {
+                    sync_to_ready(platform, stream, identity, mode, &mut auth_checks).await?;
+                }
+            }
+            Frontend::Close(target) => {
+                if target == b'S' {
+                    *prepared = None;
+                }
+                bound = false;
+                write_message(stream, b'3', &[]).await?;
+            }
+            Frontend::Sync => {
+                if let Err(error) = platform.revalidate(identity, mode).await {
+                    return refuse_access(stream, error).await;
+                }
                 ready(stream).await?;
             }
-            other => {
-                error_response(
-                    stream,
-                    "0A000",
-                    &format!("unsupported protocol message {:?}", other as char),
-                )
-                .await?;
-                ready(stream).await?;
-            }
+            Frontend::Flush => flush(stream).await?,
         }
     }
-}
-
-/// True when a Bind message carries any parameter values.
-fn bind_has_parameters(body: &[u8]) -> bool {
-    // portal name, statement name, then i16 format-code count and codes, then the
-    // i16 parameter count this cares about.
-    let mut cursor = 0;
-    for _ in 0..2 {
-        while cursor < body.len() && body[cursor] != 0 {
-            cursor += 1;
-        }
-        cursor += 1;
-    }
-    let formats = i16::from_be_bytes(match body.get(cursor..cursor + 2) {
-        Some(bytes) => bytes.try_into().unwrap_or([0, 0]),
-        None => return false,
-    });
-    cursor += 2 + usize::try_from(formats.max(0)).unwrap_or(0) * 2;
-    i16::from_be_bytes(match body.get(cursor..cursor + 2) {
-        Some(bytes) => bytes.try_into().unwrap_or([0, 0]),
-        None => return false,
-    }) > 0
 }
 
 async fn run_statement<P: Platform>(
     platform: &P,
     stream: &mut BufStream<TcpStream>,
     identity: &Identity,
+    mode: ConnectionMode,
     session: &mut Option<Session>,
     sql: &str,
-) -> Result<()> {
+) -> Result<bool> {
+    if mode == ConnectionMode::System {
+        // The system service owns admission and fresh authentication/policy/read
+        // in one deadline. A separate auth-lane preflight would double that budget.
+        return run_system_statement(platform, stream, identity, sql).await;
+    }
     // Validate at the statement boundary even if the next periodic check is not
     // due. In particular a successful handshake never authorizes a later lazy
     // session open after that same credential has been revoked.
-    if let Err(error) = platform.revalidate(identity).await {
+    if let Err(error) = platform.revalidate(identity, mode).await {
         return refuse_access(stream, error).await;
     }
     if session.is_none() {
@@ -413,13 +638,13 @@ async fn run_statement<P: Platform>(
                     &format!("could not open a session: {} [{}]", error.1, error.0.kind),
                 )
                 .await?;
-                return Ok(());
+                return Ok(false);
             }
         }
     }
     // Opening may wait for capacity. The credential must still be valid when
     // execution is about to begin, and the outer connection owns cleanup if not.
-    if let Err(error) = platform.revalidate(identity).await {
+    if let Err(error) = platform.revalidate(identity, mode).await {
         return refuse_access(stream, error).await;
     }
     let open = session.as_ref().expect("session was just opened");
@@ -434,7 +659,8 @@ async fn run_statement<P: Platform>(
         QueryOutcome::Rows(arrow) => {
             tokio::time::timeout(WRITE_TIMEOUT, write_arrow(stream, sql, &arrow))
                 .await
-                .context("pgwire result write timed out")?
+                .context("pgwire result write timed out")??;
+            Ok(true)
         }
         QueryOutcome::Refused { kind, message } => {
             let message =
@@ -450,7 +676,53 @@ async fn run_statement<P: Platform>(
                 .context("pgwire refusal write timed out")??;
                 bail!("pgwire statement access refused [{kind}]");
             }
-            error_response(stream, sqlstate(&kind), &format!("{message} [{kind}]")).await
+            error_response(stream, sqlstate(&kind), &format!("{message} [{kind}]")).await?;
+            Ok(false)
+        }
+    }
+}
+
+async fn run_system_statement<P: Platform>(
+    platform: &P,
+    stream: &mut BufStream<TcpStream>,
+    identity: &Identity,
+    sql: &str,
+) -> Result<bool> {
+    match platform
+        .query_system(identity, system_query::Request::sql(sql.to_owned()))
+        .await
+    {
+        Ok(result) => {
+            // The result owns its output permit until all bytes have been flushed,
+            // including the slow-peer path. No worker route or request notice exists.
+            tokio::time::timeout(WRITE_TIMEOUT, async {
+                write_arrow(stream, "SELECT", result.arrow()).await?;
+                flush(stream).await
+            })
+            .await
+            .context("pgwire system result write timed out")??;
+            drop(result);
+            Ok(true)
+        }
+        Err(error) => {
+            if matches!(
+                error.0.kind,
+                "unauthorized" | "unavailable" | "system_query_unavailable"
+            ) {
+                return refuse_access(stream, error).await;
+            }
+            if error.0.kind == "forbidden"
+                && let Err(access) = platform.revalidate(identity, ConnectionMode::System).await
+            {
+                return refuse_access(stream, access).await;
+            }
+            error_response(
+                stream,
+                sqlstate(error.0.kind),
+                &format!("{} [{}]", error.1, error.0.kind),
+            )
+            .await?;
+            Ok(false)
         }
     }
 }
@@ -459,6 +731,10 @@ async fn run_statement<P: Platform>(
 fn sqlstate(kind: &str) -> &'static str {
     match kind {
         "sql_error" => "42601",
+        "system_query_unsupported" => "0A000",
+        "system_query_too_wide" | "invalid_request" => "22023",
+        "system_query_timeout" => "57014",
+        "system_query_unavailable" => "57P01",
         "timeout" | "queue_timeout" | "canceled" | "budget_exceeded" => "57014",
         "unauthorized" => "28P01",
         "forbidden" => "42501",
@@ -540,7 +816,8 @@ fn type_oid(data_type: &DataType) -> i32 {
         DataType::Float64 => 701,
         DataType::Decimal128(..) => 1700,
         DataType::Date32 => 1082,
-        DataType::Timestamp(..) => 1114,
+        DataType::Timestamp(_, Some(_)) => 1184,
+        DataType::Timestamp(_, None) => 1114,
         _ => 25,
     }
 }
@@ -603,31 +880,31 @@ fn text_value(array: &dyn Array, row: usize) -> Result<Option<String>> {
             *scale,
         ),
         DataType::Date32 => format_date(array.as_primitive::<types::Date32Type>().value(row)),
-        DataType::Timestamp(unit, _) => {
+        DataType::Timestamp(unit, timezone) => {
             let raw = match unit {
-                TimeUnit::Second => {
-                    array
-                        .as_primitive::<types::TimestampSecondType>()
-                        .value(row)
-                        * 1_000_000
-                }
-                TimeUnit::Millisecond => {
-                    array
-                        .as_primitive::<types::TimestampMillisecondType>()
-                        .value(row)
-                        * 1_000
-                }
+                TimeUnit::Second => array
+                    .as_primitive::<types::TimestampSecondType>()
+                    .value(row)
+                    .checked_mul(1_000_000)
+                    .context("timestamp is out of range")?,
+                TimeUnit::Millisecond => array
+                    .as_primitive::<types::TimestampMillisecondType>()
+                    .value(row)
+                    .checked_mul(1_000)
+                    .context("timestamp is out of range")?,
                 TimeUnit::Microsecond => array
                     .as_primitive::<types::TimestampMicrosecondType>()
                     .value(row),
-                TimeUnit::Nanosecond => {
-                    array
-                        .as_primitive::<types::TimestampNanosecondType>()
-                        .value(row)
-                        / 1_000
-                }
+                TimeUnit::Nanosecond => array
+                    .as_primitive::<types::TimestampNanosecondType>()
+                    .value(row)
+                    .div_euclid(1_000),
             };
-            format_timestamp(raw)
+            let mut rendered = format_timestamp(raw);
+            if timezone.is_some() {
+                rendered.push_str("+00:00");
+            }
+            rendered
         }
         other => bail!("result type {other:?} has no wire rendering; cast to VARCHAR in SQL"),
     };
@@ -635,18 +912,21 @@ fn text_value(array: &dyn Array, row: usize) -> Result<Option<String>> {
 }
 
 fn format_decimal(raw: i128, scale: i8) -> String {
-    if scale <= 0 {
+    if scale == 0 {
         return raw.to_string();
     }
-    let factor = 10_u128.pow(u32::from(scale.unsigned_abs()));
+    if scale < 0 {
+        return format!("{raw}{}", "0".repeat(usize::from(scale.unsigned_abs())));
+    }
     let sign = if raw < 0 { "-" } else { "" };
-    let magnitude = raw.unsigned_abs();
-    format!(
-        "{sign}{}.{:0width$}",
-        magnitude / factor,
-        magnitude % factor,
-        width = scale.unsigned_abs() as usize
-    )
+    let magnitude = raw.unsigned_abs().to_string();
+    let scale = scale as usize;
+    if magnitude.len() <= scale {
+        format!("{sign}0.{}{magnitude}", "0".repeat(scale - magnitude.len()))
+    } else {
+        let (integer, fraction) = magnitude.split_at(magnitude.len() - scale);
+        format!("{sign}{integer}.{fraction}")
+    }
 }
 
 /// Civil date from days since the epoch — Howard Hinnant's algorithm, so dates
@@ -700,14 +980,23 @@ async fn sync_to_ready<P: Platform>(
     platform: &P,
     stream: &mut BufStream<TcpStream>,
     identity: &Identity,
+    mode: ConnectionMode,
     auth_checks: &mut tokio::time::Interval,
 ) -> Result<()> {
     loop {
-        let Some((kind, _)) = read_authenticated(platform, stream, identity, auth_checks).await?
+        let Some((kind, body)) =
+            read_authenticated(platform, stream, identity, mode, auth_checks).await?
         else {
             bail!("disconnected during error recovery");
         };
         if kind == b'S' {
+            if !body.is_empty() {
+                error_response(stream, "08P01", "malformed Sync message").await?;
+                bail!("malformed Sync message");
+            }
+            if let Err(error) = platform.revalidate(identity, mode).await {
+                return refuse_access(stream, error).await;
+            }
             return ready(stream).await;
         }
         if kind == b'X' {
@@ -723,16 +1012,22 @@ async fn read_authenticated<P: Platform>(
     platform: &P,
     stream: &mut BufStream<TcpStream>,
     identity: &Identity,
+    mode: ConnectionMode,
     checks: &mut tokio::time::Interval,
 ) -> Result<Option<(u8, Vec<u8>)>> {
     let denied = {
-        let message = read_message(stream);
+        let limit = if mode == ConnectionMode::System {
+            65_552
+        } else {
+            10_000_000
+        };
+        let message = read_message_limited(stream, limit);
         tokio::pin!(message);
         loop {
             tokio::select! {
                 biased;
                 _ = checks.tick() => {
-                    if let Err(error) = platform.revalidate(identity).await {
+                    if let Err(error) = platform.revalidate(identity, mode).await {
                         break error;
                     }
                 }
@@ -749,7 +1044,7 @@ async fn read_authenticated<P: Platform>(
 /// Report authentication refusal or backend failure with its actual SQLSTATE,
 /// then unwind through the session-close path. A peer not reading its socket
 /// cannot indefinitely delay that cleanup.
-async fn refuse_access(stream: &mut BufStream<TcpStream>, error: ApiError) -> Result<()> {
+async fn refuse_access<T>(stream: &mut BufStream<TcpStream>, error: ApiError) -> Result<T> {
     tokio::time::timeout(
         WRITE_TIMEOUT,
         error_response(
@@ -816,10 +1111,16 @@ async fn flush(stream: &mut BufStream<TcpStream>) -> Result<()> {
 }
 
 async fn read_message(stream: &mut BufStream<TcpStream>) -> Result<(u8, Vec<u8>)> {
+    read_message_limited(stream, 10_000_000).await
+}
+async fn read_message_limited(
+    stream: &mut BufStream<TcpStream>,
+    max_length: i32,
+) -> Result<(u8, Vec<u8>)> {
     let kind = stream.read_u8().await?;
     let length = stream.read_i32().await?;
     anyhow::ensure!(
-        (4..=10_000_000).contains(&length),
+        (4..=max_length).contains(&length),
         "malformed message length"
     );
     let mut body = vec![0; usize::try_from(length - 4)?];
@@ -847,12 +1148,29 @@ mod tests {
         request_ids: Mutex<Vec<Uuid>>,
         hold_open: bool,
         hold_query: bool,
+        system_queries: AtomicUsize,
+        modes: Mutex<Vec<ConnectionMode>>,
+        system_denied: AtomicU8,
+        metadata_only: bool,
+        system_arrow: Option<Vec<u8>>,
+        output_slots: Option<Arc<Semaphore>>,
         entered: Notify,
         resume: Notify,
     }
 
     impl Platform for TestPlatform {
-        async fn authenticate(&self, token: String) -> std::result::Result<Identity, ApiError> {
+        async fn authenticate(
+            &self,
+            token: String,
+            mode: ConnectionMode,
+        ) -> std::result::Result<Identity, ApiError> {
+            self.modes.lock().unwrap().push(mode);
+            if self.metadata_only && mode != ConnectionMode::System {
+                return Err(ApiError::new(
+                    crate::failure::FORBIDDEN,
+                    "no execution grant",
+                ));
+            }
             assert_eq!(token, "test-token");
             Ok(Identity {
                 kind: crate::credentials::ActorKind::Named,
@@ -862,7 +1180,18 @@ mod tests {
             })
         }
 
-        async fn revalidate(&self, identity: &Identity) -> std::result::Result<(), ApiError> {
+        async fn revalidate(
+            &self,
+            identity: &Identity,
+            mode: ConnectionMode,
+        ) -> std::result::Result<(), ApiError> {
+            self.modes.lock().unwrap().push(mode);
+            if self.metadata_only && mode != ConnectionMode::System {
+                return Err(ApiError::new(
+                    crate::failure::FORBIDDEN,
+                    "no execution grant",
+                ));
+            }
             assert_eq!(identity.credential_id.as_deref(), Some("test-credential"));
             self.checks.fetch_add(1, Ordering::SeqCst);
             match self.access.load(Ordering::SeqCst) {
@@ -870,6 +1199,10 @@ mod tests {
                 1 => Err(ApiError::new(
                     crate::failure::UNAUTHORIZED,
                     "credential revoked",
+                )),
+                3 => Err(ApiError::new(
+                    crate::failure::FORBIDDEN,
+                    "metadata access was removed",
                 )),
                 _ => Err(ApiError::new(
                     crate::failure::UNAVAILABLE,
@@ -919,6 +1252,30 @@ mod tests {
             QueryOutcome::Rows(bytes)
         }
 
+        async fn query_system(
+            &self,
+            identity: &Identity,
+            _request: system_query::Request,
+        ) -> std::result::Result<system_query::SystemResult, ApiError> {
+            self.revalidate(identity, ConnectionMode::System).await?;
+            self.system_queries.fetch_add(1, Ordering::SeqCst);
+            if self.system_denied.load(Ordering::SeqCst) != 0 {
+                return Err(ApiError::new(
+                    crate::failure::FORBIDDEN,
+                    "relation not permitted",
+                ));
+            }
+            let permit = self
+                .output_slots
+                .as_ref()
+                .map(|slots| slots.clone().try_acquire_owned().unwrap());
+            let arrow = self.system_arrow.clone().unwrap_or_else(empty_arrow);
+            self.entered.notify_one();
+            Ok(system_query::SystemResult::from_arrow_for_test(
+                arrow, permit,
+            ))
+        }
+
         async fn close_session(&self, _session: Session) {
             self.closed.fetch_add(1, Ordering::SeqCst);
         }
@@ -931,6 +1288,13 @@ mod tests {
     async fn test_connection(
         platform: Arc<TestPlatform>,
     ) -> (BufStream<TcpStream>, tokio::task::JoinHandle<Result<()>>) {
+        test_connection_mode(platform, "lake").await
+    }
+
+    async fn test_connection_mode(
+        platform: Arc<TestPlatform>,
+        database: &str,
+    ) -> (BufStream<TcpStream>, tokio::task::JoinHandle<Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -938,13 +1302,13 @@ mod tests {
         let (server, _) = listener.accept().await.unwrap();
         let task = tokio::spawn(connection(platform, server));
         let mut client = BufStream::new(client);
-        let startup = b"user\0test-user\0database\0lake\0\0";
+        let startup = format!("user\0test-user\0database\0{database}\0\0");
         client
             .write_i32(i32::try_from(startup.len() + 8).unwrap())
             .await
             .unwrap();
         client.write_i32(PROTOCOL_V3).await.unwrap();
-        client.write_all(startup).await.unwrap();
+        client.write_all(startup.as_bytes()).await.unwrap();
         flush(&mut client).await.unwrap();
         let (kind, body) = response(&mut client).await;
         assert_eq!((kind, body), (b'R', 3_i32.to_be_bytes().to_vec()));
@@ -1220,6 +1584,8 @@ mod tests {
         assert_eq!(format_decimal(-12345, 2), "-123.45");
         assert_eq!(format_decimal(5, 3), "0.005");
         assert_eq!(format_decimal(42, 0), "42");
+        assert_eq!(format_decimal(-42, -2), "-4200");
+        assert_eq!(format_decimal(-1, 38), format!("-0.{}1", "0".repeat(37)));
     }
 
     #[test]
@@ -1230,13 +1596,360 @@ mod tests {
         assert_eq!(sqlstate("forbidden"), "42501");
         assert_eq!(sqlstate("invented_later"), "XX000");
     }
+    fn empty_arrow() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut writer =
+            arrow_ipc::writer::StreamWriter::try_new(&mut bytes, &arrow_schema::Schema::empty())
+                .unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        bytes
+    }
+
+    fn batch_arrow(batch: &RecordBatch) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut writer =
+            arrow_ipc::writer::StreamWriter::try_new(&mut bytes, &batch.schema()).unwrap();
+        writer.write(batch).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        bytes
+    }
+
+    async fn messages_to_ready(client: &mut BufStream<TcpStream>) -> Vec<(u8, Vec<u8>)> {
+        let mut messages = Vec::new();
+        loop {
+            let (kind, body) = response(client).await;
+            assert_ne!(kind, b'E', "{}", String::from_utf8_lossy(&body));
+            messages.push((kind, body));
+            if kind == b'Z' {
+                return messages;
+            }
+        }
+    }
+
+    fn row_text(body: &[u8]) -> Vec<Option<String>> {
+        let mut fields = Fields(body);
+        let count = fields.count().unwrap();
+        let values = (0..count)
+            .map(|_| {
+                let len = fields.i32().unwrap();
+                if len == -1 {
+                    None
+                } else {
+                    Some(
+                        std::str::from_utf8(fields.take(len as usize).unwrap())
+                            .unwrap()
+                            .to_owned(),
+                    )
+                }
+            })
+            .collect();
+        fields.finish().unwrap();
+        values
+    }
 
     #[test]
-    fn a_bind_with_parameters_is_recognised() {
-        // portal "", statement "", zero format codes, one parameter.
-        let with = [0u8, 0, 0, 0, 0, 1];
-        assert!(bind_has_parameters(&with));
-        let without = [0u8, 0, 0, 0, 0, 0];
-        assert!(!bind_has_parameters(&without));
+    fn reserved_database_is_exact_and_other_aliases_stay_warehouse() {
+        for database in ["lake", "", "other", "Duckfleet_System", "duckfleet_system "] {
+            let packet = format!("user\0advisory\0database\0{database}\0\0");
+            assert_eq!(
+                startup_mode(packet.as_bytes()).unwrap(),
+                ("advisory".into(), ConnectionMode::Warehouse)
+            );
+        }
+        assert_eq!(
+            startup_mode(b"database\0duckfleet_system\0\0").unwrap().1,
+            ConnectionMode::System
+        );
+        assert_eq!(
+            startup_mode(b"user\0a\0\0").unwrap().1,
+            ConnectionMode::Warehouse
+        );
+        assert_eq!(
+            startup_mode(b"database\0duckfleet_system\0database\0lake\0\0")
+                .unwrap_err()
+                .code,
+            "08P01"
+        );
+        assert_eq!(
+            startup_mode(b"user\0a\0user\0b\0\0").unwrap_err().code,
+            "08P01"
+        );
+        for malformed in [
+            b"database\0duckfleet_system\0".as_slice(),
+            b"user\0a\0\0extra",
+            b"user\0\xff\0\0",
+        ] {
+            assert_eq!(startup_mode(malformed).unwrap_err().code, "08P01");
+        }
+    }
+
+    #[test]
+    fn extended_frames_are_complete_unnamed_parameterless_and_text_only() {
+        assert_eq!(
+            frontend(b'P', b"\0select 1\0\0\0").unwrap(),
+            Frontend::Parse("select 1")
+        );
+        assert_eq!(frontend(b'B', &[0; 8]).unwrap(), Frontend::Bind);
+        assert_eq!(frontend(b'E', &[0; 5]).unwrap(), Frontend::Execute);
+        assert_eq!(frontend(b'D', b"S\0").unwrap(), Frontend::Describe(b'S'));
+        for (kind, bytes) in [
+            (b'B', vec![0; 6]),
+            (b'B', vec![0, 0, 255, 255]),
+            (b'P', b"\0select 1\0".to_vec()),
+            (b'P', b"\0select 1\0\0\x01".to_vec()),
+            (b'E', vec![0; 4]),
+            (b'E', vec![0, 255, 255, 255, 255]),
+            (b'D', b"X\0".to_vec()),
+            (b'S', vec![0]),
+            (b'Q', b"select 1".to_vec()),
+            (b'Q', b"select 1\0ignored\0".to_vec()),
+        ] {
+            assert_eq!(
+                frontend(kind, &bytes).unwrap_err().code,
+                "08P01",
+                "{kind:?} {bytes:?}"
+            );
+        }
+        for (kind, bytes) in [
+            (b'P', b"named\0select 1\0\0\0".to_vec()),
+            (b'P', b"\0select $1\0\0\x01\0\0\0\x17".to_vec()),
+            (b'B', b"\0\0\0\0\0\x01\xff\xff\xff\xff\0\0".to_vec()),
+            (b'B', b"\0\0\0\0\0\0\0\x01\0\x01".to_vec()),
+            (b'B', b"portal\0\0\0\0\0\0\0\0".to_vec()),
+            (b'E', vec![0, 0, 0, 0, 1]),
+            (b'E', b"portal\0\0\0\0\0".to_vec()),
+        ] {
+            assert_eq!(
+                frontend(kind, &bytes).unwrap_err().code,
+                "0A000",
+                "{kind:?} {bytes:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_only_system_connection_has_typed_results_and_no_worker_or_notice() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("cost", DataType::Decimal128(38, 6), true),
+            arrow_schema::Field::new(
+                "at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    arrow_array::Decimal128Array::from(vec![
+                        Some(-12345678901234567890123456_i128),
+                        None,
+                    ])
+                    .with_precision_and_scale(38, 6)
+                    .unwrap(),
+                ),
+                Arc::new(
+                    arrow_array::TimestampMicrosecondArray::from(vec![Some(-1), None])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+        let platform = Arc::new(TestPlatform {
+            metadata_only: true,
+            system_arrow: Some(batch_arrow(&batch)),
+            ..Default::default()
+        });
+        let (mut client, task) = test_connection_mode(platform.clone(), "duckfleet_system").await;
+        statement(&mut client, "SHOW TABLES").await;
+        let messages = messages_to_ready(&mut client).await;
+        assert!(!messages.iter().any(|(kind, _)| *kind == b'N'));
+        assert_eq!(
+            messages.iter().find(|(kind, _)| *kind == b'C').unwrap().1,
+            b"SELECT 2\0"
+        );
+        let mut desc = Fields(&messages.iter().find(|(kind, _)| *kind == b'T').unwrap().1);
+        assert_eq!(desc.count().unwrap(), 2);
+        for (name, oid) in [("cost", 1700), ("at", 1184)] {
+            assert_eq!(desc.string().unwrap(), name);
+            desc.take(6).unwrap();
+            assert_eq!(desc.i32().unwrap(), oid);
+            desc.take(8).unwrap();
+        }
+        desc.finish().unwrap();
+        let rows: Vec<_> = messages
+            .iter()
+            .filter(|(kind, _)| *kind == b'D')
+            .map(|(_, body)| row_text(body))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Some("-12345678901234567890.123456".into()),
+                    Some("1969-12-31 23:59:59.999999+00:00".into())
+                ],
+                vec![None, None]
+            ]
+        );
+        write_message(&mut client, b'X', &[]).await.unwrap();
+        flush(&mut client).await.unwrap();
+        finished(task).await;
+        assert_eq!(platform.system_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(platform.opened.load(Ordering::SeqCst), 0);
+        assert_eq!(platform.closed.load(Ordering::SeqCst), 0);
+        assert!(platform.request_ids.lock().unwrap().is_empty());
+        assert!(platform.statements.lock().unwrap().is_empty());
+        assert!(
+            platform
+                .modes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|mode| *mode == ConnectionMode::System)
+        );
+    }
+
+    #[tokio::test]
+    async fn system_relation_denial_recovers_after_sync_without_executing_pipeline() {
+        let platform = Arc::new(TestPlatform {
+            metadata_only: true,
+            ..Default::default()
+        });
+        let (mut client, task) = test_connection_mode(platform.clone(), "duckfleet_system").await;
+        platform.system_denied.store(1, Ordering::SeqCst);
+        for (kind, body) in [
+            (b'P', b"\0select 1\0\0\0".as_slice()),
+            (b'B', &[0; 8]),
+            (b'E', &[0; 5]),
+            (b'E', &[0; 5]),
+            (b'S', &[]),
+        ] {
+            write_message(&mut client, kind, body).await.unwrap();
+        }
+        flush(&mut client).await.unwrap();
+        assert_eq!(response(&mut client).await.0, b'1');
+        assert_eq!(response(&mut client).await.0, b'2');
+        refusal(&mut client, "42501").await;
+        assert_eq!(response(&mut client).await, (b'Z', b"I".to_vec()));
+        assert_eq!(platform.system_queries.load(Ordering::SeqCst), 1);
+        platform.system_denied.store(0, Ordering::SeqCst);
+        statement(&mut client, "SHOW TABLES").await;
+        successful_response(&mut client).await;
+        assert_eq!(platform.system_queries.load(Ordering::SeqCst), 2);
+        platform.access.store(1, Ordering::SeqCst);
+        statement(&mut client, "SHOW TABLES").await;
+        refusal(&mut client, "28P01").await;
+        finished(task).await;
+        assert_eq!(platform.system_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(platform.opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_bind_never_reaches_system_service_and_sync_checks_current_identity() {
+        let platform = Arc::new(TestPlatform {
+            metadata_only: true,
+            ..Default::default()
+        });
+        let (mut client, task) = test_connection_mode(platform.clone(), "duckfleet_system").await;
+        write_message(&mut client, b'B', &[0; 6]).await.unwrap();
+        flush(&mut client).await.unwrap();
+        refusal(&mut client, "08P01").await;
+        platform.access.store(1, Ordering::SeqCst);
+        write_message(&mut client, b'S', &[]).await.unwrap();
+        flush(&mut client).await.unwrap();
+        refusal(&mut client, "28P01").await;
+        finished(task).await;
+        assert_eq!(platform.system_queries.load(Ordering::SeqCst), 0);
+        assert_eq!(platform.opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn system_policy_loss_and_auth_outage_close_without_worker_fallback() {
+        for (state, code) in [(3, "42501"), (2, "57P01")] {
+            let platform = Arc::new(TestPlatform {
+                metadata_only: true,
+                ..Default::default()
+            });
+            let (mut client, task) =
+                test_connection_mode(platform.clone(), "duckfleet_system").await;
+            platform.access.store(state, Ordering::SeqCst);
+            statement(&mut client, "SHOW TABLES").await;
+            refusal(&mut client, code).await;
+            finished(task).await;
+            assert_eq!(platform.system_queries.load(Ordering::SeqCst), 0);
+            assert_eq!(platform.opened.load(Ordering::SeqCst), 0);
+            assert_eq!(platform.closed.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn system_fragmented_reads_survive_checks_then_idle_revocation_closes_without_worker() {
+        let platform = Arc::new(TestPlatform {
+            metadata_only: true,
+            ..Default::default()
+        });
+        let (mut client, task) = test_connection_mode(platform.clone(), "duckfleet_system").await;
+        let body = b"SHOW TABLES\0";
+        client.write_u8(b'Q').await.unwrap();
+        client.write_i32((body.len() + 4) as i32).await.unwrap();
+        client.write_all(&body[..4]).await.unwrap();
+        flush(&mut client).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            while platform.checks.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        client.write_all(&body[4..]).await.unwrap();
+        flush(&mut client).await.unwrap();
+        successful_response(&mut client).await;
+        platform.access.store(1, Ordering::SeqCst);
+        refusal(&mut client, "28P01").await;
+        finished(task).await;
+        assert_eq!(platform.system_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(platform.opened.load(Ordering::SeqCst), 0);
+        assert_eq!(platform.closed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn system_result_permit_is_held_while_output_is_backpressured() {
+        let slots = Arc::new(Semaphore::new(1));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                "x".repeat(8 * 1024 * 1024),
+            ]))],
+        )
+        .unwrap();
+        let platform = Arc::new(TestPlatform {
+            metadata_only: true,
+            system_arrow: Some(batch_arrow(&batch)),
+            output_slots: Some(slots.clone()),
+            ..Default::default()
+        });
+        let (mut client, task) = test_connection_mode(platform.clone(), "duckfleet_system").await;
+        statement(&mut client, "SHOW TABLES").await;
+        tokio::time::timeout(Duration::from_secs(2), platform.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "output must retain its bounded service slot"
+        );
+        successful_response(&mut client).await;
+        assert_eq!(slots.available_permits(), 1);
+        write_message(&mut client, b'X', &[]).await.unwrap();
+        flush(&mut client).await.unwrap();
+        finished(task).await;
     }
 }

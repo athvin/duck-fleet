@@ -235,18 +235,21 @@ Do not use
 `suspended:true` for this flow: suspension also stops bundled PostgreSQL and removes
 the migration Job.
 
-After the stop succeeds, apply the desired schema 3 chart/image with a fresh
+After stopping compute, rerun administrator database provisioning. Schema 4 requires
+the gateway role to have a finite `temp_file_limit` of at most 16MB; the bundled
+provisioner sets 16MB, and an external database administrator must apply the same
+setting. The gateway cannot raise this setting. Then apply the schema 4 chart/image with a fresh
 `platformMigration.runId` and wait for migration/rollout; new compute cannot become
-usable before schema 3, its runtime grants, and its admission policy exist. For Compose, build/pull the
+usable before schema 4, its runtime grants, and its admission policy exist. For Compose, build/pull the
 desired image, run `scripts/migrate-platform.sh compose`, then explicitly start
 the desired services. Bare Helm/template-apply users must follow the same stop/apply
 sequence. Do not automatically roll back the binary after migration commits.
 
 Restore also uses this stop flow, restores both databases under their dedicated
 owners with backup ACLs discarded, runs a fresh migration and explicit
-`platform-grants` repair, and leaves compute stopped for explicit restart. A schema 1 or 2 backup is upgraded to 3
-by the current image. `migrate-platform.sh kube` requires the current schema 3 Job
-template; cloning an old schema 1/2 image cannot perform this upgrade. Apply the
+`platform-grants` repair, and leaves compute stopped for explicit restart. A schema 1, 2, or 3 backup is upgraded to 4
+by the current image. `migrate-platform.sh kube` requires the current schema 4 Job
+template; cloning an old schema 1/2/3 image cannot perform this upgrade. Apply the
 desired chart only after old compute has stopped. Same-image DB reset/retarget
 still requires a fresh Job/runId; prior completion does not prove the new database.
 
@@ -319,7 +322,7 @@ public/internal tokens, and set `postgres.bundled=false`, reviewed external CIDR
 and `databaseRoles` to your chosen names. External database deployments do not need
 the administrator or `DATABASE_*_PASSWORD` seed keys in their chart Secret. Apply
 the chart after provisioning; the migration installs explicit table/column grants
-in the same transaction as schema 3. Ordinary current-version migration remains
+in the same transaction as schema 4. Ordinary current-version migration remains
 read-only. For an intentional grant repair after restoring or changing role names:
 
 ```sh
