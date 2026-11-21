@@ -313,6 +313,21 @@ async fn protocol_checks(ctx: &Ctx, connection: &RemoteConnection) -> anyhow::Re
         "SQL error poisoned session",
     )?;
 
+    // This value previously changed by one bit in JSON decoding, before SQL.
+    // Exercise both gateway and worker decoding plus Arrow response encoding.
+    let expected = 0.0012033694344163659_f64;
+    let precise = connection
+        .execute("select ?::double", vec![json!(expected)])
+        .await?;
+    let actual = precise.rows[0][0]
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("double parameter unexpectedly returned NULL"))?
+        .parse::<f64>()?;
+    require(
+        actual.to_bits() == expected.to_bits(),
+        "HTTP/Arrow round-trip changed a double parameter",
+    )?;
+
     // Typed round-trip: assert on the stringified cells the gateway returns.
     let typed = connection
         .execute(
