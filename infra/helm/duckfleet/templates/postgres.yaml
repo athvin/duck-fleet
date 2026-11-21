@@ -18,9 +18,12 @@ kind: ConfigMap
 metadata:
   name: duckfleet-postgres-init
 data:
-  init.sql: |
-    CREATE DATABASE lake;
-    CREATE DATABASE platform;
+  init.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    psql -X -q -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres --file /etc/duckfleet/provision-database.sql
+  provision-database.sql: |
+{{ .Files.Get "files/provision-database.sql" | indent 4 }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -55,6 +58,7 @@ spec:
           env:
             - {name: POSTGRES_USER, value: duckfleet}
             - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            {{- include "duckfleet.databaseProvisionEnvironment" . | nindent 12 }}
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef: {name: {{ .Values.secretName }}, key: POSTGRES_PASSWORD}
@@ -63,11 +67,18 @@ spec:
           volumeMounts:
             - {name: data, mountPath: /var/lib/postgresql/data}
             - {name: init, mountPath: /docker-entrypoint-initdb.d}
+            - {name: provisioning, mountPath: /etc/duckfleet, readOnly: true}
             - {name: run, mountPath: /var/run/postgresql}
             - {name: tmp, mountPath: /tmp}
       volumes:
         - name: init
-          configMap: {name: duckfleet-postgres-init}
+          configMap:
+            name: duckfleet-postgres-init
+            items: [{key: init.sh, path: init.sh}]
+        - name: provisioning
+          configMap:
+            name: duckfleet-postgres-init
+            items: [{key: provision-database.sql, path: provision-database.sql}]
         - name: run
           emptyDir: {}
         - name: tmp

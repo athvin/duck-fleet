@@ -1,8 +1,9 @@
 //! Pins each session to one configured worker. It never retries or reroutes SQL.
 use crate::{
     ApiError,
+    authz::{self, Action, TrustedOperation},
     compute::{ForwardedSessionRequest, Mode, Placement, Resources, SessionRequest},
-    credentials::{self, Identity},
+    credentials::{self, ActorKind, Identity},
     failure,
     isolated::Isolation,
     pools::PoolRegistry,
@@ -43,15 +44,18 @@ enum Cleanup {
 struct Route {
     endpoint: String,
     touched: Instant,
-    /// Who opened this session. Session IDs appear in history, which every
-    /// credential can read, so possession of an ID proves nothing — only the
-    /// opener (or the bootstrap) may run, cancel, or close the session.
-    principal: Arc<str>,
+    /// Immutable workload ownership; observation grants never transfer a session.
+    owner_id: Option<String>,
+    placement: Placement,
+    operation: TrustedOperation,
     /// The last authorized request may rotate credentials without changing owner.
     identity: Identity,
     active: Arc<AtomicUsize>,
     closing: bool,
     cleanup: Option<Cleanup>,
+    /// Keep the authorizing user on explicit-close retries; never promote a
+    /// lost acknowledgement into an internal-service privilege.
+    close_identity: Option<Identity>,
     /// The session pod to remove when this route goes away, for an isolated session.
     /// `None` for a persistent worker, which outlives every session it serves.
     pod: Option<String>,
@@ -175,37 +179,6 @@ fn observed_at() -> u64 {
             .as_millis(),
     )
     .unwrap_or(u64::MAX)
-}
-
-/// Who a request authenticated as, attached by `authenticate` so handlers read a
-/// fact the middleware established rather than re-deriving it.
-#[derive(Clone)]
-enum Principal {
-    /// The environment token: the operator's bootstrap credential, and the only
-    /// principal allowed to manage credentials.
-    Bootstrap,
-    Named(Arc<str>),
-}
-impl Principal {
-    fn from_identity(identity: &Identity) -> Self {
-        if identity.is_bootstrap() {
-            Self::Bootstrap
-        } else {
-            Self::Named(identity.principal.clone().into())
-        }
-    }
-    fn name(&self) -> &str {
-        match self {
-            Self::Bootstrap => credentials::BOOTSTRAP_PRINCIPAL,
-            Self::Named(name) => name,
-        }
-    }
-    /// Whether this caller may act on a session `owner` opened. The bootstrap may
-    /// act on anyone's — it is the operator, and cancelling a runaway statement is
-    /// its job — while a named principal is confined to its own.
-    fn may_act_on(&self, owner: &str) -> bool {
-        matches!(self, Self::Bootstrap) || self.name() == owner
-    }
 }
 
 #[derive(Default)]
@@ -404,7 +377,14 @@ fn authenticated_request(
     request: reqwest::RequestBuilder,
     identity: &Identity,
 ) -> reqwest::RequestBuilder {
-    let request = request.header(credentials::PRINCIPAL_HEADER, &identity.principal);
+    let kind = match identity.kind {
+        ActorKind::Named => "named",
+        ActorKind::Bootstrap => "bootstrap",
+        ActorKind::Internal => "internal",
+    };
+    let request = request
+        .header(credentials::PRINCIPAL_HEADER, &identity.principal)
+        .header(credentials::ACTOR_KIND_HEADER, kind);
     match &identity.credential_id {
         Some(id) => request.header(credentials::CREDENTIAL_HEADER, id),
         None => request,
@@ -428,9 +408,6 @@ async fn authenticate(
     };
     match authn.authenticate(&token).await {
         Ok(identity) => {
-            request
-                .extensions_mut()
-                .insert(Principal::from_identity(&identity));
             request.extensions_mut().insert(identity);
             next.run(request).await
         }
@@ -476,6 +453,10 @@ struct Gateway {
     /// gateway has no engine slot to watch, so this count is its notion of busy.
     inflight: Arc<AtomicUsize>,
     authn: Arc<Authn>,
+    /// Pure routing fixtures inject a resolved policy; production always reads
+    /// the current database policy and persists external-operation audits.
+    #[cfg(test)]
+    resolved_access: Option<authz::Access>,
 }
 
 /// Counts a request in on construction and out on `Drop`.
@@ -537,6 +518,194 @@ impl Gateway {
                 .map_err(|_| ApiError::internal())?;
             operation(&mut db)
         }).await.map_err(|_| ApiError::internal())?
+    }
+
+    async fn authorize_action(
+        &self,
+        identity: &Identity,
+        action: Action,
+        owner: Option<String>,
+    ) -> Result<authz::Access, ApiError> {
+        #[cfg(test)]
+        if let Some(access) = &self.resolved_access {
+            access.require(action, owner.as_deref())?;
+            return Ok(access.clone());
+        }
+        let identity = identity.clone();
+        self.control_db(move |db| authz::authorize_action(db, &identity, action, owner.as_deref()))
+            .await
+    }
+
+    async fn authorize_execution(
+        &self,
+        identity: &Identity,
+        owner: &str,
+        placement: &Placement,
+        operation: &TrustedOperation,
+    ) -> Result<authz::Access, ApiError> {
+        #[cfg(test)]
+        if let Some(access) = &self.resolved_access {
+            access.require_execution(
+                access.actor.principal_id.as_deref(),
+                &serde_json::to_value(placement).map_err(|_| ApiError::internal())?,
+                operation,
+            )?;
+            return Ok(access.clone());
+        }
+        let identity = identity.clone();
+        let owner = owner.to_owned();
+        let compute = serde_json::to_value(placement).map_err(|_| ApiError::internal())?;
+        let operation = operation.clone();
+        self.control_db(move |db| {
+            authz::authorize_execution(db, &identity, &owner, &compute, &operation)
+        })
+        .await
+    }
+
+    async fn authorize_owned_execution(
+        &self,
+        identity: &Identity,
+        owner: Option<String>,
+        placement: &Placement,
+        operation: &TrustedOperation,
+    ) -> Result<authz::Access, ApiError> {
+        let compute = serde_json::to_value(placement).map_err(|_| ApiError::internal())?;
+        #[cfg(test)]
+        if let Some(access) = &self.resolved_access {
+            access.require_execution(owner.as_deref(), &compute, operation)?;
+            return Ok(access.clone());
+        }
+        let identity = identity.clone();
+        let operation = operation.clone();
+        self.control_db(move |db| {
+            authz::authorize_execution_for_owner(
+                db,
+                &identity,
+                owner.as_deref(),
+                &compute,
+                &operation,
+            )
+        })
+        .await
+    }
+
+    async fn start_execution_operation(
+        &self,
+        identity: &Identity,
+        placement: &Placement,
+        operation: &TrustedOperation,
+        correlation: Uuid,
+    ) -> Result<authz::Access, ApiError> {
+        #[cfg(test)]
+        if self.resolved_access.is_some() {
+            return self
+                .authorize_execution(identity, &identity.principal, placement, operation)
+                .await;
+        }
+        let identity = identity.clone();
+        let compute = serde_json::to_value(placement).map_err(|_| ApiError::internal())?;
+        let operation = operation.clone();
+        self.control_db(move |db| {
+            let mut tx = db.transaction().map_err(|_| ApiError::internal())?;
+            authz::bounded(&mut tx).map_err(|_| ApiError::internal())?;
+            authz::lock_actor_in(&mut tx, &identity)?;
+            let access = authz::resolve_in(&mut tx, &identity)?;
+            let allowed = access.require_execution(
+                access.actor.principal_id.as_deref(),
+                &compute,
+                &operation,
+            );
+            crate::audit::append_in(
+                &mut tx,
+                &crate::audit::Event::new(
+                    &access,
+                    operation.action(),
+                    "session",
+                    Some(&correlation.to_string()),
+                    if allowed.is_ok() { "started" } else { "denied" },
+                    "session_open",
+                    Some(&correlation.to_string()),
+                ),
+            )
+            .map_err(|_| ApiError::internal())?;
+            tx.commit().map_err(|_| ApiError::internal())?;
+            allowed?;
+            Ok(access)
+        })
+        .await
+    }
+
+    async fn start_action_operation(
+        &self,
+        identity: &Identity,
+        action: Action,
+        target: &'static str,
+        correlation: Uuid,
+    ) -> Result<authz::Access, ApiError> {
+        #[cfg(test)]
+        if self.resolved_access.is_some() {
+            return self.authorize_action(identity, action, None).await;
+        }
+        let identity = identity.clone();
+        self.control_db(move |db| {
+            let mut tx = db.transaction().map_err(|_| ApiError::internal())?;
+            authz::bounded(&mut tx).map_err(|_| ApiError::internal())?;
+            authz::lock_actor_in(&mut tx, &identity)?;
+            let access = authz::resolve_in(&mut tx, &identity)?;
+            let allowed = access.require(action, None);
+            crate::audit::append_in(
+                &mut tx,
+                &crate::audit::Event::new(
+                    &access,
+                    action,
+                    "operation",
+                    Some(target),
+                    if allowed.is_ok() { "started" } else { "denied" },
+                    "operation_authorization",
+                    Some(&correlation.to_string()),
+                ),
+            )
+            .map_err(|_| ApiError::internal())?;
+            tx.commit().map_err(|_| ApiError::internal())?;
+            allowed?;
+            Ok(access)
+        })
+        .await
+    }
+
+    async fn audit_outcome(
+        &self,
+        access: authz::Access,
+        action: Action,
+        target: &'static str,
+        correlation: Uuid,
+        succeeded: Option<bool>,
+    ) {
+        #[cfg(test)]
+        if self.resolved_access.is_some() {
+            return;
+        }
+        if let Err(error) = self
+            .control_db(move |db| {
+                crate::audit::append(
+                    db,
+                    &access,
+                    action,
+                    target,
+                    match succeeded {
+                        Some(true) => "succeeded",
+                        Some(false) => "failed",
+                        None => "unknown",
+                    },
+                    "operation_outcome",
+                    Some(&correlation.to_string()),
+                )
+                .map_err(|_| ApiError::internal())
+            })
+            .await
+        {
+            tracing::error!(%correlation, kind=error.0.kind, "operation outcome audit was not confirmed; start event remains authoritative");
+        }
     }
 
     async fn publish_policy(&self, registry: &PoolRegistry) -> Result<(), ApiError> {
@@ -774,19 +943,25 @@ impl Gateway {
         placement: &Placement,
         body: Vec<u8>,
         identity: &Identity,
+        operation: &TrustedOperation,
         open_span: Uuid,
     ) -> Result<OpenOutcome, ApiError> {
         let candidates = self.endpoints_for(registry, placement).await?;
         let total = candidates.len();
         for (position, endpoint) in candidates.into_iter().enumerate() {
             let last = position + 1 == total;
-            self.authn.revalidate(identity).await?;
+            self.authorize_execution(identity, &identity.principal, placement, operation)
+                .await?;
             let request = self
                 .client
                 .request(Method::POST, format!("{endpoint}/v1/sessions"))
                 .bearer_auth(&self.token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-duckfleet-open-span-id", open_span.to_string())
+                .header(
+                    "x-duckfleet-operation",
+                    serde_json::to_string(operation).map_err(|_| ApiError::internal())?,
+                )
                 .body(body.clone());
             let upstream = match authenticated_request(request, identity).send().await {
                 Ok(upstream) => upstream,
@@ -862,8 +1037,15 @@ impl Gateway {
         body: Bytes,
         identity: &Identity,
     ) -> Result<reqwest::Response, ApiError> {
-        self.send_as_protocol(endpoint, method, path, body, identity, Protocol::Http)
-            .await
+        self.send_as_protocol(
+            endpoint,
+            method,
+            path,
+            body,
+            identity,
+            (Protocol::Http, &TrustedOperation::Sql),
+        )
+        .await
     }
 
     async fn send_as_protocol(
@@ -873,8 +1055,9 @@ impl Gateway {
         path: &str,
         body: Bytes,
         identity: &Identity,
-        protocol: Protocol,
+        execution: (Protocol, &TrustedOperation),
     ) -> Result<reqwest::Response, ApiError> {
+        let (protocol, operation) = execution;
         // Middleware ran before body extraction and route/provisioning waits.
         // Recheck here; the worker also checks at dequeue, before any SQL runs.
         self.authn.revalidate(identity).await?;
@@ -884,6 +1067,10 @@ impl Gateway {
                 .bearer_auth(&self.token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-duckfleet-protocol", protocol.name())
+                .header(
+                    "x-duckfleet-operation",
+                    serde_json::to_string(operation).map_err(|_| ApiError::internal())?,
+                )
                 .body(body),
             identity,
         )
@@ -891,20 +1078,24 @@ impl Gateway {
         .await
         .map_err(|_| ApiError::internal())
     }
-    async fn route(&self, id: Uuid, caller: &Principal) -> Result<String, ApiError> {
+    async fn route(
+        &self,
+        id: Uuid,
+        identity: &Identity,
+        action: Action,
+    ) -> Result<String, ApiError> {
+        let owner = self
+            .routes
+            .lock()
+            .await
+            .get(&id)
+            .map(|route| route.owner_id.clone())
+            .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
+        self.authorize_action(identity, action, owner).await?;
         let mut routes = self.routes.lock().await;
         let route = routes
             .get_mut(&id)
             .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
-        // A 403 rather than a masked 404: the caller is a colleague, not an
-        // adversary, and naming the refusal is this API's idiom. Checked before the
-        // touch so a probing caller cannot keep someone else's session alive.
-        if !caller.may_act_on(&route.principal) {
-            return Err(ApiError::new(
-                failure::FORBIDDEN,
-                "this session belongs to another principal",
-            ));
-        }
         route.touched = Instant::now();
         Ok(route.endpoint.clone())
     }
@@ -914,18 +1105,27 @@ impl Gateway {
         id: Uuid,
         identity: &Identity,
     ) -> Result<(String, InFlight), ApiError> {
-        self.authn.revalidate(identity).await?;
+        let (owner, placement, operation) = self
+            .routes
+            .lock()
+            .await
+            .get(&id)
+            .filter(|route| !route.closing || route.cleanup.is_some())
+            .map(|route| {
+                (
+                    route.owner_id.clone(),
+                    route.placement.clone(),
+                    route.operation.clone(),
+                )
+            })
+            .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
+        self.authorize_owned_execution(identity, owner, &placement, &operation)
+            .await?;
         let mut routes = self.routes.lock().await;
         let route = routes
             .get_mut(&id)
             .filter(|route| !route.closing || route.cleanup.is_some())
             .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown or expired session"))?;
-        if !Principal::from_identity(identity).may_act_on(&route.principal) {
-            return Err(ApiError::new(
-                failure::FORBIDDEN,
-                "this session belongs to another principal",
-            ));
-        }
         route.touched = Instant::now();
         Ok((route.endpoint.clone(), InFlight::enter(&route.active)))
     }
@@ -935,6 +1135,7 @@ impl Gateway {
         id: Uuid,
         endpoint: &str,
         cleanup: Option<&Cleanup>,
+        identity: Option<&Identity>,
     ) -> Result<(StatusCode, Value), ApiError> {
         let mut request = self
             .client
@@ -953,14 +1154,17 @@ impl Gateway {
             }
             None => {}
         }
+        if let Some(identity) = identity {
+            request = authenticated_request(request, identity);
+        }
         let response = request.send().await.map_err(|_| ApiError::internal())?;
         let status = response.status();
         let value = response.json().await.map_err(|_| ApiError::internal())?;
         Ok((status, value))
     }
 
-    /// Retire a route only after the worker acknowledges the close. Pair the
-    /// cached increment on open with a decrement so rapid session churn cannot
+    /// Retire a route only after a close acknowledgment or durable closed marker.
+    /// Pair the cached increment on open with a decrement so session churn cannot
     /// exhaust the sampled capacity while the worker itself is idle.
     async fn retire_route(&self, id: Uuid) -> Option<String> {
         let route = self.routes.lock().await.remove(&id)?;
@@ -986,9 +1190,10 @@ impl Gateway {
             };
             route.closing = true;
             route.cleanup = None;
+            route.close_identity = None;
             route.endpoint.clone()
         };
-        if let Ok((status, value)) = self.close_backend(id, &endpoint, None).await
+        if let Ok((status, value)) = self.close_backend(id, &endpoint, None, None).await
             && status.is_success()
             && value["closed"] == true
         {
@@ -997,9 +1202,51 @@ impl Gateway {
         }
     }
 
+    /// A worker closes revoked-policy sessions independently. Reclaim the route
+    /// only after its durable closed marker proves the connection ended; a policy
+    /// denial snapshot or an unreachable worker is never proof of closure.
+    async fn reap_closed_routes(&self) {
+        #[cfg(test)]
+        if self.resolved_access.is_some() {
+            return;
+        }
+        let candidates: Vec<_> = self
+            .routes
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, route)| route.active.load(Ordering::Acquire) == 0)
+            .map(|(id, _)| id.to_string())
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let closed = self.control_db(move |db| {
+            db.query("SELECT session_id FROM queue_sessions WHERE session_id=ANY($1) AND closed_at IS NOT NULL ORDER BY closed_at,session_id LIMIT 64", &[&candidates])
+                .map(|rows| rows.iter().filter_map(|r| Uuid::parse_str(r.get::<_,&str>(0)).ok()).collect::<Vec<_>>())
+                .map_err(|_| ApiError::internal())
+        }).await;
+        let Ok(closed) = closed else {
+            return;
+        };
+        let mut pods = Vec::new();
+        for id in closed {
+            if let Some(pod) = self.retire_route(id).await {
+                pods.push(pod);
+            }
+        }
+        // Deletion retries already use the bounded retired-pod lane. Record all
+        // confirmed closed pods, then let that lane handle a small batch per tick.
+        let mut retired = self.retired_pods.lock().await;
+        for pod in pods {
+            retired.entry(pod).or_insert_with(Instant::now);
+        }
+    }
+
     /// Periodic, independent of new client traffic. Close on the worker before
     /// deleting an isolated pod, so cleanup never interrupts accepted active SQL.
     async fn expire(&self) {
+        self.reap_closed_routes().await;
         let candidates: Vec<_> = self
             .routes
             .lock()
@@ -1046,15 +1293,23 @@ impl Gateway {
                         });
                     }
                     route.closing = true;
-                    retire.push((id, route.endpoint.clone(), route.cleanup.clone()));
+                    retire.push((
+                        id,
+                        route.endpoint.clone(),
+                        route.cleanup.clone(),
+                        route.close_identity.clone(),
+                    ));
                 }
             }
         }
         let mut closes = tokio::task::JoinSet::new();
-        for (id, endpoint, reason) in retire {
+        for (id, endpoint, reason, identity) in retire {
             let app = self.clone();
             closes.spawn(async move {
-                match app.close_backend(id, &endpoint, reason.as_ref()).await {
+                match app
+                    .close_backend(id, &endpoint, reason.as_ref(), identity.as_ref())
+                    .await
+                {
                     Ok((status, value)) if status.is_success() && value["closed"] == true => {
                         let pod = app.retire_route(id).await;
                         tokio::spawn(async move { app.release(pod).await });
@@ -1069,6 +1324,19 @@ impl Gateway {
                         {
                             route.closing = false;
                             route.cleanup = None;
+                            route.close_identity = None;
+                        }
+                    }
+                    Ok((StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, _)) => {
+                        // The user lost authority before close was accepted.
+                        // Drop only that same intent, leaving ordinary expiry and
+                        // a newly authorized explicit request available.
+                        if let Some(route) = app.routes.lock().await.get_mut(&id)
+                            && route.close_identity == identity
+                            && identity.is_some()
+                        {
+                            route.closing = false;
+                            route.close_identity = None;
                         }
                     }
                     _ => {} // Keep the same conditional intent for the next pass.
@@ -1168,6 +1436,16 @@ impl Gateway {
         request: SessionRequest,
         identity: &Identity,
     ) -> Result<SessionOutcome, ApiError> {
+        self.open_operation(request, identity, TrustedOperation::Sql)
+            .await
+    }
+
+    async fn open_operation(
+        &self,
+        request: SessionRequest,
+        identity: &Identity,
+        operation: TrustedOperation,
+    ) -> Result<SessionOutcome, ApiError> {
         if self.draining.load(Ordering::Acquire) {
             return Err(draining_refusal());
         }
@@ -1176,7 +1454,13 @@ impl Gateway {
         // if the operator reloads the registry while this open is awaiting a worker.
         let registry = self.registry();
         let placement = registry.resolve(&request.compute)?;
+        self.authorize_execution(identity, &identity.principal, &placement, &operation)
+            .await?;
         let open_span = Uuid::new_v4();
+        let access = self
+            .start_execution_operation(identity, &placement, &operation, open_span)
+            .await?;
+        let action = operation.action();
         let principal = identity.principal.clone();
         let scope = placement
             .pool
@@ -1194,7 +1478,7 @@ impl Gateway {
             tracing::warn!(%open_span, kind=error.0.kind, "could not persist session open start; gateway timing remains unavailable");
         }
         let result = self
-            .open_resolved(request, identity, registry, placement, open_span)
+            .open_resolved(request, identity, registry, placement, operation, open_span)
             .await;
         let session_id = match &result {
             Ok(SessionOutcome::Opened { id, .. }) => Some(*id),
@@ -1207,6 +1491,13 @@ impl Gateway {
             }
             Err(error) => Some(error.0.kind.to_owned()),
         };
+        let audit_result = match &result {
+            Ok(SessionOutcome::Opened { .. }) => Some(true),
+            Ok(SessionOutcome::Refused(_)) => Some(false),
+            Err(_) => None,
+        };
+        self.audit_outcome(access, action, "session_open", open_span, audit_result)
+            .await;
         let elapsed_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
         if let Err(error) = self
             .control_db(move |db| {
@@ -1226,11 +1517,14 @@ impl Gateway {
         identity: &Identity,
         registry: Arc<PoolRegistry>,
         placement: Placement,
+        operation: TrustedOperation,
         open_span: Uuid,
     ) -> Result<SessionOutcome, ApiError> {
         // Body extraction may have outlived authentication. Refuse before spending
         // resources on isolated provisioning, then check again before worker open.
-        self.authn.revalidate(identity).await?;
+        let access = self
+            .authorize_execution(identity, &identity.principal, &placement, &operation)
+            .await?;
         let permit = self
             .capacity
             .clone()
@@ -1252,7 +1546,7 @@ impl Gateway {
         let (endpoint, pod, upstream) = match placement.mode {
             Mode::Persistent => {
                 match self
-                    .open_persistent(&registry, &placement, body, identity, open_span)
+                    .open_persistent(&registry, &placement, body, identity, &operation, open_span)
                     .await?
                 {
                     OpenOutcome::Opened { endpoint, upstream } => (endpoint, None, upstream),
@@ -1270,7 +1564,10 @@ impl Gateway {
                 // says why it refused, and replacing that with a gateway error would
                 // lose the only useful detail.
                 let pod = Some(started.name);
-                if let Err(error) = self.authn.revalidate(identity).await {
+                if let Err(error) = self
+                    .authorize_execution(identity, &identity.principal, &placement, &operation)
+                    .await
+                {
                     self.release(pod).await;
                     return Err(error);
                 }
@@ -1280,6 +1577,10 @@ impl Gateway {
                     .bearer_auth(&self.token)
                     .header(header::CONTENT_TYPE, "application/json")
                     .header("x-duckfleet-open-span-id", open_span.to_string())
+                    .header(
+                        "x-duckfleet-operation",
+                        serde_json::to_string(&operation).map_err(|_| ApiError::internal())?,
+                    )
                     .body(body);
                 let upstream = match authenticated_request(open_request, identity)
                     .send()
@@ -1316,11 +1617,14 @@ impl Gateway {
             Route {
                 endpoint: endpoint.clone(),
                 touched: Instant::now(),
-                principal: identity.principal.clone().into(),
+                owner_id: access.actor.principal_id,
+                placement,
+                operation,
                 identity: identity.clone(),
                 active: Arc::new(AtomicUsize::new(0)),
                 closing: false,
                 cleanup: None,
+                close_identity: None,
                 pod,
                 _permit: permit,
             },
@@ -1420,16 +1724,17 @@ async fn request_cancel(
 
 async fn cancel(
     State(app): State<Gateway>,
-    Extension(principal): Extension<Principal>,
+    Extension(identity): Extension<Identity>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let endpoint = app.route(id, &principal).await?;
+    let endpoint = app.route(id, &identity, Action::QueryCancel).await?;
     response(
-        app.send(
+        app.send_as(
             &endpoint,
             Method::POST,
             &format!("/v1/sessions/{id}/cancel"),
             Bytes::new(),
+            &identity,
         )
         .await?,
     )
@@ -1437,16 +1742,26 @@ async fn cancel(
 }
 async fn close(
     State(app): State<Gateway>,
-    Extension(principal): Extension<Principal>,
+    Extension(identity): Extension<Identity>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let endpoint = app.route(id, &principal).await?;
+    let endpoint = app.route(id, &identity, Action::SessionClose).await?;
     if let Some(route) = app.routes.lock().await.get_mut(&id) {
         route.closing = true;
         route.cleanup = None;
+        route.close_identity = Some(identity.clone());
     }
-    let (status, value) = app.close_backend(id, &endpoint, None).await?;
-    if status.is_success() && value["closed"] == true {
+    let (status, value) = app
+        .close_backend(id, &endpoint, None, Some(&identity))
+        .await?;
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        if let Some(route) = app.routes.lock().await.get_mut(&id)
+            && route.close_identity.as_ref() == Some(&identity)
+        {
+            route.closing = false;
+            route.close_identity = None;
+        }
+    } else if status.is_success() && value["closed"] == true {
         let pod = app.retire_route(id).await;
         app.release(pod).await;
     }
@@ -1455,45 +1770,44 @@ async fn close(
 
 async fn history(
     State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
     Query(filter): Query<crate::history::Filter>,
 ) -> Result<Json<Value>, ApiError> {
-    app.history.list(filter).await.map(Json)
+    app.history.list(identity, filter).await.map(Json)
 }
 async fn query_detail(
     State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    app.history.detail(id).await.map(Json)
+    app.history.detail(identity, id).await.map(Json)
 }
 async fn request_detail(
     State(app): State<Gateway>,
     Extension(identity): Extension<Identity>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    let bootstrap = identity.is_bootstrap();
-    app.requests
-        .detail(id, identity.principal, bootstrap)
-        .await
-        .map(Json)
+    app.requests.detail(identity, id).await.map(Json)
 }
 async fn usage_events(
     State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
     Query(filter): Query<crate::usage::Filter>,
 ) -> Result<Json<Value>, ApiError> {
-    app.usage.events(filter).await.map(Json)
+    app.usage.events(identity, filter).await.map(Json)
 }
-async fn budget(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
-    app.usage.budget().await.map(Json)
+async fn budget(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Json<Value>, ApiError> {
+    app.usage.budget(identity).await.map(Json)
 }
 async fn set_budget(
     State(app): State<Gateway>,
-    Extension(principal): Extension<Principal>,
+    Extension(identity): Extension<Identity>,
     Json(update): Json<crate::usage::BudgetUpdate>,
 ) -> Result<Json<Value>, ApiError> {
-    // Reading the balance stays open to every credential — it is how a caller
-    // sizes a request — but the ceiling belongs to whoever answers for the bill.
-    admin_only(&principal, "set budget limits")?;
-    app.usage.set_budget(update).await.map(Json)
+    app.usage.set_budget(identity, update).await.map(Json)
 }
 /// Runs one platform-owned statement through the ordinary execution machinery: a
 /// session on a default-size worker, the statement, a close. Deliberately not a
@@ -1503,14 +1817,16 @@ async fn set_budget(
 async fn platform_statement(
     app: &Gateway,
     identity: &Identity,
-    operation: &str,
-    sql: String,
+    operation: TrustedOperation,
 ) -> Result<Response, ApiError> {
-    let request = SessionRequest {
-        context: json!({"operation": operation}),
-        ..SessionRequest::default()
-    };
-    let (endpoint, session) = match app.open_session(request, identity).await? {
+    let sql = operation
+        .canonical_sql()
+        .ok_or_else(|| ApiError::bad("expected a fixed platform operation"))?;
+    let request = SessionRequest::default();
+    let (endpoint, session) = match app
+        .open_operation(request, identity, operation.clone())
+        .await?
+    {
         SessionOutcome::Opened { endpoint, id, .. } => (endpoint, id),
         SessionOutcome::Refused(response) => return Ok(response),
     };
@@ -1521,43 +1837,65 @@ async fn platform_statement(
             return Err(error);
         }
     };
+    let request_id = Uuid::new_v4();
+    let access = match app
+        .start_action_operation(
+            identity,
+            operation.action(),
+            "platform_statement",
+            request_id,
+        )
+        .await
+    {
+        Ok(access) => access,
+        Err(error) => {
+            drop(guard);
+            app.close_internal(session).await;
+            return Err(error);
+        }
+    };
     let result = app
         .send_as_protocol(
             &endpoint,
             Method::POST,
             &format!("/v1/sessions/{session}/queries"),
             json!({
-                "request_id": Uuid::new_v4(),
+                "request_id": request_id,
                 "sql": sql,
                 "timeout_seconds": 60,
-                "context": {"operation": operation},
             })
             .to_string()
             .into(),
             identity,
-            Protocol::Platform,
+            (Protocol::Platform, &operation),
         )
         .await;
     drop(guard);
     app.close_internal(session).await;
-    response(result?).await
+    let result = match result {
+        Ok(upstream) => response(upstream).await,
+        Err(error) => Err(error),
+    };
+    let outcome = result
+        .as_ref()
+        .ok()
+        .map(|reply| reply.status().is_success());
+    app.audit_outcome(
+        access,
+        operation.action(),
+        "platform_statement",
+        request_id,
+        outcome,
+    )
+    .await;
+    result
 }
 
-/// Snapshots of the lake, as the engine reports them. Readable by any principal:
-/// listing destroys nothing and is how a caller decides what expiry would cost.
 async fn lake_snapshots(
     State(app): State<Gateway>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Response, ApiError> {
-    platform_statement(
-        &app,
-        &identity,
-        "lake_snapshots",
-        "SELECT snapshot_id, snapshot_time, schema_version, changes \
-         FROM ducklake_snapshots('lake') ORDER BY snapshot_id"
-            .to_owned(),
-    )
-    .await
+    platform_statement(&app, &identity, TrustedOperation::LakeSnapshots).await
 }
 
 /// The gateway as the pgwire front sees it: authenticate a credential, run
@@ -1571,7 +1909,19 @@ impl crate::pgwire::Platform for PgPlatform {
     }
 
     async fn revalidate(&self, identity: &Identity) -> Result<(), ApiError> {
-        self.0.authn.revalidate(identity).await
+        let placement = self
+            .0
+            .registry()
+            .resolve(&SessionRequest::default().compute)?;
+        self.0
+            .authorize_execution(
+                identity,
+                &identity.principal,
+                &placement,
+                &TrustedOperation::Sql,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn open_session(&self, identity: &Identity) -> Result<crate::pgwire::Session, ApiError> {
@@ -1644,7 +1994,7 @@ impl crate::pgwire::Platform for PgPlatform {
                 .to_string()
                 .into(),
                 identity,
-                Protocol::Pgwire,
+                (Protocol::Pgwire, &TrustedOperation::Sql),
             )
             .await;
         let upstream = match sent {
@@ -1703,16 +2053,13 @@ struct MaintenanceRequest {
     cleanup: bool,
 }
 
-/// Lake maintenance, bootstrap-only: expiry forfeits time travel and cleanup
-/// deletes files, which is the operator's call — a named principal keeping the
-/// lake tidy should be handed the statements, not the lever.
+/// Fixed operations are independently authorized; supplied context cannot turn
+/// arbitrary SQL into maintenance.
 async fn lake_maintenance(
     State(app): State<Gateway>,
-    Extension(principal): Extension<Principal>,
     Extension(identity): Extension<Identity>,
     Json(request): Json<MaintenanceRequest>,
 ) -> Result<Response, ApiError> {
-    admin_only(&principal, "run lake maintenance")?;
     if request.expire_older_than_days.is_none() && !request.compact && !request.cleanup {
         return Err(ApiError::bad(
             "ask for at least one of expire_older_than_days, compact, or cleanup",
@@ -1724,26 +2071,16 @@ async fn lake_maintenance(
     {
         return Err(ApiError::bad("expire_older_than_days must be at most 3650"));
     }
-    // Built from validated integers and booleans only — nothing caller-supplied
-    // reaches the SQL as text.
-    let mut statements = Vec::new();
-    if let Some(days) = request.expire_older_than_days {
-        statements.push(format!(
-            "CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL '{days} days')"
-        ));
-    }
-    if request.compact {
-        statements.push("CALL ducklake_merge_adjacent_files('lake')".to_owned());
-    }
-    if request.cleanup {
-        statements.push(match request.expire_older_than_days {
-            Some(days) if days > 0 => format!(
-                "CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL '{days} days')"
-            ),
-            _ => "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)".to_owned(),
-        });
-    }
-    platform_statement(&app, &identity, "lake_maintenance", statements.join(";\n")).await
+    platform_statement(
+        &app,
+        &identity,
+        TrustedOperation::LakeMaintenance {
+            expire_older_than_days: request.expire_older_than_days,
+            compact: request.compact,
+            cleanup: request.cleanup,
+        },
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1754,28 +2091,13 @@ struct MintRequest {
     expires_seconds: Option<i64>,
 }
 
-/// Operator-only actions. Credential management because a named credential that
-/// could mint could quietly become every principal at once; budget writes because a
-/// spend ceiling writable by the spenders it constrains is not a control; lake
-/// maintenance because expiry and cleanup destroy what they tidy.
-fn admin_only(principal: &Principal, what: &str) -> Result<(), ApiError> {
-    match principal {
-        Principal::Bootstrap => Ok(()),
-        Principal::Named(_) => Err(ApiError::new(
-            failure::FORBIDDEN,
-            format!("only the bootstrap credential may {what}"),
-        )),
-    }
-}
-
 /// Issues a credential. The token in the response is the only time it exists in
 /// plaintext anywhere the caller can reach — the database holds its digest.
 async fn mint_credential(
     State(app): State<Gateway>,
-    Extension(principal): Extension<Principal>,
+    Extension(identity): Extension<Identity>,
     Json(request): Json<MintRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    admin_only(&principal, "manage credentials")?;
     // Validated here so a bad request is the caller's 400, not a swallowed
     // internal error from the issuing transaction.
     if !credentials::valid_principal(&request.principal) {
@@ -1788,9 +2110,13 @@ async fn mint_credential(
         return Err(ApiError::bad("expires_seconds must be at least 1"));
     }
     let issued = app
-        .authn
-        .with_db(true, move |client| {
-            credentials::issue(client, &request.principal, request.expires_seconds)
+        .control_db(move |client| {
+            credentials::issue_authorized(
+                client,
+                &identity,
+                &request.principal,
+                request.expires_seconds,
+            )
         })
         .await?;
     Ok(Json(json!({
@@ -1802,23 +2128,23 @@ async fn mint_credential(
 
 async fn list_credentials(
     State(app): State<Gateway>,
-    Extension(principal): Extension<Principal>,
+    Extension(identity): Extension<Identity>,
+    Query(filter): Query<ListFilter>,
 ) -> Result<Json<Value>, ApiError> {
-    admin_only(&principal, "manage credentials")?;
-    Ok(Json(app.authn.with_db(false, credentials::list).await?))
+    app.control_db(move |client| {
+        credentials::list_authorized(client, &identity, filter.limit, filter.after.as_deref())
+    })
+    .await
+    .map(Json)
 }
 
 async fn revoke_credential(
     State(app): State<Gateway>,
-    Extension(principal): Extension<Principal>,
+    Extension(identity): Extension<Identity>,
     Path(credential_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    admin_only(&principal, "manage credentials")?;
     let revoked = app
-        .authn
-        .with_db(true, move |client| {
-            credentials::revoke(client, &credential_id)
-        })
+        .control_db(move |client| credentials::revoke_authorized(client, &identity, &credential_id))
         .await?;
     if !revoked {
         return Err(ApiError::new(
@@ -1831,6 +2157,81 @@ async fn revoke_credential(
     // instead of after the cache window.
     app.authn.cache.lock().await.invalidate();
     Ok(Json(json!({"revoked": true})))
+}
+
+async fn list_principals(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+    Query(filter): Query<ListFilter>,
+) -> Result<Json<Value>, ApiError> {
+    app.control_db(move |client| {
+        authz::list_principals(client, &identity, filter.limit, filter.after.as_deref())
+    })
+    .await
+    .map(Json)
+}
+
+async fn get_policy(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+    Path(principal): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    app.control_db(move |client| authz::get_policy(client, &identity, &principal))
+        .await
+        .map(Json)
+}
+
+async fn set_policy(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+    Path(principal): Path<String>,
+    Json(policy): Json<authz::PolicyUpdate>,
+) -> Result<Json<Value>, ApiError> {
+    let updated = app
+        .control_db(move |client| authz::set_policy(client, &identity, &principal, &policy))
+        .await?;
+    app.authn.cache.lock().await.invalidate();
+    Ok(Json(updated))
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AuditFilter {
+    limit: i64,
+    before: Option<String>,
+}
+impl Default for AuditFilter {
+    fn default() -> Self {
+        Self {
+            limit: 100,
+            before: None,
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ListFilter {
+    limit: i64,
+    after: Option<String>,
+}
+impl Default for ListFilter {
+    fn default() -> Self {
+        Self {
+            limit: 100,
+            after: None,
+        }
+    }
+}
+async fn audit_events(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+    Query(filter): Query<AuditFilter>,
+) -> Result<Json<Value>, ApiError> {
+    app.control_db(move |client| {
+        crate::audit::list(client, &identity, filter.limit, filter.before.as_deref())
+    })
+    .await
+    .map(Json)
 }
 
 /// Wraps every `/v1` route so the drain can see work in flight.
@@ -1867,7 +2268,12 @@ async fn health(State(app): State<Gateway>) -> Response {
     Json(json!({"status": "ok", "role": "gateway"})).into_response()
 }
 
-async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
+async fn workers(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Json<Value>, ApiError> {
+    app.authorize_action(&identity, Action::FleetRead, None)
+        .await?;
     let registry = app.registry();
     let fleet = app.fleet_snapshot(&registry).await;
     Ok(Json(json!({
@@ -1879,7 +2285,12 @@ async fn workers(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
     })))
 }
 
-async fn pool_discovery(State(app): State<Gateway>) -> Result<Json<Value>, ApiError> {
+async fn pool_discovery(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Json<Value>, ApiError> {
+    app.authorize_action(&identity, Action::FleetRead, None)
+        .await?;
     let registry = app.registry();
     let fleet = app.fleet_snapshot(&registry).await;
     // Cleanup can outlive a registry entry. Count every retained closing route,
@@ -1931,24 +2342,21 @@ async fn reload_pools(
     State(app): State<Gateway>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Json<Value>, ApiError> {
-    admin_only(
-        &Principal::from_identity(&identity),
-        "reload persistent pools",
-    )?;
-    app.authn.revalidate(&identity).await?;
+    app.authorize_action(&identity, Action::FleetManage, None)
+        .await?;
     // Keep serialization and the registry swap alive with the database write if
     // the HTTP caller disappears. A dropped waiter must not release the guard
     // while its blocking PostgreSQL publication can still commit.
     let inflight = InFlight::enter(&app.inflight);
     tokio::spawn(async move {
         let _inflight = inflight;
-        reload_pool_registry(app).await
+        reload_pool_registry(app, identity).await
     })
     .await
     .map_err(|_| ApiError::internal())?
 }
 
-async fn reload_pool_registry(app: Gateway) -> Result<Json<Value>, ApiError> {
+async fn reload_pool_registry(app: Gateway, identity: Identity) -> Result<Json<Value>, ApiError> {
     let _publication_guard = app
         .publishing
         .clone()
@@ -1970,12 +2378,34 @@ async fn reload_pool_registry(app: Gateway) -> Result<Json<Value>, ApiError> {
     .map_err(|_| {
         ApiError::bad("invalid or unavailable pool configuration; previous registry retained")
     })?;
-    app.publish_policy(&candidate).await?;
+    let correlation = Uuid::new_v4();
+    let access = app
+        .start_action_operation(&identity, Action::FleetManage, "pool_reload", correlation)
+        .await?;
+    if let Err(error) = app.publish_policy(&candidate).await {
+        app.audit_outcome(
+            access,
+            Action::FleetManage,
+            "pool_reload",
+            correlation,
+            None,
+        )
+        .await;
+        return Err(error);
+    }
     let revision = candidate.revision.clone();
     *app.pools.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(candidate);
     // Existing routes retain their endpoint and session. A concurrent open retains
     // its complete old snapshot; a fleet cache also carries its registry revision.
     *app.fleet.lock().await = None;
+    app.audit_outcome(
+        access,
+        Action::FleetManage,
+        "pool_reload",
+        correlation,
+        Some(true),
+    )
+    .await;
     Ok(Json(json!({"reloaded": true, "revision": revision})))
 }
 
@@ -1983,11 +2413,24 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
     let (registry, pools_file) = PoolRegistry::load()?;
     let max_sessions = crate::configured_limit("DUCKFLEET_GATEWAY_MAX_SESSIONS", 64, 4096)?;
     let platform_dsn = std::env::var("PLATFORM_DSN")?;
+    let maintenance_dsn = std::env::var("DUCKFLEET_MAINTENANCE_DSN").map_err(|_| {
+        anyhow::anyhow!("DUCKFLEET_MAINTENANCE_DSN must name the separate maintainer database role")
+    })?;
     let maintenance_config = crate::platform::MaintenanceConfig::from_env()?;
     let schema_wait = crate::platform::schema_wait()?;
     let schema_dsn = platform_dsn.clone();
+    let maintenance_schema_dsn = maintenance_dsn.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        drop(crate::platform::wait_schema(&schema_dsn, schema_wait)?);
+        let mut db = crate::platform::wait_schema(&schema_dsn, schema_wait)?;
+        crate::db_roles::validate_runtime(&mut db, crate::db_roles::RuntimeRole::Gateway)?;
+        authz::validate_namespace(&mut db)?;
+        let mut maintenance_db =
+            crate::platform::wait_schema(&maintenance_schema_dsn, schema_wait)?;
+        crate::db_roles::validate_runtime(
+            &mut maintenance_db,
+            crate::db_roles::RuntimeRole::Maintainer,
+        )?;
+        authz::validate_namespace(&mut maintenance_db)?;
         Ok(())
     })
     .await??;
@@ -2014,13 +2457,23 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             }
         },
     };
-    let token: Arc<str> = token.into();
+    let bootstrap: Arc<str> = token.into();
+    let internal = std::env::var("DUCKFLEET_INTERNAL_TOKEN").map_err(|_| {
+        anyhow::anyhow!(
+            "DUCKFLEET_INTERNAL_TOKEN must be separate from the public bootstrap credential"
+        )
+    })?;
+    anyhow::ensure!(
+        !internal.is_empty() && !credentials::tokens_match(&internal, &bootstrap),
+        "DUCKFLEET_INTERNAL_TOKEN must be nonempty and different from DUCKFLEET_TOKEN"
+    );
+    let token: Arc<str> = internal.into();
     let app = Gateway {
         client: Client::builder()
             .timeout(Duration::from_secs(75))
             .retry(reqwest::retry::never())
             .build()?,
-        authn: Authn::new(token.clone(), std::env::var("PLATFORM_DSN")?),
+        authn: Authn::new(bootstrap, platform_dsn.clone()),
         token,
         pools: Arc::new(RwLock::new(Arc::new(registry))),
         pools_file: pools_file.map(Arc::new),
@@ -2043,6 +2496,8 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         rate: crate::pricing::RateCard::from_env()?,
         draining: Arc::new(AtomicBool::new(false)),
         inflight: Arc::new(AtomicUsize::new(0)),
+        #[cfg(test)]
+        resolved_access: None,
     };
     app.publish_policy(&app.registry())
         .await
@@ -2087,6 +2542,12 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/workers", get(workers))
         .route("/v1/pools", get(pool_discovery))
         .route("/v1/pools/reload", post(reload_pools))
+        .route("/v1/principals", get(list_principals))
+        .route(
+            "/v1/principals/{principal}/policy",
+            get(get_policy).put(set_policy),
+        )
+        .route("/v1/audit", get(audit_events))
         .route(
             "/v1/credentials",
             get(list_credentials).post(mint_credential),
@@ -2131,7 +2592,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .merge(api)
         .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(app);
-    let maintenance = crate::platform::spawn_maintenance(platform_dsn, maintenance_config);
+    let maintenance = crate::platform::spawn_maintenance(maintenance_dsn, maintenance_config);
     tracing::info!("DuckFleet gateway ready");
     let served = axum::serve(tokio::net::TcpListener::bind("0.0.0.0:8080").await?, router)
         .with_graceful_shutdown(async move {
@@ -2167,6 +2628,7 @@ mod tests {
         closes: Arc<AtomicUsize>,
         close_status: Arc<Mutex<StatusCode>>,
         close_ack: Arc<AtomicBool>,
+        close_actors: Arc<Mutex<Vec<Value>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -2183,6 +2645,8 @@ mod tests {
         let closes = Arc::new(AtomicUsize::new(0));
         let close_status = Arc::new(Mutex::new(StatusCode::OK));
         let close_ack = Arc::new(AtomicBool::new(true));
+        let close_actors = Arc::new(Mutex::new(Vec::new()));
+        let handler_close_actors = close_actors.clone();
         let handler_close_ack = close_ack.clone();
         let handler_reply = reply.clone();
         let handler_requests = requests.clone();
@@ -2218,12 +2682,18 @@ mod tests {
             )
             .route(
                 "/v1/sessions/{id}",
-                axum::routing::delete(move || {
+                axum::routing::delete(move |headers: axum::http::HeaderMap| {
+                    let actors = handler_close_actors.clone();
                     let closes = handler_closes.clone();
                     let status = handler_close_status.clone();
                     let ack = handler_close_ack.clone();
                     async move {
                         closes.fetch_add(1, Ordering::SeqCst);
+                        actors.lock().await.push(json!({
+                            "kind": headers.get(credentials::ACTOR_KIND_HEADER).and_then(|v|v.to_str().ok()),
+                            "principal": headers.get(credentials::PRINCIPAL_HEADER).and_then(|v|v.to_str().ok()),
+                            "credential_id": headers.get(credentials::CREDENTIAL_HEADER).and_then(|v|v.to_str().ok()),
+                        }));
                         (*status.lock().await, Json(json!({"closed":ack.load(Ordering::Acquire),"authority_changed":!ack.load(Ordering::Acquire)})))
                     }
                 }),
@@ -2241,6 +2711,7 @@ mod tests {
             closes,
             close_status,
             close_ack,
+            close_actors,
             task,
         }
     }
@@ -2269,6 +2740,7 @@ mod tests {
         let token: Arc<str> = "test-gateway-token".into();
         let dsn = "host=unused";
         Gateway {
+            resolved_access: Some(authz::Access::bootstrap_for_test()),
             client: Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(75))
@@ -2399,7 +2871,7 @@ mod tests {
         );
         let response = close(
             State(app.clone()),
-            Extension(Principal::from_identity(&identity)),
+            Extension(identity.clone()),
             Path(ids[1]),
         )
         .await
@@ -2432,7 +2904,7 @@ mod tests {
         let pg = PgPlatform(app.clone());
         let refused = pg.open_session(&identity).await.err().unwrap();
         assert_eq!(refused.0.kind, "capacity");
-        let refused = platform_statement(&app, &identity, "fixture", "SELECT 1".into())
+        let refused = platform_statement(&app, &identity, TrustedOperation::LakeSnapshots)
             .await
             .unwrap_err();
         assert_eq!(refused.0.kind, "capacity");
@@ -2450,7 +2922,7 @@ mod tests {
         assert_eq!(app.routes.lock().await.len(), 1);
         pg.close_session(session).await;
         assert_eq!(app.capacity.available_permits(), 1);
-        let response = platform_statement(&app, &identity, "fixture", "SELECT 1".into())
+        let response = platform_statement(&app, &identity, TrustedOperation::LakeSnapshots)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2482,7 +2954,15 @@ mod tests {
             "cpu":1,"memory":"1Gi","disk":"2Gi","endpoints":[second.endpoint],"max_sessions_per_worker":32
         }}});
         std::fs::write(&path, candidate.to_string()).unwrap();
-        let denied = reload_pools(State(app.clone()), Extension(issued_identity()))
+        let named_identity = issued_identity();
+        let mut denied_app = app.clone();
+        let mut no_grants = authz::Access::bootstrap_for_test();
+        no_grants.actor.kind = ActorKind::Named;
+        no_grants.actor.principal = named_identity.principal.clone();
+        no_grants.actor.principal_id = Some(Uuid::new_v4().to_string());
+        no_grants.actor.credential_id = named_identity.credential_id.clone();
+        denied_app.resolved_access = Some(no_grants);
+        let denied = reload_pools(State(denied_app), Extension(named_identity))
             .await
             .unwrap_err();
         assert_eq!(denied.0.kind, "forbidden");
@@ -2583,6 +3063,7 @@ mod tests {
 
     fn issued_identity() -> Identity {
         Identity {
+            kind: ActorKind::Named,
             principal: "analyst".into(),
             credential_id: Some(Uuid::new_v4().to_string()),
             expires_at: Some(SystemTime::now() + Duration::from_secs(300)),
@@ -2674,6 +3155,7 @@ mod tests {
             .json(&json!({"context": {"principal": "bootstrap-admin", "credential_id": "forged"}})), &identity)
             .build().unwrap();
         assert_eq!(request.headers()[credentials::PRINCIPAL_HEADER], "analyst");
+        assert_eq!(request.headers()[credentials::ACTOR_KIND_HEADER], "named");
         assert_eq!(
             request.headers()[credentials::CREDENTIAL_HEADER],
             identity.credential_id.unwrap()
@@ -2702,12 +3184,18 @@ mod tests {
             id,
             Route {
                 endpoint,
-                principal: identity.principal.clone().into(),
+                owner_id: None,
+                placement: app
+                    .registry()
+                    .resolve(&SessionRequest::default().compute)
+                    .unwrap(),
+                operation: TrustedOperation::Sql,
                 identity,
                 touched,
                 active: Arc::new(AtomicUsize::new(0)),
                 closing: false,
                 cleanup: None,
+                close_identity: None,
                 pod: None,
                 _permit: app.capacity.clone().try_acquire_owned().unwrap(),
             },
@@ -2729,7 +3217,7 @@ mod tests {
         *server.close_status.lock().await = StatusCode::SERVICE_UNAVAILABLE;
         let result = close(
             State(app.clone()),
-            Extension(Principal::Bootstrap),
+            Extension(Identity::bootstrap()),
             Path(id),
         )
         .await
@@ -2742,6 +3230,37 @@ mod tests {
         *server.close_status.lock().await = StatusCode::OK;
         app.expire().await;
         assert_eq!(app.capacity.available_permits(), 64);
+    }
+
+    #[tokio::test]
+    async fn explicit_close_retries_preserve_the_authenticated_actor() {
+        let server = status_server(status("ready")).await;
+        let app = test_gateway(vec![server.endpoint.clone()]);
+        let actor = issued_identity();
+        let id =
+            insert_test_route(&app, server.endpoint.clone(), actor.clone(), Instant::now()).await;
+        *server.close_status.lock().await = StatusCode::SERVICE_UNAVAILABLE;
+        let result = close(State(app.clone()), Extension(actor.clone()), Path(id))
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            app.routes.lock().await[&id].close_identity,
+            Some(actor.clone())
+        );
+        *server.close_status.lock().await = StatusCode::OK;
+        app.expire().await;
+        let actors = server.close_actors.lock().await;
+        assert_eq!(actors.len(), 2);
+        for forwarded in actors.iter() {
+            assert_eq!(forwarded["kind"], "named");
+            assert_eq!(forwarded["principal"], actor.principal);
+            assert_eq!(
+                forwarded["credential_id"],
+                actor.credential_id.as_deref().unwrap()
+            );
+        }
+        assert!(!app.routes.lock().await.contains_key(&id));
     }
 
     #[tokio::test]
@@ -2849,7 +3368,9 @@ mod tests {
         app.close_internal(first).await;
         app.close_internal(second).await;
         assert_eq!(app.capacity.available_permits(), 61);
-        let Json(pending) = pool_discovery(State(app.clone())).await.unwrap();
+        let Json(pending) = pool_discovery(State(app.clone()), Extension(Identity::bootstrap()))
+            .await
+            .unwrap();
         assert_eq!(pending["pools"][0]["configured_workers"], 0);
         assert_eq!(pending["gateway_open_sessions"], 3);
         assert_eq!(pending["gateway_closing_sessions"], 2);
@@ -2866,7 +3387,9 @@ mod tests {
         assert!(!app.routes.lock().await.contains_key(&first));
         assert!(!app.routes.lock().await.contains_key(&second));
         assert!(app.routes.lock().await.contains_key(&active));
-        let Json(cleaned) = pool_discovery(State(app.clone())).await.unwrap();
+        let Json(cleaned) = pool_discovery(State(app.clone()), Extension(Identity::bootstrap()))
+            .await
+            .unwrap();
         assert_eq!(cleaned["gateway_open_sessions"], 1);
         assert_eq!(cleaned["gateway_closing_sessions"], 0);
         assert_eq!(cleaned["gateway_closing_endpoints"], json!({}));
@@ -2904,7 +3427,9 @@ mod tests {
 
         failing.reply.lock().await.0 = StatusCode::SERVICE_UNAVAILABLE;
         *app.fleet.lock().await = None;
-        let Json(report) = workers(State(app.clone())).await.unwrap();
+        let Json(report) = workers(State(app.clone()), Extension(Identity::bootstrap()))
+            .await
+            .unwrap();
         assert_eq!(report["workers"].as_array().unwrap().len(), 2);
         assert_eq!(report["workers"][0]["state"], "ready");
         let unavailable = &report["workers"][1];
@@ -3071,6 +3596,7 @@ mod tests {
                     &placement(Resources::default()),
                     b"{}".to_vec(),
                     &Identity::bootstrap(),
+                    &TrustedOperation::Sql,
                     Uuid::new_v4(),
                 )
                 .await
@@ -3098,7 +3624,9 @@ mod tests {
         assert_eq!(first.opens.load(Ordering::SeqCst), 2);
         assert_eq!(second.opens.load(Ordering::SeqCst), 2);
         assert_eq!(failed.opens.load(Ordering::SeqCst), 0);
-        let Json(report) = workers(State(app)).await.unwrap();
+        let Json(report) = workers(State(app), Extension(Identity::bootstrap()))
+            .await
+            .unwrap();
         // Local tie-breaker adjustments must not pretend to be worker samples.
         assert_eq!(report["workers"], json!(initial.reported));
     }
@@ -3230,18 +3758,6 @@ mod tests {
     }
 
     #[test]
-    fn only_the_bootstrap_may_manage_credentials() {
-        assert!(admin_only(&Principal::Bootstrap, "manage credentials").is_ok());
-        let refused =
-            admin_only(&Principal::Named("analyst".into()), "set budget limits").unwrap_err();
-        assert_eq!(refused.0.kind, "forbidden");
-        assert!(!refused.0.retry_safe);
-        assert_eq!(refused.0.http, StatusCode::FORBIDDEN);
-        // The refusal names the action, so a caller knows which lever was refused.
-        assert!(refused.1.contains("set budget limits"), "{}", refused.1);
-    }
-
-    #[test]
     fn failover_is_earned_only_by_a_worker_condition_that_ran_nothing() {
         // The three conditions that are about the worker, not the request.
         for kind in ["capacity", "draining", "starting"] {
@@ -3327,19 +3843,6 @@ mod tests {
         workers[0].ready = false;
         workers[1].ready = false;
         assert!(ranked_endpoints(&workers, small, "small", &endpoints, 32, false).is_empty());
-    }
-
-    #[test]
-    fn a_session_answers_only_to_its_owner_and_the_bootstrap() {
-        let owner = Principal::Named("analyst".into());
-        let intruder = Principal::Named("intruder".into());
-        assert!(owner.may_act_on("analyst"));
-        assert!(!intruder.may_act_on("analyst"));
-        // The operator can cancel or close anyone's runaway session.
-        assert!(Principal::Bootstrap.may_act_on("analyst"));
-        // And nobody impersonates the bootstrap by name: minting refuses the name,
-        // so a route owned by it can only have been opened with the real token.
-        assert!(!owner.may_act_on(credentials::BOOTSTRAP_PRINCIPAL));
     }
 
     #[test]

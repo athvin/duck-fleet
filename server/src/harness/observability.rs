@@ -215,6 +215,7 @@ async fn wait_worker(
 /// both worker and fleet status keep responding. A queued query is counted too.
 pub(super) async fn worker_status(ctx: &Ctx) -> anyhow::Result<()> {
     let client = ctx.client()?;
+    let internal_token = ctx.internal_test_token()?;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let baseline = fleet(&client).await?;
     let mut session = ctx.open_named("worker-status", None).await?;
@@ -228,12 +229,18 @@ pub(super) async fn worker_status(ctx: &Ctx) -> anyhow::Result<()> {
     let endpoint = worker(&baseline, &id)?["endpoint"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("worker has no endpoint"))?;
-    let direct = Client::new(endpoint, &ctx.token)?;
+    let direct = Client::new(endpoint, &internal_token)?;
     // A session allows one outstanding accepted query. Open the second real
     // connection before occupying the serial engine, pinned to the same worker.
-    let mut queued_session =
-        RemoteConnection::open(endpoint, &ctx.token, "worker-status-queued", None, None, 90)
-            .await?;
+    let mut queued_session = RemoteConnection::open(
+        endpoint,
+        &internal_token,
+        "worker-status-queued",
+        None,
+        None,
+        90,
+    )
+    .await?;
     let query_client = client.clone();
     let query_path = format!("{}/queries", session.path());
     let busy = tokio::spawn(async move {
@@ -342,6 +349,7 @@ pub(super) async fn worker_status(ctx: &Ctx) -> anyhow::Result<()> {
 /// A real pgwire query must influence placement of a new HTTP session.
 pub(super) async fn mixed_protocol_status(ctx: &Ctx) -> anyhow::Result<()> {
     let client = ctx.client()?;
+    let internal_token = ctx.internal_test_token()?;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let baseline = fleet(&client).await?;
     require(
@@ -396,7 +404,10 @@ pub(super) async fn mixed_protocol_status(ctx: &Ctx) -> anyhow::Result<()> {
         let session_id = record["session_id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("pgwire history has no session"))?;
-        active_session = Some((Client::new(endpoint, &ctx.token)?, session_id.to_owned()));
+        active_session = Some((
+            Client::new(endpoint, &internal_token)?,
+            session_id.to_owned(),
+        ));
         let active = wait_worker(&client, id, |w| w["active_queries"] == 1).await?;
         require(
             active["open_sessions"].as_u64()
@@ -426,7 +437,7 @@ pub(super) async fn mixed_protocol_status(ctx: &Ctx) -> anyhow::Result<()> {
     }
     .await;
     // Cancel through the worker's authenticated internal endpoint: pgwire does
-    // not implement CancelRequest and its session is not an HTTP gateway route.
+    // not implement CancelRequest.
     if let Some((direct, id)) = active_session {
         let _ = request_json(
             &direct,

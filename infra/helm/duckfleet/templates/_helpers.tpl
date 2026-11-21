@@ -151,7 +151,7 @@ seccompProfile:
 {{- toJson $config -}}
 {{- end -}}
 {{/* Runtime exact-version checks remain authoritative; this marks rollout intent. */}}
-{{- define "duckfleet.platformSchema" -}}2{{- end -}}
+{{- define "duckfleet.platformSchema" -}}3{{- end -}}
 {{/*
 The worker container's environment, defined once. The persistent Deployments and the
 isolated pod template both render from this, so they cannot drift apart on secret
@@ -196,15 +196,16 @@ template and the code that patches it from drifting silently.
 - {name: S3_DATA_PATH, value: {{ printf "s3://%s/%s/" $.Values.bucket $.Values.lakePrefix | quote }}}
 - {name: AWS_REGION, value: {{ $.Values.region }}}
 - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
-- name: DUCKFLEET_TOKEN
+- {name: DUCKFLEET_NAMESPACE, value: {{ $.Release.Namespace | quote }}}
+- name: DUCKFLEET_INTERNAL_TOKEN
   valueFrom:
-    secretKeyRef: {name: {{ $.Values.secretName }}, key: DUCKFLEET_TOKEN}
+    secretKeyRef: {name: {{ $.Values.secretName }}, key: DUCKFLEET_INTERNAL_TOKEN}
 - name: CATALOG_DSN
   valueFrom:
     secretKeyRef: {name: {{ $.Values.secretName }}, key: CATALOG_DSN}
 - name: PLATFORM_DSN
   valueFrom:
-    secretKeyRef: {name: {{ $.Values.secretName }}, key: PLATFORM_DSN}
+    secretKeyRef: {name: {{ $.Values.secretName }}, key: PLATFORM_WORKER_DSN}
 {{- end -}}
 {{/*
 The pod an isolated session runs in. The gateway replaces its name, its owner
@@ -292,4 +293,43 @@ startupProbe:
      Release.Revision is insufficient for helm template/kubectl apply installs. */}}
 {{- define "duckfleet.migrationJob" -}}
 {{- printf "duckfleet-platform-migrate-%s" (toJson .Values | sha256sum | trunc 12) -}}
+{{- end -}}
+
+{{/* Role names are namespaced even when several deployments share one PG cluster. */}}
+{{- define "duckfleet.databaseRoles" -}}
+{{- $prefix := printf "df_%s_%s" (.Release.Namespace | replace "-" "_" | trunc 36) (.Release.Namespace | sha256sum | trunc 8) -}}
+{{- $roles := dict -}}
+{{- $seen := dict -}}
+{{- range $part := list "migrator" "gateway" "worker" "maintainer" "catalog" -}}
+{{- $name := default (printf "%s_%s" $prefix $part) (index $.Values.databaseRoles $part) -}}
+{{- if hasKey $seen $name -}}{{ fail "databaseRoles must name five distinct roles" }}{{- end -}}
+{{- $_ := set $seen $name true -}}{{- $_ := set $roles $part $name -}}
+{{- end -}}
+{{ toJson $roles }}
+{{- end -}}
+{{- define "duckfleet.authorizationSeed" -}}
+{{- $grant := .Values.authorization.defaultPersistentGrant -}}
+{{- $pools := include "duckfleet.pools" . | fromJson -}}
+{{- if ne $grant.pool .Values.defaultPool -}}{{ fail "authorization.defaultPersistentGrant.pool must match defaultPool; review the bounded upgrade grant explicitly" }}{{- end -}}
+{{- $pool := index $pools $grant.pool -}}
+{{- if or (lt (int $grant.cpu) (int $pool.cpu)) (lt (include "duckfleet.quantityBytes" $grant.memory | int64) (include "duckfleet.quantityBytes" $pool.memory | int64)) (lt (include "duckfleet.quantityBytes" $grant.disk | int64) (include "duckfleet.quantityBytes" $pool.disk | int64)) -}}
+{{ fail "authorization.defaultPersistentGrant must cover the default allocation; review its explicit CPU/memory/disk ceilings" }}
+{{- end -}}
+- {name: DUCKFLEET_NAMESPACE, value: {{ .Release.Namespace | quote }}}
+- {name: DUCKFLEET_AUTHZ_DEFAULT_POOL, value: {{ $grant.pool | quote }}}
+- {name: DUCKFLEET_AUTHZ_DEFAULT_CPU, value: {{ $grant.cpu | quote }}}
+- {name: DUCKFLEET_AUTHZ_DEFAULT_MEMORY, value: {{ $grant.memory | quote }}}
+- {name: DUCKFLEET_AUTHZ_DEFAULT_DISK, value: {{ $grant.disk | quote }}}
+{{- end -}}
+{{- define "duckfleet.databaseProvisionEnvironment" -}}
+{{- $roles := include "duckfleet.databaseRoles" . | fromJson -}}
+{{- range $part := list "migrator" "gateway" "worker" "maintainer" "catalog" }}
+- {name: DUCKFLEET_DB_{{ upper $part }}_ROLE, value: {{ index $roles $part | quote }}}
+- name: DUCKFLEET_DB_{{ upper $part }}_PASSWORD
+  valueFrom:
+    secretKeyRef: {name: {{ $.Values.secretName }}, key: DATABASE_{{ upper $part }}_PASSWORD}
+{{- end }}
+- {name: DUCKFLEET_PLATFORM_DATABASE, value: platform}
+- {name: DUCKFLEET_LAKE_DATABASE, value: lake}
+- {name: DUCKFLEET_ADOPT_DATABASE_OWNER, value: "no"}
 {{- end -}}

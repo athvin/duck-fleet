@@ -460,7 +460,8 @@ fn sqlstate(kind: &str) -> &'static str {
     match kind {
         "sql_error" => "42601",
         "timeout" | "queue_timeout" | "canceled" | "budget_exceeded" => "57014",
-        "unauthorized" | "forbidden" => "28P01",
+        "unauthorized" => "28P01",
+        "forbidden" => "42501",
         "unknown_session" | "session_lost" | "queue_drained" | "draining" | "starting"
         | "unavailable" => "57P01",
         "capacity" | "queue_capacity" | "session_busy" | "budget_exhausted" | "budget_job_cost" => {
@@ -854,6 +855,7 @@ mod tests {
         async fn authenticate(&self, token: String) -> std::result::Result<Identity, ApiError> {
             assert_eq!(token, "test-token");
             Ok(Identity {
+                kind: crate::credentials::ActorKind::Named,
                 principal: "test-user".into(),
                 credential_id: Some("test-credential".into()),
                 expires_at: None,
@@ -1225,6 +1227,7 @@ mod tests {
         assert_eq!(sqlstate("transaction_conflict"), "40001");
         assert_eq!(sqlstate("timeout"), "57014");
         assert_eq!(sqlstate("sql_error"), "42601");
+        assert_eq!(sqlstate("forbidden"), "42501");
         assert_eq!(sqlstate("invented_later"), "XX000");
     }
 

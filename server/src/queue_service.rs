@@ -1,8 +1,8 @@
 //! Bounded metadata actors independent of the serial DuckDB engine.
 //! Durable queue rows own work; response waiters and wakeups never own permits.
 use crate::{
-    ApiError, Output, Reply,
-    credentials::{self, Identity},
+    ApiError, Output, Reply, authz,
+    credentials::Identity,
     failure,
     query::{Acceptance, Protocol, QueryRequest},
     queue::{self, CloseIntent, WorkerEpoch},
@@ -75,6 +75,7 @@ fn connection<'a>(slot: &'a mut Option<Client>, dsn: &str) -> Result<&'a mut Cli
 
 #[derive(Default)]
 struct State {
+    authority_cursor: Option<Uuid>,
     sessions: HashSet<Uuid>,
     closing: HashSet<Uuid>,
     close_ready: HashSet<Uuid>,
@@ -381,6 +382,34 @@ impl Service {
             .await
     }
 
+    pub async fn cancel_session(self: &Arc<Self>, session: Uuid, actor: Identity) -> Reply {
+        let service = self.clone();
+        self.control
+            .call(move |client| {
+                if let Some(id) = worker::active_query(&service.active, session) {
+                    let receipt = queue::request_cancel(client, id, &actor)?;
+                    let requested = receipt["cancel_requested"].as_bool() == Some(true);
+                    if requested {
+                        service.notify_cancel(id);
+                    }
+                    return Ok(Output::Json(json!({"interrupted_active_query":requested})));
+                }
+                let authority = queue::authorities(client, &service.epoch)
+                    .map_err(|_| ApiError::internal())?
+                    .into_iter()
+                    .find(|row| row.session_id == session)
+                    .ok_or_else(|| ApiError::new(failure::UNKNOWN_SESSION, "unknown session"))?;
+                authz::authorize_action(
+                    client,
+                    &actor,
+                    authz::Action::QueryCancel,
+                    authority.owner_principal_id.as_deref(),
+                )?;
+                Ok(Output::Json(json!({"interrupted_active_query":false})))
+            })
+            .await
+    }
+
     fn register_close_waiter(
         &self,
         id: Uuid,
@@ -403,7 +432,7 @@ impl Service {
         Ok(true)
     }
 
-    pub async fn close(self: &Arc<Self>, id: Uuid, reason: CloseRequest) -> Reply {
+    pub async fn close(self: &Arc<Self>, id: Uuid, reason: CloseRequest, actor: Identity) -> Reply {
         let service = self.clone();
         let (waiter, receiver) = oneshot::channel();
         let closing = self
@@ -426,7 +455,7 @@ impl Service {
                     return Ok(false);
                 };
                 let intent = match reason {
-                    CloseRequest::Explicit => CloseIntent::Explicit,
+                    CloseRequest::Explicit => CloseIntent::Explicit { actor },
                     CloseRequest::Credential {
                         credential_id,
                         generation,
@@ -454,8 +483,7 @@ impl Service {
                         }
                     }
                 };
-                let closing = queue::begin_close(client, id, &service.epoch, &intent)
-                    .map_err(|_| ApiError::internal())?;
+                let closing = queue::begin_close(client, id, &service.epoch, &intent)?;
                 if closing {
                     service.register_close_waiter(id, waiter)
                 } else {
@@ -509,48 +537,64 @@ impl Service {
             self.wake.notify_one();
         }
         if check_authorities {
-            let authorities = queue::authorities(client, &self.epoch)?;
-            let ids: Vec<_> = authorities
-                .iter()
-                .filter_map(|row| row.identity.credential_id.clone())
-                .collect();
-            let valid = credentials::resolve_ids(client, &ids).unwrap_or_else(|error| {
-                // Fail closed for named cleanup authorities, while still using
-                // the durable generation predicate before closing a connection.
-                tracing::warn!(
-                    cause = crate::secrets::Redactor::from_env().scrub(&format!("{error:#}")),
-                    "credential cleanup lookup unavailable; closing named authorities conditionally"
-                );
-                Vec::new()
-            });
+            let mut authorities = queue::authorities(client, &self.epoch)?;
+            let cursor = self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .authority_cursor;
+            if let Some(cursor) = cursor {
+                let split = authorities.partition_point(|row| row.session_id <= cursor);
+                authorities.rotate_left(split);
+            }
             let started = Instant::now();
             for row in authorities {
+                if started.elapsed() >= Duration::from_millis(250) {
+                    break;
+                }
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .authority_cursor = Some(row.session_id);
                 if row.closing {
                     continue;
                 }
-                let invalid = row.identity.credential_id.is_some()
-                    && !valid.iter().any(|item| {
-                        item.credential_id == row.identity.credential_id
-                            && item.principal == row.identity.principal
-                            && !item.expired()
-                    });
-                let intent = if invalid {
-                    Some(CloseIntent::Credential {
-                        credential_id: row.identity.credential_id,
-                        authority_generation: row.generation,
-                    })
-                } else if row.outstanding.is_none()
+                let intent = if row.outstanding.is_none()
                     && row.touched_at.elapsed().unwrap_or_default() >= Duration::from_secs(300)
                 {
+                    // Idle expiry does not depend on the availability of a grant
+                    // table: its durable touched-at predicate is sufficient.
                     Some(CloseIntent::Idle {
                         authority_generation: row.generation,
                         touched_at: row.touched_at,
                     })
                 } else {
-                    None
+                    match authz::authorize_execution_for_owner(
+                        client,
+                        &row.identity,
+                        row.owner_principal_id.as_deref(),
+                        &row.compute,
+                        &row.operation,
+                    ) {
+                        Ok(_) => None,
+                        Err(error) if matches!(error.0.kind, "unauthorized" | "forbidden") => {
+                            Some(CloseIntent::Policy {
+                                authority_generation: row.generation,
+                                policy_version: row.authority_policy_version,
+                            })
+                        }
+                        Err(error) => {
+                            return Err(anyhow::anyhow!(
+                                "policy lookup unavailable: {}",
+                                error.0.kind
+                            ));
+                        }
+                    }
                 };
                 if let Some(intent) = intent {
-                    if queue::begin_close(client, row.session_id, &self.epoch, &intent)? {
+                    if queue::begin_close(client, row.session_id, &self.epoch, &intent).map_err(
+                        |error| anyhow::anyhow!("conditional cleanup failed: {}", error.0.kind),
+                    )? {
                         self.state
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())

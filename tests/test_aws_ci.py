@@ -355,21 +355,23 @@ class RolloutWaitTests(unittest.TestCase):
             'apiVersion': 'v1', 'kind': 'Secret', 'type': 'Opaque',
             'metadata': {'name': 'duckfleet-dev', 'namespace': 'duckfleet-dev'},
             'stringData': {
-                'POSTGRES_PASSWORD': 'leaked',
+                'DATABASE_CATALOG_PASSWORD': 'leaked',
+                'POSTGRES_PASSWORD': 'administrator-unchanged',
                 # Deliberately not the values this script would have guessed: a
                 # non-default port and database are what a reconstruction would break.
                 'CATALOG_DSN': 'host=postgres port=6543 dbname=lake_v2 user=duckfleet password=leaked',
-                'PLATFORM_DSN': 'host=postgres port=6543 dbname=platform_v2 user=duckfleet password=leaked',
+                'PLATFORM_DSN': 'host=postgres port=6543 dbname=platform_v2 user=duckfleet_gateway password=platform-unchanged',
                 'DUCKFLEET_TOKEN': 'bearer-token-unchanged',
             },
         }
         after = rotate.rotate(before, 'fresh')['stringData']
-        self.assertEqual(after['POSTGRES_PASSWORD'], 'fresh')
+        self.assertEqual(after['DATABASE_CATALOG_PASSWORD'], 'fresh')
+        self.assertEqual(after['POSTGRES_PASSWORD'], 'administrator-unchanged')
         # Everything but the password survives exactly.
         self.assertEqual(after['CATALOG_DSN'],
                          'host=postgres port=6543 dbname=lake_v2 user=duckfleet password=fresh')
         self.assertEqual(after['PLATFORM_DSN'],
-                         'host=postgres port=6543 dbname=platform_v2 user=duckfleet password=fresh')
+                         'host=postgres port=6543 dbname=platform_v2 user=duckfleet_gateway password=platform-unchanged')
         # The bearer token is not a database credential. Rotating it here would log
         # every caller out as a side effect of database maintenance.
         self.assertEqual(after['DUCKFLEET_TOKEN'], 'bearer-token-unchanged')
@@ -384,9 +386,10 @@ class RolloutWaitTests(unittest.TestCase):
             'apiVersion': 'v1', 'kind': 'Secret',
             'metadata': {'name': 'duckfleet-dev', 'namespace': 'duckfleet-dev'},
             'data': {key: base64.b64encode(value.encode()).decode() for key, value in {
-                'POSTGRES_PASSWORD': 'leaked',
+                'DATABASE_CATALOG_PASSWORD': 'leaked',
+                'POSTGRES_PASSWORD': 'administrator-unchanged',
                 'CATALOG_DSN': 'host=postgres port=5432 dbname=lake user=duckfleet password=leaked',
-                'PLATFORM_DSN': 'host=postgres port=5432 dbname=platform user=duckfleet password=leaked',
+                'PLATFORM_DSN': 'host=postgres port=5432 dbname=platform user=duckfleet_gateway password=platform-unchanged',
             }.items()},
         }
         after = rotate.rotate(encoded, 'fresh')['stringData']
@@ -408,7 +411,8 @@ class RolloutWaitTests(unittest.TestCase):
         passwordless = {
             'apiVersion': 'v1', 'kind': 'Secret',
             'metadata': {'name': 'duckfleet-dev', 'namespace': 'duckfleet-dev'},
-            'stringData': {'POSTGRES_PASSWORD': 'leaked',
+            'stringData': {'DATABASE_CATALOG_PASSWORD': 'leaked',
+                'POSTGRES_PASSWORD': 'administrator-unchanged',
                            'CATALOG_DSN': 'host=postgres dbname=lake user=duckfleet',
                            'PLATFORM_DSN': 'host=postgres dbname=platform user=duckfleet'},
         }
@@ -422,11 +426,11 @@ class RolloutWaitTests(unittest.TestCase):
         script = (ROOT/'scripts/aws/rotate-catalog-credential.sh').read_text()
         commands = '\n'.join(line for line in script.splitlines()
                              if not line.lstrip().startswith('#'))
-        self.assertIn('ALTER USER duckfleet PASSWORD', commands)
+        self.assertIn('ALTER ROLE :"catalog_role" PASSWORD', commands)
         self.assertIn('rotate_secret.py', commands)
         # The database moves first: the inverse would leave the database reachable
         # only with a credential that no longer exists anywhere.
-        self.assertLess(commands.index('ALTER USER'), commands.index('apply -f -'))
+        self.assertLess(commands.index('ALTER ROLE'), commands.index('apply -f -'))
         # And the fleet is restarted, because a Secret change does not reach a running
         # pod's environment.
         self.assertIn('rollout restart', commands)
@@ -568,8 +572,11 @@ class NamedPoolPackagingTests(unittest.TestCase):
     }
 
     def render(self, pools=None, *extra):
-        text = chart(['--set-json', 'persistentPools='+json.dumps(self.POOLS if pools is None else pools),
-                      *extra])
+        effective = self.POOLS if pools is None else pools
+        default = next((arg.split('=', 1)[1] for arg in extra if arg.startswith('defaultPool=')), 'small')
+        reviewed = dict(pool=default, **{key: effective.get(default, {'cpu':1,'memory':'1Gi','disk':'2Gi'})[key] for key in ('cpu','memory','disk')})
+        text = chart(['--set-json', 'persistentPools='+json.dumps(effective),
+                      '--set-json', 'authorization.defaultPersistentGrant='+json.dumps(reviewed), *extra])
         objects = [item for item in yaml.safe_load_all(text) if item]
         # Exercise the same resource-boundary validator used on every deployment.
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml') as handle:
@@ -687,6 +694,8 @@ elif 'inspect' in sys.argv:
                       'State':{'Running':not os.path.exists(os.environ['STOPPED'])}}]))
 elif 'stop' in sys.argv:
     open(os.environ['STOPPED'], 'w').close()
+if 'psql' in sys.argv:
+    print('duckfleet_catalog' if 'lake' in sys.argv else 'duckfleet_migrator')
 if 'pg_restore' in sys.argv:
     sys.stdin.read()
     if os.environ.get('FAIL_PLATFORM') == 'yes' and sys.argv[-1] == 'platform':
@@ -705,7 +714,7 @@ if 'pg_restore' in sys.argv:
             restores = [call for call in calls if 'pg_restore' in call]
             self.assertEqual([call[-1] for call in restores], ['lake', 'platform'])
             self.assertTrue(all('--exit-on-error' in call for call in restores))
-            self.assertEqual(calls[-1], ['compose', 'run', '--rm', '--no-deps', 'platform-migrate'])
+            self.assertEqual(calls[-1], ['compose', 'run', '--rm', '--no-deps', '-e', 'DUCKFLEET_ROLE=platform-grants', 'platform-migrate'])
             self.assertIn('compute remains stopped', success.stdout)
             log.unlink()
             failed = subprocess.run(command, env=dict(env, FAIL_PLATFORM='yes'),
@@ -718,7 +727,7 @@ if 'pg_restore' in sys.argv:
     def test_manual_kube_migration_clones_configuration_with_a_new_job_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            source = {'metadata': {'annotations': {'duckfleet.io/platform-schema':'2'}},
+            source = {'metadata': {'annotations': {'duckfleet.io/platform-schema':'3'}},
                       'spec': {'selector': {'matchLabels': {'controller-uid': 'old'}},
                                'manualSelector': False, 'activeDeadlineSeconds': 390,
                                'backoffLimit': 0,
@@ -836,8 +845,8 @@ class QueueDeploymentTests(unittest.TestCase):
 
     def test_upgrade_guard_allows_fresh_and_same_schema_but_requires_actual_quiescence(self):
         lifecycle.check_kube_state([], [])
-        current = self.deployment('server', lifecycle.GATEWAY, '2')
-        lifecycle.check_kube_state([current], [self.pod('server-new', lifecycle.GATEWAY, '2')])
+        current = self.deployment('server', lifecycle.GATEWAY, str(lifecycle.PLATFORM_SCHEMA))
+        lifecycle.check_kube_state([current], [self.pod('server-new', lifecycle.GATEWAY, str(lifecycle.PLATFORM_SCHEMA))])
         old = self.deployment('worker-pool-wide-0', lifecycle.WORKER)
         with self.assertRaisesRegex(ValueError, 'stop-compute'):
             lifecycle.check_kube_state([old], [])
@@ -846,7 +855,7 @@ class QueueDeploymentTests(unittest.TestCase):
             lifecycle.check_kube_state([old], [self.pod('terminating-old', lifecycle.WORKER)])
         lifecycle.check_kube_state([old], [])
         with self.assertRaisesRegex(ValueError, 'rollback is unsupported'):
-            lifecycle.check_kube_state([self.deployment('newer', lifecycle.GATEWAY, '3', 0)], [])
+            lifecycle.check_kube_state([self.deployment('newer', lifecycle.GATEWAY, str(lifecycle.PLATFORM_SCHEMA+1), 0)], [])
 
     def test_stop_compute_orders_gateway_before_all_workers_and_preserves_database_and_jobs(self):
         deployments = [self.deployment('worker-small', lifecycle.WORKER),
@@ -1302,6 +1311,169 @@ class OwnershipBoundaryTests(unittest.TestCase):
         workflow = (ROOT/'.github/workflows/aws-dev.yml').read_text()
         self.assertNotIn('apply-boundary', workflow)
         self.assertIn('check-access.sh', workflow)
+
+
+class DatabaseRolePackagingTests(unittest.TestCase):
+    def test_helm_schema_rejects_invalid_roles_and_authorization_at_the_top_level(self):
+        cases = [
+            ('databaseRoles', {'worker': 'Invalid-Role'}, 'databaseRoles.worker'),
+            ('databaseRoles', {'worker': 12}, 'databaseRoles.worker'),
+            ('databaseRoles', {'typo': 'fixture_role'}, 'databaseRoles'),
+            ('authorization.defaultPersistentGrant.cpu', 65, 'authorization.defaultPersistentGrant.cpu'),
+            ('authorization.defaultPersistentGrant.cpu', 1.5, 'authorization.defaultPersistentGrant.cpu'),
+            ('authorization.defaultPersistentGrant.memory', '1GB', 'authorization.defaultPersistentGrant.memory'),
+            ('authorization.unknown', True, 'authorization'),
+            ('admissionLimits.default.databaseRoles', {'worker': 'fixture_role'}, 'admissionLimits.default'),
+        ]
+        for key, value, error_path in cases:
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(subprocess.CalledProcessError) as error:
+                    chart(['--set-json', key+'='+json.dumps(value)])
+                self.assertIn('schema', error.exception.stderr)
+                # Helm validators render the same path as dotted properties or
+                # a JSON pointer, depending on the installed Helm version.
+                paths = (error_path, '/' + error_path.replace('.', '/'))
+                self.assertTrue(any(path in error.exception.stderr for path in paths),
+                                error.exception.stderr)
+        chart(['--set-json', 'databaseRoles='+json.dumps({
+            part: 'fixture_'+part for part in ('migrator','gateway','worker','maintainer','catalog')})])
+
+    def test_namespace_roles_are_distinct_bounded_and_do_not_alias_sanitized_names(self):
+        roles = load('database_roles', 'scripts/database_roles.py')
+        first = roles.role_names('a-'+'b'*60)
+        second = roles.role_names('a-'+'b'*59+'c')
+        self.assertEqual(len(set(first.values())), 5)
+        self.assertTrue(all(len(name)<=63 for name in first.values()))
+        self.assertFalse(set(first.values()) & set(second.values()))
+        with self.assertRaises(ValueError):
+            roles.role_names('Bad/Namespace')
+
+    def test_generated_credentials_and_retarget_keep_component_identities_separate(self):
+        roles = load('database_roles', 'scripts/database_roles.py')
+        document = roles.secret('fixture')
+        roles.check_secret(document)
+        data = document['stringData']
+        passwords = [data['POSTGRES_PASSWORD'],data['DUCKFLEET_TOKEN'],data['DUCKFLEET_INTERNAL_TOKEN']]
+        passwords += [data['DATABASE_'+part.upper()+'_PASSWORD'] for part in roles.PARTS]
+        self.assertEqual(len(passwords),len(set(passwords)))
+        changed = roles.retarget(document,'external-postgres')['stringData']
+        for key in roles.DSN_KEYS.values():
+            self.assertEqual(changed[key],data[key].replace('host=postgres','host=external-postgres'))
+        with self.assertRaises(ValueError):
+            roles.check_secret({'stringData':{'PLATFORM_DSN':'old-owner'}})
+        data['DUCKFLEET_INTERNAL_TOKEN']=data['DUCKFLEET_TOKEN']
+        with self.assertRaises(ValueError):
+            roles.check_secret(document)
+
+    def test_secret_upgrade_is_repeatable_and_preserves_admin_and_bootstrap(self):
+        original = {'metadata':{'name':'duckfleet-dev'},'stringData':{
+            'POSTGRES_PASSWORD':'admin-preserved','DUCKFLEET_TOKEN':'public-preserved',
+            'CATALOG_DSN':'host=postgres user=old_owner password=old dbname=lake'}}
+        command=['python3',str(ROOT/'scripts/database_roles.py'),'fixture','--upgrade']
+        upgraded=json.loads(subprocess.check_output(command,input=json.dumps(original),text=True))
+        repeated=json.loads(subprocess.check_output(command,input=json.dumps(upgraded),text=True))
+        self.assertEqual(upgraded,repeated)
+        self.assertEqual(upgraded['stringData']['POSTGRES_PASSWORD'],'admin-preserved')
+        self.assertEqual(upgraded['stringData']['DUCKFLEET_TOKEN'],'public-preserved')
+        self.assertNotIn('old_owner',upgraded['stringData']['CATALOG_DSN'])
+
+    def test_real_render_keeps_worker_and_isolated_secrets_restricted(self):
+        objects={(o['kind'],o['metadata']['name']):o for o in yaml.safe_load_all(chart()) if o}
+        pods=[o['spec']['template']['spec'] for (kind,name),o in objects.items()
+              if kind=='Deployment' and name.startswith('worker-')]
+        isolated=json.loads(objects['ConfigMap','duckfleet-isolated-pod']['data']['pod.json'])
+        pods.append(isolated['spec'])
+        for pod in pods:
+            env=pod['containers'][0]['env']
+            names={item['name'] for item in env}
+            refs={item['name']:item['valueFrom']['secretKeyRef']['key'] for item in env if 'secretKeyRef' in item.get('valueFrom',{})}
+            self.assertNotIn('DUCKFLEET_TOKEN',names)
+            self.assertNotIn('DUCKFLEET_MAINTENANCE_DSN',names)
+            self.assertEqual(refs['PLATFORM_DSN'],'PLATFORM_WORKER_DSN')
+            self.assertEqual(refs['DUCKFLEET_INTERNAL_TOKEN'],'DUCKFLEET_INTERNAL_TOKEN')
+            self.assertFalse(any('secret' in volume for volume in pod.get('volumes',[])))
+        migration=next(o for (kind,_),o in objects.items() if kind=='Job' and o['metadata'].get('labels',{}).get('app')=='duckfleet-platform-migrate')
+        env=migration['spec']['template']['spec']['containers'][0]['env']
+        refs={item['valueFrom']['secretKeyRef']['key'] for item in env if 'secretKeyRef' in item.get('valueFrom',{})}
+        self.assertEqual(refs,{'PLATFORM_MIGRATION_DSN'})
+        role_env=json.loads(next(item['value'] for item in env if item['name']=='DUCKFLEET_DATABASE_ROLES_JSON'))
+        roles=load('database_roles','scripts/database_roles.py').role_names('duckfleet-dev')
+        self.assertEqual(role_env,{key:roles[key] for key in ('gateway','worker','maintainer')})
+
+    def test_live_pod_posture_rejects_whole_secret_or_worker_bootstrap(self):
+        check=load('role_posture','scripts/kind/assert_role_posture.py')
+        objects=[o for o in yaml.safe_load_all(chart()) if o]
+        pods=[{'metadata':o['spec']['template']['metadata'],'spec':o['spec']['template']['spec']}
+              for o in objects if o['kind']=='Deployment']
+        counts=check.validate(pods)
+        self.assertEqual(counts['gateway'],1)
+        self.assertGreater(counts['worker'],0)
+        worker=next(p for p in pods if p['metadata']['labels']['app']=='duckfleet-worker')
+        worker['spec']['containers'][0]['env'].append({'name':'DUCKFLEET_TOKEN','value':'forbidden-bootstrap'})
+        with self.assertRaises(AssertionError):
+            check.validate(pods)
+        worker['spec']['containers'][0]['env'].pop()
+        worker['spec']['containers'][0]['envFrom']=[{'secretRef':{'name':'shared'}}]
+        with self.assertRaises(AssertionError):
+            check.validate(pods)
+
+    def test_custom_default_requires_explicit_reviewed_compute_envelope(self):
+        pools={'wide':{'cpu':2,'memory':'3Gi','disk':'4Gi','workers':1}}
+        args=['--set-json','persistentPools='+json.dumps(pools),'--set','defaultPool=wide']
+        with self.assertRaises(subprocess.CalledProcessError):
+            chart(args)
+        chart(args+['--set-json','authorization.defaultPersistentGrant='+json.dumps(dict(pool='wide',cpu=2,memory='3Gi',disk='4Gi'))])
+
+    def test_compose_provisions_before_migration_and_compute_gets_no_owner_secret(self):
+        services=yaml.safe_load((ROOT/'compose.yaml').read_text())['services']
+        self.assertEqual(services['platform-migrate']['depends_on']['platform-provision']['condition'],'service_completed_successfully')
+        for name in ('worker-small','worker-small-b','worker-pool-interactive-0'):
+            env=services[name]['environment']
+            self.assertNotIn('DUCKFLEET_TOKEN',env)
+            self.assertNotIn('DUCKFLEET_MAINTENANCE_DSN',env)
+            self.assertIn('user=duckfleet_worker ',env['PLATFORM_DSN'])
+            self.assertIn('user=duckfleet_catalog ',env['CATALOG_DSN'])
+        self.assertIn('user=duckfleet_migrator ',services['platform-migrate']['environment']['PLATFORM_DSN'])
+        self.assertIn('DUCKFLEET_INTERNAL_TEST_TOKEN',services['dbt']['environment'])
+
+    def test_namespace_probe_uses_current_catalog_role_and_live_service(self):
+        roles = load('probe_database_roles', 'scripts/database_roles.py')
+        probe = load('team_namespace_probe', 'scripts/kind/team_namespace_probe.py')
+        document = roles.secret('duckfleet-dev', host='external-postgres')
+        dsn = document['stringData']['CATALOG_DSN']
+        query = probe.catalog_probe(dsn, 'duckfleet-dev')
+        self.assertIn('host=external-postgres.duckfleet-dev.svc.cluster.local ', query)
+        self.assertIn('user=' + roles.role_names('duckfleet-dev')['catalog'] + ' ', query)
+        self.assertNotIn('user=duckfleet ', query)
+        self.assertIn(" connect_timeout=3'", query)
+        self.assertEqual(query.count('connect_timeout='), 1)
+        with self.assertRaises(ValueError):
+            probe.catalog_probe(dsn + ' host=obsolete', 'duckfleet-dev')
+        with self.assertRaises(ValueError):
+            probe.catalog_probe(dsn.replace('host=external-postgres', "host=\"bad'host\""), 'duckfleet-dev')
+
+    def test_namespace_probe_rejects_dns_authentication_and_redaction_false_positives(self):
+        probe = load('team_denial_probe', 'scripts/kind/team_namespace_probe.py')
+        for message in ('could not translate host name', 'password authentication failed',
+                        'postgres_scan does not exist', 'relation ducklake_snapshot does not exist'):
+            with self.subTest(message=message), self.assertRaises(AssertionError):
+                probe.verify_denial({'failure_kind': 'sql_error', 'error': message}, 'fixture-secret')
+        probe.verify_denial({'failure_kind': 'sql_error', 'error': 'connection timed out'}, 'fixture-secret')
+        probe.verify_denial({'failure_kind': 'sql_error', 'error': 'connection to server failed: timeout expired'}, 'fixture-secret')
+        probe.verify_denial({'failure_kind': 'timeout', 'error': 'query deadline elapsed'}, 'fixture-secret')
+        with self.assertRaises(AssertionError):
+            probe.verify_denial({'failure_kind': 'timeout', 'error': 'fixture-secret'}, 'fixture-secret')
+        calls = []
+        def failed_positive(port, token, method, path, payload=None, timeout=70):
+            calls.append((method, path))
+            if path == '/v1/sessions':
+                return b'{"session_id":"fixture"}'
+            if method == 'POST':
+                raise RuntimeError('positive endpoint unavailable')
+            return b'{}'
+        with mock.patch.object(probe, 'call', side_effect=failed_positive), self.assertRaises(RuntimeError):
+            probe.positive_control(1, 'fixture-token', 'SELECT 1')
+        self.assertEqual(calls[-1], ('DELETE', '/v1/sessions/fixture'))
 
 
 if __name__ == '__main__':

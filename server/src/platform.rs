@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{credentials, metering, pricing::RateCard, requests};
 
-pub(crate) const SCHEMA_VERSION: i32 = 2;
+pub(crate) const SCHEMA_VERSION: i32 = 3;
 const MIGRATION_LOCK: i64 = 4_283_121;
 const POLL: Duration = Duration::from_millis(250);
 const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
@@ -206,7 +206,7 @@ pub(crate) fn wait_schema(dsn: &str, wait: Duration) -> Result<Client> {
         })();
         match attempt {
             Ok((client, Some(current))) if current == SCHEMA_VERSION => return Ok(client),
-            Ok((_, Some(1))) => {}
+            Ok((_, Some(1 | 2))) => {}
             Ok((_, Some(current))) => {
                 supported(current)?;
             }
@@ -275,6 +275,13 @@ fn elapsed_ms(started: Instant) -> u64 {
 /// The caller bounds migration statements; deployment uses a separate, longer
 /// bound than foreground work because a one-time backfill can be substantial.
 pub(crate) fn migrate(client: &mut Client, seed: &Seed) -> Result<MigrationReport> {
+    migrate_with_roles(client, seed, None)
+}
+fn migrate_with_roles(
+    client: &mut Client,
+    seed: &Seed,
+    roles: Option<&crate::db_roles::RoleNames>,
+) -> Result<MigrationReport> {
     let started = Instant::now();
     anyhow::ensure!(
         seed.prepaid_micro_usd > 0 && seed.max_job_micro_usd > 0,
@@ -289,7 +296,7 @@ pub(crate) fn migrate(client: &mut Client, seed: &Seed) -> Result<MigrationRepor
             });
         }
         anyhow::ensure!(
-            current == 1,
+            matches!(current, 1 | 2),
             "unsupported migration source version {current}"
         );
     }
@@ -308,7 +315,7 @@ pub(crate) fn migrate(client: &mut Client, seed: &Seed) -> Result<MigrationRepor
         });
     }
     anyhow::ensure!(
-        current.is_none() || current == Some(1),
+        current.is_none() || matches!(current, Some(1 | 2)),
         "unsupported migration source version"
     );
     if current.is_none() {
@@ -338,11 +345,23 @@ pub(crate) fn migrate(client: &mut Client, seed: &Seed) -> Result<MigrationRepor
             &[],
         )?;
     }
-    crate::queue::migrate(&mut transaction)?;
+    if current.is_none() || current == Some(1) {
+        crate::queue::migrate(&mut transaction)?;
+        transaction.execute(
+            "INSERT INTO platform_schema_migrations(version,name) VALUES (2,'durable-query-queue')",
+            &[],
+        )?;
+    }
+    crate::authz::migrate(&mut transaction, &crate::authz::Seed::from_env()?)?;
+    crate::audit::migrate(&mut transaction)?;
+    crate::metadata::migrate(&mut transaction)?;
     transaction.execute(
-        "INSERT INTO platform_schema_migrations(version,name) VALUES (2,'durable-query-queue')",
+        "INSERT INTO platform_schema_migrations(version,name) VALUES(3,'platform-authorization')",
         &[],
     )?;
+    if let Some(roles) = roles {
+        crate::db_roles::grant_runtime(&mut transaction, roles)?;
+    }
     transaction.commit()?;
     Ok(MigrationReport {
         version: SCHEMA_VERSION,
@@ -866,6 +885,7 @@ pub(crate) async fn migrate_command() -> Result<()> {
     let wait = schema_wait()?;
     let timeout = seconds_env("DUCKFLEET_MIGRATION_TIMEOUT_SECONDS", 240, 3600)?;
     let seed = Seed::from_env()?;
+    let roles = crate::db_roles::RoleNames::from_env()?;
     let report = tokio::task::spawn_blocking(move || -> Result<MigrationReport> {
         let started = Instant::now();
         loop {
@@ -879,7 +899,7 @@ pub(crate) async fn migrate_command() -> Result<()> {
                 remaining.min(Duration::from_secs(3)),
                 Some(timeout),
             ) {
-                Ok(mut client) => return migrate(&mut client, &seed),
+                Ok(mut client) => return migrate_with_roles(&mut client, &seed, Some(&roles)),
                 Err(error) if fatal_startup(&error) => return Err(startup_error(&error)),
                 Err(_) => {}
             }
@@ -898,11 +918,28 @@ pub(crate) async fn migrate_command() -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn grants_command() -> Result<()> {
+    let dsn = std::env::var("PLATFORM_DSN")?;
+    let roles = crate::db_roles::RoleNames::from_env()?;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut client = connect(&dsn, Duration::from_secs(3), Duration::from_secs(30))?;
+        check_schema(&mut client)?;
+        let mut tx = client.transaction()?;
+        crate::db_roles::grant_runtime(&mut tx, &roles)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await??;
+    println!("platform runtime privileges repaired");
+    Ok(())
+}
+
 pub(crate) async fn maintain_command() -> Result<()> {
     let dsn = std::env::var("PLATFORM_DSN")?;
     let config = MaintenanceConfig::from_env()?;
     let report = tokio::task::spawn_blocking(move || -> Result<PassReport> {
         let mut client = connect(&dsn, Duration::from_secs(3), config.statement_timeout)?;
+        crate::db_roles::validate_runtime(&mut client, crate::db_roles::RuntimeRole::Maintainer)?;
         maintenance_pass(&mut client, Uuid::new_v4(), &config, true)
     })
     .await
@@ -929,6 +966,10 @@ pub(crate) fn spawn_maintenance(
             let config = config.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<PassReport> {
                 let mut client = connect(&dsn, Duration::from_secs(3), config.statement_timeout)?;
+                crate::db_roles::validate_runtime(
+                    &mut client,
+                    crate::db_roles::RuntimeRole::Maintainer,
+                )?;
                 maintenance_pass(&mut client, owner, &config, false)
             })
             .await;

@@ -1,2 +1,1 @@
-CREATE DATABASE lake;
-CREATE DATABASE platform;
+-- Databases and restricted component roles are created by platform-provision.

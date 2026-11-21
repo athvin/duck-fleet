@@ -363,7 +363,12 @@ async fn idle_rollback(ctx: &Ctx, admin: &Client) -> Result<()> {
         .and_then(|workers| workers.iter().find(|w| w["worker_id"] == worker_id))
         .and_then(|worker| worker["endpoint"].as_str())
         .context("worker endpoint")?;
-    let direct = Client::new(endpoint, &ctx.token)?;
+    let public = Client::new(endpoint, &ctx.token)?;
+    expect_status(
+        request_json(&public, Method::POST, "/v1/sessions", Some(&json!({}))).await,
+        401,
+    )?;
+    let direct = Client::new(endpoint, &ctx.internal_test_token()?)?;
     let credential = issue(admin, "auth-idle", None).await?;
     let abandoned = open(ctx, &credential).await?;
     sql(&abandoned, "begin").await?;
@@ -572,6 +577,27 @@ pub(super) async fn checks(ctx: &Ctx) -> Result<()> {
 pub(super) async fn isolated_cleanup(ctx: &Ctx) -> Result<()> {
     let admin = ctx.client()?;
     let credential = issue(&admin, "auth-isolated", None).await?;
+    let mut policy = request_json(
+        &admin,
+        Method::GET,
+        "/v1/principals/auth-isolated/policy",
+        None,
+    )
+    .await?;
+    let mut compute = policy["compute"]
+        .take()
+        .as_array()
+        .context("principal compute grants")?
+        .clone();
+    compute.push(json!({"mode":"isolated","pool":null,"cpu":1,"memory_bytes":1073741824u64,"disk_bytes":2147483648u64}));
+    request_json(
+        &admin,
+        Method::PUT,
+        "/v1/principals/auth-isolated/policy",
+        Some(&json!({"roles":["analyst"],"permissions":[],"compute":compute,"disabled":false})),
+    )
+    .await?;
+
     let connection = RemoteConnection::open(
         &ctx.url,
         &credential.token,

@@ -4,14 +4,17 @@
 
 use crate::{
     ApiError,
+    authz::{Action, MetadataAccess},
     compute::{ComputeRequest, Resources},
-    credentials, failure, metering,
+    credentials::{self, ActorKind, Identity},
+    failure,
+    metadata::{self, Relation},
+    metering,
     pricing::RateCard,
 };
-use postgres::{Client, GenericClient, NoTls, Row, Transaction};
+use postgres::{Client, GenericClient, Row, Transaction};
 use serde_json::{Value, json};
-use std::{fmt::Write, sync::Arc, time::Duration};
-use tokio::sync::Semaphore;
+use std::fmt::Write;
 use uuid::Uuid;
 
 const FINGERPRINT_VERSION: i32 = 3;
@@ -34,6 +37,13 @@ pub(crate) struct Submission<'a> {
     pub worker_id: &'a str,
     pub placement: &'a Value,
     pub principal: &'a str,
+}
+
+/// Canonical authority supplied by the durable session, never caller labels.
+pub(crate) struct Ownership<'a> {
+    pub namespace_id: &'a str,
+    pub owner_principal_id: Option<&'a str>,
+    pub actor_kind: ActorKind,
 }
 
 pub(crate) enum AdmissionResult {
@@ -386,6 +396,40 @@ impl Stored {
         Ok(())
     }
 
+    fn authorize_owner(
+        &self,
+        tx: &mut Transaction<'_>,
+        input: &Submission<'_>,
+        ownership: Option<&Ownership<'_>>,
+    ) -> Result<(), ApiError> {
+        let Some(authority) = ownership else {
+            // Only the isolated pre-schema-3 upgrade fixtures use this path.
+            return self.authorize(input.principal, is_bootstrap(input.principal));
+        };
+        let namespace = self.queue_record["namespace_id"].as_str();
+        if namespace.is_some_and(|ns| ns != authority.namespace_id) {
+            return Err(not_found());
+        }
+        if authority.actor_kind != ActorKind::Named {
+            return Ok(());
+        }
+        let mut owner = self.queue_record["owner_principal_id"]
+            .as_str()
+            .map(str::to_owned);
+        if owner.is_none() && namespace.is_none() {
+            // This migration-only mapping records credible pre-upgrade owners.
+            // Never resolve an unknown legacy label through today's dictionary.
+            owner = tx.query_opt(
+                "SELECT principal_id FROM authz_legacy_owners WHERE namespace_id=$1 AND legacy_name=$2",
+                &[&authority.namespace_id, &self.principal],
+            ).map_err(|_|ApiError::internal())?.map(|row| row.get(0));
+        }
+        if owner.is_none() || owner.as_deref() != authority.owner_principal_id {
+            return Err(not_found());
+        }
+        Ok(())
+    }
+
     fn retryable(&self) -> bool {
         self.state == "terminal"
             && self.outcome == Outcome::NotExecuted.name()
@@ -444,6 +488,12 @@ impl Stored {
             },
         });
         for key in [
+            "namespace_id",
+            "owner_principal_id",
+            "actor_principal_id",
+            "actor_kind",
+            "actor_credential_id",
+            "authorization_policy_version",
             "session_id",
             "session_sequence",
             "worker_boot_id",
@@ -469,7 +519,7 @@ impl Stored {
     }
 
     fn duplicate(&self, input: &Submission<'_>, hash: &str) -> Result<Value, ApiError> {
-        self.authorize(input.principal, is_bootstrap(input.principal))?;
+        // The caller checks immutable owner authority before invoking this.
         // Legacy fingerprints stay unknown permanently. Returning their outcome
         // is safe; asserting either equality or mismatch would invent evidence.
         if self.retry_of.as_deref() != input.retry_of
@@ -518,6 +568,7 @@ fn legacy_collision(
     input: &Submission<'_>,
     hash: &str,
     inserted_history: bool,
+    ownership: Option<&Ownership<'_>>,
 ) -> Result<Value, ApiError> {
     if inserted_history {
         transaction
@@ -534,9 +585,9 @@ fn legacy_collision(
         )
         .map_err(|_| ApiError::internal())?;
     backfill(transaction, Some(input.request_id)).map_err(|_| ApiError::internal())?;
-    load(transaction, input.request_id)?
-        .ok_or_else(ApiError::internal)?
-        .duplicate(input, hash)
+    let stored = load(transaction, input.request_id)?.ok_or_else(ApiError::internal)?;
+    stored.authorize_owner(transaction, input, ownership)?;
+    stored.duplicate(input, hash)
 }
 
 pub(crate) enum ClaimResult {
@@ -545,10 +596,20 @@ pub(crate) enum ClaimResult {
 }
 
 /// Atomic identity/history claim, deliberately without execution-budget locks.
-pub(crate) fn claim_in(
+pub(crate) fn claim_authorized_in(
     transaction: &mut Transaction<'_>,
     input: &Submission<'_>,
     state: &str,
+    ownership: &Ownership<'_>,
+) -> Result<ClaimResult, ApiError> {
+    claim_in(transaction, input, state, Some(ownership))
+}
+
+fn claim_in(
+    transaction: &mut Transaction<'_>,
+    input: &Submission<'_>,
+    state: &str,
+    ownership: Option<&Ownership<'_>>,
 ) -> Result<ClaimResult, ApiError> {
     let status = if state == "queued" {
         "queued"
@@ -560,6 +621,7 @@ pub(crate) fn claim_in(
     // after the one-time migration; these never scan all retained history.
     backfill(transaction, Some(input.request_id)).map_err(|_| ApiError::internal())?;
     if let Some(stored) = load(transaction, input.request_id)? {
+        stored.authorize_owner(transaction, input, ownership)?;
         let duplicate = stored.duplicate(input, &hash);
         return duplicate.map(ClaimResult::Duplicate);
     }
@@ -572,7 +634,7 @@ pub(crate) fn claim_in(
         }
         backfill(transaction, Some(parent_id)).map_err(|_| ApiError::internal())?;
         let parent = load(transaction, parent_id)?.ok_or_else(not_found)?;
-        parent.authorize(input.principal, is_bootstrap(input.principal))?;
+        parent.authorize_owner(transaction, input, ownership)?;
         if !parent.retryable() || parent.principal.as_deref() != Some(input.principal) {
             return Err(ApiError::new(
                 failure::INVALID_RETRY,
@@ -612,6 +674,7 @@ pub(crate) fn claim_in(
         .map_err(|_| ApiError::internal())?;
     if claimed == 0 {
         if let Some(stored) = load(transaction, input.request_id)? {
+            stored.authorize_owner(transaction, input, ownership)?;
             return stored.duplicate(input, &hash).map(ClaimResult::Duplicate);
         }
         return Err(ApiError::new(
@@ -626,7 +689,7 @@ pub(crate) fn claim_in(
           &input.worker_id, &input.placement.to_string(), &input.principal, &status],
     ).map_err(|_| ApiError::internal())?;
     if inserted_history == 0 {
-        let duplicate = legacy_collision(transaction, input, &hash, false);
+        let duplicate = legacy_collision(transaction, input, &hash, false, ownership);
         return duplicate.map(ClaimResult::Duplicate);
     }
     Ok(ClaimResult::New)
@@ -639,7 +702,7 @@ pub(crate) fn admit(
     rate: &RateCard,
 ) -> Result<AdmissionResult, ApiError> {
     let mut transaction = client.transaction().map_err(|_| ApiError::internal())?;
-    if let ClaimResult::Duplicate(value) = claim_in(&mut transaction, &input, "accepted")? {
+    if let ClaimResult::Duplicate(value) = claim_in(&mut transaction, &input, "accepted", None)? {
         transaction.commit().map_err(|_| ApiError::internal())?;
         return Ok(AdmissionResult::Duplicate(value));
     }
@@ -657,7 +720,7 @@ pub(crate) fn admit(
             Ok(AdmissionResult::Admitted(admission))
         }
         Err(refusal) if refusal.0.kind == failure::DUPLICATE_REQUEST.kind => {
-            let duplicate = legacy_collision(&mut transaction, &input, &hash, true);
+            let duplicate = legacy_collision(&mut transaction, &input, &hash, true, None);
             transaction.commit().map_err(|_| ApiError::internal())?;
             duplicate.map(AdmissionResult::Duplicate)
         }
@@ -769,43 +832,37 @@ pub(crate) fn interrupt_abandoned_prefix(
 /// Owner-scoped durable lookup, using the same bounded independent connection
 /// pattern as diagnostic history. Shared team-visible history remains a separate
 /// API contract until RBAC: this reader grants no additional outcome visibility.
+pub(crate) fn detail_in(
+    tx: &mut Transaction<'_>,
+    access: &MetadataAccess,
+    id: Uuid,
+) -> Result<Value, ApiError> {
+    let plan = metadata::relation_plan(access, Relation::Attempts)?;
+    let row=tx.query_opt(&format!("SELECT {COLUMNS} FROM requests r LEFT JOIN authz_legacy_owners l
+        ON r.owner_principal_id IS NULL AND r.namespace_id IS NULL AND l.namespace_id=$2 AND l.legacy_name=r.principal
+        WHERE r.request_id=$1 AND COALESCE(r.namespace_id,$2)=$2 AND ($4 OR COALESCE(r.owner_principal_id,l.principal_id)=$3)"),
+        &[&id.to_string(),&plan.namespace_id,&plan.principal_id,&plan.all]).map_err(|_|ApiError::internal())?.ok_or_else(not_found)?;
+    Ok(Stored::from_row(row).detail())
+}
 #[derive(Clone)]
 pub(crate) struct Reader {
-    dsn: Arc<str>,
-    capacity: Arc<Semaphore>,
+    reader: metadata::Reader,
 }
 impl Reader {
     pub fn new(dsn: String) -> Self {
         Self {
-            dsn: dsn.into(),
-            capacity: Arc::new(Semaphore::new(8)),
+            reader: metadata::Reader::new(dsn),
         }
     }
-
-    pub async fn detail(
-        &self,
-        id: Uuid,
-        principal: String,
-        is_bootstrap: bool,
-    ) -> Result<Value, ApiError> {
-        let permit = self
-            .capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ApiError::new(failure::CAPACITY, "request reader capacity reached"))?;
-        let dsn = self.dsn.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut config: postgres::Config = dsn.parse().map_err(|_| ApiError::internal())?;
-            config.connect_timeout(Duration::from_secs(3));
-            config.options("-c default_transaction_read_only=on -c statement_timeout=3000");
-            let mut client = config.connect(NoTls).map_err(|_| ApiError::internal())?;
-            let row = client.query_opt(
-                &format!("SELECT {COLUMNS} FROM requests r WHERE r.request_id=$1 AND (r.principal=$2 OR $3)"),
-                &[&id.to_string(), &principal, &is_bootstrap],
-            ).map_err(|_| ApiError::internal())?.ok_or_else(not_found)?;
-            Ok(Stored::from_row(row).detail())
-        }).await.map_err(|_| ApiError::internal())?
+    pub async fn detail(&self, identity: Identity, id: Uuid) -> Result<Value, ApiError> {
+        self.reader
+            .run(
+                identity,
+                Action::HistoryRead,
+                Some(id.to_string()),
+                move |tx, access| detail_in(tx, &access.metadata(), id),
+            )
+            .await
     }
 }
 
@@ -939,14 +996,20 @@ mod tests {
     }
 
     #[test]
-    fn owner_check_precedes_duplicate_payload_comparison() {
+    fn legacy_fixture_owner_check_precedes_duplicate_payload_comparison() {
         let parameters = [json!(1)];
         let context = json!({});
         let compute = json!({"mode":"persistent"});
         let mut input = submission(&parameters, &context, &compute);
         let original = stored(Some(fingerprint(&input).unwrap()));
         input.principal = "different-user";
-        let refused = original.duplicate(&input, "different-hash").unwrap_err();
+        // The old admission fixture retains its name-based authorization seam.
+        // Production's immutable-owner seam is exercised by rbac_storage using
+        // actual PostgreSQL rows, including ambiguous legacy labels.
+        let refused = original
+            .authorize(input.principal, false)
+            .and_then(|()| original.duplicate(&input, "different-hash"))
+            .unwrap_err();
         assert_eq!(refused.0, failure::NOT_FOUND);
         assert_eq!(refused.1, "request not found");
         input.principal = "analyst";
@@ -972,14 +1035,16 @@ mod tests {
         assert!(original.payload_hash.is_none());
         original.principal = None;
         assert_eq!(
-            original
-                .duplicate(&input, "new-unproven-hash")
-                .unwrap_err()
-                .0,
+            original.authorize(input.principal, false).unwrap_err().0,
             failure::NOT_FOUND
         );
         input.principal = credentials::BOOTSTRAP_PRINCIPAL;
-        assert!(original.duplicate(&input, "new-unproven-hash").is_ok());
+        assert!(
+            original
+                .authorize(input.principal, true)
+                .and_then(|()| original.duplicate(&input, "new-unproven-hash"))
+                .is_ok()
+        );
     }
 
     #[test]

@@ -50,6 +50,7 @@ spec:
             limits: {cpu: 500m, memory: 256Mi}
           env:
             - {name: DUCKFLEET_ROLE, value: gateway}
+            - {name: DUCKFLEET_NAMESPACE, value: {{ .Release.Namespace | quote }}}
             - {name: DUCKFLEET_GATEWAY_MAX_SESSIONS, value: {{ .Values.gatewayMaxSessions | quote }}}
             - {name: DUCKFLEET_ADMISSION_LIMITS_JSON, value: {{ include "duckfleet.admissionConfig" . | quote }}}
             - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ .Values.platformWaitSeconds | quote }}}
@@ -61,7 +62,13 @@ spec:
             - {name: DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR, value: {{ .Values.rateCard.computeMicroUsdPerUnitHour | quote }}}
             - name: PLATFORM_DSN
               valueFrom:
-                secretKeyRef: {name: {{ .Values.secretName }}, key: PLATFORM_DSN}
+                secretKeyRef: {name: {{ .Values.secretName }}, key: PLATFORM_GATEWAY_DSN}
+            - name: DUCKFLEET_MAINTENANCE_DSN
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.secretName }}, key: PLATFORM_MAINTENANCE_DSN}
+            - name: DUCKFLEET_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.secretName }}, key: DUCKFLEET_INTERNAL_TOKEN}
             # Endpoints, not classes. The gateway asks each worker what resources it
             # has, because it cannot list pods: the service account mounts no token
             # and the deploy asserts DuckFleet cannot grant itself RBAC.

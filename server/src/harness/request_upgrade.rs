@@ -694,7 +694,7 @@ fn policy_upgrade_fixtures(client: &mut Client, rate: &RateCard) -> Result<()> {
         "fingerprint upgrade left held funds or duplicate events",
     )?;
     println!(
-        "PASS: frozen v1 direct/gateway/default identities survive pruning and produce one v2 retry child without duplicate charges"
+        "PASS: frozen v1 direct/gateway/default identities survive pruning and produce one v3 retry child without duplicate charges"
     );
     Ok(())
 }

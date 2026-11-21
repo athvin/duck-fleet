@@ -4,12 +4,12 @@ services:
     image: postgres:17.6-bookworm
     environment:
       POSTGRES_USER: duckfleet
-      POSTGRES_PASSWORD: local-catalog-password
+      POSTGRES_PASSWORD: ${DUCKFLEET_POSTGRES_ADMIN_PASSWORD:-local-administrator-password}
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./docker/init-postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: [CMD-SHELL, 'pg_isready -U duckfleet -d lake']
+      test: [CMD-SHELL, 'pg_isready -U duckfleet -d postgres']
       interval: 2s
       timeout: 3s
       retries: 30
@@ -29,6 +29,33 @@ services:
       dockerfile: docker/s3.Dockerfile
     depends_on: [object-store]
 
+  platform-provision:
+    image: postgres:17.6-bookworm
+    entrypoint: [/bin/bash, /etc/duckfleet/provision-database.sh]
+    environment: &database-provision-environment
+      PGHOST: postgres
+      POSTGRES_USER: duckfleet
+      PGPASSWORD: ${DUCKFLEET_POSTGRES_ADMIN_PASSWORD:-local-administrator-password}
+      DUCKFLEET_DB_MIGRATOR_ROLE: duckfleet_migrator
+      DUCKFLEET_DB_GATEWAY_ROLE: duckfleet_gateway
+      DUCKFLEET_DB_WORKER_ROLE: duckfleet_worker
+      DUCKFLEET_DB_MAINTAINER_ROLE: duckfleet_maintainer
+      DUCKFLEET_DB_CATALOG_ROLE: duckfleet_catalog
+      DUCKFLEET_DB_MIGRATOR_PASSWORD: local-platform-migration-password
+      DUCKFLEET_DB_GATEWAY_PASSWORD: local-platform-gateway-password
+      DUCKFLEET_DB_WORKER_PASSWORD: local-platform-worker-password
+      DUCKFLEET_DB_MAINTAINER_PASSWORD: local-platform-maintainer-password
+      DUCKFLEET_DB_CATALOG_PASSWORD: local-lake-catalog-password
+      # Explicit opt-in only after stop-compute for a pre-RBAC local volume.
+      DUCKFLEET_ADOPT_DATABASE_OWNER: ${DUCKFLEET_ADOPT_DATABASE_OWNER:-no}
+    volumes:
+      - ./docker/provision-database.sh:/etc/duckfleet/provision-database.sh:ro
+      - ./infra/helm/duckfleet/files/provision-database.sql:/etc/duckfleet/provision-database.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   # Explicit schema changes run once before compute, without DuckDB, S3, or a token.
   # After restoring/resetting platform, rerun: scripts/migrate-platform.sh compose
   platform-migrate:
@@ -38,12 +65,18 @@ services:
       dockerfile: docker/server.Dockerfile
     environment:
       DUCKFLEET_ROLE: migrate
-      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
+      DUCKFLEET_NAMESPACE: local
+      DUCKFLEET_DATABASE_ROLES_JSON: '{"gateway":"duckfleet_gateway","worker":"duckfleet_worker","maintainer":"duckfleet_maintainer"}'
+      DUCKFLEET_AUTHZ_DEFAULT_POOL: small
+      DUCKFLEET_AUTHZ_DEFAULT_CPU: "1"
+      DUCKFLEET_AUTHZ_DEFAULT_MEMORY: 1Gi
+      DUCKFLEET_AUTHZ_DEFAULT_DISK: 2Gi
+      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_migrator password=local-platform-migration-password
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       DUCKFLEET_MIGRATION_TIMEOUT_SECONDS: "240"
     depends_on:
-      postgres:
-        condition: service_healthy
+      platform-provision:
+        condition: service_completed_successfully
     mem_limit: 256m
     cpus: 0.5
     restart: "no"
@@ -52,13 +85,14 @@ services:
   # needs Kubernetes; explicit persistent pools are available via the pools profile.
   worker-small:
     labels:
-      duckfleet.io/platform-schema: "2"
+      duckfleet.io/platform-schema: "3"
     image: duckfleet-worker:local
     build:
       context: .
       dockerfile: docker/server.Dockerfile
     environment: &worker-environment
-      DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
+      DUCKFLEET_NAMESPACE: local
+      DUCKFLEET_INTERNAL_TOKEN: ${DUCKFLEET_INTERNAL_TOKEN:-duckfleet-local-internal-service-token}
       DUCKFLEET_WORKER_ID: small
       DUCKFLEET_POOL: small
       DUCKFLEET_WORKER_MAX_SESSIONS: "32"
@@ -73,8 +107,8 @@ services:
       DUCKFLEET_RATE_CARD_VERSION: local-dev-1
       DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR: "100000"
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
-      CATALOG_DSN: host=postgres port=5432 dbname=lake user=duckfleet password=local-catalog-password
-      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
+      CATALOG_DSN: host=postgres port=5432 dbname=lake user=duckfleet_catalog password=local-lake-catalog-password
+      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_worker password=local-platform-worker-password
       S3_ENDPOINT: object-store:9000
       S3_ACCESS_KEY: DUCKFLEETLOCAL
       S3_SECRET_KEY: local-object-store-password
@@ -99,7 +133,7 @@ services:
   # the gateway at it via DUCKFLEET_WORKER_URLS.
   worker-small-b:
     labels:
-      duckfleet.io/platform-schema: "2"
+      duckfleet.io/platform-schema: "3"
     profiles: [scale-out]
     image: duckfleet-worker:local
     environment:
@@ -115,10 +149,12 @@ services:
 
   server:
     labels:
-      duckfleet.io/platform-schema: "2"
+      duckfleet.io/platform-schema: "3"
     image: duckfleet-worker:local
     environment:
       DUCKFLEET_ROLE: gateway
+      DUCKFLEET_NAMESPACE: local
+      DUCKFLEET_INTERNAL_TOKEN: ${DUCKFLEET_INTERNAL_TOKEN:-duckfleet-local-internal-service-token}
       DUCKFLEET_GATEWAY_MAX_SESSIONS: "64"
       DUCKFLEET_ADMISSION_LIMITS_JSON: "${DUCKFLEET_ADMISSION_LIMITS_JSON:-{}}"
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
@@ -126,7 +162,8 @@ services:
       DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
       # The wire front is exercised by the harness; the port stays internal.
       DUCKFLEET_PGWIRE: "true"
-      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
+      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_gateway password=local-platform-gateway-password
+      DUCKFLEET_MAINTENANCE_DSN: host=postgres port=5432 dbname=platform user=duckfleet_maintainer password=local-platform-maintainer-password
       DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
       # The same card the workers price with; the gateway reports it on the budget.
       DUCKFLEET_RATE_CARD_VERSION: local-dev-1
@@ -151,7 +188,7 @@ services:
   # isolation. Start with: docker compose --profile pools up -d --wait server-pools
   worker-pool-interactive-0:
     labels:
-      duckfleet.io/platform-schema: "2"
+      duckfleet.io/platform-schema: "3"
     profiles: [pools]
     image: duckfleet-worker:local
     environment:
@@ -173,17 +210,20 @@ services:
 
   server-pools:
     labels:
-      duckfleet.io/platform-schema: "2"
+      duckfleet.io/platform-schema: "3"
     profiles: [pools]
     image: duckfleet-worker:local
     environment:
       DUCKFLEET_ROLE: gateway
+      DUCKFLEET_NAMESPACE: local
+      DUCKFLEET_INTERNAL_TOKEN: ${DUCKFLEET_INTERNAL_TOKEN:-duckfleet-local-internal-service-token}
       DUCKFLEET_GATEWAY_MAX_SESSIONS: "64"
       DUCKFLEET_ADMISSION_LIMITS_JSON: "${DUCKFLEET_ADMISSION_LIMITS_JSON:-{}}"
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
       DUCKFLEET_PGWIRE: "true"
-      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
+      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_gateway password=local-platform-gateway-password
+      DUCKFLEET_MAINTENANCE_DSN: host=postgres port=5432 dbname=platform user=duckfleet_maintainer password=local-platform-maintainer-password
       DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
       DUCKFLEET_RATE_CARD_VERSION: local-dev-1
       DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR: "100000"
@@ -215,7 +255,12 @@ services:
       DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
       # Test-only fault injection for bounded auth reads and revocation while
       # admission waits on a database lock. Never part of the public client API.
-      DUCKFLEET_PLATFORM_TEST_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-catalog-password
+      DUCKFLEET_INTERNAL_TEST_TOKEN: ${DUCKFLEET_INTERNAL_TOKEN:-duckfleet-local-internal-service-token}
+      DUCKFLEET_PLATFORM_TEST_DSN: host=postgres port=5432 dbname=platform user=duckfleet password=local-administrator-password
+      DUCKFLEET_WORKER_TEST_DSN: host=postgres port=5432 dbname=platform user=duckfleet_worker password=local-platform-worker-password
+      DUCKFLEET_GATEWAY_TEST_DSN: host=postgres port=5432 dbname=platform user=duckfleet_gateway password=local-platform-gateway-password
+      DUCKFLEET_MAINTAINER_TEST_DSN: host=postgres port=5432 dbname=platform user=duckfleet_maintainer password=local-platform-maintainer-password
+      DUCKFLEET_CATALOG_TEST_DSN: host=postgres port=5432 dbname=lake user=duckfleet_catalog password=local-lake-catalog-password
     volumes:
       - ./artifacts:/artifacts
     depends_on:

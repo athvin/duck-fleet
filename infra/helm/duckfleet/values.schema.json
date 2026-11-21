@@ -18,6 +18,70 @@
     }
   },
   "properties": {
+    "databaseRoles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "migrator": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+        },
+        "gateway": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+        },
+        "worker": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+        },
+        "maintainer": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+        },
+        "catalog": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+        }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "defaultPersistentGrant"
+      ],
+      "properties": {
+        "defaultPersistentGrant": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "pool",
+            "cpu",
+            "memory",
+            "disk"
+          ],
+          "properties": {
+            "pool": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,38}[a-z0-9]$|^[a-z]$"
+            },
+            "cpu": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64
+            },
+            "memory": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,5}(Ki|Mi|Gi)$"
+            },
+            "disk": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,5}(Ki|Mi|Gi)$"
+            }
+          }
+        }
+      }
+    },
     "workerImage": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9.-]*(:[0-9]+)?/[a-zA-Z0-9._/-]+@sha256:[a-f0-9]{64}$"

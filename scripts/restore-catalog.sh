@@ -34,20 +34,28 @@ case "$mode" in
     [[ -n "$template" ]] || { echo 'Apply the current chart before restoring' >&2; exit 1; }
     version=$("${kube[@]}" get job "$template" \
       -o jsonpath='{.metadata.annotations.duckfleet\.io/platform-schema}')
-    [[ "$version" == 2 ]] || { echo 'Stop compute and apply the schema 2 chart/image before restoring' >&2; exit 1; }
+    [[ "$version" == 3 ]] || { echo 'Stop compute and apply the schema 3 chart/image before restoring' >&2; exit 1; }
     bash "$ROOT/scripts/stop-compute.sh" kube
     ;;
   *) echo "unknown mode: $mode (compose or kube)" >&2; exit 64 ;;
 esac
 
 restore() { # restore <database>
+  # --role restores objects under their dedicated database owner. Old backup ACLs
+  # are discarded; the matching migration reinstalls the reviewed runtime grants.
+  local owner
+  case "$mode" in
+    compose) owner=$(docker compose exec -T postgres psql -U duckfleet -d "$1" -tAc 'SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname=current_database()') ;;
+    kube) owner=$("${kube[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d "$1" -tAc 'SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname=current_database()') ;;
+  esac
+  [[ "$owner" != duckfleet && "$owner" =~ ^[a-z_][a-z0-9_]*$ ]] || { echo 'Provision separate database owners before restoring' >&2; return 1; }
   case "$mode" in
     compose)
-      docker compose exec -T postgres pg_restore --exit-on-error -U duckfleet --no-owner -d "$1" ;;
+      docker compose exec -T postgres pg_restore --exit-on-error -U duckfleet --role="$owner" --no-owner --no-privileges -d "$1" ;;
     kube)
       kubectl --context "${DUCKFLEET_KUBE_CONTEXT:?set DUCKFLEET_KUBE_CONTEXT}" \
         --namespace "${DUCKFLEET_NAMESPACE:?set DUCKFLEET_NAMESPACE}" \
-        exec -i statefulset/duckfleet-postgres -- pg_restore --exit-on-error -U duckfleet --no-owner -d "$1" ;;
+        exec -i statefulset/duckfleet-postgres -- pg_restore --exit-on-error -U duckfleet --role="$owner" --no-owner --no-privileges -d "$1" ;;
     *)
       echo "unknown mode: $mode (compose or kube)" >&2; exit 64 ;;
   esac < "$src/$1.dump"
@@ -56,5 +64,6 @@ restore() { # restore <database>
 restore lake
 restore platform
 bash "$ROOT/scripts/migrate-platform.sh" "$mode"
+bash "$ROOT/scripts/migrate-platform.sh" "$mode" platform-grants
 echo 'Platform schema migrated successfully; compute remains stopped and may now be restarted.'
 echo "restored lake and platform from $src, taken $(cat "$src/taken-at.txt" 2>/dev/null || echo 'at an unrecorded time')"

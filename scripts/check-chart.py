@@ -252,7 +252,9 @@ else:
     env = {item['name']: item.get('value') for item in migrate['env']}
     assert set(env) == {'DUCKFLEET_ROLE', 'PLATFORM_DSN', 'DUCKFLEET_PLATFORM_WAIT_SECONDS',
                         'DUCKFLEET_MIGRATION_TIMEOUT_SECONDS', 'DUCKFLEET_PREPAID_MICRO_USD',
-                        'DUCKFLEET_MAX_JOB_MICRO_USD'}, env
+                        'DUCKFLEET_MAX_JOB_MICRO_USD', 'DUCKFLEET_NAMESPACE', 'DUCKFLEET_DATABASE_ROLES_JSON',
+                        'DUCKFLEET_AUTHZ_DEFAULT_POOL', 'DUCKFLEET_AUTHZ_DEFAULT_CPU',
+                        'DUCKFLEET_AUTHZ_DEFAULT_MEMORY', 'DUCKFLEET_AUTHZ_DEFAULT_DISK'}, env
     assert env['DUCKFLEET_ROLE'] == 'migrate'
     # Helm may stringify large numeric YAML values in scientific notation.
     # Migrations parse whole micro-USD, and the Kind YAML round trip must retain
@@ -436,6 +438,27 @@ else:
     assert declared['AWS_EC2_METADATA_DISABLED'] == 'true'
     assert 'S3_SECRET_KEY' not in declared
     secrets = {e['name'] for e in container['env'] if 'valueFrom' in e}
-    assert {'CATALOG_DSN', 'PLATFORM_DSN', 'DUCKFLEET_TOKEN'} <= secrets, secrets
+    assert {'CATALOG_DSN', 'PLATFORM_DSN', 'DUCKFLEET_INTERNAL_TOKEN'} <= secrets, secrets
 
 print('PASS: chart resource sizes, identity, isolation, private services, and scoped DNS')
+
+# Key-level mounts never expose a sibling component's database or recovery token.
+def secret_keys(container):
+    assert not container.get('envFrom'), 'whole-Secret imports expose privileged sibling keys'
+    return {item['name']: item['valueFrom']['secretKeyRef']['key'] for item in container.get('env', [])
+            if 'secretKeyRef' in item.get('valueFrom', {})}
+
+for worker in persistent_workers.values():
+    pod = worker['spec']['template']['spec']
+    keys = secret_keys(pod['containers'][0])
+    assert keys['PLATFORM_DSN'] == 'PLATFORM_WORKER_DSN'
+    assert keys['DUCKFLEET_INTERNAL_TOKEN'] == 'DUCKFLEET_INTERNAL_TOKEN'
+    assert not {'DUCKFLEET_TOKEN', 'DUCKFLEET_MAINTENANCE_DSN'} & set(keys)
+    assert not any('secret' in volume for volume in pod.get('volumes', []))
+gateway_keys = secret_keys(gateway)
+assert gateway_keys['PLATFORM_DSN'] == 'PLATFORM_GATEWAY_DSN'
+assert gateway_keys['DUCKFLEET_MAINTENANCE_DSN'] == 'PLATFORM_MAINTENANCE_DSN'
+assert gateway_keys['DUCKFLEET_TOKEN'] != gateway_keys['DUCKFLEET_INTERNAL_TOKEN']
+if migrations:
+    keys = secret_keys(migrations[0]['spec']['template']['spec']['containers'][0])
+    assert keys == {'PLATFORM_DSN': 'PLATFORM_MIGRATION_DSN'}

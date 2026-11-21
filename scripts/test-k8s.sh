@@ -77,17 +77,7 @@ kind load docker-image --name "$CLUSTER" duckfleet-worker:local duckfleet-dbt:lo
 # grant missing a verb, would show up here instead of on a deploy.
 python3 scripts/aws/render_boundary.py "$NS" | kubectl --context "$CONTEXT" apply -f -
 # Same shape the AWS deploy generates, created here rather than committed.
-python3 - <<'PY' | "${KUBE[@]}" create -f -
-import json, secrets
-password = secrets.token_hex(32)
-dsn = f'host=postgres port=5432 user=duckfleet password={password}'
-print(json.dumps({'apiVersion': 'v1', 'kind': 'Secret',
-                  'metadata': {'name': 'duckfleet-dev'}, 'type': 'Opaque',
-                  'stringData': {'POSTGRES_PASSWORD': password,
-                                 'DUCKFLEET_TOKEN': secrets.token_hex(32),
-                                 'CATALOG_DSN': dsn + ' dbname=lake',
-                                 'PLATFORM_DSN': dsn + ' dbname=platform'}}))
-PY
+python3 scripts/database_roles.py "$NS" | "${KUBE[@]}" create -f -
 
 "${KUBE[@]}" apply -f infra/kind/object-store.yaml
 "${KUBE[@]}" rollout status deployment/object-store --timeout=240s
@@ -95,7 +85,10 @@ PY
 
 digest=$(printf 'a%.0s' {1..64})
 render() {
+  # The RBAC continuity fixture exercises the PostgreSQL wire listener. Keep it
+  # enabled across this test's rerenders; ordinary deployments remain opt-in.
   helm template duckfleet infra/helm/duckfleet --namespace "$NS" \
+    --set pgwire.enabled=true \
     --set "workerImage=$REGISTRY/worker@sha256:$digest" \
     --set "dbtImage=$REGISTRY/dbt@sha256:$digest" "$@"
 }
@@ -161,6 +154,8 @@ harness() { # harness <job-name> <command> [timeout]
   "${KUBE[@]}" logs "job/$name" -c dbt > "artifacts/kind/$name.log"
 }
 
+python3 scripts/kind/assert_role_posture.py --context "$CONTEXT" --namespace "$NS" > artifacts/kind/role-secret-posture.json
+harness duckfleet-rbac 'duckfleet-server --rbac' 900
 harness duckfleet-harness 'duckfleet-server'
 grep -q 'PASS: protocol checks and dbt lifecycle' artifacts/kind/duckfleet-harness.log
 grep -q 'PASS: resource/sizing routing refuses what it cannot serve' artifacts/kind/duckfleet-harness.log
@@ -466,7 +461,16 @@ echo 'PASS: two persistent pools and isolated compute matched their declared all
 # running against RDS looks like scaled to kind. The in-namespace stand-in needs
 # no externalCidrs — the isolation policy already permits 5432 between this
 # namespace's pods; the out-of-namespace egress render is proven in check-infra.
-"${KUBE[@]}" apply -f infra/kind/external-postgres.yaml
+"${KUBE[@]}" get statefulset/duckfleet-postgres -o json | python3 -c '
+import json,sys,yaml
+source=json.load(sys.stdin)
+env=source["spec"]["template"]["spec"]["containers"][0]["env"]
+objects=list(yaml.safe_load_all(open("infra/kind/external-postgres.yaml")))
+for obj in objects:
+    if obj["kind"]=="Deployment":
+        obj["spec"]["template"]["spec"]["containers"][0]["env"]=env
+yaml.safe_dump_all(objects,sys.stdout)
+' | "${KUBE[@]}" apply -f -
 "${KUBE[@]}" rollout status deployment/external-postgres --timeout=240s
 # Quiesce every engine before changing the target of the shared Secret. Existing
 # process environments otherwise keep writing the old database during the switch.
@@ -475,13 +479,12 @@ DUCKFLEET_KUBE_CONTEXT="$CONTEXT" DUCKFLEET_NAMESPACE="$NS" scripts/stop-compute
 "${KUBE[@]}" get statefulset/duckfleet-postgres > /dev/null
 "${KUBE[@]}" get jobs -l app=duckfleet-platform-migrate -o name > artifacts/kind/stopped-migration-jobs.txt
 test -s artifacts/kind/stopped-migration-jobs.txt
-password=$("${KUBE[@]}" get secret duckfleet-dev -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)
-python3 - "$password" <<'PY' | "${KUBE[@]}" patch secret duckfleet-dev --type merge --patch-file /dev/stdin
-import json, sys
-dsn = f'host=external-postgres port=5432 user=duckfleet password={sys.argv[1]}'
-print(json.dumps({'stringData': {'CATALOG_DSN': dsn + ' dbname=lake',
-                                 'PLATFORM_DSN': dsn + ' dbname=platform'}}))
-PY
+"${KUBE[@]}" get secret duckfleet-dev -o json | python3 -c '
+import json,sys
+sys.path.insert(0,"scripts")
+from database_roles import retarget
+print(json.dumps(retarget(json.load(sys.stdin),"external-postgres")))
+' | "${KUBE[@]}" patch secret duckfleet-dev --type merge --patch-file /dev/stdin
 render --no-hooks \
   --set postgres.bundled=false \
   --set-string platformMigration.runId=external-empty-database \
@@ -496,7 +499,7 @@ python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace
 "${KUBE[@]}" apply -f "$work/release-external.yaml"
 # apply does not prune, so the bundled instance is removed by name — exactly what
 # an operator migrating to an external catalog does after restoring into it.
-"${KUBE[@]}" delete statefulset/duckfleet-postgres service/postgres configmap/duckfleet-postgres-init
+"${KUBE[@]}" delete statefulset/duckfleet-postgres service/postgres
 python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
 echo 'PASS: unchanged worker image migrated a fresh external platform database'
 # Two probes against the fresh external catalog: overlapping DuckLake writes from
@@ -530,14 +533,15 @@ team=(kubectl --context "$CONTEXT" -n "$TEAM")
 "${team[@]}" apply -f infra/kind/object-store.yaml
 "${team[@]}" rollout status deployment/object-store --timeout=240s
 "${team[@]}" wait --for=condition=complete job/bucket-init --timeout=240s
-team_token=$("${team[@]}" get secret duckfleet-dev -o jsonpath='{.data.DUCKFLEET_TOKEN}' | base64 -d)
-dev_password=$("${KUBE[@]}" get secret duckfleet-dev -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)
 "${team[@]}" port-forward svc/server 18081:8080 > /dev/null 2>&1 &
 team_forward=$!
+"${KUBE[@]}" port-forward svc/server 18080:8080 > /dev/null 2>&1 &
+source_forward=$!
 sleep 3
 python3 scripts/kind/team_namespace_probe.py --port 18081 \
-  --token "$team_token" --dev-password "$dev_password"
+  --source-port 18080 --context "$CONTEXT" --namespace "$TEAM" --source-namespace "$NS"
 kill "$team_forward" 2> /dev/null || true
+kill "$source_forward" 2> /dev/null || true
 DUCKFLEET_CONFIRM_DEPROVISION=yes DUCKFLEET_KUBE_CONTEXT="$CONTEXT" \
   bash scripts/deprovision-namespace.sh "$TEAM"
 if kubectl --context "$CONTEXT" get namespace "$TEAM" > /dev/null 2>&1; then

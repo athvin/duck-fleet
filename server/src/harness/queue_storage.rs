@@ -1,6 +1,6 @@
 //! Real PostgreSQL queue invariants, isolated from running workers and budgets.
 use crate::{
-    ApiError,
+    ApiError, authz,
     credentials::{self, Identity},
     failure, platform, pricing,
     query::{AdmissionLimits, Protocol, QueryRequest, WorkerLimits},
@@ -25,7 +25,25 @@ fn api<T>(result: Result<T, ApiError>) -> Result<T> {
 }
 fn actor(client: &mut Client, name: &str) -> Result<Identity> {
     let issued = credentials::issue(client, name, None)?;
+    api(authz::set_policy(
+        client,
+        &Identity::bootstrap(),
+        name,
+        &authz::PolicyUpdate {
+            roles: vec![authz::Role::Analyst],
+            permissions: vec![],
+            compute: vec![authz::ComputeGrant {
+                pool: Some("fixture".into()),
+                mode: crate::compute::Mode::Persistent,
+                cpu: 1,
+                memory_bytes: 1 << 30,
+                disk_bytes: 2 << 30,
+            }],
+            disabled: false,
+        },
+    ))?;
     Ok(Identity {
+        kind: credentials::ActorKind::Named,
         principal: name.to_owned(),
         credential_id: Some(issued.credential_id),
         expires_at: None,
@@ -47,8 +65,9 @@ fn session(
         scope: "persistent:fixture".into(),
         protocol: Protocol::Http,
         open_span_id: Uuid::new_v4(),
+        operation: authz::TrustedOperation::Sql,
     };
-    queue::register_session(client, &s)?;
+    api(queue::register_session(client, &s))?;
     Ok(s)
 }
 fn query() -> QueryRequest {
@@ -132,8 +151,8 @@ fn fixtures(client: &mut Client, config: &postgres::Config) -> Result<()> {
         max_job_micro_usd: 1_000_000,
     };
     anyhow::ensure!(
-        platform::migrate(client, &seed)?.version == 2,
-        "schema2 migration missing"
+        platform::migrate(client, &seed)?.version == platform::SCHEMA_VERSION,
+        "current schema migration missing"
     );
     anyhow::ensure!(
         !platform::migrate(client, &seed)?.applied,
@@ -283,7 +302,7 @@ fn fixtures(client: &mut Client, config: &postgres::Config) -> Result<()> {
         &[&alice.credential_id],
     )?;
     anyhow::ensure!(
-        !queue::begin_close(
+        !api(queue::begin_close(
             client,
             rotation.session_id,
             &w1,
@@ -291,7 +310,7 @@ fn fixtures(client: &mut Client, config: &postgres::Config) -> Result<()> {
                 credential_id: stale.identity.credential_id,
                 authority_generation: stale.generation
             }
-        )?,
+        ))?,
         "stale opener cleanup closed accepted B"
     );
     let current = queue::authorities(client, &w1)?
@@ -727,6 +746,8 @@ fn legacy_v2_fixture(client: &mut Client, epoch: &WorkerEpoch, actor: &Identity)
     old.queue_timeout_seconds = 90;
     client.execute("INSERT INTO requests(request_id,principal,logical_request_id,fingerprint_version,payload_hash,state,status,outcome,failure_kind,retry_safe,worker_id)
         VALUES($1,$2,$1,2,$3,'terminal','refused','not_executed','budget_exhausted',true,$4)",&[&old.request_id.to_string(),&actor.principal,&V2,&epoch.worker_id])?;
+    // A v2 attempt with a proven owner keeps its original hash across schema3.
+    client.execute("UPDATE requests SET namespace_id=(SELECT id FROM platform_namespace),owner_principal_id=(SELECT principal_id FROM principals WHERE name=$2) WHERE request_id=$1", &[&old.request_id.to_string(),&actor.principal])?;
     anyhow::ensure!(
         matches!(
             submit(client, &s, old.clone(), actor)?,

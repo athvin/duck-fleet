@@ -1,5 +1,5 @@
 use crate::{
-    ApiError, Envelope, Operation, Output, Reply,
+    ApiError, Envelope, Operation, Output, Reply, authz,
     compute::{Mode, Placement, Resources, WorkerSessionRequest},
     credentials::{self, Identity},
     failure, pricing, query, queue, queue_service, requests,
@@ -28,6 +28,15 @@ pub(crate) struct Active {
     reason: Option<&'static str>,
 }
 type ActiveSlot = Arc<Mutex<Option<Active>>>;
+
+pub(crate) fn active_query(active: &ActiveSlot, session: Uuid) -> Option<Uuid> {
+    active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|current| current.session == session)
+        .map(|current| current.query)
+}
 
 pub(crate) fn interrupt(
     active: &ActiveSlot,
@@ -84,6 +93,7 @@ struct Session {
 struct Completion<'a> {
     status: &'a str,
     failure: Option<failure::Failure>,
+    credential_denial: Option<authz::Action>,
     elapsed_ms: i64,
     engine_started_at: Option<SystemTime>,
     result_rows: Option<i64>,
@@ -93,7 +103,7 @@ struct Completion<'a> {
 }
 
 fn operator_identity(identity: &Identity) -> bool {
-    identity.credential_id.is_none() && (identity.is_bootstrap() || identity.principal == "direct")
+    identity.credential_id.is_none() && identity.kind != credentials::ActorKind::Named
 }
 
 /// Resolving an ID is insufficient unless the authenticated principal matches it.
@@ -103,7 +113,9 @@ fn admitted_identity(claimed: &Identity, resolved: Option<Identity>) -> Result<I
     }
     resolved
         .filter(|identity| {
-            claimed.credential_id.is_some()
+            claimed.kind == credentials::ActorKind::Named
+                && identity.kind == credentials::ActorKind::Named
+                && claimed.credential_id.is_some()
                 && identity.credential_id == claimed.credential_id
                 && identity.principal == claimed.principal
         })
@@ -186,6 +198,23 @@ fn connection_pending(message: &str) -> bool {
     PENDING.iter().any(|pending| message.contains(pending))
 }
 
+/// The PostgreSQL catalog can race when multiple workers create a fresh lake.
+/// Only the observed metadata-table/type collision is retried, and only by the
+/// pre-readiness ATTACH caller. Other DDL, migrations, and user SQL stay fatal.
+fn catalog_attach_pending(message: &str) -> bool {
+    if connection_pending(message) {
+        return true;
+    }
+    let message = message.to_ascii_lowercase();
+    message.contains("failed to initialize ducklake:")
+        && message.contains(r#"failed to execute query "create table "#)
+        && message.contains(r#""."ducklake_metadata"("#)
+        && message.contains(
+            r#"duplicate key value violates unique constraint "pg_type_typname_nsp_index""#,
+        )
+        && message.contains("key (typname, typnamespace)=(ducklake_metadata,")
+}
+
 /// Retries an attempt that cannot succeed until a dependency is listening.
 ///
 /// DNS and PostgreSQL can both be unready when a pod starts. Exiting makes the
@@ -195,6 +224,16 @@ fn retrying<T>(
     what: &str,
     host: &str,
     budget: Duration,
+    attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    retrying_if(what, host, budget, connection_pending, attempt)
+}
+
+fn retrying_if<T>(
+    what: &str,
+    host: &str,
+    budget: Duration,
+    retryable: fn(&str) -> bool,
     mut attempt: impl FnMut() -> Result<T>,
 ) -> Result<T> {
     let deadline = Instant::now() + budget;
@@ -205,7 +244,7 @@ fn retrying<T>(
             Err(error) => error,
         };
         let cause = format!("{error:#}");
-        if !connection_pending(&cause) {
+        if !retryable(&cause) {
             return Err(error);
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -486,6 +525,9 @@ impl Worker {
             "waiting for compatible platform schema",
             crate::platform::wait_schema(&platform_dsn, platform_wait),
         )?;
+        crate::db_roles::validate_runtime(&mut ledger, crate::db_roles::RuntimeRole::Worker)?;
+        authz::validate_namespace(&mut ledger)?;
+        let platform_database: String = ledger.query_one("SELECT current_database()", &[])?.get(0);
         let rate = pricing::RateCard::from_env()?;
         let startup = Startup::new(Connection::open_in_memory()?, redactor.clone());
         startup.run(
@@ -519,15 +561,42 @@ impl Worker {
         }
         let wait = catalog_wait()?;
         let catalog_dsn = required("CATALOG_DSN")?;
+        let catalog_started = Instant::now();
+        let mut catalog_config: postgres::Config =
+            redactor.guard("parsing catalog connection", catalog_dsn.parse())?;
+        catalog_config.connect_timeout(Duration::from_secs(3));
+        catalog_config.tcp_user_timeout(Duration::from_secs(3));
+        catalog_config.keepalives_idle(Duration::from_secs(5));
+        catalog_config.keepalives_interval(Duration::from_secs(2));
+        catalog_config.keepalives_retries(2);
+        // NoTls obeys sslmode=require by failing; it never downgrades a required
+        // transport. Validate a real scoped catalog login before giving it to SQL.
+        retrying(
+            "catalog role validation",
+            &crate::secrets::dsn_host(&catalog_dsn),
+            wait,
+            || {
+                let mut catalog = redactor.guard(
+                    "connecting to catalog for role validation",
+                    catalog_config.connect(NoTls),
+                )?;
+                redactor.guard("bounding catalog validation",catalog.batch_execute("SET statement_timeout=3000; SET lock_timeout=1000; SET idle_in_transaction_session_timeout=3000"))?;
+                redactor.guard(
+                    "validating scoped catalog role",
+                    crate::db_roles::validate_catalog(&mut catalog, &platform_database),
+                )
+            },
+        )?;
         let attach = format!(
             "ATTACH {} AS lake (DATA_PATH {}); USE lake;",
             literal(&format!("ducklake:postgres:{catalog_dsn}")),
             literal(&required("S3_DATA_PATH")?)
         );
-        retrying(
+        retrying_if(
             "DuckLake catalog",
             &crate::secrets::dsn_host(&catalog_dsn),
-            wait,
+            wait.saturating_sub(catalog_started.elapsed()),
+            catalog_attach_pending,
             || startup.run("attaching the DuckLake catalog", &attach),
         )?;
         // Keep real Parquet objects in the harness, even for tiny seed data.
@@ -795,7 +864,7 @@ impl Worker {
                 .unserviceable("worker ownership", "exclusive ownership connection lost"));
         }
         match op {
-            Operation::Open(request, identity, protocol, open_span_id) => {
+            Operation::Open(request, identity, protocol, open_span_id, operation) => {
                 if self.queue.draining.load(Ordering::Acquire) {
                     return Err(ApiError::new(failure::DRAINING, "worker draining"));
                 }
@@ -857,6 +926,13 @@ impl Worker {
                     return Err(ApiError::new(failure::CAPACITY, "session limit reached"));
                 }
                 let identity = self.validate_identity(&identity)?;
+                authz::authorize_execution(
+                    &mut self.ledger.client,
+                    &identity,
+                    &identity.principal,
+                    &serde_json::to_value(&placement).map_err(|_| ApiError::internal())?,
+                    &operation,
+                )?;
                 let conn = self.root.try_clone().map_err(|_| ApiError::internal())?;
                 conn.execute_batch("USE lake")
                     .map_err(|_| ApiError::internal())?;
@@ -879,12 +955,16 @@ impl Worker {
                         .map_or_else(|| "isolated".into(), |name| format!("persistent:{name}")),
                     protocol,
                     open_span_id,
+                    operation,
                 };
-                if queue::register_session(&mut self.ledger.client, &registration).is_err() {
-                    // A lost registration ACK must not leave a usable local
-                    // session; restart recovery retires any committed evidence.
-                    self.queue.stop();
-                    return Err(ApiError::internal());
+                if let Err(error) = queue::register_session(&mut self.ledger.client, &registration)
+                {
+                    // A definitive authorization refusal happens before registration
+                    // commits. Only an uncertain metadata result requires recovery.
+                    if !matches!(error.0.kind, "unauthorized" | "forbidden") {
+                        self.queue.stop();
+                    }
+                    return Err(error);
                 }
                 self.sessions.insert(id, Session { conn, profile });
                 self.queue.register_local(id);
@@ -930,6 +1010,22 @@ impl Worker {
                 changed || completion.outcome == requests::Outcome::NotExecuted,
                 "engine terminal outcome was not persisted; retained state changed unexpectedly"
             );
+            if changed && let Some(action) = completion.credential_denial {
+                match crate::audit::append_accepted_denial_in(
+                    &mut transaction,
+                    &request_id.to_string(),
+                    action,
+                    "credential_invalid",
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(%request_id,"accepted credential denial has no retained typed actor; audit attribution omitted")
+                    }
+                    Err(_) => {
+                        tracing::warn!(%request_id,"accepted credential denial audit unavailable; preserving terminal refusal")
+                    }
+                }
+            }
             transaction.commit()?;
             Ok(())
         })();
@@ -943,11 +1039,21 @@ impl Worker {
     }
 
     fn abort_admission(&mut self, request_id: Uuid, refusal: ApiError) -> Reply {
+        self.abort_admission_with_audit(request_id, refusal, None)
+    }
+
+    fn abort_admission_with_audit(
+        &mut self,
+        request_id: Uuid,
+        refusal: ApiError,
+        credential_denial: Option<authz::Action>,
+    ) -> Reply {
         self.finish_execution(
             request_id,
             Completion {
                 status: refusal.0.status.unwrap_or("refused"),
                 failure: Some(refusal.0),
+                credential_denial,
                 elapsed_ms: 0,
                 engine_started_at: None,
                 result_rows: None,
@@ -1000,8 +1106,19 @@ impl Worker {
             .profile
             .clear();
         // The last metadata operation before engine entry is authoritative auth.
-        if let Err(refusal) = self.validate_identity(&claimed) {
-            return self.abort_admission(query_id, refusal);
+        if let Err(refusal) = payload.operation.validate_sql(&req.sql).and_then(|()| {
+            authz::authorize_execution_for_owner(
+                &mut self.ledger.client,
+                &claimed,
+                payload.owner_principal_id.as_deref(),
+                &payload.compute,
+                &payload.operation,
+            )
+            .map(|_| ())
+        }) {
+            let credential_denial =
+                (refusal.0 == failure::UNAUTHORIZED).then(|| payload.operation.action());
+            return self.abort_admission_with_audit(query_id, refusal, credential_denial);
         }
         let session = self.sessions.get_mut(&id).expect("engine session checked");
         let refusal = {
@@ -1105,6 +1222,7 @@ impl Worker {
                 Completion {
                     status,
                     failure,
+                    credential_denial: None,
                     elapsed_ms: elapsed,
                     engine_started_at: Some(engine_started_at),
                     result_rows: rows,
@@ -1264,6 +1382,7 @@ mod tests {
 
     fn named_identity(principal: &str) -> Identity {
         Identity {
+            kind: crate::credentials::ActorKind::Named,
             principal: principal.into(),
             credential_id: Some(Uuid::new_v4().to_string()),
             expires_at: None,
@@ -1313,6 +1432,82 @@ mod tests {
         ] {
             assert!(!connection_pending(fatal), "should not wait: {fatal}");
         }
+    }
+
+    const CATALOG_INIT_COLLISION: &str = r#"attaching the DuckLake catalog: Invalid Error: Failed to initialize DuckLake: Failed to execute query "CREATE TABLE "public"."ducklake_metadata"("key" VARCHAR NOT NULL, "value" VARCHAR NOT NULL, "scope" VARCHAR, "scope_id" BIGINT);": ERROR: duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+DETAIL: Key (typname, typnamespace)=(ducklake_metadata, 2200) already exists."#;
+
+    #[test]
+    fn catalog_retry_requires_the_observed_initialization_collision() {
+        assert!(catalog_attach_pending(CATALOG_INIT_COLLISION));
+        assert!(!connection_pending(CATALOG_INIT_COLLISION));
+        for fatal in [
+            CATALOG_INIT_COLLISION.replace(
+                "Failed to initialize DuckLake:",
+                "Failed to commit DuckLake transaction:",
+            ),
+            CATALOG_INIT_COLLISION.replace("CREATE TABLE", "ALTER TABLE"),
+            CATALOG_INIT_COLLISION.replace("ducklake_metadata", "customer_data"),
+            CATALOG_INIT_COLLISION.replace("pg_type_typname_nsp_index", "customer_data_pkey"),
+            CATALOG_INIT_COLLISION.replace(
+                "duplicate key value violates unique constraint",
+                "permission denied for relation",
+            ),
+            "Failed to initialize DuckLake: password authentication failed".into(),
+            "Failed to initialize DuckLake: database lake does not exist".into(),
+            "Failed to initialize DuckLake: current transaction is aborted".into(),
+            "duplicate key value violates unique constraint pg_type_typname_nsp_index".into(),
+        ] {
+            assert!(!catalog_attach_pending(&fatal), "must not replay: {fatal}");
+        }
+    }
+
+    #[test]
+    fn only_startup_attach_retries_a_catalog_creation_collision() -> Result<()> {
+        let mut attempts = 0;
+        let ready = retrying_if(
+            "DuckLake catalog",
+            "postgres",
+            Duration::from_secs(2),
+            catalog_attach_pending,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    anyhow::bail!(CATALOG_INIT_COLLISION);
+                }
+                Ok("attached")
+            },
+        )?;
+        assert_eq!((ready, attempts), ("attached", 2));
+        let mut ordinary_attempts = 0;
+        let error = retrying(
+            "catalog connection",
+            "postgres",
+            Duration::from_secs(2),
+            || -> Result<()> {
+                ordinary_attempts += 1;
+                anyhow::bail!(CATALOG_INIT_COLLISION)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(ordinary_attempts, 1);
+        assert!(error.to_string().contains("Failed to initialize DuckLake"));
+        let mut expired_attempts = 0;
+        assert!(
+            retrying_if(
+                "DuckLake catalog",
+                "postgres",
+                Duration::ZERO,
+                catalog_attach_pending,
+                || -> Result<()> {
+                    expired_attempts += 1;
+                    anyhow::bail!(CATALOG_INIT_COLLISION)
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(expired_attempts, 1);
+        Ok(())
     }
 
     #[test]

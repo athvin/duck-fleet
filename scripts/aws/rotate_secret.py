@@ -1,4 +1,4 @@
-"""Rewrites the password inside a DuckFleet Secret, leaving everything else alone.
+"""Rewrites only the dedicated catalog credential; platform/admin passwords remain unchanged.
 
 The DSNs carry a host, port, database and user as well as the password. Rebuilding
 them from parts would work until one of those differed from what this assumed, at
@@ -15,8 +15,8 @@ import os
 import re
 import sys
 
-PASSWORD_KEYS = ["POSTGRES_PASSWORD"]
-DSN_KEYS = ["CATALOG_DSN", "PLATFORM_DSN"]
+PASSWORD_KEYS = ["DATABASE_CATALOG_PASSWORD"]
+DSN_KEYS = ["CATALOG_DSN"]
 
 
 def decode(secret, key):

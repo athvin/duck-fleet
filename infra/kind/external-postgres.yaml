@@ -10,15 +10,6 @@ spec:
   selector: {app: external-postgres}
   ports: [{port: 5432, targetPort: 5432}]
 ---
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: external-postgres-init
-data:
-  init.sql: |
-    CREATE DATABASE lake;
-    CREATE DATABASE platform;
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -52,6 +43,8 @@ spec:
           env:
             - {name: POSTGRES_USER, value: duckfleet}
             - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            # scripts/test-k8s injects the same provisioning-only role env as the
+            # bundled PostgreSQL before this disposable external fixture is applied.
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef: {name: duckfleet-dev, key: POSTGRES_PASSWORD}
@@ -60,13 +53,20 @@ spec:
           volumeMounts:
             - {name: data, mountPath: /var/lib/postgresql/data}
             - {name: init, mountPath: /docker-entrypoint-initdb.d}
+            - {name: provisioning, mountPath: /etc/duckfleet, readOnly: true}
             - {name: run, mountPath: /var/run/postgresql}
             - {name: tmp, mountPath: /tmp}
       volumes:
         - name: data
           emptyDir: {}
         - name: init
-          configMap: {name: external-postgres-init}
+          configMap:
+            name: duckfleet-postgres-init
+            items: [{key: init.sh, path: init.sh}]
+        - name: provisioning
+          configMap:
+            name: duckfleet-postgres-init
+            items: [{key: provision-database.sql, path: provision-database.sql}]
         - name: run
           emptyDir: {}
         - name: tmp

@@ -5,6 +5,7 @@ mkdir -p artifacts
 # Only this Compose project is touched. Volumes deliberately survive the test.
 trap 'result=$?; if [ "$result" -ne 0 ]; then docker compose --profile "*" logs --no-color > artifacts/compose-failure.log 2>&1; fi; exit "$result"' EXIT
 python3 scripts/compute_lifecycle.py check compose
+python3 scripts/test-database-roles.py
 docker compose --profile test build
 docker compose up -d --wait server
 
@@ -15,9 +16,10 @@ test -n "$small_id"
 test "$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$small_id")" = '1000000000 1073741824'
 docker inspect --format '{"container":{{json .Name}},"nano_cpus":{{.HostConfig.NanoCpus}},"memory_bytes":{{.HostConfig.Memory}}}' "$small_id" > artifacts/docker-worker-limits.jsonl
 
-# DuckDB quotes the failing statement in its error and the process prints that error
-# as it exits, so an unscrubbed ATTACH writes the catalog password to the container
-# log on every boot failure. Force the failure and read the log back.
+# Catalog role validation probes PostgreSQL before DuckDB ATTACH. Force that
+# earlier startup failure and verify its bounded, host-only diagnostic never
+# writes the configured DSN or password to the container log. The redactor's
+# unit tests separately cover ATTACH errors that quote the connection string.
 if docker compose run --rm --no-deps -T \
   -e DUCKFLEET_CATALOG_WAIT_SECONDS=0 \
   -e CATALOG_DSN='host=catalog-does-not-resolve port=5432 dbname=lake user=duckfleet password=local-catalog-password' \
@@ -34,10 +36,11 @@ fi
 grep -q 'do not match the configured' artifacts/worker-misconfigured.log
 grep -q 'cpu=1' artifacts/worker-misconfigured.log
 grep -q 'cpu=4' artifacts/worker-misconfigured.log
-grep -q 'attaching the DuckLake catalog' artifacts/worker-boot-failure.log
-grep -q 'still unreachable' artifacts/worker-boot-failure.log
+grep -q 'catalog role validation' artifacts/worker-boot-failure.log
+grep -q 'still unreachable after 0s' artifacts/worker-boot-failure.log
 grep -q 'catalog-does-not-resolve' artifacts/worker-boot-failure.log
 ! grep -q 'local-catalog-password' artifacts/worker-boot-failure.log
+! grep -q 'host=catalog-does-not-resolve port=5432' artifacts/worker-boot-failure.log
 
 # A deleted pod's replacement can overlap its draining predecessor even under
 # Deployment Recreate. Startup recovery must wait for the stable identity owner.
@@ -50,23 +53,19 @@ fi
 grep -q 'still owned by another process' artifacts/worker-overlap-refusal.log
 echo 'PASS: overlapping worker startup refused recovery of a live predecessor'
 
-# A worker reached directly must refuse isolation too. Naming a resource (cpu/memory)
-# derives an isolated pod, which a persistent worker cannot provide. An empty
-# request uses the worker's persistent pool; explicit persistent selection is
-# exercised by the named-pool stage below.
-session() { # session <worker> <json>
-  docker compose exec -T "$1" sh -c 'curl -sS -o /dev/null -w "%{http_code}" \
-    -X POST http://localhost:8080/v1/sessions \
-    -H "Authorization: Bearer $DUCKFLEET_TOKEN" -H "Content-Type: application/json" \
-    -d '"'$2'"
-}
-test "$(session worker-small '{"compute":{"cpu":1,"memory":"1Gi"}}')" = 501
-test "$(session worker-small '{"compute":{}}')" = 200
-echo 'PASS: a worker addressed directly refuses isolation it cannot provide'
+# A worker only accepts internal service authority. Public bootstrap recovery
+# belongs to the gateway and must never become a direct SQL-worker login.
+status=$(docker compose exec -T -e PUBLIC_TEST_TOKEN="${DUCKFLEET_TOKEN:-duckfleet-local-development-token}" worker-small sh -c '
+  curl -sS -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/v1/sessions \
+    -H "Authorization: Bearer $PUBLIC_TEST_TOKEN" -H "Content-Type: application/json" -d "{}"')
+test "$status" = 401
+echo 'PASS: public bootstrap cannot authenticate directly to a worker'
 
 # dbt must be an option, not a dependency. The `api` image has no dbt binary and
 # reaches the gateway only through the Rust client (the harness --api-workflow stage).
 docker compose run --rm api
+docker compose run --rm dbt duckfleet-server --rbac-storage
+docker compose run --rm dbt duckfleet-server --rbac
 docker compose run --rm dbt duckfleet-server --auth-continuity
 docker compose run --rm dbt duckfleet-server --request-identity
 docker compose run --rm dbt duckfleet-server --platform-maintenance

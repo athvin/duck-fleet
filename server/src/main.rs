@@ -1,16 +1,20 @@
 //! Local, single-tenant DuckFleet SQL service. All DuckDB work stays on one worker thread.
 #[allow(dead_code)]
+mod audit;
+mod authz;
 mod cli;
 #[allow(dead_code)]
 mod client;
 mod compute;
 mod credentials;
+mod db_roles;
 mod failure;
 mod gateway;
 mod harness;
 mod history;
 mod isolated;
 mod kube;
+mod metadata;
 mod metering;
 mod pgwire;
 mod platform;
@@ -52,7 +56,6 @@ struct App {
     sender: mpsc::Sender<Envelope>,
     queue: Arc<queue_service::Service>,
     status: worker_status::Status,
-    active: Arc<Mutex<Option<worker::Active>>>,
     token: Arc<str>,
     history: history::Reader,
     requests: requests::Reader,
@@ -77,7 +80,13 @@ struct Envelope {
 enum Operation {
     /// Request identity travels on the authenticated internal hop, independently
     /// of the caller's SQL context and the credential that opened a session.
-    Open(WorkerSessionRequest, credentials::Identity, Protocol, Uuid),
+    Open(
+        WorkerSessionRequest,
+        credentials::Identity,
+        Protocol,
+        Uuid,
+        authz::TrustedOperation,
+    ),
 }
 enum Output {
     Json(Value),
@@ -293,6 +302,7 @@ async fn open(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Reply 
             identity,
             worker_protocol(&headers)?,
             open_span(&headers)?,
+            worker_operation(&headers)?,
         ),
     )
     .await
@@ -316,20 +326,23 @@ fn worker_identity(headers: &HeaderMap) -> Result<credentials::Identity, ApiErro
         .get(credentials::CREDENTIAL_HEADER)
         .map(|value| value.to_str().map_err(|_| denied()))
         .transpose()?;
-    match (principal, credential_id) {
-        (None, None) | (Some("direct"), None) => Ok(credentials::Identity {
-            principal: "direct".into(),
-            credential_id: None,
-            expires_at: None,
-        }),
-        (Some(credentials::BOOTSTRAP_PRINCIPAL), None) => Ok(credentials::Identity::bootstrap()),
-        (Some(principal), Some(id))
+    let kind = headers
+        .get(credentials::ACTOR_KIND_HEADER)
+        .map(|value| value.to_str().map_err(|_| denied()))
+        .transpose()?;
+    match (kind, principal, credential_id) {
+        (None, None, None) => Ok(credentials::Identity::internal("direct")),
+        (Some("internal"), Some("direct"), None) => Ok(credentials::Identity::internal("direct")),
+        (Some("bootstrap"), Some(credentials::BOOTSTRAP_PRINCIPAL), None) => {
+            Ok(credentials::Identity::bootstrap())
+        }
+        (Some("named"), Some(principal), Some(id))
             if credentials::valid_principal(principal) && Uuid::parse_str(id).is_ok() =>
         {
             Ok(credentials::Identity {
+                kind: credentials::ActorKind::Named,
                 principal: principal.into(),
                 credential_id: Some(id.into()),
-                // The database supplies authoritative expiry at admission.
                 expires_at: None,
             })
         }
@@ -375,7 +388,16 @@ async fn close(State(app): State<App>, Path(id): Path<Uuid>, headers: HeaderMap)
         }
         Some(_) => return Err(ApiError::bad("invalid close reason")),
     };
-    app.queue.close(id, reason).await
+    let actor = worker_identity(&headers)?;
+    if !matches!(reason, queue_service::CloseRequest::Explicit)
+        && actor.kind == credentials::ActorKind::Named
+    {
+        return Err(ApiError::new(
+            failure::FORBIDDEN,
+            "conditional cleanup requires internal authority",
+        ));
+    }
+    app.queue.close(id, reason, actor).await
 }
 fn open_span(headers: &HeaderMap) -> Result<Uuid, ApiError> {
     headers.get("x-duckfleet-open-span-id").map_or_else(
@@ -389,6 +411,20 @@ fn open_span(headers: &HeaderMap) -> Result<Uuid, ApiError> {
         },
     )
 }
+fn worker_operation(headers: &HeaderMap) -> Result<authz::TrustedOperation, ApiError> {
+    let operation = headers
+        .get(authz::OPERATION_HEADER)
+        .map(|v| {
+            v.to_str()
+                .ok()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .ok_or_else(|| ApiError::bad("invalid trusted operation"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    authz::TrustedOperation::validate(&operation)?;
+    Ok(operation)
+}
 fn worker_protocol(headers: &HeaderMap) -> Result<Protocol, ApiError> {
     match headers.get("x-duckfleet-protocol") {
         None => Ok(Protocol::Direct),
@@ -401,19 +437,25 @@ fn worker_protocol(headers: &HeaderMap) -> Result<Protocol, ApiError> {
         },
     }
 }
-async fn history(State(app): State<App>, Query(filter): Query<history::Filter>) -> Reply {
-    app.history.list(filter).await.map(Output::Json)
+async fn history(
+    State(app): State<App>,
+    Query(filter): Query<history::Filter>,
+    headers: HeaderMap,
+) -> Reply {
+    app.history
+        .list(worker_identity(&headers)?, filter)
+        .await
+        .map(Output::Json)
 }
-async fn query_detail(State(app): State<App>, Path(id): Path<Uuid>) -> Reply {
-    app.history.detail(id).await.map(Output::Json)
+async fn query_detail(State(app): State<App>, Path(id): Path<Uuid>, headers: HeaderMap) -> Reply {
+    app.history
+        .detail(worker_identity(&headers)?, id)
+        .await
+        .map(Output::Json)
 }
 async fn request_detail(State(app): State<App>, Path(id): Path<Uuid>, headers: HeaderMap) -> Reply {
     let identity = worker_identity(&headers)?;
-    let operator = identity.credential_id.is_none();
-    app.requests
-        .detail(id, identity.principal, operator)
-        .await
-        .map(Output::Json)
+    app.requests.detail(identity, id).await.map(Output::Json)
 }
 async fn query(
     State(app): State<App>,
@@ -422,9 +464,10 @@ async fn query(
     Json(req): Json<QueryRequest>,
 ) -> Response {
     let request_id = req.request_id;
-    let (acceptance, reply) = match worker_identity(&headers)
-        .and_then(|identity| worker_protocol(&headers).map(|protocol| (identity, protocol)))
-    {
+    let (acceptance, reply) = match worker_identity(&headers).and_then(|identity| {
+        worker_operation(&headers)?;
+        worker_protocol(&headers).map(|protocol| (identity, protocol))
+    }) {
         Ok((identity, protocol)) => app.queue.submit(id, req, identity, protocol).await,
         Err(error) => (Acceptance::NotAccepted, Err(error)),
     };
@@ -465,18 +508,36 @@ fn query_response(id: Uuid, acceptance: Acceptance, reply: Reply) -> Response {
 async fn request_cancel(State(app): State<App>, Path(id): Path<Uuid>, headers: HeaderMap) -> Reply {
     app.queue.cancel(id, worker_identity(&headers)?).await
 }
-async fn usage_events(State(app): State<App>, Query(filter): Query<usage::Filter>) -> Reply {
-    app.usage.events(filter).await.map(Output::Json)
+async fn usage_events(
+    State(app): State<App>,
+    Query(filter): Query<usage::Filter>,
+    headers: HeaderMap,
+) -> Reply {
+    app.usage
+        .events(worker_identity(&headers)?, filter)
+        .await
+        .map(Output::Json)
 }
-async fn budget(State(app): State<App>) -> Reply {
-    app.usage.budget().await.map(Output::Json)
+async fn budget(State(app): State<App>, headers: HeaderMap) -> Reply {
+    app.usage
+        .budget(worker_identity(&headers)?)
+        .await
+        .map(Output::Json)
 }
-async fn set_budget(State(app): State<App>, Json(update): Json<usage::BudgetUpdate>) -> Reply {
-    app.usage.set_budget(update).await.map(Output::Json)
+async fn set_budget(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(update): Json<usage::BudgetUpdate>,
+) -> Reply {
+    app.usage
+        .set_budget(worker_identity(&headers)?, update)
+        .await
+        .map(Output::Json)
 }
-async fn cancel(State(app): State<App>, Path(id): Path<Uuid>, _: HeaderMap) -> Json<Value> {
-    let canceled = worker::interrupt(&app.active, Some(id), None, "canceled");
-    Json(json!({"interrupted_active_query": canceled}))
+async fn cancel(State(app): State<App>, Path(id): Path<Uuid>, headers: HeaderMap) -> Reply {
+    app.queue
+        .cancel_session(id, worker_identity(&headers)?)
+        .await
 }
 
 #[tokio::main]
@@ -511,16 +572,26 @@ async fn main() -> anyhow::Result<()> {
     match std::env::var("DUCKFLEET_ROLE").as_deref() {
         Ok("migrate") => return platform::migrate_command().await,
         Ok("platform-maintain") => return platform::maintain_command().await,
+        Ok("platform-grants") => return platform::grants_command().await,
         _ => {}
     }
-    let token = std::env::var("DUCKFLEET_TOKEN")?;
-    anyhow::ensure!(
-        token.len() >= 16,
-        "DUCKFLEET_TOKEN must have at least 16 characters"
-    );
     if std::env::var("DUCKFLEET_ROLE").as_deref() == Ok("gateway") {
+        let token = std::env::var("DUCKFLEET_TOKEN")?;
+        anyhow::ensure!(
+            token.len() >= 16,
+            "DUCKFLEET_TOKEN must have at least 16 characters"
+        );
         return gateway::serve(token).await;
     }
+    let token = std::env::var("DUCKFLEET_INTERNAL_TOKEN")?;
+    anyhow::ensure!(
+        token.len() >= 16,
+        "DUCKFLEET_INTERNAL_TOKEN must have at least 16 characters"
+    );
+    anyhow::ensure!(
+        std::env::var_os("DUCKFLEET_TOKEN").is_none(),
+        "ordinary workers must not receive the public bootstrap token"
+    );
     let active = Arc::new(Mutex::new(None));
     let queue_capacity = configured_limit("DUCKFLEET_WORKER_QUEUE_CAPACITY", 64, 4096)?;
     let worker_limits = query::WorkerLimits::from_env()?;
@@ -591,7 +662,6 @@ async fn main() -> anyhow::Result<()> {
         sender,
         queue,
         status,
-        active,
         token: token.into(),
         history: history::Reader::new(std::env::var("PLATFORM_DSN")?),
         requests: requests::Reader::new(std::env::var("PLATFORM_DSN")?),
@@ -720,13 +790,23 @@ mod tests {
             credentials::PRINCIPAL_HEADER,
             "bootstrap-admin".parse().unwrap(),
         );
+        assert!(worker_identity(&headers).is_err());
+        headers.insert(credentials::ACTOR_KIND_HEADER, "bootstrap".parse().unwrap());
         assert!(worker_identity(&headers).unwrap().is_bootstrap());
         headers.insert(credentials::PRINCIPAL_HEADER, "analyst".parse().unwrap());
         headers.insert(credentials::CREDENTIAL_HEADER, id.parse().unwrap());
+        headers.insert(credentials::ACTOR_KIND_HEADER, "named".parse().unwrap());
         let identity = worker_identity(&headers).unwrap();
         assert_eq!(identity.principal, "analyst");
         assert_eq!(identity.credential_id.as_deref(), Some(id.as_str()));
         assert!(identity.expires_at.is_none());
+        headers.insert(credentials::PRINCIPAL_HEADER, "direct".parse().unwrap());
+        assert_eq!(
+            worker_identity(&headers).unwrap().kind,
+            credentials::ActorKind::Named
+        );
+        headers.insert(credentials::ACTOR_KIND_HEADER, "internal".parse().unwrap());
+        assert!(worker_identity(&headers).is_err());
     }
 
     #[test]

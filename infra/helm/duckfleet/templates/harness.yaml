@@ -45,6 +45,9 @@ spec:
             - {name: DUCKFLEET_URL, value: "http://server:8080"}
             - {name: EXPECT_S3_PREFIX, value: {{ printf "s3://%s/%s/" .Values.bucket .Values.lakePrefix | quote }}}
             - {name: HOME, value: /tmp}
+            - name: DUCKFLEET_INTERNAL_TEST_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.secretName }}, key: DUCKFLEET_INTERNAL_TOKEN}
             - name: DUCKFLEET_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.secretName }}, key: DUCKFLEET_TOKEN}
