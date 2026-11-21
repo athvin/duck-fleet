@@ -72,6 +72,82 @@ recovery-point semantics, which the Compose harness proves on every run. How oft
 this runs, and how many directories are kept, is the operator's policy — nothing
 schedules it automatically.
 
+## Named persistent pools
+
+The default remains one `small` pool at 1 CPU, 1Gi memory and 2Gi spill disk.
+Resource-only requests still select isolated compute. To keep a larger allocation
+warm, configure named pools and select one through HTTP or the CLI:
+
+```yaml
+defaultPool: small
+persistentPools:
+  small: {cpu: 1, memory: 1Gi, disk: 2Gi, workers: 1}
+  interactive:
+    cpu: 2
+    memory: 3Gi
+    disk: 4Gi
+    workers: 2
+    maxSessionsPerWorker: 32
+```
+
+The chart builds each worker and the gateway's `duckfleet-pools` ConfigMap from the
+same definitions. CPU, memory and disk are independent. Each worker's spill volume
+and ephemeral-storage request match `disk`; its pod limit includes another 1Gi
+for container overhead. DuckDB's memory and spill headroom follow the existing
+worker rules. A pool with `workers: 0` remains configured and discoverable while
+new sessions receive an availability refusal.
+
+`persistentPools: {}` uses the legacy `workerReplicas` input, whose empty map means
+one small worker. Do not combine named pools with a nonempty `workerReplicas` map.
+When adopting pools with `helm upgrade --reuse-values`, clear the inherited map
+explicitly with `--set workerReplicas=null`; an empty override map alone may merge
+with the previous values. The `small` pool retains worker-small, worker-small-1,
+and their existing recovery identities and immutable selectors. Other pools use
+worker-pool-<name>-<index> and stable pool-<name>-<index> recovery IDs, so a pool
+named small-1 cannot collide with the small pool's second worker. Pool names use
+lowercase DNS labels, start with a letter, and are at most 40 characters.
+
+Named configurations mount `/etc/duckfleet-pools/pools.json` using
+`DUCKFLEET_POOLS_FILE`. The ConfigMap has no gateway pod-template checksum:
+updating it does not restart the gateway or move open sessions. After its directory
+projection updates, the bootstrap operator applies it with
+`POST /v1/pools/reload` and checks `GET /v1/pools`. Invalid reloads preserve the
+preceding configuration. Existing sessions retain their selected worker and
+allocation; new opens use the updated policy. Switching between legacy and named
+configuration changes the pod template and restarts the gateway. Changing a
+worker's allocation or session cap replaces that worker too, so drain sessions before either
+operation. Remove a persistent identity only after its reservations are settled;
+restarting its original stable identity is the recovery path after an abrupt loss.
+
+A non-Helm gateway can use `DUCKFLEET_POOLS_JSON` for immutable inline configuration
+instead of `DUCKFLEET_POOLS_FILE`; the two sources are mutually exclusive. With
+neither source it uses the historical `DUCKFLEET_WORKER_URLS` small pool. Pool
+membership is routing configuration, not data isolation or a separate budget.
+The current pinned dbt adapter supports its existing resource fields but silently
+drops pool/mode fields; use HTTP or the CLI for explicit pool selection until the
+coordinated adapter release described in the root README is available.
+
+`workerMaxSessions` defaults to 32; a named pool's `maxSessionsPerWorker` overrides
+it (1–1024). `workerQueueCapacity` defaults to 64 queued worker operations and
+`gatewayMaxSessions` to 64 backend sessions (both 1–4096). More open sessions do
+not make one worker execute SQL in parallel. Isolated workers retain their
+one-session lifetime regardless of persistent-pool limits.
+
+Compose provides an optional two-pool example without changing its normal server:
+
+```sh
+docker compose --profile pools up -d --wait server-pools
+# Named gateway: http://localhost:18081; normal gateway remains on 18080.
+```
+
+This starts the default small worker and an interactive worker at 2 CPU, 3Gi and
+4Gi disk. `examples/pools/compose.json` supplies the registry. Override
+`DUCKFLEET_POOLS_DIRECTORY` to mount another directory containing `compose.json`;
+mounting the directory allows atomic file replacement to be seen on reload.
+The local acceptance script uses a copy in `artifacts/pools-config` and leaves the
+tracked example unchanged. Stop the optional allocation with
+`docker compose --profile pools stop server-pools worker-pool-interactive-0`.
+
 ## Platform schema and maintenance
 
 The release runs a PostgreSQL-only migration Job before compute can become ready.

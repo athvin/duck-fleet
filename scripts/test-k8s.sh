@@ -421,6 +421,30 @@ done
 harness duckfleet-harness-replaced 'duckfleet-server --after-restart' 600
 grep -q 'PASS: data and query history survived' artifacts/kind/duckfleet-harness-replaced.log
 
+# Named persistent pools use independent dimensions; the default remains small,
+# and an explicit isolated request still creates its own pod. Upgrade the real
+# chart for this stage, then restore the legacy routing fixture for later probes.
+render --no-hooks \
+  --set isolatedCompute.enabled=true \
+  --set "isolatedCompute.apiServerCidrs[0]=$api_address/32" \
+  --set "isolatedCompute.apiServerPorts[0]=$api_port" \
+  --set isolatedCompute.readySeconds=180 \
+  --set-json 'persistentPools={"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1},"interactive":{"cpu":2,"memory":"3Gi","disk":"4Gi","workers":1}}' \
+  | python3 scripts/kind/localize.py \
+  --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod \
+  > "$work/release-pools.yaml"
+"${KUBE[@]}" apply -f "$work/release-pools.yaml"
+python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+python3 scripts/kind/assert_limits.py --context "$CONTEXT" --namespace "$NS" \
+  > artifacts/kind/pool-worker-limits.jsonl
+harness duckfleet-pools 'duckfleet-server --pools-isolated' 900
+await_no_isolated_pods
+"${KUBE[@]}" apply -f "$work/release.yaml"
+python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+"${KUBE[@]}" delete deployment/worker-pool-interactive-0 service/worker-pool-interactive-0 configmap/duckfleet-pools
+
+echo 'PASS: two persistent pools and isolated compute matched their declared allocations'
+
 # The external-catalog path, last because it swaps the catalog out from under the
 # release: the same chart pointed at a PostgreSQL it does not own, which is what
 # running against RDS looks like scaled to kind. The in-namespace stand-in needs

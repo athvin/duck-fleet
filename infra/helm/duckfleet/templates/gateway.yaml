@@ -47,6 +47,7 @@ spec:
             limits: {cpu: 500m, memory: 256Mi}
           env:
             - {name: DUCKFLEET_ROLE, value: gateway}
+            - {name: DUCKFLEET_GATEWAY_MAX_SESSIONS, value: {{ .Values.gatewayMaxSessions | quote }}}
             - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ .Values.platformWaitSeconds | quote }}}
             - {name: DUCKFLEET_HISTORY_RETENTION_DAYS, value: {{ .Values.historyRetentionDays | quote }}}
             - {name: DUCKFLEET_PGWIRE, value: {{ .Values.pgwire.enabled | quote }}}
@@ -60,8 +61,12 @@ spec:
             # Endpoints, not classes. The gateway asks each worker what resources it
             # has, because it cannot list pods: the service account mounts no token
             # and the deploy asserts DuckFleet cannot grant itself RBAC.
+            {{- if .Values.persistentPools }}
+            - {name: DUCKFLEET_POOLS_FILE, value: /etc/duckfleet-pools/pools.json}
+            {{- else }}
             - name: DUCKFLEET_WORKER_URLS
               value: {{ include "duckfleet.workerUrls" . | quote }}
+            {{- end }}
             - name: DUCKFLEET_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.secretName }}, key: DUCKFLEET_TOKEN}
@@ -80,10 +85,23 @@ spec:
                 fieldRef: {fieldPath: metadata.uid}
             {{- end }}
           {{- include "duckfleet.health" . | nindent 10 }}
-          {{- if .Values.isolatedCompute.enabled }}
+          {{- if or .Values.isolatedCompute.enabled .Values.persistentPools }}
           volumeMounts:
+            {{- if .Values.isolatedCompute.enabled }}
             - {name: isolated-pod, mountPath: /etc/duckfleet, readOnly: true}
+            {{- end }}
+            {{- if .Values.persistentPools }}
+            # A directory projection allows atomic ConfigMap updates. No checksum
+            # annotation: an explicit /v1/pools/reload must preserve live sessions.
+            - {name: persistent-pools, mountPath: /etc/duckfleet-pools, readOnly: true}
+            {{- end }}
       volumes:
+        {{- if .Values.isolatedCompute.enabled }}
         - name: isolated-pod
           configMap: {name: duckfleet-isolated-pod}
+        {{- end }}
+        {{- if .Values.persistentPools }}
+        - name: persistent-pools
+          configMap: {name: duckfleet-pools}
+        {{- end }}
           {{- end }}

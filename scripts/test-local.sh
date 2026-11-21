@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p artifacts
 # Only this Compose project is touched. Volumes deliberately survive the test.
-trap 'result=$?; if [ "$result" -ne 0 ]; then docker compose logs --no-color > artifacts/compose-failure.log 2>&1; fi; exit "$result"' EXIT
+trap 'result=$?; if [ "$result" -ne 0 ]; then docker compose --profile "*" logs --no-color > artifacts/compose-failure.log 2>&1; fi; exit "$result"' EXIT
 docker compose --profile test build
 docker compose up -d --wait server
 
@@ -50,9 +50,9 @@ grep -q 'still owned by another process' artifacts/worker-overlap-refusal.log
 echo 'PASS: overlapping worker startup refused recovery of a live predecessor'
 
 # A worker reached directly must refuse isolation too. Naming a resource (cpu/memory)
-# derives an isolated pod, which a worker cannot provide; a request naming none runs
-# on that worker. (Under the reworked model the mode is derived from presence of
-# cpu/memory/disk — there is no `compute:` string.)
+# derives an isolated pod, which a persistent worker cannot provide. An empty
+# request uses the worker's persistent pool; explicit persistent selection is
+# exercised by the named-pool stage below.
 session() { # session <worker> <json>
   docker compose exec -T "$1" sh -c 'curl -sS -o /dev/null -w "%{http_code}" \
     -X POST http://localhost:8080/v1/sessions \
@@ -130,6 +130,22 @@ docker compose run --rm --no-deps dbt duckfleet-server --spread-failover
 docker compose up -d --wait worker-small server
 docker compose --profile scale-out stop worker-small-b
 
+# Named persistent allocations share the same database but resolve independently
+# of isolated resource requests. A private config copy lets the harness reload the
+# default while a transaction/temp table remains pinned, without editing examples.
+mkdir -p artifacts/pools-config
+cp examples/pools/compose.json artifacts/pools-config/compose.json
+export DUCKFLEET_POOLS_DIRECTORY=./artifacts/pools-config
+docker compose --profile pools up -d --wait server-pools
+interactive_id=$(docker compose --profile pools ps -q worker-pool-interactive-0)
+test "$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$interactive_id")" = '2000000000 3221225472'
+docker compose run --rm --no-deps \
+  -e DUCKFLEET_URL=http://server-pools:8080 \
+  -e DUCKFLEET_POOL_TEST_FILE=/artifacts/pools-config/compose.json \
+  dbt duckfleet-server --pools
+docker compose --profile pools stop server-pools worker-pool-interactive-0
+unset DUCKFLEET_POOLS_DIRECTORY
+
 # ---------------------------------------------------------------------------
 # PENDING MIGRATION (tracked for a dedicated follow-up — these stages are deeply
 # coupled to the pre-rework 2-worker fleet and the Python client, and need
@@ -143,4 +159,4 @@ docker compose --profile scale-out stop worker-small-b
 # The isolated-pod path (a sized model -> dedicated pod) is Kubernetes-only and is
 # exercised by scripts/test-k8s.sh, not here.
 # ---------------------------------------------------------------------------
-echo 'PASS: compose core path (worker limits, secret scrub, direct-worker isolation refusal, dbt-free api proof, dbt lifecycle, concurrency, metering, pgwire, ledger immutability, busy-worker status, mixed-protocol routing, partial outage)'
+echo 'PASS: compose core path (worker limits, secret scrub, direct-worker isolation refusal, dbt-free api proof, dbt lifecycle, concurrency, metering, pgwire, ledger immutability, busy-worker status, mixed-protocol routing, partial outage, persistent pools and reload)'

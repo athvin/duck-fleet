@@ -2,15 +2,21 @@
 //! execution IDs: a retry has a new ID and an explicit link to a prior refusal.
 //! No outcome in this module is evidence of exactly-once external side effects.
 
-use crate::{ApiError, credentials, failure, metering, pricing::RateCard};
+use crate::{
+    ApiError,
+    compute::{ComputeRequest, Resources},
+    credentials, failure, metering,
+    pricing::RateCard,
+};
 use postgres::{Client, GenericClient, NoTls, Row, Transaction};
 use serde_json::{Value, json};
 use std::{fmt::Write, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-const FINGERPRINT_VERSION: i32 = 1;
-const FINGERPRINT_DOMAIN: &[u8] = b"duckfleet-request-v1\0";
+const FINGERPRINT_VERSION: i32 = 2;
+const FINGERPRINT_DOMAIN: &[u8] = b"duckfleet-request-v2\0";
+const LEGACY_FINGERPRINT_DOMAIN: &[u8] = b"duckfleet-request-v1\0";
 
 /// Inputs after parameter validation and the session-context merge. `compute`
 /// contains resolved mode/resources, never observed worker or boot identity.
@@ -69,17 +75,10 @@ fn canonical(value: &Value) -> Value {
     }
 }
 
-fn fingerprint(input: &Submission<'_>) -> Result<String, ApiError> {
-    let payload = canonical(&json!({
-        "sql": input.sql,
-        "parameters": input.parameters,
-        "context": input.context,
-        "timeout_seconds": input.timeout_seconds,
-        "compute": input.compute,
-    }));
-    let encoded = serde_json::to_vec(&payload).map_err(|_| ApiError::internal())?;
+fn hash_payload(domain: &[u8], payload: &Value) -> Result<String, ApiError> {
+    let encoded = serde_json::to_vec(&canonical(payload)).map_err(|_| ApiError::internal())?;
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    digest.update(FINGERPRINT_DOMAIN);
+    digest.update(domain);
     digest.update(&encoded);
     Ok(digest
         .finish()
@@ -89,6 +88,116 @@ fn fingerprint(input: &Submission<'_>) -> Result<String, ApiError> {
             let _ = write!(hex, "{byte:02x}");
             hex
         }))
+}
+
+fn requested(input: &Submission<'_>) -> Result<ComputeRequest, ApiError> {
+    input.context.get("requested_compute").map_or_else(
+        || Ok(ComputeRequest::default()),
+        |value| serde_json::from_value(value.clone()).map_err(|_| ApiError::internal()),
+    )
+}
+
+fn fingerprint(input: &Submission<'_>) -> Result<String, ApiError> {
+    let mut context = input.context.clone();
+    if let Some(context) = context.as_object_mut() {
+        context.remove("requested_compute");
+    }
+    // Project fields explicitly: adding a diagnostic field or a new optional
+    // serde field must never silently redefine this fingerprint version.
+    let resolved = json!({"mode":input.compute["mode"],"pool":input.compute["pool"],
+        "cpu":input.compute["cpu"],"memory_bytes":input.compute["memory_bytes"],
+        "disk_bytes":input.compute["disk_bytes"]});
+    let payload = canonical(&json!({
+        "sql": input.sql,
+        "parameters": input.parameters,
+        "context": context,
+        "timeout_seconds": input.timeout_seconds,
+        "compute": {"requested":requested(input)?.canonical_intent()?,"resolved":resolved},
+    }));
+    hash_payload(FINGERPRINT_DOMAIN, &payload)
+}
+
+/// V1 saw different reserved context on the direct and gateway ingress paths.
+/// Reconstruct only those old shapes, never weaken application-context or SQL
+/// matching, and never project another persistent pool onto historical small.
+fn legacy_fingerprints(input: &Submission<'_>) -> Result<Vec<String>, ApiError> {
+    let original = requested(input)?;
+    let Some(cpu) = input.compute["cpu"]
+        .as_u64()
+        .and_then(|cpu| u16::try_from(cpu).ok())
+    else {
+        return Ok(Vec::new());
+    };
+    let (Some(memory_bytes), Some(disk_bytes)) = (
+        input.compute["memory_bytes"].as_u64(),
+        input.compute["disk_bytes"].as_u64(),
+    ) else {
+        return Ok(Vec::new());
+    };
+    let resources = Resources {
+        cpu,
+        memory_bytes,
+        disk_bytes,
+    };
+    let persistent = input.compute["mode"] == "persistent";
+    if persistent {
+        if input.compute["pool"]
+            .as_str()
+            .is_some_and(|pool| pool != "small")
+            || resources != Resources::default()
+            || original.cpu.is_some()
+            || original.memory.is_some()
+            || original.disk.is_some()
+        {
+            return Ok(Vec::new());
+        }
+    } else if input.compute["mode"] != "isolated" || !input.compute["pool"].is_null() {
+        return Ok(Vec::new());
+    }
+    let compute = json!({"mode":input.compute["mode"],"cpu":cpu,
+        "memory_bytes":memory_bytes,"disk_bytes":disk_bytes});
+    let direct = json!({"cpu":original.cpu,"memory":original.memory,"disk":original.disk});
+    let forwarded = if persistent {
+        json!({"cpu":null,"memory":null,"disk":null})
+    } else {
+        // V1 rounded non-Gi quantities down to Mi. Preserve its historical hash
+        // projection even though new resource forwarding retains exact KiB.
+        let historical_quantity = |bytes: u64| {
+            let gib = 1024 * 1024 * 1024;
+            if bytes.is_multiple_of(gib) {
+                format!("{}Gi", bytes / gib)
+            } else {
+                format!("{}Mi", bytes / (1024 * 1024))
+            }
+        };
+        json!({"cpu":cpu,"memory":historical_quantity(resources.memory_bytes),
+            "disk":historical_quantity(resources.disk_bytes)})
+    };
+    let mut contexts = Vec::with_capacity(2);
+    if input.context.get("requested_compute").is_none() {
+        // Historical internal callers/fixtures could supply no session alias.
+        contexts.push(input.context.clone());
+    } else {
+        for requested in [direct, forwarded] {
+            let mut context = input.context.clone();
+            context["requested_compute"] = requested;
+            if !contexts.contains(&context) {
+                contexts.push(context);
+            }
+        }
+    }
+    contexts
+        .into_iter()
+        .map(|context| {
+            hash_payload(
+                LEGACY_FINGERPRINT_DOMAIN,
+                &json!({
+                    "sql":input.sql,"parameters":input.parameters,"context":context,
+                    "timeout_seconds":input.timeout_seconds,"compute":compute,
+                }),
+            )
+        })
+        .collect()
 }
 
 // Legacy statements never retained bound parameters. These inserts deliberately
@@ -266,10 +375,27 @@ impl Stored {
             && self.outcome == Outcome::NotExecuted.name()
             && self.retry_safe == Some(true)
             && self.failure_kind.as_deref() == Some("budget_exhausted")
-            && self.fingerprint_version == Some(FINGERPRINT_VERSION)
+            && matches!(self.fingerprint_version, Some(1 | 2))
             && self.payload_hash.is_some()
             && self.principal.is_some()
             && self.next_attempt_id.is_none()
+    }
+
+    fn matches_payload(
+        &self,
+        input: &Submission<'_>,
+        current_hash: &str,
+    ) -> Result<bool, ApiError> {
+        let Some(previous) = self.payload_hash.as_deref() else {
+            return Ok(false);
+        };
+        match self.fingerprint_version {
+            Some(1) => Ok(legacy_fingerprints(input)?
+                .iter()
+                .any(|hash| hash == previous)),
+            Some(FINGERPRINT_VERSION) => Ok(previous == current_hash),
+            _ => Ok(false),
+        }
     }
 
     fn detail(&self) -> Value {
@@ -290,7 +416,9 @@ impl Stored {
             "elapsed_ms": self.elapsed_ms,
             "result_rows": self.result_rows,
             "fingerprint_version": self.fingerprint_version,
-            "fingerprint_status": if self.payload_hash.is_some() { "known" } else { "legacy_unavailable" },
+            "fingerprint_status": if self.payload_hash.is_none() { "legacy_unavailable" }
+                else if matches!(self.fingerprint_version, Some(1 | 2)) { "known" }
+                else { "unsupported_version" },
             "diagnostics_available": self.diagnostics_available,
             "retry": {
                 "allowed": self.retryable(),
@@ -305,9 +433,9 @@ impl Stored {
         // Legacy fingerprints stay unknown permanently. Returning their outcome
         // is safe; asserting either equality or mismatch would invent evidence.
         if self.retry_of.as_deref() != input.retry_of
-            || self.payload_hash.as_ref().is_some_and(|previous| {
-                self.fingerprint_version != Some(FINGERPRINT_VERSION) || previous != hash
-            })
+            || (self.payload_hash.is_some()
+                && matches!(self.fingerprint_version, Some(1 | 2))
+                && !self.matches_payload(input, hash)?)
         {
             return Err(ApiError::new(
                 failure::REQUEST_ID_MISMATCH,
@@ -403,7 +531,9 @@ pub(crate) fn admit(
                 "retry_of must name this principal's fingerprinted, retry-safe budget refusal before SQL execution",
             ));
         }
-        if parent.payload_hash.as_deref() != Some(&hash) {
+        // The parent may predate the current policy schema. Verify its original
+        // version, then give this new attempt its own current-version identity.
+        if !parent.matches_payload(&input, &hash)? {
             return Err(ApiError::new(
                 failure::REQUEST_ID_MISMATCH,
                 "retry payload differs from the refused attempt; no SQL ran",
@@ -797,6 +927,134 @@ mod tests {
         assert!(
             !original.retryable(),
             "a legacy payload cannot be verified for linked retry"
+        );
+    }
+
+    #[test]
+    fn frozen_v1_direct_and_gateway_shapes_match_without_rewriting_identity() {
+        // Independently frozen from the pre-pools v1 canonical payload. Direct
+        // opens retained partial fields; gateways filled the isolated allocation.
+        const DIRECT: &str = "a249ad7c77cc1abc9c6a2e6f479e1df1d58c229218bb9cee1ceaa4aa708e7103";
+        const GATEWAY: &str = "227f543c6262a7fcf36ddf2ebf4acdc823512cff439e9fd60bfab229503866bc";
+        let context = json!({"connection_name":"legacy-policy","requested_compute":{"cpu":2}});
+        let compute = json!({"mode":"isolated","pool":null,"cpu":2,
+            "memory_bytes":1073741824_u64,"disk_bytes":2147483648_u64});
+        let parameters = [json!(7)];
+        let mut input = submission(&parameters, &context, &compute);
+        input.sql = "INSERT INTO events VALUES (?)";
+        let current = fingerprint(&input).unwrap();
+        let candidates = legacy_fingerprints(&input).unwrap();
+        assert!(candidates.iter().any(|hash| hash == DIRECT));
+        assert!(candidates.iter().any(|hash| hash == GATEWAY));
+        for hash in [DIRECT, GATEWAY] {
+            let mut original = stored(Some(hash.into()));
+            original.fingerprint_version = Some(1);
+            assert!(original.duplicate(&input, &current).is_ok());
+            original.status = "refused".into();
+            original.failure_kind = Some("budget_exhausted".into());
+            original.outcome = "not_executed".into();
+            original.retry_safe = Some(true);
+            assert!(original.retryable());
+            assert!(original.matches_payload(&input, &current).unwrap());
+            assert_eq!(original.payload_hash.as_deref(), Some(hash));
+            input.sql = "INSERT INTO events VALUES (?);";
+            assert_eq!(
+                original
+                    .duplicate(&input, &fingerprint(&input).unwrap())
+                    .unwrap_err()
+                    .0,
+                failure::REQUEST_ID_MISMATCH
+            );
+            input.sql = "INSERT INTO events VALUES (?)";
+        }
+    }
+
+    #[test]
+    fn v1_persistent_identity_cannot_be_reinterpreted_as_another_same_sized_pool() {
+        const SMALL: &str = "969f5d969855167364657a532132f703ba79a3a5dc3d3d7024927ef3d0ae5f2f";
+        let parameters = [json!(7)];
+        let context =
+            json!({"connection_name":"legacy-policy","requested_compute":{"pool":"small"}});
+        let compute = json!({"mode":"persistent","pool":"small","cpu":1,
+            "memory_bytes":1073741824_u64,"disk_bytes":2147483648_u64});
+        let mut input = submission(&parameters, &context, &compute);
+        input.sql = "INSERT INTO events VALUES (?)";
+        let mut original = stored(Some(SMALL.into()));
+        original.fingerprint_version = Some(1);
+        assert!(
+            original
+                .duplicate(&input, &fingerprint(&input).unwrap())
+                .is_ok()
+        );
+        let mut other = compute.clone();
+        other["pool"] = json!("another");
+        input.compute = &other;
+        assert_eq!(
+            original
+                .duplicate(&input, &fingerprint(&input).unwrap())
+                .unwrap_err()
+                .0,
+            failure::REQUEST_ID_MISMATCH
+        );
+        input.compute = &compute;
+        let minimum =
+            json!({"connection_name":"legacy-policy","requested_compute":{"pool":"small","cpu":1}});
+        input.context = &minimum;
+        assert_eq!(
+            original
+                .duplicate(&input, &fingerprint(&input).unwrap())
+                .unwrap_err()
+                .0,
+            failure::REQUEST_ID_MISMATCH
+        );
+    }
+
+    #[test]
+    fn v2_policy_uses_canonical_requirements_and_keeps_named_pools_distinct() {
+        let parameters = [json!(1)];
+        let context = json!({"application":"billing","requested_compute":{"pool":"analytics","memory":"1Gi"}});
+        let compute = json!({"mode":"persistent","pool":"analytics","cpu":4,
+            "memory_bytes":8589934592_u64,"disk_bytes":2147483648_u64});
+        let mut input = submission(&parameters, &context, &compute);
+        let original = fingerprint(&input).unwrap();
+        let equivalent = json!({"application":"billing","requested_compute":{"memory":"1024Mi","pool":"analytics"}});
+        input.context = &equivalent;
+        assert_eq!(fingerprint(&input).unwrap(), original);
+        let changed_minimum = json!({"application":"billing","requested_compute":{"memory":"2Gi","pool":"analytics"}});
+        input.context = &changed_minimum;
+        assert_ne!(fingerprint(&input).unwrap(), original);
+        input.context = &context;
+        let mut other = compute.clone();
+        other["pool"] = json!("interactive");
+        input.compute = &other;
+        assert_ne!(fingerprint(&input).unwrap(), original);
+    }
+
+    #[test]
+    fn unsupported_fingerprint_versions_never_authorize_retry_or_claim_payload_equality() {
+        let parameters = [];
+        let context = json!({});
+        let compute = json!({});
+        let input = submission(&parameters, &context, &compute);
+        let mut original = stored(Some("future-hash".into()));
+        original.fingerprint_version = Some(99);
+        original.status = "refused".into();
+        original.failure_kind = Some("budget_exhausted".into());
+        original.outcome = "not_executed".into();
+        original.retry_safe = Some(true);
+        assert!(!original.retryable());
+        let duplicate = original
+            .duplicate(&input, &fingerprint(&input).unwrap())
+            .unwrap();
+        assert_eq!(duplicate["failure_kind"], "duplicate_request");
+        assert_eq!(
+            duplicate["original"]["fingerprint_status"],
+            "unsupported_version"
+        );
+        assert!(
+            !original
+                .matches_payload(&input, &fingerprint(&input).unwrap())
+                .unwrap()
         );
     }
 }

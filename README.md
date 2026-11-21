@@ -119,12 +119,18 @@ select * from {{ ref('stg_orders') }}
 Naming any of `cpu`, `memory`, or `disk` under `meta.platform` asks for an
 **isolated pod** of exactly that size — used by this model alone and removed when
 it finishes. A model that names none runs on the shared **persistent** tier, the
-default and the only mode Compose serves. The mode is *derived* from what you ask
-for; there is no separate `compute` key. Defaults can be set under
+default. Defaults can be set under
 `models.<project>.+meta.platform` in `dbt_project.yml`, and the adapter receives
 dbt's resolved config before its first SQL statement. Use `meta.platform.tags` for
-workload attribution — tags never size compute — and other platform keys are
-rejected rather than ignored.
+workload attribution — tags never size compute.
+
+The pinned `athvin/dbt` adapter release `duckfleet-v0.1.3` forwards only resource
+selection (`cpu`, `memory`, `disk`); it silently drops `mode` and `pool` metadata.
+Use the HTTP API or CLI for explicit pool selection. Adding these fields to dbt
+models does not enable the feature: a coordinated follow-up in
+[the adapter repository](https://github.com/athvin/dbt) must validate and forward
+them, test model/hook session affinity, and publish a new pinned release. Existing
+dbt configurations keep their resource-based isolation behavior.
 
 `cpu` is an integer; `memory` and `disk` are binary quantities such as `2Gi` or
 `512Mi`. Memory is the container cap, and DuckDB-managed memory is held to half of
@@ -146,7 +152,7 @@ an isolated pod serves its one session alone, with requests equal to limits, and
 removed afterwards — nothing else is admitted to it, before or after.
 
 An isolated request the fleet cannot serve is refused, never downgraded to the
-persistent tier. Where isolation is off (Compose) a named size is refused `501
+persistent tier. Where isolation is off (Compose) an isolated selection is refused `501
 compute_unavailable`; where it is on but no placement fits, it is `503` carrying the
 refusing component's own reason — the namespace quota's when the size is beyond what
 the namespace may hold, or the scheduler's when no node can hold it. Both are
@@ -238,8 +244,9 @@ duckfleet sql 'select region, count(*) from analytics.events group by region'
 duckfleet sql 'select * from analytics.events where region = ?' --param eu --format json
 ```
 
-The `cli` role and the dbt adapter are two front-ends over one wire protocol — the
-Arrow-IPC client in `server/src/client.rs` — so neither can drift from the other.
+The CLI uses the HTTP/Arrow client in `server/src/client.rs`. The external dbt
+adapter speaks the same API; its supported selection fields depend on the pinned
+adapter release described above.
 
 Statements given to one `sql` invocation share a session, which is what pins a load
 and the query that checks it to the same worker. Compute is selectable per invocation:
@@ -247,12 +254,19 @@ naming any of `--cpu`/`--memory`/`--disk` asks for a pod of that size, the same 
 trigger a dbt model expresses through `meta.platform`; naming none runs on the shared
 persistent tier.
 
+Explicit `--mode persistent --pool interactive` runs on a configured prestarted
+pool. Resource flags with that selection specify minimum requirements for the
+pool; the actual configured allocation is returned and metered. Invalid or
+repeated selection flags fail before opening a session.
+
 ```sh
 duckfleet sql 'select current_setting("threads")' --cpu 2 --memory 2Gi
 duckfleet sql 'select 1' --cpu 4 --memory 8Gi --disk 20Gi   # a pod of its own
+duckfleet pools
+duckfleet sql 'select 42' --mode persistent --pool interactive --memory 2Gi --placement
 ```
 
-`duckfleet history`, `query <id>`, `request <id>`, `usage`, `budget` and `workers`
+`duckfleet history`, `query <id>`, `request <id>`, `usage`, `budget`, `workers` and `pools`
 cover inspection. `request <id>` reads durable outcome metadata even after the
 diagnostic history has expired.
 A refusal exits non-zero and prints the server's own classification and `retry_safe`,
@@ -272,6 +286,8 @@ credential from the environment, or a credential it issued; see
 | --- | --- | --- |
 | GET | `/healthz` | Process health after startup initialization |
 | POST | `/v1/sessions` | Select compute, open a pinned connection; returns `session_id` and placement |
+| GET | `/v1/pools` | Configured persistent pools, allocations, capacity limits and current eligible-worker observations |
+| POST | `/v1/pools/reload` | Validate and reload the operator-configured pool file; bootstrap only |
 | POST | `/v1/sessions/{id}/queries` | Execute SQL; returns an Arrow IPC stream and `x-query-id` |
 | DELETE | `/v1/sessions/{id}` | Close connection and roll back any open transaction |
 | POST | `/v1/sessions/{id}/cancel` | Interrupt this session's currently executing statement |
@@ -310,7 +326,8 @@ An unreachable worker remains in the report as `state: "unreachable"`, with its
 is historical; stale pressure is not presented as current counters. One failed
 probe does not hide the healthy workers.
 
-New persistent sessions prefer eligible workers with fewer active plus queued
+New persistent sessions consider only their selected pool and exact configured
+CPU, memory and disk allocation. They prefer eligible workers with fewer active plus queued
 queries, then fewer open sessions, with configured endpoint order breaking ties.
 Successful opens adjust the cached session count used for ranking without
 re-probing an unreachable sibling; reported counters remain the last sampled
@@ -319,6 +336,86 @@ their own admission limits. Existing sessions stay pinned to their worker, and
 SQL is never replayed or moved as part of placement. The local harness verifies
 status during a query running longer than five seconds, mixed HTTP/pgwire
 placement, and a stopped sibling that remains visible in the fleet report.
+
+## Explicit compute selection and persistent pools
+
+A session resolves its compute policy once. Its response and query history retain
+`requested_compute`, `resolved_compute`, the registry revision, and observed
+worker placement. CPU, memory and disk are independent configuration dimensions.
+A pool is a group of prestarted workers sharing one allocation; it is not a data
+or security boundary.
+
+| Compute request | Placement |
+| --- | --- |
+| Omitted or `{}` | Configured default persistent pool |
+| Resource fields only | Isolated pod; unspecified dimensions retain 1 CPU / 1Gi / 2Gi defaults |
+| `{"pool":"interactive"}` | Named persistent pool |
+| `{"mode":"persistent"}` | Default persistent pool |
+| Persistent mode/pool plus resource fields | Named/default pool must satisfy every supplied minimum |
+| `{"mode":"isolated"}` | Isolated pod with historical defaults |
+| Isolated mode plus a pool, unknown pool, malformed quantities, insufficient allocation | `400 invalid_request` before SQL |
+| Known pool without an eligible worker | `503 no_ready_worker`; no fallback to another pool |
+
+For example, open a persistent session through HTTP:
+
+```sh
+curl -H "Authorization: Bearer $DUCKFLEET_TOKEN" -H 'Content-Type: application/json' \
+  "$DUCKFLEET_URL/v1/sessions" \
+  -d '{"compute":{"mode":"persistent","pool":"interactive","memory":"2Gi"},"context":{"workload":"interactive"}}'
+```
+
+Operators supply either `DUCKFLEET_POOLS_FILE` (a JSON file) or
+`DUCKFLEET_POOLS_JSON` (inline JSON). The two sources are mutually exclusive.
+Without either, the gateway synthesizes the legacy `small` pool from
+`DUCKFLEET_WORKER_URLS`. An example registry is:
+
+```json
+{"default_pool":"small","pools":{
+  "small":{"cpu":1,"memory":"1Gi","disk":"2Gi","endpoints":["http://worker-small:8080"],"max_sessions_per_worker":32},
+  "interactive":{"cpu":2,"memory":"3Gi","disk":"4Gi","endpoints":["http://worker-pool-interactive-0:8080"],"max_sessions_per_worker":32}
+}}
+```
+
+Workers declare their pool with `DUCKFLEET_POOL`; isolated workers have no pool.
+A registry does not resize a container: configure its resource limits and worker
+settings together. A named pool also requires its session cap to match the worker-enforced cap;
+changing resources or that cap requires a worker rollout. A mismatched worker
+cannot serve the pool. The optional Compose
+`pools` profile supplies the example above through a gateway on port 18081:
+
+```sh
+docker compose --profile pools up -d --build --wait server-pools
+```
+
+See [infra/README.md](infra/README.md) for named Helm pools, replica counts,
+legacy-value migration and resource configuration.
+
+After replacing the configured JSON file, the bootstrap operator can call
+`POST /v1/pools/reload` with an empty body. A complete valid registry replaces the
+previous snapshot atomically; an invalid file leaves it intact. Projected
+ConfigMap updates may take time to reach the container; inspect the returned
+revision. Inline and legacy environment configurations require gateway restart.
+Adding/removing routing membership or changing the default does not move existing
+sessions: their transactions and temporary tables stay on the original worker.
+Replacing the gateway or worker process still ends its sessions. Drain workers
+before removing them permanently; after a crash, recover the same stable worker
+identity and settle its holds before retirement.
+
+`DUCKFLEET_GATEWAY_MAX_SESSIONS` defaults to 64 shared backend sessions across
+HTTP, pgwire and platform operations. `DUCKFLEET_WORKER_MAX_SESSIONS` defaults to
+32 per persistent worker and `DUCKFLEET_WORKER_QUEUE_CAPACITY` to 64 pending
+operations; one worker executes SQL serially. Pools expose configured limits and
+sampled availability separately. Isolated workers still serve one session for
+their lifetime. These are concurrency limits, not provisioned-cost ceilings;
+provisioned/idle compute accounting and budget caps are tracked in #107.
+
+Session permits remain held while a backend close is unconfirmed. Discovery
+reports `gateway_closing_sessions` and `gateway_closing_endpoints`, including
+endpoints removed from the current registry. Restore reachability so the worker
+can acknowledge closure before permanently retiring an endpoint. A reload or a
+network timeout does not prove a backend session has ended; an unreachable
+endpoint can therefore hold capacity until cleanup succeeds. Gateway restart
+abandons its routes and ends client sessions; it is not transaction recovery.
 
 ## Credentials
 
@@ -404,6 +501,11 @@ as `ERROR` with a SQLSTATE a driver can act on (`40001` for a lost commit race,
 `57014` for a deadline, `42601` for SQL errors) and the platform's
 `failure_kind` in the message.
 
+Pgwire uses the configured default persistent pool when its backend session
+opens. This release has no per-connection pool selection mechanism; database
+names and startup options do not select a pool. A pool reload affects new backend
+sessions, while existing ones retain their worker and allocation.
+
 The honest limits, refused rather than fudged: no extended-protocol bind
 parameters (interpolate client-side, as `psql` and psycopg2 already do), no
 COPY, LISTEN/NOTIFY, cursors, or CancelRequest, and SSLRequests are answered
@@ -469,11 +571,14 @@ same payload returns HTTP 409 `duplicate_request`, including the original
 outcome and `diagnostics_available`; it never executes SQL again. Reusing it with
 a different payload returns 409 `request_id_mismatch`. Results are not cached.
 
-The version-1 SHA-256 fingerprint covers exact SQL bytes, validated bound
-parameters (including number types), effective timeout, merged session/query
-context, and resolved compute policy. JSON object key order is irrelevant;
+New attempts use the version-2 SHA-256 fingerprint covering exact SQL bytes,
+validated bound parameters (including number types), effective timeout,
+application context, original compute requirements and resolved pool/allocation.
+Version-1 records remain comparable using their historical encoding; a known
+version-1 budget refusal can produce an explicitly linked version-2 retry.
+Stored hashes are never rewritten from a replay. JSON object key order is irrelevant;
 array order and value types matter. It excludes attempt IDs, credential IDs,
-worker identity, and boot identity. It does not fingerprint ambient session or
+worker identity, boot identity and pool-registry revision. It does not fingerprint ambient session or
 database state, or establish semantic equivalence between different SQL text.
 
 `GET /v1/requests/<id>` exposes identity only to its authenticated principal or
@@ -520,8 +625,10 @@ writers while upgrading before relying on the new fingerprint/retry contract;
 older workers do not implement it. Keep identity records and the usage ledger
 when pruning diagnostic history.
 
-Each worker queue holds at most 64 operations, with at most 32 sessions. The
-gateway allows at most 64 routed sessions. Exceeding either limit returns HTTP 429
+By default each worker queues at most 64 operations and serves at most 32
+sessions; the gateway permits 64 backend sessions across all protocols. These
+limits are configurable as described under persistent pools. Admission that
+exceeds an enforced queue or session limit returns HTTP 429
 with `failure_kind` `capacity`, which is retry-safe because the request is rejected
 before any SQL runs. Sessions idle for
 five minutes are closed by periodic worker housekeeping. Statement execution has a

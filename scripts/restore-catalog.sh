@@ -22,7 +22,8 @@ test -s "$src/lake.dump" && test -s "$src/platform.dump"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 case "$mode" in
   compose)
-    docker compose --profile scale-out stop server worker-small worker-small-b
+    docker compose --profile scale-out --profile pools stop server server-pools \
+      worker-small worker-small-b worker-pool-interactive-0
     ;;
   kube)
     kube=(kubectl --context "${DUCKFLEET_KUBE_CONTEXT:?set DUCKFLEET_KUBE_CONTEXT}"

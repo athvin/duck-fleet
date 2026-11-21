@@ -1,33 +1,23 @@
-"""Checks each worker's cgroup against its pod spec, from inside the container.
+"""Compare every persistent worker's declared allocation with its pod and cgroup.
 
-The load-bearing property is that a worker's cgroup CPU quota comes from its
-CPU **limit**, not its request. The chart sets the limit to the exact class size;
-localize.py then lowers the request below it so this local node can seat the pod,
-and the cgroup still reports the full limit — which is the rule. Compose cannot
-test this at all: it has no request/limit distinction.
-
-Emits one JSON record per worker as evidence, matching the Compose harness.
+The Kind transform lowers CPU requests; the worker must still observe its full CPU
+limit. Memory and disk are independent dimensions, including for named pools.
 """
-
 import argparse
 import json
+from pathlib import Path
 import subprocess
 import sys
 
-GIB = 1024**3
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from worker_resources import assert_worker_resources, cores, quantity_bytes  # noqa: E402
 
 
 def kubectl(args, context, namespace):
     return subprocess.run(
         ["kubectl", "--context", context, "-n", namespace, *args],
-        check=True,
-        capture_output=True,
-        text=True,
+        check=True, capture_output=True, text=True,
     ).stdout.strip()
-
-
-def cores(quantity):
-    return float(quantity[:-1]) / 1000 if quantity.endswith("m") else float(quantity)
 
 
 def main():
@@ -35,57 +25,50 @@ def main():
     parser.add_argument("--context", required=True)
     parser.add_argument("--namespace", required=True)
     args = parser.parse_args()
-
     failures = []
-    for size, cpu in [("small", 1)]:
-        pod = kubectl(
-            ["get", "pod", "-l", f"size={size}", "-o", "jsonpath={.items[0].metadata.name}"],
-            args.context,
-            args.namespace,
-        )
-        spec = json.loads(
-            kubectl(
-                ["get", "pod", pod, "-o", "jsonpath={.spec.containers[0].resources}"],
-                args.context,
-                args.namespace,
-            )
-        )
+    listed = json.loads(kubectl(["get", "pods", "-l", "app=duckfleet-worker", "-o", "json"],
+                               args.context, args.namespace))["items"]
+    workers = [pod for pod in listed if "duckfleet-compute" not in pod["metadata"].get("labels", {})
+               and not pod["metadata"].get("deletionTimestamp")]
+    if not workers:
+        failures.append("no persistent workers were found")
+    for pod in workers:
+        name = pod["metadata"]["name"]
+        container = next(item for item in pod["spec"]["containers"] if item["name"] == "worker")
+        env = {entry["name"]: entry.get("value") for entry in container["env"]}
+        spec = container["resources"]
+        cpu = int(env["DUCKFLEET_WORKER_CPU"])
+        memory = quantity_bytes(env["DUCKFLEET_WORKER_MEMORY"])
+        try:
+            assert_worker_resources(spec, cpu, name, memory=env["DUCKFLEET_WORKER_MEMORY"],
+                                    disk=env["DUCKFLEET_WORKER_DISK"])
+        except AssertionError as error:
+            failures.append(str(error))
         observed = kubectl(
-            ["exec", pod, "-c", "worker", "--", "sh", "-c",
+            ["exec", name, "-c", "worker", "--", "sh", "-c",
              "cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max"],
-            args.context,
-            args.namespace,
+            args.context, args.namespace,
         ).split()
-        quota, period, memory_max = int(observed[0]), int(observed[1]), int(observed[2])
+        quota, period, memory_max = map(int, observed)
         request, limit = cores(spec["requests"]["cpu"]), cores(spec["limits"]["cpu"])
-
-        record = {
-            "pod": pod, "size": size, "cpu_request": spec["requests"]["cpu"],
-            "cpu_limit": spec["limits"]["cpu"], "cgroup_cpu_quota": quota,
-            "cgroup_cpu_period": period, "cgroup_memory_max": memory_max,
-        }
-        print(json.dumps(record))
-
-        def check(condition, message):
-            if not condition:
-                failures.append(f"{pod}: {message}")
-
-        # The container must see the class size, not whatever was requested.
-        check(quota == period * cpu, f"cpu.max {quota}/{period} is not {cpu} CPU")
-        check(memory_max == cpu * GIB, f"memory.max {memory_max} is not {cpu}GiB")
-        check(limit == cpu, f"CPU limit {limit} is not the class size {cpu}")
-        # This is the point of running in Kubernetes at all: localize.py lowers the
-        # request below the limit here, and the cgroup above still reports the limit.
-        check(request < limit, f"CPU request {request} must be below the limit to prove the rule")
-        check(0 < request, f"CPU request {request} must be positive")
-
+        print(json.dumps({
+            "pod": name, "size": pod["metadata"].get("labels", {}).get("size"),
+            "pool": env.get("DUCKFLEET_POOL"), "worker_id": env["DUCKFLEET_WORKER_ID"],
+            "cpu_request": spec["requests"]["cpu"], "cpu_limit": spec["limits"]["cpu"],
+            "memory_limit": spec["limits"]["memory"], "disk": env["DUCKFLEET_WORKER_DISK"],
+            "cgroup_cpu_quota": quota, "cgroup_cpu_period": period, "cgroup_memory_max": memory_max,
+        }))
+        if quota != period * cpu:
+            failures.append(f"{name}: cpu.max {quota}/{period} is not {cpu} CPU")
+        if memory_max != memory:
+            failures.append(f"{name}: memory.max {memory_max} differs from declared {memory} bytes")
+        if not 0 < request < limit:
+            failures.append(f"{name}: Kind CPU request must be positive and below its limit")
     if failures:
         print("\n".join(failures), file=sys.stderr)
         return 1
-    print(
-        "PASS: worker cgroups match their CPU limits while requests sit lower",
-        file=sys.stderr,
-    )
+    print("PASS: worker cgroups match independent allocations while CPU requests sit lower",
+          file=sys.stderr)
     return 0
 
 

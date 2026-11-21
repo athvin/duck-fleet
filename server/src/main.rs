@@ -14,6 +14,7 @@ mod kube;
 mod metering;
 mod pgwire;
 mod platform;
+mod pools;
 mod pricing;
 mod profiling;
 mod requests;
@@ -22,7 +23,7 @@ mod usage;
 mod worker;
 mod worker_ownership;
 mod worker_status;
-use compute::SessionRequest;
+use compute::WorkerSessionRequest;
 
 use axum::{
     Json, Router,
@@ -72,7 +73,7 @@ struct Envelope {
 enum Operation {
     /// Request identity travels on the authenticated internal hop, independently
     /// of the caller's SQL context and the credential that opened a session.
-    Open(SessionRequest, credentials::Identity),
+    Open(WorkerSessionRequest, credentials::Identity),
     Close(Uuid),
     Query(Uuid, QueryRequest, credentials::Identity),
 }
@@ -101,6 +102,21 @@ fn default_context() -> Value {
 }
 fn default_timeout() -> u64 {
     30
+}
+
+pub(crate) fn configured_limit(
+    name: &str,
+    default: usize,
+    maximum: usize,
+) -> anyhow::Result<usize> {
+    let value = match std::env::var(name) {
+        Ok(value) => value.parse::<usize>().ok(),
+        Err(std::env::VarError::NotPresent) => Some(default),
+        Err(_) => None,
+    };
+    value
+        .filter(|value| (1..=maximum).contains(value))
+        .ok_or_else(|| anyhow::anyhow!("{name} must be a whole number from 1 to {maximum}"))
 }
 
 /// Resolves when the process is asked to stop.
@@ -283,8 +299,8 @@ async fn open(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Reply 
     }
     // Empty body => default (persistent); malformed body => the gateway's own
     // classified error, not axum's raw 422.
-    let request: SessionRequest = if body.is_empty() {
-        SessionRequest::default()
+    let request: WorkerSessionRequest = if body.is_empty() {
+        WorkerSessionRequest::Direct(compute::SessionRequest::default())
     } else {
         serde_json::from_slice(&body).map_err(|e| {
             ApiError::new(
@@ -293,7 +309,6 @@ async fn open(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Reply 
             )
         })?
     };
-    request.validate()?;
     let identity = worker_identity(&headers)?;
     dispatch(app, Operation::Open(request, identity)).await
 }
@@ -438,7 +453,8 @@ async fn main() -> anyhow::Result<()> {
         return gateway::serve(token).await;
     }
     let active = Arc::new(Mutex::new(None));
-    let (sender, receiver) = mpsc::channel(64);
+    let queue_capacity = configured_limit("DUCKFLEET_WORKER_QUEUE_CAPACITY", 64, 4096)?;
+    let (sender, receiver) = mpsc::channel(queue_capacity);
     let (failed_tx, failed_rx) = oneshot::channel();
     let ready = Arc::new(AtomicBool::new(false));
     let draining = Arc::new(AtomicBool::new(false));
@@ -446,6 +462,12 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("DUCKFLEET_WORKER_ID").unwrap_or_default(),
         ready.clone(),
         draining.clone(),
+        json!({
+            "pool": if std::env::var("DUCKFLEET_ISOLATED").as_deref() == Ok("true") { None }
+                else { Some(std::env::var("DUCKFLEET_POOL").unwrap_or_else(|_| "small".into())) },
+            "max_sessions": configured_limit("DUCKFLEET_WORKER_MAX_SESSIONS", 32, 1024)?,
+            "queue_capacity": queue_capacity,
+        }),
     );
     let worker_active = active.clone();
     let status_for_drain = status.clone();
@@ -618,7 +640,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let ready = Arc::new(AtomicBool::new(true));
         let draining = Arc::new(AtomicBool::new(false));
-        let status = worker_status::Status::new("small".into(), ready.clone(), draining.clone());
+        let status =
+            worker_status::Status::new("small".into(), ready.clone(), draining.clone(), json!({}));
         status.initialize(json!({"worker_id":"small", "cpu":1}));
         (
             App {

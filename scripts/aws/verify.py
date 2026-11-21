@@ -37,7 +37,8 @@ for pod in workers:
     container = next(c for c in pod['spec']['containers'] if c['name'] == 'worker')
     # The same rule the chart check applies to the rendered release, so what is legal
     # on a live pod cannot drift from what is legal in the chart.
-    assert_worker_resources(container['resources'], cpu, f'pod {pod["metadata"]["name"]}')
+    assert_worker_resources(container['resources'], cpu, f'pod {pod["metadata"]["name"]}',
+                            memory=f'{cpu}Gi', disk='2Gi')
     observed = next(w for w in evidence['workers'] if w['worker_id'] == size)
     assert observed['cgroup_memory_max'] == cpu * 1024**3
     assert observed['cgroup_cpu_quota'] == cpu * observed['cgroup_cpu_period']

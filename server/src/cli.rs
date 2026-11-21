@@ -5,10 +5,9 @@
 //! load and a query are usually one unit of work and a session is what pins them
 //! to a single worker.
 //!
-//! Naming any of cpu, memory, or disk asks for a dedicated pod of that size; the
-//! server fills the dimensions left unset from the default. Naming none runs on
-//! the shared persistent tier. There is no mode flag — asking for a size is the
-//! request.
+//! Resource flags alone preserve the dedicated-pod behavior. Explicit `--mode`
+//! and `--pool` select a persistent pool or isolated compute; placement stays
+//! fixed for all statements passed to one invocation.
 
 use serde_json::{Map, Value, json};
 
@@ -70,8 +69,11 @@ pub async fn run(args: Vec<String>) -> i32 {
         }
         "budget" => get(&url, &token, "/v1/budget").await,
         "workers" => get(&url, &token, "/v1/workers").await,
+        "pools" => get(&url, &token, "/v1/pools").await,
         other => {
-            eprintln!("unknown command: {other} (sql|history|query|request|usage|budget|workers)");
+            eprintln!(
+                "unknown command: {other} (sql|history|query|request|usage|budget|workers|pools)"
+            );
             return 2;
         }
     };
@@ -95,7 +97,12 @@ pub async fn run(args: Vec<String>) -> i32 {
 }
 
 async fn run_sql(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
-    let compute = parsed.compute();
+    let compute = parsed.compute().map_err(|message| RemoteError {
+        status: None,
+        failure_kind: Some("invalid_request".into()),
+        retry_safe: true,
+        message,
+    })?;
     let mut connection = RemoteConnection::open(url, token, "cli", compute, None, 90).await?;
     if parsed.flags.contains(&"placement".to_owned()) {
         eprintln!("{}", connection.placement);
@@ -278,8 +285,10 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 7] =
-        ["url", "token", "cpu", "memory", "disk", "format", "limit"];
+    const VALUE_FLAGS: [&'static str; 9] = [
+        "url", "token", "cpu", "memory", "disk", "mode", "pool", "format", "limit",
+    ];
+    const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
     fn from_args(args: &[String]) -> Result<Self, String> {
         let mut command: Option<String> = None;
@@ -304,6 +313,9 @@ impl Parsed {
                     if name == "param" {
                         params.push(value.clone());
                     } else {
+                        if values.iter().any(|(key, _)| key == name) {
+                            return Err(format!("--{name} must be supplied only once"));
+                        }
                         values.push((name.to_owned(), value.clone()));
                     }
                     index += 2;
@@ -318,13 +330,24 @@ impl Parsed {
                 index += 1;
             }
         }
-        Ok(Parsed {
-            command: command.ok_or("usage: <sql|history|query|usage|budget|workers> ...")?,
+        let parsed = Parsed {
+            command: command
+                .ok_or("usage: <sql|history|query|request|usage|budget|workers|pools> ...")?,
             positionals,
             values,
             params,
             flags,
-        })
+        };
+        if parsed.command != "sql"
+            && parsed
+                .values
+                .iter()
+                .any(|(name, _)| Self::COMPUTE_FLAGS.contains(&name.as_str()))
+        {
+            return Err("compute selection flags apply only to the sql command".into());
+        }
+        parsed.compute()?;
+        Ok(parsed)
     }
 
     fn value(&self, name: &str) -> Option<&str> {
@@ -340,23 +363,92 @@ impl Parsed {
             .unwrap_or(default)
     }
 
-    /// The compute request, or `None` to take the shared default: naming any of
-    /// cpu/memory/disk asks for a dedicated pod; naming none runs shared.
-    fn compute(&self) -> Option<Value> {
+    /// Validate before opening a connection: malformed flags must never silently
+    /// become an empty request and execute on the default pool.
+    fn compute(&self) -> Result<Option<Value>, String> {
         let mut map = Map::new();
-        if let Some(cpu) = self.value("cpu").and_then(|text| text.parse::<u16>().ok()) {
+        if let Some(text) = self.value("cpu") {
+            let cpu = text
+                .parse::<u16>()
+                .ok()
+                .filter(|cpu| *cpu > 0)
+                .ok_or("--cpu must be a positive whole number from 1 to 65535")?;
             map.insert("cpu".to_owned(), json!(cpu));
         }
-        if let Some(memory) = self.value("memory") {
-            map.insert("memory".to_owned(), json!(memory));
-        }
-        if let Some(disk) = self.value("disk") {
-            map.insert("disk".to_owned(), json!(disk));
+        for field in ["memory", "disk", "mode", "pool"] {
+            if let Some(value) = self.value(field) {
+                map.insert(field.to_owned(), json!(value));
+            }
         }
         if map.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(Value::Object(map))
+            let value = Value::Object(map);
+            let request: crate::compute::ComputeRequest = serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid compute selection: {error}"))?;
+            request.validate().map_err(|error| error.1)?;
+            Ok(Some(value))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Parsed, String> {
+        Parsed::from_args(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn invalid_selection_never_becomes_default_compute() {
+        for cpu in ["zero", "0", "-1", "1.5", "65536", ""] {
+            assert!(parse(&["sql", "--cpu", cpu, "SELECT 1"]).is_err(), "{cpu}");
+        }
+        for args in [
+            vec!["sql", "--mode", "automatic", "SELECT 1"],
+            vec!["sql", "--mode", "isolated", "--pool", "etl", "SELECT 1"],
+            vec!["sql", "--pool", "../bad", "SELECT 1"],
+            vec!["sql", "--cpu", "1", "--cpu", "2", "SELECT 1"],
+            vec!["workers", "--pool", "etl"],
+            vec!["sql", "--memory", "bogus", "SELECT 1"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn compute_flags_preserve_legacy_and_explicit_selection() {
+        assert!(
+            parse(&["sql", "SELECT 1"])
+                .unwrap()
+                .compute()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            parse(&["sql", "--cpu", "2", "SELECT 1"])
+                .unwrap()
+                .compute()
+                .unwrap(),
+            Some(json!({"cpu":2}))
+        );
+        assert_eq!(
+            parse(&[
+                "sql",
+                "--mode",
+                "persistent",
+                "--pool",
+                "etl",
+                "--memory",
+                "4Gi",
+                "SELECT 1"
+            ])
+            .unwrap()
+            .compute()
+            .unwrap(),
+            Some(json!({"mode":"persistent","pool":"etl","memory":"4Gi"}))
+        );
+        assert_eq!(parse(&["pools"]).unwrap().command, "pools");
     }
 }

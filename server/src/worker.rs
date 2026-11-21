@@ -1,6 +1,6 @@
 use crate::{
     ApiError, Envelope, Operation, Output, QueryRequest, Reply,
-    compute::{Mode, Placement, Resources},
+    compute::{Mode, Placement, Resources, WorkerSessionRequest},
     credentials::{self, Identity},
     failure, metering, pricing, requests,
     secrets::{Redactor, Startup},
@@ -77,6 +77,7 @@ struct Session {
     /// reads this rather than the worker's own class, so a future placement that
     /// exceeds the request cannot quietly start charging for the provision.
     placement: Placement,
+    diagnostics: Value,
     /// Who the gateway authenticated when this session opened, recorded on every
     /// history row the session writes. Server-derived, never caller-supplied:
     /// the caller's own context cannot name someone else.
@@ -174,6 +175,8 @@ pub(crate) struct Worker {
     worker_id: String,
     resources: Resources,
     placement: Value,
+    pool: Option<String>,
+    max_sessions: usize,
     /// True when this process is a pod created for a single isolated session, which
     /// bounds what it will admit below.
     dedicated: bool,
@@ -537,7 +540,32 @@ impl Worker {
         } else {
             Mode::Persistent
         };
-        let mut placement = Placement { mode, resources }.describe(&worker_id);
+        let pool = if dedicated {
+            anyhow::ensure!(
+                std::env::var_os("DUCKFLEET_POOL").is_none(),
+                "isolated workers must not declare DUCKFLEET_POOL"
+            );
+            None
+        } else {
+            Some(std::env::var("DUCKFLEET_POOL").unwrap_or_else(|_| "small".into()))
+        };
+        anyhow::ensure!(
+            pool.as_deref().is_none_or(crate::compute::valid_pool_name),
+            "invalid DUCKFLEET_POOL name"
+        );
+        let max_sessions = crate::configured_limit("DUCKFLEET_WORKER_MAX_SESSIONS", 32, 1024)?;
+        let mut placement = Placement {
+            mode,
+            resources,
+            pool: pool.clone(),
+        }
+        .describe(&worker_id);
+        placement["max_sessions"] = json!(if dedicated { 1 } else { max_sessions });
+        placement["queue_capacity"] = json!(crate::configured_limit(
+            "DUCKFLEET_WORKER_QUEUE_CAPACITY",
+            64,
+            4096
+        )?);
         placement["cgroup_memory_max"] = json!(observed.memory_bytes);
         placement["cgroup_cpu_quota"] = json!(observed.cpu_quota);
         placement["cgroup_cpu_period"] = json!(observed.cpu_period);
@@ -669,6 +697,8 @@ impl Worker {
             worker_id,
             resources,
             placement,
+            pool,
+            max_sessions,
             dedicated,
             served: 0,
             rate,
@@ -794,7 +824,7 @@ impl Worker {
             .collect();
         if !ids.is_empty() {
             let valid = self.ledger.identities(&ids).unwrap_or_default();
-            // The worker admits at most 32 sessions, bounding this scan and the
+            // The configured session ceiling bounds this scan and the
             // one database query. Lookup failure closes named sessions as well:
             // an unavailable authority cannot indefinitely retain a transaction.
             retain_authorized_sessions(&mut self.sessions, &valid);
@@ -809,17 +839,39 @@ impl Worker {
                 .unserviceable("worker ownership", "exclusive ownership connection lost"));
         }
         match op {
-            Operation::Open(mut request, identity) => {
+            Operation::Open(request, identity) => {
                 // The gateway already routed by mode and size; this is the worker
                 // refusing to serve a placement that is not its own.
-                let placement = request.validate()?;
-                if placement.resources != self.resources {
-                    return Err(ApiError::bad(
-                        "request does not match this worker's resources",
-                    ));
-                }
+                let (mut request, placement, revision) = match request {
+                    WorkerSessionRequest::Direct(request) => {
+                        request.validate()?;
+                        let placement = request
+                            .compute
+                            .resolve_local(self.pool.as_deref(), self.resources)?;
+                        (request, placement, None)
+                    }
+                    WorkerSessionRequest::Forwarded(forwarded) => {
+                        forwarded.validate_version()?;
+                        forwarded.request.validate()?;
+                        forwarded
+                            .request
+                            .compute
+                            .validate_resolved(&forwarded.resolved)?;
+                        (
+                            forwarded.request,
+                            forwarded.resolved,
+                            Some(forwarded.registry_revision),
+                        )
+                    }
+                };
+                placement.validate_worker(self.pool.as_deref(), self.resources)?;
                 request.context["requested_compute"] =
                     serde_json::to_value(&request.compute).map_err(|_| ApiError::internal())?;
+                let mut diagnostics = self.placement.clone();
+                diagnostics["requested_compute"] = request.context["requested_compute"].clone();
+                diagnostics["resolved_compute"] =
+                    serde_json::to_value(&placement).map_err(|_| ApiError::internal())?;
+                diagnostics["registry_revision"] = json!(revision);
                 // Refused here as well as at the gateway, because a worker is
                 // reachable in its own right: this process is the shared compute the
                 // isolation guarantee excludes, so it must never serve the request.
@@ -842,7 +894,7 @@ impl Worker {
                          session per pod",
                     ));
                 }
-                if self.sessions.len() >= 32 {
+                if self.sessions.len() >= self.max_sessions {
                     return Err(ApiError::new(failure::CAPACITY, "session limit reached"));
                 }
                 let identity = self.validate_identity(&identity)?;
@@ -860,13 +912,14 @@ impl Worker {
                         touched: Instant::now(),
                         context: request.context,
                         placement,
+                        diagnostics: diagnostics.clone(),
                         principal: identity.principal.clone(),
                         authority: identity,
                     },
                 );
                 self.served += 1;
                 Ok(Output::Json(json!({"session_id":id, "database":"lake",
-                        "duckdb_version": self.placement["duckdb_version"], "placement":self.placement})))
+                        "duckdb_version": self.placement["duckdb_version"], "placement":diagnostics})))
             }
             Operation::Close(id) => {
                 self.sessions.remove(&id);
@@ -1001,10 +1054,12 @@ impl Worker {
         let resources = session.placement.resources;
         let compute = json!({
             "mode": session.placement.mode.name(),
+            "pool": session.placement.pool,
             "cpu": resources.cpu,
             "memory_bytes": resources.memory_bytes,
             "disk_bytes": resources.disk_bytes,
         });
+        let placement = session.diagnostics.clone();
         let session_id = id.to_string();
         let submission = || requests::Submission {
             request_id: &query_id,
@@ -1016,7 +1071,7 @@ impl Worker {
             timeout_seconds: req.timeout_seconds,
             compute: &compute,
             worker_id: &self.worker_id,
-            placement: &self.placement,
+            placement: &placement,
             principal: &principal,
         };
         // Canonicalization sees validated parameters and effective session context,
@@ -1328,7 +1383,9 @@ mod tests {
                 placement: Placement {
                     mode: Mode::Persistent,
                     resources: Resources::default(),
+                    pool: Some("small".into()),
                 },
+                diagnostics: json!({}),
                 principal: identity.principal.clone(),
                 authority: identity,
             })

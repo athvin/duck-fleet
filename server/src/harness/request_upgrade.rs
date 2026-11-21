@@ -433,7 +433,7 @@ fn fixtures(client: &mut Client, schema: &str) -> Result<()> {
     require(
         preserved.get::<_, String>("payload_hash") == fingerprint
             && preserved.get::<_, String>("principal") == PRINCIPAL
-            && preserved.get::<_, i32>("fingerprint_version") == 1,
+            && preserved.get::<_, i32>("fingerprint_version") == 2,
         "repeated migration rewrote a fingerprinted request",
     )?;
     require(
@@ -560,5 +560,139 @@ fn fixtures(client: &mut Client, schema: &str) -> Result<()> {
         "succeeded",
         "statement_result",
     )?;
+    policy_upgrade_fixtures(client, &rate)?;
+    Ok(())
+}
+
+fn policy_upgrade_fixtures(client: &mut Client, rate: &RateCard) -> Result<()> {
+    // Independently frozen pre-pools hashes. No current fingerprint helper is
+    // used to manufacture historical identity, and no original history is needed.
+    let cases = [
+        (
+            "direct",
+            "a249ad7c77cc1abc9c6a2e6f479e1df1d58c229218bb9cee1ceaa4aa708e7103",
+            false,
+        ),
+        (
+            "gateway",
+            "227f543c6262a7fcf36ddf2ebf4acdc823512cff439e9fd60bfab229503866bc",
+            false,
+        ),
+        (
+            "small",
+            "969f5d969855167364657a532132f703ba79a3a5dc3d3d7024927ef3d0ae5f2f",
+            true,
+        ),
+    ];
+    let before = assert_accounting(client)?;
+    for (name, hash, persistent) in cases {
+        let parent = format!("v1-policy-{name}");
+        let child = format!("v2-policy-{name}");
+        client.execute(
+            "INSERT INTO requests(request_id,principal,logical_request_id,fingerprint_version,
+                payload_hash,state,status,outcome,failure_kind,retry_safe,worker_id,finished_at)
+             VALUES ($1,$2,$1,1,$3,'terminal','refused','not_executed','budget_exhausted',true,$4,now())",
+            &[&parent, &PRINCIPAL, &hash, &WORKER],
+        )?;
+        let compute = json!({"mode":if persistent { "persistent" } else { "isolated" },
+            "pool":if persistent { Some("small") } else { None },
+            "cpu":if persistent {1} else {2},"memory_bytes":1073741824_u64,"disk_bytes":2147483648_u64});
+        let context = json!({"connection_name":"legacy-policy","requested_compute":
+            if persistent { json!({"pool":"small"}) } else { json!({"cpu":2}) }});
+        let parameters = [json!(7)];
+        let placement = json!({"worker_id":WORKER});
+        let input = |id, retry_of| requests::Submission {
+            request_id: id,
+            retry_of,
+            session_id: "new-policy-session",
+            sql: "INSERT INTO events VALUES (?)",
+            parameters: &parameters,
+            context: &context,
+            timeout_seconds: 30,
+            compute: &compute,
+            worker_id: WORKER,
+            placement: &placement,
+            principal: PRINCIPAL,
+        };
+        let replay = requests::admit(client, input(&parent, None), 2, rate)
+            .map_err(|error| anyhow::anyhow!("v1 {name} replay: {}", error.1))?;
+        require(
+            matches!(replay, requests::AdmissionResult::Duplicate(_)),
+            "v1 replay executed again",
+        )?;
+        let mut foreign = input(&parent, None);
+        foreign.principal = "another-principal";
+        require(
+            matches!(requests::admit(client, foreign, 2, rate),
+            Err(crate::ApiError(failure, _)) if failure.kind == "not_found"),
+            "v1 replay exposed another principal's identity",
+        )?;
+        let mut changed = input(&parent, None);
+        changed.sql = "INSERT INTO events VALUES (?);";
+        require(
+            matches!(requests::admit(client, changed, 2, rate),
+            Err(crate::ApiError(failure, _)) if failure.kind == "request_id_mismatch"),
+            "v1 replay accepted changed SQL",
+        )?;
+        let admission = match requests::admit(client, input(&child, Some(&parent)), 2, rate)
+            .map_err(|error| anyhow::anyhow!("v1 {name} retry: {}", error.1))?
+        {
+            requests::AdmissionResult::Admitted(admission) => admission,
+            requests::AdmissionResult::Duplicate(_) => {
+                anyhow::bail!("fresh v2 child was duplicate")
+            }
+        };
+        let identities = client.query_one(
+            "SELECT p.fingerprint_version,p.payload_hash,c.fingerprint_version AS child_version,
+                c.logical_request_id,c.retry_of FROM requests p JOIN requests c ON c.retry_of=p.request_id
+             WHERE p.request_id=$1", &[&parent],
+        )?;
+        require(
+            identities.get::<_, i32>("fingerprint_version") == 1
+                && identities.get::<_, String>("payload_hash") == hash
+                && identities.get::<_, i32>("child_version") == 2
+                && identities.get::<_, String>("logical_request_id") == parent
+                && identities.get::<_, String>("retry_of") == parent,
+            "v1 parent -> v2 child changed historical evidence or lost lineage",
+        )?;
+        requests::mark_executing(client, &child)
+            .map_err(|error| anyhow::anyhow!("v2 execution grant: {}", error.1))?;
+        let mut transaction = client.transaction()?;
+        finish(
+            &mut transaction,
+            &admission,
+            requests::Outcome::StatementResult,
+            1000,
+            rate,
+        )?;
+        transaction.commit()?;
+        let replay = requests::admit(client, input(&child, Some(&parent)), 2, rate)
+            .map_err(|error| anyhow::anyhow!("v2 child replay: {}", error.1))?;
+        require(
+            matches!(replay, requests::AdmissionResult::Duplicate(_)),
+            "v2 child replay executed again",
+        )?;
+        let count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM usage_events WHERE execution_id=$1 OR execution_id=$2",
+                &[&parent, &child],
+            )?
+            .get(0);
+        require(count == 1, "v1 parent/v2 child replay produced extra usage")?;
+        let sibling = format!("forbidden-sibling-{name}");
+        require(
+            matches!(requests::admit(client, input(&sibling, Some(&parent)), 2, rate),
+            Err(crate::ApiError(failure, _)) if failure.kind == "invalid_retry"),
+            "v1 parent allowed a second retry branch",
+        )?;
+    }
+    let after = assert_accounting(client)?;
+    require(
+        after.1 == 0 && after.2 == before.2 + 3,
+        "fingerprint upgrade left held funds or duplicate events",
+    )?;
+    println!(
+        "PASS: frozen v1 direct/gateway/default identities survive pruning and produce one v2 retry child without duplicate charges"
+    );
     Ok(())
 }

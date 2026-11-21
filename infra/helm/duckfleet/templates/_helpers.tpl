@@ -42,29 +42,83 @@ fsGroup: 10001
 seccompProfile:
   type: RuntimeDefault
 {{- end -}}
-{{/*
-The worker classes this release runs, defined once. The gateway's endpoint list and
-the Deployments it points at are both derived from this, so they cannot drift apart
-and leave the gateway routing to a Service that was never rendered.
-*/}}
-{{/* Consumers must coerce the size with `int`: Helm parses this through JSON, so a
-     number arrives as a float and `printf "%d"` on it renders invalid YAML. */}}
-{{- /* The fleet is a single persistent tier at the default size (1 CPU / 1Gi);
-       sizing above it is served by isolated pods, not a second class. `small` is
-       kept as the identity so an in-place upgrade from the two-class chart keeps
-       the existing worker-small Deployment, Service, and history/reservation keys. */}}
-{{- define "duckfleet.workerClasses" -}}
-small: 1
+{{/* Parse the binary quantities the worker accepts; values.schema.json bounds
+     spelling and length so Helm arithmetic cannot overflow. */}}
+{{- define "duckfleet.quantityBytes" -}}
+{{- $number := regexFind "^[0-9]+" . | int64 -}}
+{{- if hasSuffix "Gi" . -}}{{ mul $number 1073741824 }}
+{{- else if hasSuffix "Mi" . -}}{{ mul $number 1048576 }}
+{{- else -}}{{ mul $number 1024 }}{{- end -}}
+{{- end -}}
+{{- define "duckfleet.diskLimit" -}}
+{{- $bytes := add (include "duckfleet.quantityBytes" . | int64) 1073741824 -}}
+{{- if eq (mod $bytes 1073741824) 0 -}}{{ div $bytes 1073741824 }}Gi
+{{- else if eq (mod $bytes 1048576) 0 -}}{{ div $bytes 1048576 }}Mi
+{{- else -}}{{ div $bytes 1024 }}Ki{{- end -}}
+{{- end -}}
+{{/* Stable recovery identities. Only small uses the historical spelling;
+     other pool names can never collide with small-1 or another pool's index. */}}
+{{- define "duckfleet.workerId" -}}
+{{- if eq .pool "small" -}}
+{{- ternary "small" (printf "small-%d" (int .index)) (eq (int .index) 0) -}}
+{{- else -}}{{ printf "pool-%s-%d" .pool (int .index) }}{{- end -}}
+{{- end -}}
+{{/* One validated pool map generates workers and gateway endpoints together. */}}
+{{- define "duckfleet.pools" -}}
+{{- $pools := dict -}}
+{{- if .Values.persistentPools -}}
+{{- if .Values.workerReplicas -}}
+{{- fail "persistentPools cannot be combined with workerReplicas; clear legacy workerReplicas when adopting named pools" -}}
+{{- end -}}
+{{- range $name, $definition := .Values.persistentPools -}}
+{{- $pool := deepCopy $definition -}}
+{{- if not (hasKey $pool "workers") -}}{{- $_ := set $pool "workers" 1 -}}{{- end -}}
+{{- if not (hasKey $pool "maxSessionsPerWorker") -}}{{- $_ := set $pool "maxSessionsPerWorker" $.Values.workerMaxSessions -}}{{- end -}}
+{{- if lt (include "duckfleet.quantityBytes" $pool.memory | int64) 268435456 -}}
+{{- fail (printf "pool %s memory must be at least 256Mi" $name) -}}
+{{- end -}}
+{{- if lt (include "duckfleet.quantityBytes" $pool.disk | int64) 1073741824 -}}
+{{- fail (printf "pool %s disk must be at least 1Gi" $name) -}}
+{{- end -}}
+{{- $_ := set $pools $name $pool -}}
+{{- end -}}
+{{- else -}}
+{{- $_ := set $pools "small" (dict "cpu" 1 "memory" "1Gi" "disk" "2Gi" "workers" (dig "small" 1 (.Values.workerReplicas | default dict)) "maxSessionsPerWorker" .Values.workerMaxSessions) -}}
+{{- end -}}
+{{- if not (hasKey $pools .Values.defaultPool) -}}{{- fail "defaultPool must name a configured persistent pool" -}}{{- end -}}
+{{- $identities := dict -}}
+{{- range $name, $pool := $pools -}}
+{{- range $index := until (int $pool.workers) -}}
+{{- $id := include "duckfleet.workerId" (dict "pool" $name "index" $index) -}}
+{{- if or (hasKey $identities $id) (gt (len (printf "worker-%s" $id)) 63) -}}
+{{- fail (printf "generated worker identity collides or is too long: %s" $id) -}}
+{{- end -}}
+{{- $_ := set $identities $id true -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $pools -}}
+{{- end -}}
+{{- define "duckfleet.poolEndpoints" -}}
+{{- $urls := list -}}
+{{- range $index := until (int .workers) -}}
+{{- $id := include "duckfleet.workerId" (dict "pool" $.name "index" $index) -}}
+{{- $urls = append $urls (printf "http://worker-%s:8080" $id) -}}
+{{- end -}}
+{{- toJson $urls -}}
 {{- end -}}
 {{- define "duckfleet.workerUrls" -}}
 {{- $urls := list -}}
-{{- range $size, $cpu := include "duckfleet.workerClasses" . | fromYaml -}}
-{{- range $index := until (int (dig $size 1 ($.Values.workerReplicas | default dict))) -}}
-{{- $id := ternary $size (printf "%s-%d" $size $index) (eq $index 0) -}}
-{{- $urls = append $urls (printf "http://worker-%s:8080" $id) -}}
-{{- end -}}
+{{- range $name, $pool := include "duckfleet.pools" . | fromJson -}}
+{{- $urls = concat $urls (include "duckfleet.poolEndpoints" (dict "name" $name "workers" $pool.workers) | fromJsonArray) -}}
 {{- end -}}
 {{- join "," $urls -}}
+{{- end -}}
+{{- define "duckfleet.poolConfig" -}}
+{{- $pools := dict -}}
+{{- range $name, $pool := include "duckfleet.pools" . | fromJson -}}
+{{- $_ := set $pools $name (dict "cpu" $pool.cpu "memory" $pool.memory "disk" $pool.disk "endpoints" (include "duckfleet.poolEndpoints" (dict "name" $name "workers" $pool.workers) | fromJsonArray) "max_sessions_per_worker" $pool.maxSessionsPerWorker) -}}
+{{- end -}}
+{{- toJson (dict "default_pool" .Values.defaultPool "pools" $pools) -}}
 {{- end -}}
 {{/*
 The worker container's environment, defined once. The persistent Deployments and the
@@ -83,6 +137,11 @@ template and the code that patches it from drifting silently.
 {{- fail "catalogWaitSeconds + platformWaitSeconds must fit the 600-second startup probe budget" -}}
 {{- end -}}
 - {name: DUCKFLEET_WORKER_ID, value: {{ .id | quote }}}
+{{- if hasKey . "pool" }}
+- {name: DUCKFLEET_POOL, value: {{ .pool | quote }}}
+{{- end }}
+- {name: DUCKFLEET_WORKER_MAX_SESSIONS, value: {{ .maxSessions | default 1 | quote }}}
+- {name: DUCKFLEET_WORKER_QUEUE_CAPACITY, value: {{ $.Values.workerQueueCapacity | quote }}}
 # Declared from the same values as the limits. The worker refuses to start if the
 # container it actually got disagrees.
 - {name: DUCKFLEET_WORKER_CPU, value: {{ .cpu | quote }}}
