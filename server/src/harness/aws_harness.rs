@@ -40,7 +40,11 @@ impl MockS3 {
         let listener = TcpListener::bind("0.0.0.0:5432").await?;
         let route = UdpSocket::bind("0.0.0.0:0").await?;
         route.connect("server:8080").await?;
-        let address = route.local_addr()?.ip().to_string();
+        let address = format!(
+            "{}:{}",
+            route.local_addr()?.ip(),
+            listener.local_addr()?.port()
+        );
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&requests);
         let task = tokio::spawn(async move {
@@ -115,17 +119,31 @@ async fn s3_secret_scope_check(ctx: &Ctx) -> anyhow::Result<Value> {
         )
         .await;
     let in_scope = server.take();
-    require(
-        in_scope.iter().any(|request| {
+    let signed_in_scope = in_scope
+        .iter()
+        .filter(|request| {
             request.path.starts_with("/duckfleet-scope-fixture/lake/")
                 && request
                     .authorization
                     .as_deref()
                     .is_some_and(|value| value.contains("Credential=TESTLOCALONLY/"))
-        }),
+        })
+        .count();
+    require(
+        signed_in_scope > 0,
         "the in-scope S3 fixture received no signed request",
     )?;
 
+    // Give the neighbor the same endpoint without credentials so its request is
+    // observed rather than sent to the real bucket or omitted entirely.
+    sql(
+        &connection,
+        &format!(
+            "CREATE SECRET live_scope_neighbor (TYPE S3, KEY_ID '', SECRET '', ENDPOINT '{}', URL_STYLE 'path', USE_SSL false, REGION 'us-east-2', SCOPE 's3://duckfleet-scope-fixture-other/lake/')",
+            server.address
+        ),
+    )
+    .await?;
     let _ = connection
         .execute(
             "SELECT * FROM read_csv('s3://duckfleet-scope-fixture-other/lake/fixture.csv')",
@@ -151,7 +169,7 @@ async fn s3_secret_scope_check(ctx: &Ctx) -> anyhow::Result<Value> {
         "a prefix-neighbor probe reused the in-scope bucket path",
     )?;
     let evidence = json!({
-        "signed_in_scope_requests": in_scope.len(),
+        "signed_in_scope_requests": signed_in_scope,
         "unsigned_neighbor_requests": neighbor.len(),
         "neighbor_credentials_sent": false,
     });

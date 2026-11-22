@@ -37,10 +37,16 @@ try:
     assert any(path.startswith("/test/lake/") and authorization for path, authorization in requests), requests
 
     requests.clear()
+    connection.execute(
+        "CREATE SECRET neighbor (TYPE S3, KEY_ID '', SECRET '', "
+        f"ENDPOINT '127.0.0.1:{server.server_port}', URL_STYLE 'path', USE_SSL false, "
+        "REGION 'us-east-1', SCOPE 's3://test-other/lake/')"
+    )
     try:
         connection.execute("SELECT * FROM read_csv('s3://test-other/lake/fixture.csv')")
     except duckdb.Error:
         pass
+    assert any(path.startswith("/test-other/lake/") for path, _ in requests), requests
     assert all(authorization is None for _, authorization in requests), requests
     assert not any(path.startswith("/test/") for path, _ in requests), requests
     print("PASS: scoped S3 credentials were not sent to a prefix-neighbor bucket")
