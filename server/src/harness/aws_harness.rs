@@ -3,6 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use reqwest::Method;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -223,14 +224,13 @@ async fn s3_glob_check(ctx: &Ctx, secret_scope: Value) -> anyhow::Result<()> {
             }),
         "no Parquet in the AWS lake",
     )?;
+    let model_placement = connection.placement.clone();
     let mut connection = connection;
     connection.close().await?;
 
-    let workers: Value = serde_json::from_str(&std::fs::read_to_string(
-        "/artifacts/worker-resources.json",
-    )?)?;
-    let model_placement: Value =
-        serde_json::from_str(&std::fs::read_to_string("/artifacts/model-placement.json")?)?;
+    let workers =
+        super::request_json(&ctx.client()?, Method::GET, "/v1/workers", None).await?["workers"]
+            .clone();
     let evidence = json!({
         "workers": workers,
         "model_placement": model_placement,
