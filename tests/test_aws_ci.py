@@ -1371,6 +1371,11 @@ class DatabaseRolePackagingTests(unittest.TestCase):
         self.assertIn('--reset-then-reuse-values', script)
         self.assertNotIn('--reuse-values --set', script)
 
+    def test_legacy_ownership_transfer_skips_table_owned_sequences(self):
+        sql = (ROOT/'infra/helm/duckfleet/files/provision-database.sql').read_text()
+        self.assertEqual(sql.count("c.relkind<>'S'"), 2)
+        self.assertEqual(sql.count("d.deptype='a'"), 2)
+
     def test_legacy_database_upgrade_job_is_explicit_and_least_privilege(self):
         ordinary = [o for o in yaml.safe_load_all(chart()) if o]
         self.assertFalse(any(o['metadata']['name'] == 'duckfleet-database-provision' for o in ordinary))
