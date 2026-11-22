@@ -139,10 +139,112 @@ async fn ordinary_sql_errors_stay_unsafe(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn failed_statements_abort_explicit_transactions(ctx: &Ctx) -> anyhow::Result<()> {
+    let mut connection = ctx.open_named("transaction-abort", None).await?;
+    sql(
+        &connection,
+        "CREATE TEMP TABLE transaction_values(value INTEGER)",
+    )
+    .await?;
+    for statement in [
+        "SELECT * FROM",
+        "SELECT * FROM qualification_missing_transaction_relation",
+    ] {
+        sql(&connection, "BEGIN").await?;
+        sql(&connection, "INSERT INTO transaction_values VALUES (1)").await?;
+        let error = match connection.execute(statement, Vec::new()).await {
+            Err(error) => error,
+            Ok(_) => anyhow::bail!("parser/binder error must fail"),
+        };
+        require(
+            !error.retry_safe,
+            format!("unsafe error became retryable: {error}"),
+        )?;
+        let blocked = match connection.execute("SELECT 1", Vec::new()).await {
+            Err(error) => error,
+            Ok(_) => anyhow::bail!("an aborted transaction accepted another statement"),
+        };
+        require(
+            !blocked.retry_safe,
+            format!("aborted transaction became retryable: {blocked}"),
+        )?;
+        sql(&connection, "ROLLBACK").await?;
+        require(
+            rows_eq(
+                &sql(&connection, "SELECT count(*) FROM transaction_values").await?,
+                &[&["0"]],
+            ),
+            "rollback retained a write from an aborted transaction",
+        )?;
+    }
+    connection.close().await?;
+    println!(
+        "PASS: parser/binder errors abort explicit transactions and rollback discards their writes"
+    );
+    Ok(())
+}
+
+async fn multi_match_writes_follow_native_201_semantics(ctx: &Ctx) -> anyhow::Result<()> {
+    let mut connection = ctx.open_named("multi-match", None).await?;
+    sql(
+        &connection,
+        "CREATE TEMP TABLE multi_target(id INTEGER, value INTEGER)",
+    )
+    .await?;
+    sql(
+        &connection,
+        "CREATE TEMP TABLE multi_source(id INTEGER, value INTEGER)",
+    )
+    .await?;
+    sql(&connection, "INSERT INTO multi_target VALUES (1, 0)").await?;
+    sql(
+        &connection,
+        "INSERT INTO multi_source VALUES (1, 10), (1, 20)",
+    )
+    .await?;
+    sql(
+        &connection,
+        "UPDATE multi_target t SET value=s.value FROM multi_source s WHERE t.id=s.id",
+    )
+    .await?;
+    require(
+        rows_eq(
+            &sql(
+                &connection,
+                "SELECT value IN (10, 20), count(*) FROM multi_target",
+            )
+            .await?,
+            &[&["true", "1"]],
+        ),
+        "multi-match UPDATE FROM changed row cardinality or selected an unknown value",
+    )?;
+    sql(
+        &connection,
+        "MERGE INTO multi_target t USING multi_source s ON t.id=s.id WHEN MATCHED THEN UPDATE SET value=s.value",
+    )
+    .await?;
+    require(
+        rows_eq(
+            &sql(
+                &connection,
+                "SELECT value IN (10, 20), count(*) FROM multi_target",
+            )
+            .await?,
+            &[&["true", "1"]],
+        ),
+        "multi-match MERGE changed row cardinality or selected an unknown value",
+    )?;
+    connection.close().await?;
+    println!("PASS: multi-match UPDATE FROM and MERGE retain native 2.0.1 single-target semantics");
+    Ok(())
+}
+
 pub(super) async fn checks(ctx: &Ctx) -> anyhow::Result<()> {
     appends_never_conflict(ctx).await?;
     delete_insert_conflicts_atomically(ctx).await?;
     ordinary_sql_errors_stay_unsafe(ctx).await?;
+    failed_statements_abort_explicit_transactions(ctx).await?;
+    multi_match_writes_follow_native_201_semantics(ctx).await?;
     let mut connection = ctx.open_named("concurrency-admin", None).await?;
     sql(&connection, "drop table if exists concurrency.target").await?;
     connection.close().await?;

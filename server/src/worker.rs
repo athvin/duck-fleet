@@ -2210,6 +2210,17 @@ DETAIL: Key (typname, typnamespace)=(ducklake_metadata, 2200) already exists."#;
         Ok(())
     }
     #[test]
+    fn variant_results_fail_explicitly_instead_of_coercing_values() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let error = execute(&conn, "SELECT {'duck': 2}::VARIANT AS value", vec![])
+            .expect_err("VARIANT results must have an explicit support-or-error contract");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("variant"),
+            "{error}"
+        );
+        Ok(())
+    }
+    #[test]
     fn profiles_are_fresh_and_optional() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         let profile = crate::profiling::Profile::new(Uuid::new_v4(), true, &conn)?;
@@ -2217,6 +2228,10 @@ DETAIL: Key (typname, typnamespace)=(ducklake_metadata, 2200) already exists."#;
         execute(&conn, "SELECT sum(i) FROM range(100) t(i)", vec![])?;
         let captured = profile.capture(cleared);
         assert_eq!(captured.status, "captured");
+        let metrics: Value = serde_json::from_str(&captured.metrics)?;
+        assert!(metrics["cpu_time"].is_number(), "{metrics}");
+        assert!(metrics["total_bytes_read"].is_number(), "{metrics}");
+        assert!(metrics["total_bytes_written"].is_number(), "{metrics}");
         let value: Value = serde_json::from_str(captured.profile.as_deref().unwrap())?;
         assert_eq!(
             value["query"]["sql"], "SELECT sum(i) FROM range(100) t(i)",

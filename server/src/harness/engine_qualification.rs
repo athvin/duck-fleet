@@ -94,6 +94,31 @@ fn cases() -> Vec<Case> {
             sql: "SELECT sum(i)::BIGINT AS total, max(i)::BIGINT AS maximum FROM range(100000) source(i)",
             parameters: vec![],
         },
+        Case {
+            id: "peg_parser_quoted_identifiers",
+            sql: "WITH \"MixedCase\"(value) AS (SELECT 42) SELECT value FROM \"MixedCase\"",
+            parameters: vec![],
+        },
+        Case {
+            id: "identifier_case",
+            sql: "SELECT current_setting('preserve_identifier_case') AS preserved",
+            parameters: vec![],
+        },
+        Case {
+            id: "native_compatibility_settings",
+            sql: "SELECT name, value FROM duckdb_settings() WHERE name IN ('parser', 'lambda_syntax', 'error_on_division_by_zero', 'preserve_identifier_case') ORDER BY name",
+            parameters: vec![],
+        },
+        Case {
+            id: "result_type_matrix",
+            sql: "SELECT UUID '00000000-0000-4000-8000-000000000001' AS id, '\\x00ff'::BLOB AS bytes, B'101' AS bits, [1,NULL,3] AS items, {'name':'duck','value':7} AS record",
+            parameters: vec![],
+        },
+        Case {
+            id: "variant_result",
+            sql: "SELECT {'duck': 2}::VARIANT AS value",
+            parameters: vec![],
+        },
     ]
 }
 

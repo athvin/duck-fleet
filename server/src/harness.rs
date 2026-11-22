@@ -1436,6 +1436,7 @@ async fn main_lifecycle(ctx: &Ctx, args: &[String]) -> anyhow::Result<()> {
     )?;
     dbt(ctx, "tests", &["test"], 0)?;
     dbt(ctx, "docs", &["docs", "generate"], 0)?;
+    let replay_before = sql(&connection, "SELECT count(*) FROM checks.replay").await?;
     dbt(
         ctx,
         "expected-failure",
@@ -1447,6 +1448,11 @@ async fn main_lifecycle(ctx: &Ctx, args: &[String]) -> anyhow::Result<()> {
             "{\"exercise_failure\":true}",
         ],
         1,
+    )?;
+    let replay_after = sql(&connection, "SELECT count(*) FROM checks.replay").await?;
+    require(
+        replay_after == replay_before,
+        "a failed dbt model committed its pre-hook write",
     )?;
     let history = request_json(connection.client(), Method::GET, "/v1/queries", None).await?;
     let count = history["queries"].as_array().map(|q| q.len()).unwrap_or(0);

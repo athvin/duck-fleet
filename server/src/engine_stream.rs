@@ -191,6 +191,36 @@ mod tests {
     }
 
     #[test]
+    fn multi_match_update_and_merge_keep_one_target_row() -> Result<()> {
+        let connection = connection()?;
+        connection.execute_batch(
+            "CREATE TABLE multi_target(id INTEGER, value INTEGER);
+             CREATE TABLE multi_source(id INTEGER, value INTEGER);
+             INSERT INTO multi_target VALUES (1, 0);
+             INSERT INTO multi_source VALUES (1, 10), (1, 20);
+             UPDATE multi_target t SET value=s.value FROM multi_source s WHERE t.id=s.id",
+        )?;
+        ensure!(
+            scalar(
+                &connection,
+                "SELECT (value IN (10, 20))::INTEGER FROM multi_target"
+            )? == 1
+        );
+        connection.execute_batch(
+            "MERGE INTO multi_target t USING multi_source s ON t.id=s.id
+             WHEN MATCHED THEN UPDATE SET value=s.value",
+        )?;
+        ensure!(
+            scalar(
+                &connection,
+                "SELECT (value IN (10, 20))::INTEGER FROM multi_target"
+            )? == 1
+        );
+        ensure!(scalar(&connection, "SELECT count(*) FROM multi_target")? == 1);
+        Ok(())
+    }
+
+    #[test]
     fn materialized_ctas_and_returning_report_success_before_schema_or_delivery() -> Result<()> {
         let connection = connection()?;
         connection.execute_batch(
