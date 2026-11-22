@@ -31,4 +31,6 @@ DuckFleet uses native 2.0.1 parser and expression behavior; it does not enable t
 
 Arrow IPC preserves nulls, decimals, timestamps, nested values, blobs/bitstrings, UUIDs, empty schemas, and chunked artifacts. An untyped DuckDB `NULL` is an Arrow `Null` value and becomes JSON null, never an empty string. `VARIANT` results currently fail explicitly because Arrow variant decoding is unsupported; DuckFleet does not silently coerce them. SQL completion remains distinct from result conversion, storage, and delivery failures.
 
+The pgwire text front preserves nulls, decimals, timestamps, and UUID strings. Binary/bitstring and nested Arrow results have an explicit `cast to VARCHAR in SQL` error rather than an ambiguous text conversion; `VARIANT` fails at the same Arrow conversion boundary as HTTP. Empty-result and multi-chunk artifact behavior is exercised through the durable-job lane.
+
 DuckDB 2.0.1 places profile metrics under `query`, `system`, and `io`. The Rust worker exports only the existing numeric metric names, whether found at the profile root or in those sections. It does not invent values for omitted metrics such as `rows_returned` or latency. The existing pre-execution file deletion proves profile freshness.
