@@ -1366,6 +1366,11 @@ class DatabaseRolePackagingTests(unittest.TestCase):
         rendered = chart(['--set', 'results=null'])
         self.assertNotIn('DUCKFLEET_RESULT_DATA_PATH', rendered)
 
+    def test_suspension_rebases_legacy_releases_onto_current_defaults(self):
+        script = (ROOT/'scripts/aws/suspend.sh').read_text()
+        self.assertIn('--reset-then-reuse-values', script)
+        self.assertNotIn('--reuse-values --set', script)
+
     def test_legacy_database_upgrade_job_is_explicit_and_least_privilege(self):
         ordinary = [o for o in yaml.safe_load_all(chart()) if o]
         self.assertFalse(any(o['metadata']['name'] == 'duckfleet-database-provision' for o in ordinary))
