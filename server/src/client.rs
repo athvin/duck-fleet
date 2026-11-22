@@ -448,7 +448,7 @@ impl QueryResult {
             for row in 0..batch.num_rows() {
                 let mut cells = Vec::with_capacity(batch.num_columns());
                 for (column, formatter) in batch.columns().iter().zip(&formatters) {
-                    if column.is_null(row) {
+                    if column.is_null(row) || column.data_type() == &arrow_schema::DataType::Null {
                         cells.push(None);
                     } else {
                         cells.push(Some(formatter.value(row).to_string()));
@@ -783,6 +783,30 @@ mod tests {
         );
         assert!(output.is_empty());
         task.abort();
+    }
+
+    #[test]
+    fn arrow_null_type_remains_json_null() {
+        use arrow_array::{NullArray, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Null,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(NullArray::new(2))])
+            .expect("null batch");
+        let mut bytes = Vec::new();
+        let mut writer =
+            arrow_ipc::writer::StreamWriter::try_new(&mut bytes, &schema).expect("Arrow writer");
+        writer.write(&batch).expect("write null batch");
+        writer.finish().expect("finish Arrow stream");
+        drop(writer);
+        let result = QueryResult::from_arrow(&bytes).expect("decode null result");
+        assert_eq!(result.column_types, vec!["Null"]);
+        assert_eq!(result.rows, vec![vec![None], vec![None]]);
     }
 
     #[test]

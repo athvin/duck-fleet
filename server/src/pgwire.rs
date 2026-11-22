@@ -829,7 +829,7 @@ fn type_oid(data_type: &DataType) -> i32 {
 }
 
 fn text_value(array: &dyn Array, row: usize) -> Result<Option<String>> {
-    if array.is_null(row) {
+    if array.is_null(row) || array.data_type() == &DataType::Null {
         return Ok(None);
     }
     let rendered = match array.data_type() {
@@ -1654,6 +1654,27 @@ mod tests {
             "2026-01-01 01:01:01.000001"
         );
         assert_eq!(format_timestamp(-1), "1969-12-31 23:59:59.999999");
+    }
+
+    #[test]
+    fn null_uuid_and_unsupported_nested_binary_results_are_explicit() -> Result<()> {
+        let null = arrow_array::NullArray::new(1);
+        assert_eq!(text_value(&null, 0)?, None);
+        let uuid = arrow_array::StringArray::from(vec!["00000000-0000-4000-8000-000000000001"]);
+        assert_eq!(
+            text_value(&uuid, 0)?,
+            Some("00000000-0000-4000-8000-000000000001".into())
+        );
+        let blob = arrow_array::BinaryArray::from_vec(vec![b"\x00\xff".as_slice()]);
+        let nested =
+            arrow_array::ListArray::from_iter_primitive::<types::Int32Type, _, _>(vec![Some(
+                vec![Some(1), None, Some(3)],
+            )]);
+        for value in [&blob as &dyn Array, &nested as &dyn Array] {
+            let error = text_value(value, 0).expect_err("unsupported result must fail");
+            assert!(error.to_string().contains("cast to VARCHAR"), "{error}");
+        }
+        Ok(())
     }
 
     #[test]

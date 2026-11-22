@@ -88,7 +88,12 @@ impl Profile {
             "total_bytes_read",
             "total_bytes_written",
         ] {
-            if let Some(number) = value.get(key).filter(|v| v.is_number()) {
+            let number = value.get(key).or_else(|| {
+                ["query", "system", "io"]
+                    .iter()
+                    .find_map(|section| value.get(*section).and_then(|nested| nested.get(key)))
+            });
+            if let Some(number) = number.filter(|v| v.is_number()) {
                 metrics[key] = number.clone();
             }
         }
@@ -108,6 +113,33 @@ impl Drop for Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nested_profile_sections_retain_existing_metric_names() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let profile = Profile::new(Uuid::new_v4(), true, &conn)?;
+        fs::write(
+            &profile.path,
+            br#"{
+            "query":{"latency":0.5,"cpu_time":0.25},
+            "system":{"system_peak_buffer_memory":1024,"system_peak_temp_dir_size":0},
+            "io":{"total_bytes_read":64,"total_bytes_written":32},
+            "rows_returned":7
+        }"#,
+        )?;
+        let captured = profile.capture(true);
+        assert_eq!(captured.status, "captured");
+        let metrics: Value = serde_json::from_str(&captured.metrics)?;
+        assert_eq!(metrics["latency"], 0.5);
+        assert_eq!(metrics["cpu_time"], 0.25);
+        assert_eq!(metrics["system_peak_buffer_memory"], 1024);
+        assert_eq!(metrics["system_peak_temp_dir_size"], 0);
+        assert_eq!(metrics["total_bytes_read"], 64);
+        assert_eq!(metrics["total_bytes_written"], 32);
+        assert_eq!(metrics["rows_returned"], 7);
+        assert!(profile.clear());
+        Ok(())
+    }
+
     #[test]
     fn rejects_oversized_or_malformed_profiles() -> Result<()> {
         let conn = Connection::open_in_memory()?;

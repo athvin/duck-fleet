@@ -234,6 +234,7 @@ def run_lane(name, project, tag, version, directory, override, corpus_tag, skip_
         stages = [
             ("api", ["run", "--rm", "api"]),
             ("dbt", ["run", "--rm", "dbt"]),
+            ("scale", ["run", "--rm", "dbt", "duckfleet-server", "--scale"]),
             ("concurrency", ["run", "--rm", "dbt", "duckfleet-server", "--concurrency"]),
             ("jobs", ["run", "--rm", "dbt", "duckfleet-server", "--jobs"]),
             ("engine-corpus", ["run", "--rm", "api", "duckfleet-server", "--engine-qualification"]),
@@ -241,7 +242,7 @@ def run_lane(name, project, tag, version, directory, override, corpus_tag, skip_
             ("pgwire", None),
         ]
         for stage, command in stages:
-            if skip_dbt and stage == "dbt":
+            if skip_dbt and stage in ("dbt", "scale"):
                 summary["stages"][stage] = "skipped_local_arm"
                 continue
             print(f"{name}: {stage}", flush=True)
