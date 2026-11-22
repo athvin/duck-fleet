@@ -214,8 +214,11 @@ def validate_extensions(report):
 
 
 def cli_sql(base, env, statement):
-    text = output(base + ["run", "--rm", "api", "sql", statement, "--format", "json"], env=env)
-    return json.loads(text)
+    command = base + ["run", "--rm", "api", "sql", statement, "--format", "json"]
+    result = run(command, env=env, check=False)
+    if result.returncode:
+        raise RuntimeError(f"recovery SQL failed: {statement}: {result.stderr.strip()}")
+    return json.loads(result.stdout)
 
 
 def cli_scalar(base, env, statement, expected):
