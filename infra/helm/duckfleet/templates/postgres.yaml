@@ -59,6 +59,7 @@ spec:
             - {name: POSTGRES_USER, value: duckfleet}
             - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
             {{- include "duckfleet.databaseProvisionEnvironment" . | nindent 12 }}
+            - {name: DUCKFLEET_ADOPT_DATABASE_OWNER, value: "no"}
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef: {name: {{ .Values.secretName }}, key: POSTGRES_PASSWORD}

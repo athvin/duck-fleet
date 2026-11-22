@@ -5,12 +5,15 @@ source "$(dirname "$0")/common.sh"
 cd "$ROOT"
 assert_cluster
 [[ -f artifacts/aws/values.json ]] || { echo 'Publish images first' >&2; exit 1; }
-python3 scripts/compute_lifecycle.py check kube --context "$KUBE_CONTEXT" --namespace "$NAMESPACE"
 # The values only the live cluster can supply — isolated compute on with the API
 # server's real egress address, workers pinned to the DuckFleet pool — merged into
 # values.json before anything reads it. Written here rather than baked into chart
 # defaults because the API server address is a fact about the cluster (#39).
 python3 scripts/aws/deploy_values.py "$KUBE_CONTEXT"
+if [[ "${DUCKFLEET_UPGRADE_LEGACY_DATABASE:-false}" == true ]]; then
+  bash scripts/aws/upgrade-database-roles.sh
+fi
+python3 scripts/compute_lifecycle.py check kube --context "$KUBE_CONTEXT" --namespace "$NAMESPACE"
 # A policy that cannot reach the cluster's resolver presents as an unreachable
 # catalog, which cost six deploys to diagnose. Fail here instead.
 python3 scripts/aws/check-dns-egress.py "$DUCKFLEET_CLUSTER" "$AWS_REGION"

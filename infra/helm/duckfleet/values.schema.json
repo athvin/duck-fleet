@@ -50,6 +50,7 @@
     }
   },
   "properties": {
+    "legacyDatabaseUpgrade": {"type": "boolean"},
     "databaseRoles": {
       "type": "object",
       "additionalProperties": false,

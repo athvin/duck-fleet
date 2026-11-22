@@ -1362,6 +1362,52 @@ class OwnershipBoundaryTests(unittest.TestCase):
 
 
 class DatabaseRolePackagingTests(unittest.TestCase):
+    def test_legacy_null_results_render_without_result_storage(self):
+        rendered = chart(['--set', 'results=null'])
+        self.assertNotIn('DUCKFLEET_RESULT_DATA_PATH', rendered)
+
+    def test_legacy_database_upgrade_job_is_explicit_and_least_privilege(self):
+        ordinary = [o for o in yaml.safe_load_all(chart()) if o]
+        self.assertFalse(any(o['metadata']['name'] == 'duckfleet-database-provision' for o in ordinary))
+        upgraded = [o for o in yaml.safe_load_all(chart(['--set', 'legacyDatabaseUpgrade=true'])) if o]
+        jobs = [o for o in upgraded if o['metadata']['name'] == 'duckfleet-database-provision']
+        self.assertEqual(len(jobs), 1)
+        job = jobs[0]
+        self.assertEqual(job['spec']['backoffLimit'], 0)
+        pod = job['spec']['template']['spec']
+        self.assertEqual(pod['serviceAccountName'], 'duckfleet-no-aws')
+        self.assertFalse(pod['automountServiceAccountToken'])
+        container = pod['containers'][0]
+        self.assertEqual(container['image'], 'postgres:17.6-bookworm')
+        self.assertIn('/etc/duckfleet/provision-database.sql', container['command'])
+        self.assertNotIn('envFrom', container)
+        env = container['env']
+        self.assertEqual(len({item['name'] for item in env}), len(env))
+        refs = {item['name']: item['valueFrom']['secretKeyRef']['key']
+                for item in env if 'secretKeyRef' in item.get('valueFrom', {})}
+        expected = {'PGPASSWORD': 'POSTGRES_PASSWORD'}
+        expected.update({'DUCKFLEET_DB_'+part.upper()+'_PASSWORD': 'DATABASE_'+part.upper()+'_PASSWORD'
+                         for part in ('migrator', 'gateway', 'worker', 'maintainer', 'catalog')})
+        self.assertEqual(refs, expected)
+        values = {item['name']: item.get('value') for item in env}
+        self.assertEqual(values['DUCKFLEET_ADOPT_DATABASE_OWNER'], 'yes')
+        self.assertEqual(values['DUCKFLEET_PLATFORM_DATABASE'], 'platform')
+        self.assertEqual(values['DUCKFLEET_LAKE_DATABASE'], 'lake')
+        config = next(v['configMap'] for v in pod['volumes'] if v['name'] == 'provisioning')
+        self.assertEqual(config['name'], 'duckfleet-postgres-init')
+        self.assertEqual(config['items'], [{'key': 'provision-database.sql', 'path': 'provision-database.sql'}])
+
+    def test_legacy_upgrade_is_opt_in_for_workflow_dispatch_only(self):
+        workflow = yaml.safe_load((ROOT/'.github/workflows/aws-dev.yml').read_text())
+        option = workflow[True]['workflow_dispatch']['inputs']['upgrade_legacy_database']
+        self.assertFalse(option['default'])
+        self.assertEqual(option['type'], 'boolean')
+        deploy = workflow['jobs']['deploy']
+        self.assertIn('inputs.upgrade_legacy_database', deploy['env']['DUCKFLEET_UPGRADE_LEGACY_DATABASE'])
+        script = (ROOT/'scripts/aws/deploy.sh').read_text()
+        self.assertIn('"${DUCKFLEET_UPGRADE_LEGACY_DATABASE:-false}" == true', script)
+        self.assertIn('bash scripts/aws/upgrade-database-roles.sh', script)
+
     def test_helm_schema_rejects_invalid_roles_and_authorization_at_the_top_level(self):
         cases = [
             ('databaseRoles', {'worker': 'Invalid-Role'}, 'databaseRoles.worker'),

@@ -7,6 +7,9 @@ secretName: duckfleet-dev
 # Empty entries derive distinct namespace-scoped names. Provision roles separately;
 # the migration login owns platform objects but never receives CREATEROLE.
 databaseRoles: {}
+# Render the administrator-only provisioning Job only through the explicit legacy
+# database upgrade helper. Ordinary releases must never adopt database ownership.
+legacyDatabaseUpgrade: false
 authorization:
   # Reviewed seed for existing/new analysts, not a grant for every pool. Repeated
   # migrations preserve revoked grants. Custom defaults must set this explicitly.

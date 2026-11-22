@@ -185,9 +185,10 @@ template and the code that patches it from drifting silently.
 {{/* Results never share DuckLake's managed prefix. Only paths, not lake
 credentials, are sent to the gateway for the same runtime overlap validation. */}}
 {{- define "duckfleet.resultEnv" -}}
-{{- if .Values.results.enabled -}}
+{{- $results := .Values.results | default dict -}}
+{{- if $results.enabled -}}
 {{- $lake := trimSuffix "/" .Values.lakePrefix -}}
-{{- $result := trimSuffix "/" .Values.results.prefix -}}
+{{- $result := trimSuffix "/" $results.prefix -}}
 {{- if or (eq $lake $result) (hasPrefix (printf "%s/" $lake) $result) (hasPrefix (printf "%s/" $result) $lake) -}}
 {{- fail "results.prefix and lakePrefix must be separate non-overlapping prefixes" -}}
 {{- end -}}
@@ -367,5 +368,4 @@ startupProbe:
 {{- end }}
 - {name: DUCKFLEET_PLATFORM_DATABASE, value: platform}
 - {name: DUCKFLEET_LAKE_DATABASE, value: lake}
-- {name: DUCKFLEET_ADOPT_DATABASE_OWNER, value: "no"}
 {{- end -}}

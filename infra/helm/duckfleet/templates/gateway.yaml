@@ -1,3 +1,5 @@
+{{- $results := .Values.results | default dict -}}
+{{- $resultsEnabled := $results.enabled | default false -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -36,7 +38,7 @@ spec:
       {{- include "duckfleet.termination" . | nindent 6 }}
       # Identity follows capability: a gateway that creates pods needs a token, and
       # one that cannot must not have one.
-      serviceAccountName: {{ ternary "duckfleet-gateway" (ternary "duckfleet-results" "duckfleet-no-aws" .Values.results.enabled) .Values.isolatedCompute.enabled }}
+      serviceAccountName: {{ ternary "duckfleet-gateway" (ternary "duckfleet-results" "duckfleet-no-aws" $resultsEnabled) .Values.isolatedCompute.enabled }}
       {{- include "duckfleet.placement" . | nindent 6 }}
       securityContext:
         {{- include "duckfleet.podSecurity" . | nindent 8 }}
@@ -54,7 +56,7 @@ spec:
             - {name: DUCKFLEET_GATEWAY_MAX_SESSIONS, value: {{ .Values.gatewayMaxSessions | quote }}}
             - {name: DUCKFLEET_ADMISSION_LIMITS_JSON, value: {{ include "duckfleet.admissionConfig" . | quote }}}
             - {name: DUCKFLEET_JOB_POLICY_JSON, value: {{ include "duckfleet.jobPolicy" . | quote }}}
-            {{- if .Values.results.enabled }}
+            {{- if $resultsEnabled }}
             {{- include "duckfleet.resultEnv" . | nindent 12 }}
             - {name: AWS_REGION, value: {{ .Values.region | quote }}}
             - {name: AWS_EC2_METADATA_DISABLED, value: "true"}

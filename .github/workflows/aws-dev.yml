@@ -16,6 +16,12 @@ on:
       - 'infra/kubernetes/**'
       - '.github/workflows/**'
   workflow_dispatch:
+    inputs:
+      upgrade_legacy_database:
+        description: Stop compute and run the one-time bundled PostgreSQL role/ownership upgrade
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: read
 concurrency:
@@ -92,6 +98,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      DUCKFLEET_UPGRADE_LEGACY_DATABASE: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_legacy_database }}
     outputs:
       deployment_started: ${{ steps.start.outputs.deployment_started }}
     steps:
