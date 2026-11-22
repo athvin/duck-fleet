@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Restores both databases from a backup-catalog.sh directory into the freshly
-# initialised PostgreSQL the init script leaves behind: an empty `lake` and
-# `platform`. Compute is stopped before restoration and remains stopped on failure.
+# Restores both databases from a backup-catalog.sh directory, replacing each
+# database's public schema so an existing installation cannot retain objects the
+# recovery point does not contain. Compute is stopped before restoration and
+# remains stopped on failure.
 # The explicit migration runs against the restored schema before compute may resume.
 # Start the desired workers/gateway after this command succeeds.
 #
@@ -49,6 +50,14 @@ restore() { # restore <database>
     kube) owner=$("${kube[@]}" exec statefulset/duckfleet-postgres -- psql -U duckfleet -d "$1" -tAc 'SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname=current_database()') ;;
   esac
   [[ "$owner" != duckfleet && "$owner" =~ ^[a-z_][a-z0-9_]*$ ]] || { echo 'Provision separate database owners before restoring' >&2; return 1; }
+  case "$mode" in
+    compose)
+      docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U duckfleet -d "$1" \
+        -c 'DROP SCHEMA public CASCADE' -c "CREATE SCHEMA public AUTHORIZATION \"$owner\"" ;;
+    kube)
+      "${kube[@]}" exec statefulset/duckfleet-postgres -- psql -v ON_ERROR_STOP=1 -U duckfleet -d "$1" \
+        -c 'DROP SCHEMA public CASCADE' -c "CREATE SCHEMA public AUTHORIZATION \"$owner\"" ;;
+  esac
   case "$mode" in
     compose)
       docker compose exec -T postgres pg_restore --exit-on-error -U duckfleet --role="$owner" --no-owner --no-privileges -d "$1" ;;

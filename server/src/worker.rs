@@ -591,7 +591,7 @@ impl Worker {
             },
         )?;
         let attach = format!(
-            "ATTACH {} AS lake (DATA_PATH {}); USE lake;",
+            "ATTACH {} AS lake (DATA_PATH {}, DUCKLAKE_VERSION '1.0'); USE lake;",
             literal(&format!("ducklake:postgres:{catalog_dsn}")),
             literal(&required("S3_DATA_PATH")?)
         );

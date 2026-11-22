@@ -213,12 +213,96 @@ def validate_extensions(report):
     return extensions
 
 
+def cli_sql(base, env, statement):
+    command = base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", statement, "--format", "json"]
+    result = run(command, env=env, check=False)
+    if result.returncode:
+        raise RuntimeError(f"recovery SQL failed: {statement}: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def cli_scalar(base, env, statement, expected):
+    rows = cli_sql(base, env, statement)
+    if len(rows) != 1 or rows[0].get("value") != expected:
+        raise RuntimeError(f"recovery query {statement!r} returned {rows}, expected {expected!r}")
+    return rows[0]["value"]
+
+
+def recovery_drill(base, env, baseline_tag, candidate_tag, directory):
+    evidence = {
+        "catalog_version": None,
+        "restore_verified": False,
+        "rollback_verified": False,
+        "mixed_version_writers": False,
+    }
+    recovery_log = directory / "recovery.log"
+    try:
+        version = cli_scalar(base, env, "SELECT value FROM lake.options() WHERE option_name='version'", "1.0")
+        evidence["catalog_version"] = version
+        cli_sql(base, env, "CREATE SCHEMA IF NOT EXISTS analytics")
+        cli_sql(base, env, "CREATE OR REPLACE TABLE analytics.rollback_fixture(id INTEGER)")
+        cli_sql(base, env, "INSERT INTO analytics.rollback_fixture VALUES (1)")
+        snapshots = cli_sql(base, env, "SELECT snapshot_id AS value FROM ducklake_snapshots('lake') ORDER BY snapshot_id")
+        if not snapshots:
+            raise RuntimeError("the 1.0 fixture emitted no snapshot")
+        snapshot = snapshots[-1]["value"]
+        recovery_point = directory / "recovery-point"
+        run(["bash", str(ROOT / "scripts/backup-catalog.sh"), "compose", str(recovery_point)], env=env, log=recovery_log)
+
+        cli_sql(base, env, "INSERT INTO analytics.rollback_fixture VALUES (2)")
+        cli_scalar(base, env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 2)
+        cli_scalar(base, env, f"SELECT count(*) AS value FROM analytics.rollback_fixture AT (VERSION => {snapshot})", 1)
+        cli_sql(base, env, "CALL ducklake_merge_adjacent_files('lake')")
+
+        restore_env = env.copy()
+        restore_env["DUCKFLEET_CONFIRM_RESTORE"] = "yes"
+        run(["bash", str(ROOT / "scripts/restore-catalog.sh"), "compose", str(recovery_point)], env=restore_env, log=recovery_log)
+        running = output(base + ["ps", "--status", "running", "--format", "{{.Service}}"], env=env).splitlines()
+        if any(service in running for service in ["server", "worker-small"]):
+            raise RuntimeError(f"restore left compute running: {running}")
+        run(base + ["up", "-d", "--wait", "server"], env=env, log=recovery_log)
+        cli_scalar(base, env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 1)
+        cli_scalar(base, env, "SELECT value FROM lake.options() WHERE option_name='version'", "1.0")
+        run(base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "history", "--limit", "5"], env=env, log=recovery_log)
+        evidence["restore_verified"] = True
+        evidence["post_backup_write_discarded"] = True
+        evidence["time_travel_snapshot"] = snapshot
+        evidence["maintenance"] = "merge_adjacent_files"
+
+        cli_sql(base, env, "INSERT INTO analytics.rollback_fixture VALUES (3)")
+        cli_scalar(base, env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 2)
+        run(["bash", str(ROOT / "scripts/stop-compute.sh"), "compose"], env=env, log=recovery_log)
+
+        rollback_env = env.copy()
+        rollback_env["DUCKFLEET_IMAGE_TAG"] = baseline_tag
+        rollback_env["DUCKFLEET_DBT_IMAGE_TAG"] = baseline_tag
+        rollback_env["DUCKFLEET_API_IMAGE_TAG"] = baseline_tag
+        run(base + ["up", "-d", "--wait", "server"], env=rollback_env, log=recovery_log)
+        cli_scalar(base, rollback_env, "SELECT value FROM lake.options() WHERE option_name='version'", "1.0")
+        cli_scalar(base, rollback_env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 2)
+        cli_sql(base, rollback_env, "INSERT INTO analytics.rollback_fixture VALUES (4)")
+        cli_scalar(base, rollback_env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 3)
+        run(base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "history", "--limit", "5"], env=rollback_env, log=recovery_log)
+        evidence["rollback_verified"] = True
+        evidence["rollback_engine"] = "v1.5.4"
+        evidence["write_after_restore_engine"] = "v2.0.1"
+        evidence["passed"] = True
+        return evidence
+    except Exception as error:
+        evidence["passed"] = False
+        evidence["error"] = str(error)
+        raise
+    finally:
+        (directory / "recovery.json").write_text(json.dumps(evidence, indent=2) + "\n")
+
+
 def run_lane(name, project, tag, version, directory, override, corpus_tag, skip_dbt):
     directory.mkdir(parents=True, exist_ok=True)
     artifacts = directory / "artifacts"
     artifacts.mkdir(exist_ok=True)
     env = os.environ.copy()
     env.update({
+        "COMPOSE_PROJECT_NAME": project,
         "DUCKFLEET_IMAGE_TAG": tag,
         "DUCKFLEET_DBT_IMAGE_TAG": tag,
         "DUCKFLEET_API_IMAGE_TAG": tag,
@@ -303,12 +387,14 @@ def main():
             summary["baseline_ref"] = build_images(args.baseline_tag, args.baseline_ref, output / "build-baseline")
             summary["candidate_ref"] = build_images(args.candidate_tag, args.candidate_ref, output / "build-candidate")
         paths = {}
+        runtime = {}
         for lane, tag, version in [("baseline", args.baseline_tag, args.baseline_version), ("candidate", args.candidate_tag, args.candidate_version)]:
             directory = output / lane
             directory.mkdir(parents=True, exist_ok=True)
             paths[lane] = write_override(directory / "override.yaml", f"engine-qualification/{lane}")
             lane_summary, base, env = run_lane(lane, projects[lane], tag, version, directory, directory / "override.yaml", args.candidate_tag, args.skip_dbt)
             running.append((base, env))
+            runtime[lane] = (base, env)
             summary["lanes"][lane] = lane_summary
         summary["isolation"] = isolation_evidence(projects["baseline"], projects["candidate"], paths)
         comparison = output / "comparison.json"
@@ -320,9 +406,13 @@ def main():
             "--output", str(comparison),
         ], check=False)
         summary["comparison"] = json.loads(comparison.read_text())
+        summary["recovery"] = recovery_drill(
+            *runtime["candidate"], args.baseline_tag, args.candidate_tag, output / "candidate"
+        )
         summary["passed"] = bool(
             summary["isolation"]["passed"]
             and summary["comparison"]["passed"]
+            and summary["recovery"]["passed"]
             and all(lane.get("passed") for lane in summary["lanes"].values())
         )
         print(json.dumps({"passed": summary["passed"], "output": str(output)}))

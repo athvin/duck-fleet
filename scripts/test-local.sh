@@ -200,8 +200,8 @@ unset DUCKFLEET_POOLS_DIRECTORY
 #   - SIGTERM drain of the worker and of the gateway (--drain-inflight /
 #     --gateway-drain-inflight harness stages + docker kill)
 #   - maintenance (--maintenance)
-#   - the backup/restore drill (scripts/backup-catalog.sh / restore-catalog.sh,
-#     with the post-backup write + restore verification now via `duckfleet-server cli`)
+# The backup/restore and engine rollback drill runs in the isolated qualification
+# lane (scripts/qualify-engine.py), which owns disposable volumes and image sets.
 # The isolated-pod path (a sized model -> dedicated pod) is Kubernetes-only and is
 # exercised by scripts/test-k8s.sh, not here.
 # ---------------------------------------------------------------------------
