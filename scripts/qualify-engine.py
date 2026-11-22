@@ -214,7 +214,7 @@ def validate_extensions(report):
 
 
 def cli_sql(base, env, statement):
-    command = base + ["run", "--rm", "api", "duckfleet-server", "sql", statement, "--format", "json"]
+    command = base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", statement, "--format", "json"]
     result = run(command, env=env, check=False)
     if result.returncode:
         raise RuntimeError(f"recovery SQL failed: {statement}: {result.stderr.strip()}")
@@ -263,7 +263,7 @@ def recovery_drill(base, env, baseline_tag, candidate_tag, directory):
         run(base + ["up", "-d", "--wait", "server"], env=env, log=recovery_log)
         cli_scalar(base, env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 1)
         cli_scalar(base, env, "SELECT value FROM lake.options() WHERE option_name='version'", "1.0")
-        run(base + ["run", "--rm", "api", "duckfleet-server", "history", "--limit", "5"], env=env, log=recovery_log)
+        run(base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "history", "--limit", "5"], env=env, log=recovery_log)
         evidence["restore_verified"] = True
         evidence["post_backup_write_discarded"] = True
         evidence["time_travel_snapshot"] = snapshot
@@ -282,7 +282,7 @@ def recovery_drill(base, env, baseline_tag, candidate_tag, directory):
         cli_scalar(base, rollback_env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 2)
         cli_sql(base, rollback_env, "INSERT INTO analytics.rollback_fixture VALUES (4)")
         cli_scalar(base, rollback_env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 3)
-        run(base + ["run", "--rm", "api", "duckfleet-server", "history", "--limit", "5"], env=rollback_env, log=recovery_log)
+        run(base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "history", "--limit", "5"], env=rollback_env, log=recovery_log)
         evidence["rollback_verified"] = True
         evidence["rollback_engine"] = "v1.5.4"
         evidence["write_after_restore_engine"] = "v2.0.1"
