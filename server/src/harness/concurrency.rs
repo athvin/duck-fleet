@@ -211,10 +211,10 @@ async fn multi_match_writes_follow_native_201_semantics(ctx: &Ctx) -> anyhow::Re
         rows_eq(
             &sql(
                 &connection,
-                "SELECT value IN (10, 20), count(*) FROM multi_target",
+                "SELECT count(*)=1 AND bool_and(value IN (10, 20)) FROM multi_target",
             )
             .await?,
-            &[&["true", "1"]],
+            &[&["true"]],
         ),
         "multi-match UPDATE FROM changed row cardinality or selected an unknown value",
     )?;
@@ -227,10 +227,10 @@ async fn multi_match_writes_follow_native_201_semantics(ctx: &Ctx) -> anyhow::Re
         rows_eq(
             &sql(
                 &connection,
-                "SELECT value IN (10, 20), count(*) FROM multi_target",
+                "SELECT count(*)=1 AND bool_and(value IN (10, 20)) FROM multi_target",
             )
             .await?,
-            &[&["true", "1"]],
+            &[&["true"]],
         ),
         "multi-match MERGE changed row cardinality or selected an unknown value",
     )?;
