@@ -40,7 +40,11 @@ impl MockS3 {
         let listener = TcpListener::bind("0.0.0.0:5432").await?;
         let route = UdpSocket::bind("0.0.0.0:0").await?;
         route.connect("server:8080").await?;
-        let address = route.local_addr()?.ip().to_string();
+        let address = format!(
+            "{}:{}",
+            route.local_addr()?.ip(),
+            listener.local_addr()?.port()
+        );
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&requests);
         let task = tokio::spawn(async move {
