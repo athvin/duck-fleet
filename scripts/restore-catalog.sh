@@ -53,10 +53,10 @@ restore() { # restore <database>
   case "$mode" in
     compose)
       docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U duckfleet -d "$1" \
-        -c 'DROP SCHEMA public CASCADE' -c "CREATE SCHEMA public OWNER TO \"$owner\"" ;;
+        -c 'DROP SCHEMA public CASCADE' -c "CREATE SCHEMA public AUTHORIZATION \"$owner\"" ;;
     kube)
       "${kube[@]}" exec statefulset/duckfleet-postgres -- psql -v ON_ERROR_STOP=1 -U duckfleet -d "$1" \
-        -c 'DROP SCHEMA public CASCADE' -c "CREATE SCHEMA public OWNER TO \"$owner\"" ;;
+        -c 'DROP SCHEMA public CASCADE' -c "CREATE SCHEMA public AUTHORIZATION \"$owner\"" ;;
   esac
   case "$mode" in
     compose)
