@@ -23,7 +23,16 @@ spec:
       containers:
         - name: provision
           image: postgres:17.6-bookworm
-          command: [psql, -X, -q, --no-password, --username, duckfleet, --dbname, postgres, --file, /etc/duckfleet/provision-database.sql]
+          command: [/bin/bash, -c]
+          args:
+            - |
+              psql -X -q --no-password --username duckfleet --dbname postgres \
+                --file /etc/duckfleet/provision-database.sql 2>/tmp/provision-error
+              status=$?
+              if (( status != 0 )); then
+                sed -n -E '/^(psql: )?(ERROR|FATAL):/p' /tmp/provision-error > /dev/termination-log
+              fi
+              exit "$status"
           securityContext:
             {{- include "duckfleet.containerSecurity" . | nindent 12 }}
           resources:

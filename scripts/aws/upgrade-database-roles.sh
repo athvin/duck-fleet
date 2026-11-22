@@ -19,9 +19,26 @@ render=(helm template duckfleet infra/helm/duckfleet --kube-context "$KUBE_CONTE
 
 "${KUBE[@]}" delete job duckfleet-database-provision --ignore-not-found --wait=true --timeout=2m
 "${render[@]}" --show-only templates/postgres-provision.yaml | "${KUBE[@]}" apply -f -
-if ! "${KUBE[@]}" wait --for=condition=complete job/duckfleet-database-provision --timeout=10m; then
-  "${KUBE[@]}" get job duckfleet-database-provision \
-    -o jsonpath='Database provisioning failed: {.status.failed} pod attempt(s); inspect the bounded Job without publishing its environment or logs.{ "\n" }'
+completed=false
+for ((attempt=0; attempt<300; attempt++)); do
+  if [[ $("${KUBE[@]}" get job duckfleet-database-provision \
+    -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}') == True ]]; then
+    completed=true
+    break
+  fi
+  if [[ $("${KUBE[@]}" get job duckfleet-database-provision \
+    -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}') == True ]]; then
+    break
+  fi
+  sleep 2
+done
+if [[ $completed != true ]]; then
+  reason=$("${KUBE[@]}" get pods -l job-name=duckfleet-database-provision \
+    -o jsonpath='{.items[*].status.containerStatuses[*].state.terminated.reason}')
+  diagnostic=$("${KUBE[@]}" get pods -l job-name=duckfleet-database-provision \
+    -o jsonpath='{.items[*].status.containerStatuses[*].state.terminated.message}')
+  printf 'Database provisioning failed or timed out: reason=%s diagnostic=%s\n' \
+    "${reason:-unavailable}" "${diagnostic:-no PostgreSQL error diagnostic}"
   exit 1
 fi
 "${KUBE[@]}" delete job duckfleet-database-provision --wait=true --timeout=2m

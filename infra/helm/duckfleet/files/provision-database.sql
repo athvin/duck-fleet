@@ -75,11 +75,15 @@ REVOKE ALL ON SCHEMA public FROM PUBLIC;
 ALTER SCHEMA public OWNER TO :"migrator";
 -- Transfer only objects in this dedicated database/schema. REASSIGN OWNED is
 -- deliberately avoided: it also changes ownership of shared cluster objects.
+-- Serial/identity sequences follow their table and reject direct ALTER OWNER;
+-- the same auto-dependency exclusion is applied in the lake loop below.
 SELECT format('ALTER %s public.%I OWNER TO %I', CASE relkind WHEN 'S' THEN 'SEQUENCE' WHEN 'v' THEN 'VIEW'
     WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END, relname, :'migrator')
 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 WHERE n.nspname='public' AND relkind IN ('r','p','S','v','m')
-  AND NOT EXISTS(SELECT 1 FROM pg_depend d WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e') \gexec
+  AND NOT EXISTS(SELECT 1 FROM pg_depend d WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+  AND (c.relkind<>'S' OR NOT EXISTS(SELECT 1 FROM pg_depend d
+      WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='a')) \gexec
 SELECT format('ALTER FUNCTION public.%I(%s) OWNER TO %I', proname,pg_get_function_identity_arguments(p.oid),:'migrator')
 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public'
   AND NOT EXISTS(SELECT 1 FROM pg_depend d WHERE d.classid='pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e') \gexec
@@ -104,7 +108,9 @@ SELECT format('ALTER %s public.%I OWNER TO %I', CASE relkind WHEN 'S' THEN 'SEQU
     WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END, relname, :'catalog')
 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 WHERE n.nspname='public' AND relkind IN ('r','p','S','v','m')
-  AND NOT EXISTS(SELECT 1 FROM pg_depend d WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e') \gexec
+  AND NOT EXISTS(SELECT 1 FROM pg_depend d WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+  AND (c.relkind<>'S' OR NOT EXISTS(SELECT 1 FROM pg_depend d
+      WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='a')) \gexec
 SELECT format('ALTER FUNCTION public.%I(%s) OWNER TO %I', proname,pg_get_function_identity_arguments(p.oid),:'catalog')
 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public'
   AND NOT EXISTS(SELECT 1 FROM pg_depend d WHERE d.classid='pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e') \gexec
