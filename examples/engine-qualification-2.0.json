@@ -4,7 +4,9 @@
     "factorial_precedence",
     "binary_literals",
     "single_arrow_lambda",
-    "missing_relation"
+    "missing_relation",
+    "identifier_case",
+    "result_type_matrix"
   ],
   "fixed": [
     "integer_division_by_zero",

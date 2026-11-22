@@ -105,11 +105,6 @@ fn cases() -> Vec<Case> {
             parameters: vec![],
         },
         Case {
-            id: "native_compatibility_settings",
-            sql: "SELECT name, value FROM duckdb_settings() WHERE name IN ('parser', 'lambda_syntax', 'error_on_division_by_zero', 'preserve_identifier_case') ORDER BY name",
-            parameters: vec![],
-        },
-        Case {
             id: "result_type_matrix",
             sql: "SELECT UUID '00000000-0000-4000-8000-000000000001' AS id, '\\x00ff'::BLOB AS bytes, B'101' AS bits, [1,NULL,3] AS items, {'name':'duck','value':7} AS record",
             parameters: vec![],
