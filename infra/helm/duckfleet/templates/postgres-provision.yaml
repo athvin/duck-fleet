@@ -1,0 +1,51 @@
+{{- if .Values.legacyDatabaseUpgrade }}
+{{- if not .Values.postgres.bundled }}{{ fail "legacyDatabaseUpgrade requires the bundled PostgreSQL fixture" }}{{ end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: duckfleet-database-provision
+  labels:
+    app: duckfleet-database-provision
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app: duckfleet-database-provision
+    spec:
+      restartPolicy: Never
+      serviceAccountName: duckfleet-no-aws
+      automountServiceAccountToken: false
+      {{- include "duckfleet.placement" . | nindent 6 }}
+      securityContext:
+        {{- include "duckfleet.podSecurity" . | nindent 8 }}
+      containers:
+        - name: provision
+          image: postgres:17.6-bookworm
+          command: [psql, -X, -q, --no-password, --username, duckfleet, --dbname, postgres, --file, /etc/duckfleet/provision-database.sql]
+          securityContext:
+            {{- include "duckfleet.containerSecurity" . | nindent 12 }}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          env:
+            - {name: HOME, value: /tmp}
+            - {name: PGHOST, value: postgres}
+            - {name: PGPORT, value: "5432"}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.secretName }}, key: POSTGRES_PASSWORD}
+            {{- include "duckfleet.databaseProvisionEnvironment" . | nindent 12 }}
+            - {name: DUCKFLEET_ADOPT_DATABASE_OWNER, value: "yes"}
+          volumeMounts:
+            - {name: provisioning, mountPath: /etc/duckfleet, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: provisioning
+          configMap:
+            name: duckfleet-postgres-init
+            items: [{key: provision-database.sql, path: provision-database.sql}]
+        - name: tmp
+          emptyDir: {}
+{{- end }}

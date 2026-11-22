@@ -456,6 +456,16 @@ run ID only after provisioning succeeds. External PostgreSQL uses the explicit
 administrator helper instead. The normal deploy helper never invents permission
 to transfer an existing database or stop compute.
 
+The AWS development lane has an equivalent one-time path that does not require
+`pods/exec`: manually dispatch `AWS development harness` on `main` with
+`upgrade_legacy_database=true`. This stops compute, preserves the existing
+administrator/bootstrap credentials while adding separated role credentials,
+applies only the bundled PostgreSQL resources, and runs the reviewed provisioning
+SQL as a bounded `postgres:17.6-bookworm` Job with explicit ownership adoption.
+Ordinary pushes leave this option false and never render that Job. The Job uses
+only named Secret keys, has no AWS identity or API token, and is deleted after
+success; the complete deployment and migration resume only after it completes.
+
 This is platform-interface RBAC for trusted SQL executors. Until executor isolation
 in #106, SQL runs in a process holding its worker/catalog credentials and internal
 service token; file/environment access may expose that authority. Role separation
