@@ -1384,7 +1384,10 @@ class DatabaseRolePackagingTests(unittest.TestCase):
         self.assertFalse(pod['automountServiceAccountToken'])
         container = pod['containers'][0]
         self.assertEqual(container['image'], 'postgres:17.6-bookworm')
-        self.assertIn('/etc/duckfleet/provision-database.sql', container['command'])
+        command = container['args'][0]
+        self.assertIn('/etc/duckfleet/provision-database.sql', command)
+        self.assertIn('/dev/termination-log', command)
+        self.assertIn("sed -n -E", command)
         self.assertNotIn('envFrom', container)
         env = container['env']
         self.assertEqual(len({item['name'] for item in env}), len(env))
@@ -1412,6 +1415,11 @@ class DatabaseRolePackagingTests(unittest.TestCase):
         script = (ROOT/'scripts/aws/deploy.sh').read_text()
         self.assertIn('"${DUCKFLEET_UPGRADE_LEGACY_DATABASE:-false}" == true', script)
         self.assertIn('bash scripts/aws/upgrade-database-roles.sh', script)
+        upgrade = (ROOT/'scripts/aws/upgrade-database-roles.sh').read_text()
+        self.assertIn('@.type=="Complete"', upgrade)
+        self.assertIn('@.type=="Failed"', upgrade)
+        self.assertIn('.state.terminated.message', upgrade)
+        self.assertNotIn('logs', upgrade)
 
     def test_helm_schema_rejects_invalid_roles_and_authorization_at_the_top_level(self):
         cases = [
