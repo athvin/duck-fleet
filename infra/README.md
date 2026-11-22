@@ -744,10 +744,15 @@ from medium to small and back, checks hooks/session affinity and rejected sizes,
 and reads Parquet directly from the real S3 path through a worker. It records
 model placement, process/cgroup evidence, pod UID, node and resource requests/
 limits in `artifacts/aws/evidence.json`; detailed logs go in the same directory.
-Only a successful `test.sh` with that evidence warrants saying the AWS test passed.
-The live lane does not yet automate the local suite's worker-restart/unavailable
-worker orchestration, long-duration credential refresh, IAM adversarial probes,
-or network-policy enforcement tests. These remain gates before external tenants.
+The image build forces an expired fixture credential to receive HTTP 403 and
+requires a fresh container-credential fetch and signed retry. The live harness
+additionally sends prefix-neighbor requests through a worker to an in-cluster S3
+fixture and requires them to be unsigned; real Pod Identity is proven by the S3
+lake read. Only a successful `test.sh` with that evidence warrants saying the AWS
+test passed. The live lane does not yet automate the local suite's
+worker-restart/unavailable worker orchestration, long-duration live credential
+renewal, broader IAM adversarial probes, or network-policy enforcement tests.
+These remain gates before external tenants.
 
 To inspect the private API, use an explicit-context port forward from an authorized
 operator session (the API still requires the generated bearer token):
@@ -781,7 +786,7 @@ class deletes its volume. S3 versioning is not a backup of the PostgreSQL catalo
 
 ## Authentication and isolation
 
-Workers use the [DuckDB 1.5 AWS credential chain with automatic refresh](https://duckdb.org/docs/1.5/core_extensions/aws)
+Workers use the [DuckDB 2.0 AWS credential chain with automatic refresh](https://duckdb.org/docs/2.0/core_extensions/aws)
 and the [EKS Pod Identity container endpoint](https://docs.aws.amazon.com/eks/latest/userguide/pod-id-how-it-works.html).
 The identity requires the exact cluster/namespace/service-account tuple and grants
 S3 access only to `lake/` in DuckFleet's bucket. Gateway, database and dbt test pods

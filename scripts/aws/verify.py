@@ -46,5 +46,9 @@ for pod in workers:
     observed['pod_uid'] = pod['metadata']['uid']
     observed['node'] = pod['spec']['nodeName']
 assert evidence['s3_files'] and all(p.startswith('s3://duckfleet-dev-797781631727-us-east-2/lake/') for p in evidence['s3_files'])
+scope = evidence['secret_scope']
+assert scope['signed_in_scope_requests'] > 0
+assert scope['unsigned_neighbor_requests'] > 0
+assert scope['neighbor_credentials_sent'] is False
 (root/'evidence.json').write_text(json.dumps(evidence, indent=2)+'\n')
-print('PASS: AWS model placement, Kubernetes requests/limits, worker cgroups, and S3 Parquet agree')
+print('PASS: AWS placement, worker cgroups, S3 Parquet, and secret-scope isolation agree')
