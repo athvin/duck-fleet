@@ -1,8 +1,7 @@
 # DuckFleet
 
 A managed DuckLake platform, starting with a local Docker feasibility harness.
-DuckFleet is planned as a separate entity from DupeZero, using the same AWS
-organization. The intended domain is `duckfleet.com`, pending purchase.
+The intended domain is `duckfleet.com`, pending purchase.
 
 ## What DuckFleet is
 
