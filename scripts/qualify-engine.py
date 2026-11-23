@@ -306,12 +306,19 @@ def cli_json(base, env, args):
 
 
 def cutover_drill(base, env, baseline_tag, candidate_tag, directory, skip_dbt):
-    evidence = {"drained_statement": False, "old_writers": None, "passed": False}
+    evidence = {
+        "drained_statement": False,
+        "statement_outcome": None,
+        "old_writers": None,
+        "automatic_replay": False,
+        "passed": False,
+    }
     log = directory / "cutover.log"
+    statement_log = directory / "cutover-statement.log"
     process = None
     try:
         run(["bash", str(ROOT / "scripts/backup-catalog.sh"), "compose", str(directory / "cutover-point")], env=env, log=log)
-        with log.open("a") as handle:
+        with statement_log.open("w") as handle:
             process = subprocess.Popen(
                 base + ["run", "--rm", "--no-deps", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", "SELECT sum(sin(i)) FROM range(1000000000) AS source(i)"],
                 cwd=ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT,
@@ -331,9 +338,18 @@ def cutover_drill(base, env, baseline_tag, candidate_tag, directory, skip_dbt):
         run(["bash", str(ROOT / "scripts/stop-compute.sh"), "compose"], env=env, log=log)
         result = process.wait(timeout=120)
         process = None
-        if result != 0:
-            raise RuntimeError(f"the active statement did not drain successfully: {result}; see {log}")
-        evidence["drained_statement"] = True
+        if result == 0:
+            evidence["drained_statement"] = True
+            evidence["statement_outcome"] = "succeeded"
+        else:
+            outcome = statement_log.read_text()
+            if "timeout (HTTP 400)" not in outcome or "retry_safe: false" not in outcome:
+                raise RuntimeError(f"the active statement failed without a truthful bounded outcome: {result}; see {statement_log}")
+            evidence["statement_outcome"] = "timeout"
+            evidence["retry_safe"] = False
+        request_match = re.search(r"request_id: ([0-9a-f-]{36})", statement_log.read_text())
+        if request_match:
+            evidence["request_id"] = request_match.group(1)
         refused = run(base + ["run", "--rm", "--no-deps", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", "SELECT 1"], env=env, check=False)
         if refused.returncode == 0:
             raise RuntimeError("stopped compute accepted new SQL")
@@ -369,6 +385,9 @@ def cutover_drill(base, env, baseline_tag, candidate_tag, directory, skip_dbt):
         run(base + ["run", "--rm", "--no-deps", "dbt", "duckfleet-server", "--maintenance"], env=env, log=log)
         run(base + ["run", "--rm", "--no-deps", "dbt", "duckfleet-server", "--rbac"], env=env, log=log)
         cli_json(base, env, ["history", "--limit", "5"])
+        if evidence.get("request_id"):
+            cli_json(base, env, ["request", evidence["request_id"]])
+            evidence["durable_request_readable"] = True
         evidence["smoke"] = smoke + ["maintenance", "rbac", "history"]
         evidence["engine"] = "v2.0.1"
         evidence["catalog_version"] = "1.0"
