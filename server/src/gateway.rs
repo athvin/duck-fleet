@@ -2438,6 +2438,8 @@ async fn retention_report(
         }))
     }).await?;
     Ok(Json(report))
+}
+
 async fn operational_metrics(
     State(app): State<Gateway>,
     Extension(identity): Extension<Identity>,
