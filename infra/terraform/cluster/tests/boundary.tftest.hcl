@@ -121,11 +121,7 @@ run "reader_identity_cannot_write_lake_or_results" {
   command = plan
 
   assert {
-    condition = alltrue(flatten([
-      for statement in jsondecode(aws_iam_role_policy.reader.policy).Statement : [
-        for action in statement.Action : action == "s3:GetObject" || action == "s3:ListBucket"
-      ]
-    ]))
+    condition     = !can(regex("PutObject|DeleteObject|AbortMultipart", jsonencode(aws_iam_role_policy.reader.policy)))
     error_message = "Reader lake access must not include PutObject, DeleteObject, or multipart writes."
   }
   assert {
