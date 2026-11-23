@@ -313,7 +313,7 @@ def cutover_drill(base, env, baseline_tag, candidate_tag, directory, skip_dbt):
         run(["bash", str(ROOT / "scripts/backup-catalog.sh"), "compose", str(directory / "cutover-point")], env=env, log=log)
         with log.open("a") as handle:
             process = subprocess.Popen(
-                base + ["run", "--rm", "--no-deps", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", "SELECT sum(sin(i)) FROM range(100000000000) AS source(i)"],
+                base + ["run", "--rm", "--no-deps", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", "SELECT sum(sin(i)) FROM range(1000000000) AS source(i)"],
                 cwd=ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT,
             )
         observed = False
