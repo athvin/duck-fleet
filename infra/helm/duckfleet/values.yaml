@@ -45,6 +45,12 @@ tolerations: []
 suspended: false
 
 profiling: true
+# Percentage of sessions whose raw profiles persist; metrics are still captured.
+# 100 preserves existing behavior. Open context {"profile":"debug"} overrides sampling.
+profileSamplePercent: 100
+# Independent artifact expiry; 0 preserves each artifact forever.
+sqlRetentionDays: 0
+profileRetentionDays: 0
 
 # A worker reports not-ready while it waits for the catalog, so this must stay inside
 # the startup probe budget (failureThreshold 120 at 5s). The probe, not this value,

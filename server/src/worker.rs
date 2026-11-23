@@ -151,6 +151,7 @@ pub(crate) struct Worker {
     active: ActiveSlot,
     runtime: tokio::runtime::Handle,
     profiling_enabled: bool,
+    profile_sample_percent: u8,
     result_store: Option<artifacts::Store>,
     lifecycle_id: String,
     lifecycle_policy: crate::compute_lifecycle::Policy,
@@ -827,6 +828,13 @@ impl Worker {
                 _ => anyhow::bail!("DUCKFLEET_PROFILING must be true or false"),
             },
             redactor,
+            profile_sample_percent: match std::env::var("DUCKFLEET_PROFILE_SAMPLE_PERCENT")
+                .unwrap_or_else(|_| "100".into())
+                .parse::<u8>()
+            {
+                Ok(value) if value <= 100 => value,
+                _ => anyhow::bail!("DUCKFLEET_PROFILE_SAMPLE_PERCENT must be 0-100"),
+            },
             result_store: match authority {
                 Authority::Reader => None,
                 Authority::Writer => artifacts::StoreConfig::from_env()?
@@ -1098,8 +1106,15 @@ impl Worker {
                 conn.execute_batch("USE lake")
                     .map_err(|_| ApiError::internal())?;
                 let id = Uuid::new_v4();
-                let profile = crate::profiling::Profile::new(id, self.profiling_enabled, &conn)
-                    .map_err(|_| ApiError::internal())?;
+                let debug_profile = request.context["profile"] == "debug";
+                let profile = crate::profiling::Profile::new(
+                    id,
+                    self.profiling_enabled,
+                    self.profile_sample_percent,
+                    debug_profile,
+                    &conn,
+                )
+                .map_err(|_| ApiError::internal())?;
                 let resources = placement.resources;
                 let system_dimensions = crate::metadata::capture_session(
                     &request.compute,
@@ -1202,9 +1217,14 @@ impl Worker {
         let conn = self.root.try_clone().map_err(|_| ApiError::internal())?;
         conn.execute_batch("USE lake")
             .map_err(|_| ApiError::internal())?;
-        let profile =
-            crate::profiling::Profile::new(token.session_id, self.profiling_enabled, &conn)
-                .map_err(|_| ApiError::internal())?;
+        let profile = crate::profiling::Profile::new(
+            token.session_id,
+            self.profiling_enabled,
+            self.profile_sample_percent,
+            false,
+            &conn,
+        )
+        .map_err(|_| ApiError::internal())?;
         let dimensions = crate::metadata::capture_session(
             &crate::compute::ComputeRequest::default(),
             &claim.placement,
@@ -2376,7 +2396,7 @@ DETAIL: Key (typname, typnamespace)=(ducklake_metadata, 2200) already exists."#;
     #[test]
     fn profiles_are_fresh_and_optional() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        let profile = crate::profiling::Profile::new(Uuid::new_v4(), true, &conn)?;
+        let profile = crate::profiling::Profile::new(Uuid::new_v4(), true, 100, false, &conn)?;
         let cleared = profile.clear();
         execute(&conn, "SELECT sum(i) FROM range(100) t(i)", vec![])?;
         let captured = profile.capture(cleared);
@@ -2396,7 +2416,7 @@ DETAIL: Key (typname, typnamespace)=(ducklake_metadata, 2200) already exists."#;
         assert_eq!(failed.status, "captured");
         assert!(failed.profile.is_some());
         let other = Connection::open_in_memory()?;
-        let disabled = crate::profiling::Profile::new(Uuid::new_v4(), false, &other)?;
+        let disabled = crate::profiling::Profile::new(Uuid::new_v4(), false, 100, false, &other)?;
         execute(&other, "SELECT 1", vec![])?;
         assert_eq!(disabled.capture(disabled.clear()).status, "disabled");
         Ok(())

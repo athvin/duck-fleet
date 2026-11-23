@@ -119,7 +119,7 @@ fn columns(policy: &metadata::PrivacySql) -> String {
     let owner = &policy.owner;
     let captured = metadata::history_capture_json(sql);
     format!("h.query_id,h.session_id,CASE WHEN {sql} THEN h.sql ELSE NULL END,h.context,h.status,h.accepted_at::text,h.finished_at::text,h.elapsed_ms,h.result_rows,CASE WHEN {sql} THEN h.error ELSE NULL END,h.placement,h.history_id,h.worker_id,h.profile_status,h.metrics,h.failure_kind,h.retry_safe,h.principal,
-        jsonb_build_object('queued_at',h.queued_at,'selected_at',h.selected_at,'execution_granted_at',h.execution_granted_at,'engine_started_at',h.engine_started_at,'queue_deadline_at',h.queue_deadline_at,'session_sequence',h.session_sequence,'worker_boot_id',h.worker_boot_id,'pool_scope',h.pool_scope,'protocol',h.protocol,'open_span_id',h.open_span_id,'namespace_id',COALESCE(h.namespace_id,$1),'owner_principal_id',{owner},'actor_principal_id',h.actor_principal_id,'actor_kind',h.actor_kind,'actor_principal',h.actor_principal,'actor_credential_id',h.actor_credential_id)::text,{owner},{captured}").replace("h.context,",&format!("CASE WHEN {sql} THEN h.context ELSE 'null' END,"))
+        jsonb_build_object('queued_at',h.queued_at,'selected_at',h.selected_at,'execution_granted_at',h.execution_granted_at,'engine_started_at',h.engine_started_at,'queue_deadline_at',h.queue_deadline_at,'session_sequence',h.session_sequence,'worker_boot_id',h.worker_boot_id,'pool_scope',h.pool_scope,'protocol',h.protocol,'open_span_id',h.open_span_id,'namespace_id',COALESCE(h.namespace_id,$1),'owner_principal_id',{owner},'actor_principal_id',h.actor_principal_id,'actor_kind',h.actor_kind,'actor_principal',h.actor_principal,'actor_credential_id',h.actor_credential_id)::text,{owner},{captured},h.sql_status").replace("h.context,",&format!("CASE WHEN {sql} THEN h.context ELSE 'null' END,"))
 }
 fn record(row: &Row, plan: &RelationPlan) -> Value {
     let json_column =
@@ -133,7 +133,8 @@ fn record(row: &Row, plan: &RelationPlan) -> Value {
         "error":row.get::<_,Option<String>>(9),"placement":if plan.sql_visible(owner){placement}else{metadata::safe_placement(&placement)},
         "history_id":row.get::<_,i64>(11),"worker_id":row.get::<_,Option<String>>(12),"profile_status":row.get::<_,String>(13),
         "metrics":metadata::numeric_metrics(&json_column(14)),"failure_kind":row.get::<_,Option<String>>(15),"retry_safe":row.get::<_,Option<bool>>(16),
-        "principal":row.get::<_,String>(17)
+        "principal":row.get::<_,String>(17),
+        "sql_status":row.get::<_,String>(21)
     });
     queue_metadata(&mut value, &json_column(18));
     if let Some(captured) = json_column(20).as_object() {

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{credentials, metering, pricing::RateCard, requests};
 
-pub(crate) const SCHEMA_VERSION: i32 = 6;
+pub(crate) const SCHEMA_VERSION: i32 = 7;
 const MIGRATION_LOCK: i64 = 4_283_121;
 const POLL: Duration = Duration::from_millis(250);
 const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
@@ -206,7 +206,7 @@ pub(crate) fn wait_schema(dsn: &str, wait: Duration) -> Result<Client> {
         })();
         match attempt {
             Ok((client, Some(current))) if current == SCHEMA_VERSION => return Ok(client),
-            Ok((_, Some(1..=5))) => {}
+            Ok((_, Some(1..=6))) => {}
             Ok((_, Some(current))) => {
                 supported(current)?;
             }
@@ -229,7 +229,7 @@ pub(crate) struct MigrationReport {
 }
 
 const HISTORY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS query_history (
-    query_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,sql TEXT NOT NULL,
+    query_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,sql TEXT,
     context TEXT NOT NULL,status TEXT NOT NULL,
     accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),finished_at TIMESTAMPTZ,
     elapsed_ms BIGINT,result_rows BIGINT,error TEXT);
@@ -237,6 +237,8 @@ const HISTORY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS query_history (
     ALTER TABLE query_history ADD COLUMN IF NOT EXISTS placement TEXT NOT NULL DEFAULT '{}';
     ALTER TABLE query_history ADD COLUMN IF NOT EXISTS history_id BIGSERIAL;
     ALTER TABLE query_history ADD COLUMN IF NOT EXISTS profile_status TEXT NOT NULL DEFAULT 'not_recorded';
+    ALTER TABLE query_history ADD COLUMN IF NOT EXISTS sql_status TEXT NOT NULL DEFAULT 'available';
+    UPDATE query_history SET sql_status='not_recorded' WHERE sql IS NULL AND sql_status='available';
     ALTER TABLE query_history ADD COLUMN IF NOT EXISTS profile TEXT;
     ALTER TABLE query_history ADD COLUMN IF NOT EXISTS metrics TEXT NOT NULL DEFAULT '{}';
     ALTER TABLE query_history ADD COLUMN IF NOT EXISTS failure_kind TEXT;
@@ -296,7 +298,7 @@ fn migrate_with_roles(
             });
         }
         anyhow::ensure!(
-            matches!(current, 1..=5),
+            matches!(current, 1..=6),
             "unsupported migration source version {current}"
         );
     }
@@ -315,7 +317,7 @@ fn migrate_with_roles(
         });
     }
     anyhow::ensure!(
-        current.is_none() || matches!(current, Some(1..=5)),
+        current.is_none() || matches!(current, Some(1..=6)),
         "unsupported migration source version"
     );
     if current.is_none() {
@@ -376,6 +378,15 @@ fn migrate_with_roles(
         crate::compute_lifecycle::migrate(&mut transaction)?;
         transaction.execute(
             "INSERT INTO platform_schema_migrations(version,name) VALUES(6,'compute-lifecycle')",
+            &[],
+        )?;
+    }
+    if current.is_none() || current.is_some_and(|v| v < 7) {
+        transaction.batch_execute("ALTER TABLE query_history ADD COLUMN IF NOT EXISTS sql_status TEXT NOT NULL DEFAULT 'available';
+            ALTER TABLE query_history ALTER COLUMN sql DROP NOT NULL;
+            UPDATE query_history SET sql_status='not_recorded' WHERE sql IS NULL AND sql_status='available';")?;
+        transaction.execute(
+            "INSERT INTO platform_schema_migrations(version,name) VALUES(7,'artifact-retention')",
             &[],
         )?;
     }
@@ -443,6 +454,8 @@ pub(crate) fn worker_startup(
 #[derive(Clone, Debug)]
 pub(crate) struct MaintenanceConfig {
     pub retention_days: Option<i32>,
+    pub sql_retention_days: Option<i32>,
+    pub profile_retention_days: Option<i32>,
     pub retention_batch_size: i64,
     pub retention_max_batches: u32,
     pub retention_interval: Duration,
@@ -456,6 +469,8 @@ impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
             retention_days: None,
+            sql_retention_days: None,
+            profile_retention_days: None,
             retention_batch_size: 5000,
             retention_max_batches: 2,
             retention_interval: Duration::from_secs(3600),
@@ -476,6 +491,14 @@ impl MaintenanceConfig {
             "DUCKFLEET_HISTORY_RETENTION_DAYS must be from 0 (keep forever) to 3650"
         );
         config.retention_days = (days > 0).then_some(days as i32);
+        let sql_days = nonnegative_env("DUCKFLEET_SQL_RETENTION_DAYS", 0)?;
+        let profile_days = nonnegative_env("DUCKFLEET_PROFILE_RETENTION_DAYS", 0)?;
+        anyhow::ensure!(
+            sql_days <= 3650 && profile_days <= 3650,
+            "SQL and profile retention must be from 0 (keep forever) to 3650 days"
+        );
+        config.sql_retention_days = (sql_days > 0).then_some(sql_days as i32);
+        config.profile_retention_days = (profile_days > 0).then_some(profile_days as i32);
         // Deliberate one-shot repair can receive a larger bound, without making
         // the recurring foreground default an unbounded lifetime scan.
         config.statement_timeout = seconds_env("DUCKFLEET_MAINTENANCE_STATEMENT_SECONDS", 3, 600)?;
@@ -488,11 +511,17 @@ impl MaintenanceConfig {
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.retention_days
-                .is_none_or(|days| (1..=3650).contains(&days)),
-            "retention days must be 1..3650 or absent"
+                .is_none_or(|days| (1..=3650).contains(&days))
+                && self
+                    .sql_retention_days
+                    .is_none_or(|days| (1..=3650).contains(&days))
+                && self
+                    .profile_retention_days
+                    .is_none_or(|days| (1..=3650).contains(&days)),
+            "summary, SQL and profile retention days must be 1..3650 or absent"
         );
         anyhow::ensure!(
-            (1..=5000).contains(&self.retention_batch_size)
+            (1..=6000).contains(&self.retention_batch_size)
                 && (1..=100).contains(&self.retention_max_batches),
             "retention batches must contain 1..5000 rows with 1..100 batches"
         );
@@ -671,9 +700,12 @@ fn retention(
     run_id: &str,
     started: Instant,
 ) -> Result<()> {
-    let Some(days) = config.retention_days else {
+    if config.retention_days.is_none()
+        && config.sql_retention_days.is_none()
+        && config.profile_retention_days.is_none()
+    {
         return Ok(());
-    };
+    }
     for _ in 0..config.retention_max_batches {
         let Some(remaining) = config.pass_budget.checked_sub(started.elapsed()) else {
             break;
@@ -685,26 +717,56 @@ fn retention(
         bounded.statement_timeout = config.statement_timeout.min(remaining);
         bounded.lock_timeout = config.lock_timeout.min(bounded.statement_timeout);
         let mut transaction = fenced_transaction(client, lease, &bounded)?;
-        let removed = transaction.execute(
-            &format!(
-                "DELETE FROM query_history WHERE query_id IN (
-                SELECT h.query_id FROM query_history h WHERE {ELIGIBLE}
-                ORDER BY h.accepted_at,h.query_id LIMIT $2 FOR UPDATE OF h SKIP LOCKED)"
-            ),
-            &[&days, &config.retention_batch_size],
-        )?;
-        transaction.execute("DELETE FROM session_events WHERE open_span_id IN (
-            SELECT open_span_id FROM session_events WHERE COALESCE(closed_at,finished_at,provisioning_started_at)<now()-($1::INT*interval '1 day')
-            AND NOT EXISTS(SELECT 1 FROM queue_sessions s WHERE s.open_span_id=session_events.open_span_id AND s.closed_at IS NULL)
-            ORDER BY COALESCE(closed_at,finished_at,provisioning_started_at),open_span_id LIMIT $2 FOR UPDATE SKIP LOCKED)", &[&days,&config.retention_batch_size])?;
-        transaction.execute("DELETE FROM queue_sessions WHERE session_id IN (SELECT session_id FROM queue_sessions
-            WHERE closed_at<now()-($1::INT*interval '1 day') AND outstanding IS NULL ORDER BY closed_at,session_id LIMIT $2 FOR UPDATE SKIP LOCKED)", &[&days,&config.retention_batch_size])?;
+        let sql_removed = match config.sql_retention_days {
+            Some(days) => transaction.execute(
+                &format!(
+                    "UPDATE query_history SET sql=NULL,sql_status='expired' WHERE query_id IN (
+                    SELECT h.query_id FROM query_history h WHERE {ELIGIBLE} AND h.sql IS NOT NULL
+                    ORDER BY h.accepted_at,h.query_id LIMIT $2 FOR UPDATE OF h SKIP LOCKED)"
+                ),
+                &[&days, &config.retention_batch_size],
+            )?,
+            None => 0,
+        };
+        let profile_removed = match config.profile_retention_days {
+            Some(days) => transaction.execute(
+                &format!("UPDATE query_history SET profile=NULL,profile_status='expired' WHERE query_id IN (
+                    SELECT h.query_id FROM query_history h WHERE {ELIGIBLE} AND h.profile IS NOT NULL
+                    ORDER BY h.accepted_at,h.query_id LIMIT $2 FOR UPDATE OF h SKIP LOCKED)"),
+                &[&days, &config.retention_batch_size],
+            )?,
+            None => 0,
+        };
+        let removed = match config.retention_days {
+            Some(days) => {
+                let removed = transaction.execute(
+                    &format!(
+                        "DELETE FROM query_history WHERE query_id IN (
+                        SELECT h.query_id FROM query_history h WHERE {ELIGIBLE}
+                        ORDER BY h.accepted_at,h.query_id LIMIT $2 FOR UPDATE OF h SKIP LOCKED)"
+                    ),
+                    &[&days, &config.retention_batch_size],
+                )?;
+                transaction.execute("DELETE FROM session_events WHERE open_span_id IN (
+                    SELECT open_span_id FROM session_events WHERE COALESCE(closed_at,finished_at,provisioning_started_at)<now()-($1::INT*interval '1 day')
+                    AND NOT EXISTS(SELECT 1 FROM queue_sessions s WHERE s.open_span_id=session_events.open_span_id AND s.closed_at IS NULL)
+                    ORDER BY COALESCE(closed_at,finished_at,provisioning_started_at),open_span_id LIMIT $2 FOR UPDATE SKIP LOCKED)", &[&days,&config.retention_batch_size])?;
+                transaction.execute("DELETE FROM queue_sessions WHERE session_id IN (SELECT session_id FROM queue_sessions
+                    WHERE closed_at<now()-($1::INT*interval '1 day') AND outstanding IS NULL ORDER BY closed_at,session_id LIMIT $2 FOR UPDATE SKIP LOCKED)", &[&days,&config.retention_batch_size])?;
+                removed
+            }
+            None => 0,
+        };
+        let artifacts_removed = removed + sql_removed + profile_removed;
         transaction.execute(
             "UPDATE platform_maintenance_runs SET rows_pruned=rows_pruned+$2 WHERE run_id=$1",
-            &[&run_id, &(removed as i64)],
+            &[&run_id, &(artifacts_removed as i64)],
         )?;
         transaction.commit()?;
-        if removed < config.retention_batch_size as u64 {
+        if [removed, sql_removed, profile_removed]
+            .into_iter()
+            .all(|count| count < config.retention_batch_size as u64)
+        {
             break;
         }
     }
@@ -731,7 +793,25 @@ fn finish_task(
     } else {
         None
     };
-    let backlog = (task == "retention" && error.is_none()).then_some(oldest.is_some());
+    let artifact_backlog = if task == "retention" && error.is_none() {
+        let mut found = false;
+        for (days, column) in [
+            (config.sql_retention_days, "sql"),
+            (config.profile_retention_days, "profile"),
+        ] {
+            if let Some(days) = days {
+                found |= transaction.query_one(
+                    &format!("SELECT EXISTS(SELECT 1 FROM query_history h WHERE {ELIGIBLE} AND h.{column} IS NOT NULL)"),
+                    &[&days],
+                )?.get::<_, bool>(0);
+            }
+        }
+        found
+    } else {
+        false
+    };
+    let backlog =
+        (task == "retention" && error.is_none()).then_some(oldest.is_some() || artifact_backlog);
     let status = if error.is_some() {
         "failed"
     } else {

@@ -852,6 +852,12 @@ profiles have explicit statuses (`not_emitted`, `disabled`, `invalid`, `too_larg
 `io_error`). Older records and in-flight executions use `not_recorded`. A missing
 profile does not change a SQL success into a SQL failure. Profiling remains
 best-effort for trusted SQL; callers can modify DuckDB settings themselves.
+`profileSamplePercent` (environment `DUCKFLEET_PROFILE_SAMPLE_PERCENT`) selects a
+deterministic percentage of sessions whose raw JSON persists. Sampling still
+captures profiles to obtain compact metrics, so it reduces storage, not capture
+overhead; sampled-out records say `sampled_out`. Open context
+`{"profile":"debug"}` explicitly retains a full profile even at 0%. Expired raw
+profiles say `expired`, and SQL text has a matching `sql_status`.
 
 `latency` and `cpu_time` are seconds; buffer-memory, temporary-directory, and byte
 counters are bytes. DuckDB CPU/operator times can overlap and must not be summed
@@ -877,9 +883,16 @@ keeps everything. With a window set, the gateway coordinates hourly cleanup in
 batches of at most 5,000 rows, with two batches per pass. A backlog makes the
 next bounded pass due sooner. Running requests, held reservations, and rows
 without a durable terminal identity remain protected. Request identities and
-append-only usage events have no diagnostic retention policy. SQL and profiles
-are deleted together with eligible history; their separate policies are tracked
-in #109.
+append-only usage events have no diagnostic retention policy. SQL text and raw
+profiles also have independent `sqlRetentionDays` and `profileRetentionDays`
+settings (matching `DUCKFLEET_SQL_RETENTION_DAYS` and
+`DUCKFLEET_PROFILE_RETENTION_DAYS`). Zero keeps each artifact forever, preserving
+upgrade behavior. Artifact expiry nulls only that payload, retains the compact
+summary/metrics, and never touches usage evidence. `GET /v1/retention` requires
+fleet-read permission and reports stored profile/SQL counts and bytes, expired
+artifact counts, and the last cleanup's status, affected count and backlog.
+A small installation can keep summaries for 90 days, SQL for 7 and profiles for 1
+while sampling 10%; this trades forensic detail for bounded storage.
 
 ## Platform migrations and maintenance
 
@@ -893,8 +906,8 @@ unsupported future versions with an actionable error.
 Deployment runs `DUCKFLEET_ROLE=migrate` using the same binary and its dedicated
 owner/migrator `PLATFORM_DSN`; runtime processes use their own restricted DSNs.
 This PostgreSQL-only command supports a fresh database, unversioned installations
-and ordered schema-1 through schema-5 upgrades. Schema 5 adds durable jobs, their
-artifact journals and finite job policy envelopes; existing interactive request
+and ordered schema-1 through schema-6 upgrades. Schema 7 adds independent SQL and
+profile artifact states; existing interactive request
 fingerprints, credentials, policies and usage are preserved. It adopts existing request identities,
 reservations and usage without refilling the budget. Migrations commit their
 version atomically; repeats skip the baseline scans. Quiesce older writers for

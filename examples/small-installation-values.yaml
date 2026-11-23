@@ -1,0 +1,7 @@
+# Bounded forensic storage for a small self-hosted installation.
+historyRetentionDays: 90
+sqlRetentionDays: 7
+profileRetentionDays: 1
+profileSamplePercent: 10
+# Raw-profile capture still occurs for every statement to collect compact metrics.
+# Use open context {"profile":"debug"} for an explicit full-profile exception.

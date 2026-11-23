@@ -10,6 +10,7 @@ const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 pub(crate) struct Profile {
     path: PathBuf,
     enabled: bool,
+    sampled: bool,
 }
 pub(crate) struct Capture {
     pub status: &'static str,
@@ -26,7 +27,21 @@ impl Capture {
     }
 }
 impl Profile {
-    pub fn new(id: Uuid, enabled: bool, conn: &Connection) -> Result<Self> {
+    pub fn new(
+        id: Uuid,
+        enabled: bool,
+        sample_percent: u8,
+        debug: bool,
+        conn: &Connection,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            sample_percent <= 100,
+            "profile sample percent must be 0-100"
+        );
+        let sampled = debug || sample_percent == 100 || {
+            let bytes = id.as_bytes();
+            u16::from_be_bytes([bytes[0], bytes[1]]) % 100 < u16::from(sample_percent)
+        };
         let directory = std::env::temp_dir().join("duckfleet-profiles");
         fs::create_dir_all(&directory)?;
         let path = directory.join(format!("{id}.json"));
@@ -36,7 +51,11 @@ impl Profile {
                 "SET enable_profiling='json'; SET profiling_output='{escaped}'; SET profiling_coverage='ALL';"
             ))?;
         }
-        Ok(Self { path, enabled })
+        Ok(Self {
+            path,
+            enabled,
+            sampled,
+        })
     }
 
     // Always remove the previous output before executing. If the engine emits no
@@ -98,8 +117,12 @@ impl Profile {
             }
         }
         Capture {
-            status: "captured",
-            profile: Some(value.to_string()),
+            status: if self.sampled {
+                "captured"
+            } else {
+                "sampled_out"
+            },
+            profile: self.sampled.then(|| value.to_string()),
             metrics: metrics.to_string(),
         }
     }
@@ -116,7 +139,7 @@ mod tests {
     #[test]
     fn nested_profile_sections_retain_existing_metric_names() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        let profile = Profile::new(Uuid::new_v4(), true, &conn)?;
+        let profile = Profile::new(Uuid::new_v4(), true, 100, false, &conn)?;
         fs::write(
             &profile.path,
             br#"{
@@ -143,7 +166,7 @@ mod tests {
     #[test]
     fn rejects_oversized_or_malformed_profiles() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        let profile = Profile::new(Uuid::new_v4(), true, &conn)?;
+        let profile = Profile::new(Uuid::new_v4(), true, 100, false, &conn)?;
         fs::write(&profile.path, vec![b' '; MAX_PROFILE_BYTES as usize + 1])?;
         assert_eq!(profile.capture(true).status, "too_large");
         fs::write(&profile.path, b"not json")?;
@@ -151,6 +174,22 @@ mod tests {
         assert_eq!(profile.capture(false).status, "io_error");
         assert!(profile.clear());
         assert_eq!(profile.capture(true).status, "not_emitted");
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_preserves_metrics_and_debug_retains_the_profile() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let id = Uuid::new_v4();
+        let sampled = Profile::new(id, true, 0, false, &conn)?;
+        fs::write(&sampled.path, br#"{"latency":1.5}"#)?;
+        let capture = sampled.capture(true);
+        assert_eq!(capture.status, "sampled_out");
+        assert!(capture.profile.is_none());
+        assert_eq!(capture.metrics, r#"{"latency":1.5}"#);
+        let debug = Profile::new(id, true, 0, true, &conn)?;
+        fs::write(&debug.path, br#"{"latency":1.5}"#)?;
+        assert_eq!(debug.capture(true).status, "captured");
         Ok(())
     }
 }
