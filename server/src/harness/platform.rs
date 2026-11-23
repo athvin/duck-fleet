@@ -230,6 +230,9 @@ pub(super) fn remove_job_fixture_schema(client: &mut Client) -> Result<()> {
     let current: i32 = client
         .query_one("SELECT MAX(version) FROM platform_schema_migrations", &[])?
         .get(0);
+    if current >= 7 {
+        client.batch_execute("ALTER TABLE query_history DROP COLUMN sql_status; ALTER TABLE query_history ALTER COLUMN sql SET NOT NULL; DELETE FROM platform_schema_migrations WHERE version=7;")?;
+    }
     if current >= 6 {
         client.batch_execute("DROP TABLE compute_lifecycles,compute_reservations,compute_policies; DELETE FROM platform_schema_migrations WHERE version=6;")?;
     }
@@ -636,10 +639,81 @@ fn checks_in_schema(client: &mut Client, config: &postgres::Config) -> Result<()
     abandoned_transaction(client, config)?;
     maintenance_lock_failure(client, config, &cfg)?;
     retention_checks(client, &cfg)?;
+    artifact_retention_checks(client)?;
     maintenance_fairness(client, config)?;
     compute_lifecycle_checks(client, config)?;
     concurrent_accounting(client, config, &cfg)?;
     startup_scaling(client, config)?;
+    Ok(())
+}
+
+fn artifact_retention_checks(client: &mut Client) -> Result<()> {
+    let admission = admit(client, "artifact-expired", "artifact-worker")?;
+    finish(client, &admission, "artifact-worker")?;
+    client.execute(
+        "UPDATE query_history SET sql='select sensitive_literal',profile='{\"latency\":1}',profile_status='captured',accepted_at=now()-interval '2 days' WHERE query_id='artifact-expired'",
+        &[],
+    )?;
+    let running = admit(client, "artifact-running", "artifact-worker")?;
+    client.execute(
+        "UPDATE query_history SET sql='select still_running',accepted_at=now()-interval '2 days' WHERE query_id=$1",
+        &[&running.execution_id],
+    )?;
+    let usage: i64 = client
+        .query_one("SELECT count(*) FROM usage_events", &[])?
+        .get(0);
+    let config = platform::MaintenanceConfig {
+        sql_retention_days: Some(1),
+        profile_retention_days: Some(1),
+        retention_batch_size: 1,
+        retention_max_batches: 1,
+        ..platform::MaintenanceConfig::default()
+    };
+    for expected in [2, 0] {
+        let report = platform::maintenance_pass(client, Uuid::new_v4(), &config, true)?;
+        let retention = report
+            .tasks
+            .iter()
+            .find(|task| task.task == "retention")
+            .unwrap();
+        require(
+            retention.rows_pruned == expected,
+            "artifact cleanup count or repeat settlement drifted",
+        )?;
+    }
+    let expired = client.query_one(
+        "SELECT sql IS NULL,sql_status,profile IS NULL,profile_status,metrics FROM query_history WHERE query_id='artifact-expired'",
+        &[],
+    )?;
+    require(
+        expired.get::<_, bool>(0)
+            && expired.get::<_, String>(1) == "expired"
+            && expired.get::<_, bool>(2)
+            && expired.get::<_, String>(3) == "expired"
+            && expired.get::<_, String>(4) == "{}",
+        "independent artifact expiry did not preserve the compact summary",
+    )?;
+    require(
+        client
+            .query_one(
+                "SELECT sql FROM query_history WHERE query_id=$1",
+                &[&running.execution_id],
+            )?
+            .get::<_, Option<String>>(0)
+            .as_deref()
+            == Some("select still_running"),
+        "artifact retention expired a running statement",
+    )?;
+    require(
+        client
+            .query_one("SELECT count(*) FROM usage_events", &[])?
+            .get::<_, i64>(0)
+            == usage,
+        "artifact retention changed immutable usage evidence",
+    )?;
+    println!(
+        "PASS: independent SQL/profile retention preserves running statements, metrics and usage"
+    );
     Ok(())
 }
 

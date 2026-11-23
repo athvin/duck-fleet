@@ -32,8 +32,8 @@ case "$mode" in
     python3 - "$work/template.json" "$name" "$role" <<'PY' | "${kube[@]}" create -f -
 import json, sys
 source = json.load(open(sys.argv[1]))
-if source.get('metadata', {}).get('annotations', {}).get('duckfleet.io/platform-schema') != '6':
-    sys.exit('Current migration template predates schema 6; stop compute and apply the desired chart/image first')
+if source.get('metadata', {}).get('annotations', {}).get('duckfleet.io/platform-schema') != '7':
+    sys.exit('Current migration template predates schema 7; stop compute and apply the desired chart/image first')
 spec = source['spec']
 for container in spec['template']['spec']['containers']:
     for item in container.get('env', []):

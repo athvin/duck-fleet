@@ -157,12 +157,11 @@ async fn pgwire_continuity(ctx: &Ctx, admin: &Client) -> Result<()> {
     pg.close().await;
 
     // The TTL must comfortably outlive worst-case connect plus lazy session
-    // creation for `select 1` (observed ~2s under a loaded or restarted fleet),
-    // while still expiring before `select 2` below.
-    let expiring = issue(admin, "auth-pg-expiry", Some(5)).await?;
+    // creation for `select 1`, while still expiring before `select 2` below.
+    let expiring = issue(admin, "auth-pg-expiry", Some(15)).await?;
     let mut pg = Pg::connect(ctx, &expiring.token).await?;
     pg.query("select 1").await?;
-    tokio::time::sleep(Duration::from_millis(5300)).await;
+    tokio::time::sleep(Duration::from_millis(15300)).await;
     denied_pg(pg.query("select 2 /* expired-established-pgwire */").await)?;
     pg.close().await;
     revoke(admin, &expiring).await?;

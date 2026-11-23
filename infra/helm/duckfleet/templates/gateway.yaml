@@ -64,6 +64,8 @@ spec:
             {{- end }}
             - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ .Values.platformWaitSeconds | quote }}}
             - {name: DUCKFLEET_HISTORY_RETENTION_DAYS, value: {{ .Values.historyRetentionDays | quote }}}
+            - {name: DUCKFLEET_SQL_RETENTION_DAYS, value: {{ .Values.sqlRetentionDays | quote }}}
+            - {name: DUCKFLEET_PROFILE_RETENTION_DAYS, value: {{ .Values.profileRetentionDays | quote }}}
             - {name: DUCKFLEET_PGWIRE, value: {{ .Values.pgwire.enabled | quote }}}
             # The same card the workers price with: the gateway reports it on the
             # budget position and settles abandoned session-pod reservations.

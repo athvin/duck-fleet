@@ -2406,6 +2406,40 @@ async fn workers(
     })))
 }
 
+async fn retention_report(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Json<Value>, ApiError> {
+    app.authorize_action(&identity, Action::FleetRead, None)
+        .await?;
+    let report = app.control_db(|db| {
+        let row = db.query_one(
+            "SELECT count(*) FILTER(WHERE profile IS NOT NULL),COALESCE(sum(octet_length(profile)),0),
+                count(*) FILTER(WHERE sql IS NOT NULL),COALESCE(sum(octet_length(sql)),0),
+                count(*) FILTER(WHERE profile_status='expired' OR sql_status='expired'),
+                (SELECT count(*) FROM query_history h WHERE h.status<>'running' AND
+                    (h.profile IS NOT NULL OR h.sql IS NOT NULL))
+             FROM query_history",
+            &[],
+        ).map_err(|_| ApiError::internal())?;
+        let last = db.query_opt(
+            "SELECT status,backlog_remaining,rows_pruned,finished_at::TEXT FROM platform_maintenance_runs
+             WHERE task='retention' ORDER BY started_at DESC LIMIT 1",
+            &[],
+        ).map_err(|_| ApiError::internal())?;
+        Ok(json!({
+            "profiles":{"count":row.get::<_,i64>(0),"bytes":row.get::<_,i64>(1)},
+            "sql_text":{"count":row.get::<_,i64>(2),"bytes":row.get::<_,i64>(3)},
+            "expired_artifacts":row.get::<_,i64>(4),
+            "rows_with_artifacts":row.get::<_,i64>(5),
+            "last_run":last.map(|run|json!({"status":run.get::<_,String>(0),
+                "backlog_remaining":run.get::<_,Option<bool>>(1),"rows_pruned":run.get::<_,i64>(2),
+                "finished_at":run.get::<_,Option<String>>(3)}))
+        }))
+    }).await?;
+    Ok(Json(report))
+}
+
 async fn compute_report(
     State(app): State<Gateway>,
     Extension(identity): Extension<Identity>,
@@ -2704,6 +2738,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/budget", get(budget).put(set_budget))
         .route("/v1/workers", get(workers))
         .route("/v1/compute", get(compute_report))
+        .route("/v1/retention", get(retention_report))
         .route("/v1/pools", get(pool_discovery))
         .route("/v1/pools/reload", post(reload_pools))
         .route("/v1/principals", get(list_principals))

@@ -243,6 +243,9 @@
       }
     },
     "historyRetentionDays": {"type": "integer", "minimum": 0, "maximum": 3650},
+    "sqlRetentionDays": {"type": "integer", "minimum": 0, "maximum": 3650},
+    "profileRetentionDays": {"type": "integer", "minimum": 0, "maximum": 3650},
+    "profileSamplePercent": {"type": "integer", "minimum": 0, "maximum": 100},
     "lakePrefix": {
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9/_.-]*[A-Za-z0-9]$"
