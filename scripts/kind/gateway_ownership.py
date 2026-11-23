@@ -70,7 +70,7 @@ class Gateway:
         return opened["session_id"], opened["placement"]["worker_id"]
 
     def query(self, session, sql):
-        return self.json("POST", f"/v1/sessions/{session}/queries",
+        return self.call("POST", f"/v1/sessions/{session}/queries",
                          {"request_id": str(uuid.uuid4()), "sql": sql, "timeout_seconds": 25})
 
 
@@ -211,8 +211,8 @@ def main():
         assert attempts == "1", attempts
         probe = second.json("POST", "/v1/sessions", {})
         probe_id = probe["session_id"]
-        rows = second.query(probe_id, "SELECT count(*) FROM api_demo.ha_commit")["rows"]
-        assert rows in ([["0"]], [[0]]), rows
+        second.query(probe_id, "SELECT CASE WHEN (SELECT count(*) FROM api_demo.ha_commit)=0 "
+                               "THEN 0 ELSE error('interrupted write committed') END")
         second.call("DELETE", f"/v1/sessions/{probe_id}")
         print("PASS: an interrupted write stayed classified and was never replayed")
     finally:

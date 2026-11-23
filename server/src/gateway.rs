@@ -1149,7 +1149,13 @@ impl Gateway {
             serde_json::from_str(&owner.operation).map_err(|_| ApiError::internal())?;
         let registry = self.registry();
         let endpoint = if worker_id.starts_with(crate::isolated::PREFIX) {
-            format!("http://{worker_id}:8080")
+            self.isolation
+                .as_ref()
+                .ok_or_else(|| {
+                    ApiError::new(failure::SESSION_LOST, "isolated worker is not configured")
+                })?
+                .endpoint(&worker_id)
+                .await?
         } else {
             registry
                 .pools

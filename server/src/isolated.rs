@@ -458,6 +458,21 @@ impl Isolation {
         }
     }
 
+    pub async fn endpoint(&self, name: &str) -> Result<String, ApiError> {
+        let pod = self
+            .kube
+            .pod(name)
+            .await
+            .map_err(|_| ApiError::internal())?
+            .filter(ready)
+            .ok_or_else(|| ApiError::new(failure::SESSION_LOST, "owning pod is not ready"))?;
+        let address = pod["status"]["podIP"]
+            .as_str()
+            .filter(|address| !address.is_empty())
+            .ok_or_else(|| ApiError::new(failure::SESSION_LOST, "owning pod has no endpoint"))?;
+        Ok(format!("http://{address}:8080"))
+    }
+
     pub async fn stop_confirmed(&self, name: &str) -> bool {
         confirm_stopped(&self.kube, name, STOP_WAIT).await
     }
@@ -849,6 +864,33 @@ mod tests {
         );
         assert!(isolation.start_job(wanted, name, None, 1800).await.is_err());
         assert_eq!(creates.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn endpoint_uses_the_ready_pod_ip() {
+        use axum::{Json, routing::get};
+        let router = axum::Router::new().route(
+            "/api/v1/namespaces/test/pods/duckfleet-session-route",
+            get(|| async {
+                Json(json!({"status":{
+                    "podIP":"10.42.0.17",
+                    "conditions":[{"type":"Ready","status":"True"}]
+                }}))
+            }),
+        );
+        let api = crate::kube::test_support::FakeKube::serve(router).await;
+        let isolation = Isolation {
+            kube: api.kube.clone(),
+            template: template(),
+            owner: owner("server", "owner"),
+            ready: Duration::from_secs(1),
+            provisioning: Duration::ZERO,
+            quota_wait: Duration::ZERO,
+        };
+        assert_eq!(
+            isolation.endpoint("duckfleet-session-route").await.unwrap(),
+            "http://10.42.0.17:8080"
+        );
     }
 
     #[tokio::test]
