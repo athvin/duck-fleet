@@ -1403,6 +1403,14 @@ impl Gateway {
     /// reservations still held, so a session that settled its own is unaffected —
     /// Retire only a known ended or abandoned isolated session. Failed deletion
     /// or bookkeeping remains tracked independently of client routes for retry.
+    async fn finish_lifecycle(&self, lifecycle_id: &str, failure_kind: Option<&str>) -> bool {
+        let id = lifecycle_id.to_owned();
+        let kind = failure_kind.map(str::to_owned);
+        self.control_db(move |db| crate::compute_lifecycle::finish(db, &id, kind.as_deref()))
+            .await
+            .is_ok()
+    }
+
     async fn release(&self, pod: Option<String>) {
         let (Some(pod), Some(isolation)) = (pod, self.isolation.as_ref()) else {
             return;
@@ -1412,7 +1420,7 @@ impl Gateway {
             .await
             .entry(pod.clone())
             .or_insert_with(Instant::now);
-        if isolation.stop_confirmed(&pod).await {
+        if isolation.stop_confirmed(&pod).await && self.finish_lifecycle(&pod, None).await {
             self.recover_retired(pod).await;
         }
     }
@@ -1616,9 +1624,31 @@ impl Gateway {
                     .isolation
                     .as_ref()
                     .ok_or_else(crate::compute::unavailable)?;
-                let started = isolation
-                    .start(placement.resources, placement.authority)
-                    .await?;
+                let lifecycle_id = format!("{}{open_span}", crate::isolated::PREFIX);
+                let principal_id = access.actor.principal_id.clone();
+                let reservation_id = lifecycle_id.clone();
+                self.control_db(move |db| {
+                    let mut tx = db.transaction().map_err(|_| ApiError::internal())?;
+                    crate::compute_lifecycle::reserve(
+                        &mut tx,
+                        &reservation_id,
+                        principal_id.as_deref(),
+                        "isolated",
+                        placement.resources,
+                    )?;
+                    tx.commit().map_err(|_| ApiError::internal())
+                })
+                .await?;
+                let started = match isolation
+                    .start(placement.resources, open_span, placement.authority)
+                    .await
+                {
+                    Ok(started) => started,
+                    Err(error) => {
+                        self.release(Some(lifecycle_id)).await;
+                        return Err(error);
+                    }
+                };
                 // From here a session pod exists, so every exit below releases it. The
                 // worker's own response is still relayed unchanged on the way out: it
                 // says why it refused, and replacing that with a gateway error would
@@ -2376,6 +2406,19 @@ async fn workers(
     })))
 }
 
+async fn compute_report(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Json<Value>, ApiError> {
+    app.authorize_action(&identity, Action::FleetRead, None)
+        .await?;
+    let rate = app.rate.clone();
+    let lifecycles = app
+        .control_db(move |db| crate::compute_lifecycle::report(db, &rate))
+        .await?;
+    Ok(Json(json!({"lifecycles": lifecycles})))
+}
+
 async fn pool_discovery(
     State(app): State<Gateway>,
     Extension(identity): Extension<Identity>,
@@ -2509,6 +2552,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
     })?;
     let maintenance_config = crate::platform::MaintenanceConfig::from_env()?;
     let schema_wait = crate::platform::schema_wait()?;
+    let compute_policy = crate::compute_lifecycle::Policy::from_env()?;
     let schema_dsn = platform_dsn.clone();
     let maintenance_schema_dsn = maintenance_dsn.clone();
     let storage_schema = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
@@ -2522,6 +2566,8 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             crate::db_roles::RuntimeRole::Maintainer,
         )?;
         authz::validate_namespace(&mut maintenance_db)?;
+        crate::compute_lifecycle::publish_policy(&mut db, &compute_policy)
+            .map_err(|error| anyhow::anyhow!(error.1))?;
         Ok(db.query_one("SELECT current_schema()", &[])?.get(0))
     })
     .await??;
@@ -2634,7 +2680,9 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
                 .await
                 .entry(pod.clone())
                 .or_insert_with(Instant::now);
-            app.recover_retired(pod).await;
+            if app.finish_lifecycle(&pod, Some("gateway_restarted")).await {
+                app.recover_retired(pod).await;
+            }
         }
         tracing::info!("isolated compute is available");
     }
@@ -2655,6 +2703,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/usage", get(usage_events))
         .route("/v1/budget", get(budget).put(set_budget))
         .route("/v1/workers", get(workers))
+        .route("/v1/compute", get(compute_report))
         .route("/v1/pools", get(pool_discovery))
         .route("/v1/pools/reload", post(reload_pools))
         .route("/v1/principals", get(list_principals))

@@ -31,12 +31,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=du
 # ubuntu 24.04 for glibc >= 2.39, which the forked dbt binary (built on that
 # toolchain) requires. duckfleet-server (glibc 2.36, built on bookworm) runs here too.
 FROM ubuntu:24.04 AS runtime
-ARG DBT_RELEASE=duckfleet-v0.1.4
+ARG DBT_RELEASE=duckfleet-v0.1.5
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 && rm -rf /var/lib/apt/lists/*
 # The forked dbt-core binary (embeds AdapterType::DuckFleet).
-RUN curl -fsSL -o /tmp/dbt.tgz "https://github.com/athvin/dbt/releases/download/${DBT_RELEASE}/dbt-linux-x86_64.tar.gz" \
+RUN case "${TARGETARCH}" in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; *) echo "unsupported dbt architecture: ${TARGETARCH}" >&2; exit 1 ;; esac \
+    && base="https://github.com/athvin/dbt/releases/download/${DBT_RELEASE}/dbt-linux-${arch}.tar.gz" \
+    && curl -fsSL -o /tmp/dbt.tgz "${base}" \
+    && curl -fsSL -o /tmp/dbt.tgz.sha256 "${base}.sha256" \
+    && echo "$(cut -d' ' -f1 /tmp/dbt.tgz.sha256)  /tmp/dbt.tgz" | sha256sum --check \
     && tar -C /usr/local/bin -xzf /tmp/dbt.tgz dbt \
-    && rm /tmp/dbt.tgz && chmod +x /usr/local/bin/dbt
+    && rm /tmp/dbt.tgz /tmp/dbt.tgz.sha256 && chmod +x /usr/local/bin/dbt
 # duckfleet-server is dynamically linked against libduckdb, so carry the lib even
 # though the harness role never opens a local database.
 COPY --from=build /usr/local/lib/libduckdb.so /usr/local/lib/libduckdb.so

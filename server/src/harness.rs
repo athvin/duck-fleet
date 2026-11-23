@@ -651,12 +651,30 @@ async fn cold_start_checks(ctx: &Ctx) -> anyhow::Result<()> {
         "the second isolated pod reused the first",
     )?;
     second.close().await?;
+    let lifecycle = request_json(&ctx.client()?, Method::GET, "/v1/compute", None).await?;
+    let isolated_lifecycles: Vec<_> = lifecycle["lifecycles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["pool"] == "isolated")
+        .collect();
+    require(
+        isolated_lifecycles.len() >= 2
+            && isolated_lifecycles.iter().all(|entry| {
+                entry["state"] == "terminated"
+                    && entry["measured_usage"]["cpu_seconds"].is_number()
+                    && entry["measured_usage"]["idle_ms"].is_number()
+                    && entry["estimated_provider_cost"]["micro_usd"].is_number()
+            }),
+        "isolated lifecycle usage or estimated cost is incomplete",
+    )?;
     write_artifact(
         "cold-start.json",
         &serde_json::to_string_pretty(&json!({
             "persistent_open_seconds": (warm_persistent * 100.0).round() / 100.0,
             "isolated_cold_open_seconds": (cold_isolated * 100.0).round() / 100.0,
             "isolated_warm_node_open_seconds": (warm_isolated * 100.0).round() / 100.0,
+            "lifecycle_usage": isolated_lifecycles,
         }))?,
     );
     require(

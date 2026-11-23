@@ -180,6 +180,23 @@ impl Kube {
         Self::expect_success(status, body, "reading a session pod").map(Some)
     }
 
+    pub async fn pod_log(&self, name: &str) -> Result<String> {
+        let response = self
+            .client
+            .get(format!("{}/{name}/log?tailLines=200", self.pods))
+            .bearer_auth(self.token()?)
+            .send()
+            .await
+            .context("reading a failed session pod log")?;
+        let status = response.status();
+        let text = response.text().await?;
+        anyhow::ensure!(
+            status.is_success(),
+            "reading a failed session pod log: {status}"
+        );
+        Ok(text)
+    }
+
     /// Deletes a pod, treating an already-absent pod as success: both callers want
     /// the pod gone, and racing a garbage collector is not a failure.
     pub async fn delete_pod(&self, name: &str) -> Result<()> {

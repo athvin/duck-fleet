@@ -35,7 +35,7 @@ case "$mode" in
     [[ -n "$template" ]] || { echo 'Apply the current chart before restoring' >&2; exit 1; }
     version=$("${kube[@]}" get job "$template" \
       -o jsonpath='{.metadata.annotations.duckfleet\.io/platform-schema}')
-    [[ "$version" == 5 ]] || { echo 'Stop compute and apply the schema 5 chart/image before restoring' >&2; exit 1; }
+    [[ "$version" == 5 ]] || { echo 'Stop compute and apply the schema 6 chart/image before restoring' >&2; exit 1; }
     bash "$ROOT/scripts/stop-compute.sh" kube
     ;;
   *) echo "unknown mode: $mode (compose or kube)" >&2; exit 64 ;;

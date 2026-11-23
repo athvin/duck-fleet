@@ -30,6 +30,8 @@ cleanup() {
     "${KUBE[@]}" logs -l app=duckfleet-worker --tail=200 --prefix > artifacts/kind/workers.log 2>&1 || true
     "${KUBE[@]}" logs -l app=duckfleet-gateway --tail=200 --prefix > artifacts/kind/gateway.log 2>&1 || true
     "${KUBE[@]}" logs -l app=duckfleet-platform-migrate --tail=200 --prefix > artifacts/kind/migrations.log 2>&1 || true
+    "${KUBE[@]}" logs -l duckfleet-compute=isolated --tail=200 --prefix > artifacts/kind/isolated.log 2>&1 || true
+    "${KUBE[@]}" logs job/duckfleet-jobs --tail=200 --all-containers --prefix > artifacts/kind/jobs.log 2>&1 || true
     # A restarted container's death is only in its previous instance's log and its
     # recorded last state; without these a crash reads as a mystery restart.
     "${KUBE[@]}" logs -l app=duckfleet-worker --tail=200 --prefix --previous > artifacts/kind/workers-previous.log 2>&1 || true

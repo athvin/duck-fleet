@@ -44,6 +44,7 @@ def main():
     args = parser.parse_args()
 
     deadline = time.monotonic() + args.timeout
+    previous_isolated_logs = ""
     while True:
         result = kubectl(["get", "job", args.job, "-o", "json"], args.context, args.namespace)
         job = json.loads(result.stdout)
@@ -56,11 +57,25 @@ def main():
             logs = kubectl(["logs", f"job/{args.job}", "--all-containers", "--tail=200"],
                            args.context, args.namespace, check=False)
             print(logs.stdout or logs.stderr, file=sys.stderr)
+            isolated = kubectl(
+                ["logs", "-l", "duckfleet-compute=isolated", "--all-containers",
+                 "--prefix", "--tail=200"],
+                args.context, args.namespace, check=False,
+            )
+            print(isolated.stdout or isolated.stderr, file=sys.stderr)
             return 1
         if time.monotonic() >= deadline:
             status = job.get("status", {})
             print(f"{args.job} did not finish within {args.timeout}s: {status}", file=sys.stderr)
             return 1
+        isolated = kubectl(
+            ["logs", "-l", "duckfleet-compute=isolated", "--all-containers",
+             "--prefix", "--tail=200"],
+            args.context, args.namespace, check=False,
+        )
+        if isolated.stdout and isolated.stdout != previous_isolated_logs:
+            print(isolated.stdout, file=sys.stderr)
+            previous_isolated_logs = isolated.stdout
         active = job.get("status", {}).get("active", 0)
         print(f"waiting: {args.job} active={active}", flush=True)
         time.sleep(args.poll_seconds)

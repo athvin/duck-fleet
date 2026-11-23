@@ -113,6 +113,22 @@ results:
 # Each supplied envelope is complete; per-pool jobLimits may lower it separately.
 jobPolicy: {}
 
+# Optional deployment/principal compute ceilings and lifecycle deadlines. Empty
+# preserves fixed-capacity admission with no additional limits. Values use runtime
+# JSON field names. Idle timeout applies only with no active query; maximum
+# lifetime interrupts active work and rolls its session back on close.
+computePolicy: {}
+# Example:
+# computePolicy:
+#   max_cpu: 8
+#   max_memory_bytes: 17179869184
+#   max_disk_bytes: 34359738368
+#   max_principal_cpu: 2
+#   max_principal_memory_bytes: 4294967296
+#   max_principal_disk_bytes: 8589934592
+#   idle_timeout_seconds: 300
+#   max_lifetime_seconds: 1800
+
 # The Postgres wire-protocol front: psql and simple-protocol drivers speak to
 # the gateway on 5432 with a platform credential as the password, through the
 # same sessions, principals, and meters as everything else. Off by default —

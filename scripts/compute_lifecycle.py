@@ -11,7 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-PLATFORM_SCHEMA = 5
+PLATFORM_SCHEMA = 6
 SCHEMA_MARKER = 'duckfleet.io/platform-schema'
 GATEWAY = 'duckfleet-gateway'
 WORKER = 'duckfleet-worker'

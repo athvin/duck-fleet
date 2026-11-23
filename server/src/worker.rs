@@ -152,6 +152,10 @@ pub(crate) struct Worker {
     runtime: tokio::runtime::Handle,
     profiling_enabled: bool,
     result_store: Option<artifacts::Store>,
+    lifecycle_id: String,
+    lifecycle_policy: crate::compute_lifecycle::Policy,
+    lifecycle_started: Instant,
+    last_activity: Instant,
     redactor: Redactor,
     status: crate::worker_status::Status,
     queue: Arc<queue_service::Service>,
@@ -773,6 +777,26 @@ impl Worker {
         }
         placement["max_queued_queries"] = json!(limits.max_queued_queries);
         placement["max_queued_bytes"] = json!(limits.max_queued_bytes);
+        let lifecycle_policy = crate::compute_lifecycle::Policy::from_env()?;
+        crate::compute_lifecycle::publish_policy(&mut ledger, &lifecycle_policy)
+            .map_err(|error| anyhow::anyhow!(error.1))?;
+        let lifecycle_id = std::env::var("DUCKFLEET_LIFECYCLE_ID").ok();
+        if lifecycle_id.is_none() {
+            let id = format!("{worker_id}:{}", status.boot_id());
+            let mut tx = ledger.transaction()?;
+            crate::compute_lifecycle::reserve(&mut tx, &id, None, &scope, resources)
+                .map_err(|error| anyhow::anyhow!(error.1))?;
+            tx.commit()?;
+        }
+        let lifecycle_id =
+            lifecycle_id.unwrap_or_else(|| format!("{worker_id}:{}", status.boot_id()));
+        crate::compute_lifecycle::ready(
+            &mut ledger,
+            &lifecycle_id,
+            &worker_id,
+            &status.boot_id().to_string(),
+        )
+        .map_err(|error| anyhow::anyhow!(error.1))?;
         Ok(Self {
             root,
             resources,
@@ -809,6 +833,10 @@ impl Worker {
                     .map(artifacts::StoreConfig::build)
                     .transpose()?,
             },
+            lifecycle_id,
+            lifecycle_policy,
+            lifecycle_started: Instant::now(),
+            last_activity: Instant::now(),
             status,
             queue,
             ownership,
@@ -830,6 +858,7 @@ impl Worker {
                 self.queue.stop();
                 break;
             }
+            self.enforce_lifecycle_deadlines();
             for id in self.queue.take_close_ready() {
                 // Storage has already made closing durable and released all
                 // outstanding work. Drop the real connection before close ACK.
@@ -934,9 +963,29 @@ impl Worker {
                 None => {}
             }
         }
+        let _ = crate::compute_lifecycle::finish(&mut self.ledger.client, &self.lifecycle_id, None);
+    }
+
+    fn enforce_lifecycle_deadlines(&mut self) {
+        let (idle, maximum) = crate::compute_lifecycle::deadlines(&self.lifecycle_policy);
+        if maximum.is_some_and(|limit| self.lifecycle_started.elapsed() >= limit) {
+            interrupt(&self.active, None, None, "compute_lifetime_exceeded");
+            self.queue.stop();
+            return;
+        }
+        if idle.is_some_and(|limit| self.last_activity.elapsed() >= limit)
+            && self
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none()
+        {
+            self.queue.stop();
+        }
     }
 
     fn respond(&mut self, envelope: Envelope) {
+        self.last_activity = Instant::now();
         let response = self.handle(envelope.op);
         self.status.set_sessions(self.sessions.len());
         let _ = envelope.reply.send(response);
@@ -1366,6 +1415,8 @@ impl Worker {
                 ApiError::new(failure, "job refused before engine entry"),
             );
         }
+        let _ =
+            crate::compute_lifecycle::activity(&mut self.ledger.client, &self.lifecycle_id, true);
         let started = Instant::now();
         let started_at = SystemTime::now();
         let until = started + Duration::from_secs(admission.deadline_seconds);
@@ -1423,6 +1474,8 @@ impl Worker {
             (result, completion, reason, rows)
         };
         monitor.abort();
+        let _ =
+            crate::compute_lifecycle::activity(&mut self.ledger.client, &self.lifecycle_id, false);
         if self.ownership.is_closed() && completion == engine_stream::EngineCompletion::Pending {
             reason = Some("ownership_lost");
         }
@@ -1594,6 +1647,8 @@ impl Worker {
                 ApiError::new(failure, "query refused before engine entry"),
             );
         }
+        let _ =
+            crate::compute_lifecycle::activity(&mut self.ledger.client, &self.lifecycle_id, true);
         let engine_started_at = SystemTime::now();
         let started = Instant::now();
         let active = self.active.clone();
@@ -1620,6 +1675,8 @@ impl Worker {
             reason = Some("ownership_lost");
         }
         deadline.abort();
+        let _ =
+            crate::compute_lifecycle::activity(&mut self.ledger.client, &self.lifecycle_id, false);
         let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
         let capture = session.profile.capture(cleared);
         session.profile.clear();

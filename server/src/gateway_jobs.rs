@@ -144,6 +144,32 @@ impl Gateway {
                     jobs::inspect_binding(db, &binding).map_err(|_| ApiError::internal())
                 })
                 .await?;
+            let lifecycle_id = pod_name.clone();
+            let principal_id = claim.principal_id.clone();
+            let reserved = self
+                .control_db(move |db| {
+                    let mut tx = db.transaction().map_err(|_| ApiError::internal())?;
+                    crate::compute_lifecycle::reserve(
+                        &mut tx,
+                        &lifecycle_id,
+                        principal_id.as_deref(),
+                        "isolated",
+                        claim.placement.resources,
+                    )?;
+                    tx.commit().map_err(|_| ApiError::internal())
+                })
+                .await;
+            if let Err(error) = reserved {
+                if error.0 == failure::CAPACITY {
+                    self.control_db(move |db| {
+                        jobs::refuse_unbound(db, &token, failure::CAPACITY)
+                            .map_err(|_| ApiError::internal())
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                return Err(error);
+            }
             let pod = isolation
                 .start_job(
                     claim.placement.resources,
@@ -311,6 +337,7 @@ impl Gateway {
             let rate = self.rate.clone();
             let recovered = self
                 .control_db(move |db| {
+                    crate::compute_lifecycle::finish(db, &pod.pod_name, Some("job_pod_retired"))?;
                     queue::recover_isolated(db, &worker, &rate)
                         .map_err(|_| ApiError::internal())?;
                     jobs::confirm_pod_cleanup(db, &pod).map_err(|_| ApiError::internal())

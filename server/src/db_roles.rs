@@ -68,6 +68,9 @@ const QUEUE_TABLES: &[&str] = &[
     "job_bindings",
     "job_dispatch_fairness",
     "job_artifacts",
+    "compute_lifecycles",
+    "compute_reservations",
+    "compute_policies",
 ];
 const POLICY_TABLES: &[&str] = &[
     "platform_namespace",

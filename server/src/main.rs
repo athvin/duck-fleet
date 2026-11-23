@@ -7,6 +7,7 @@ mod cli;
 #[allow(dead_code)]
 mod client;
 mod compute;
+mod compute_lifecycle;
 mod credentials;
 mod db_roles;
 mod engine_stream;

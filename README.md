@@ -1061,6 +1061,41 @@ What this does not yet cover: conflict rates under genuine parallel load, automa
 or coordinated retry, locking or reservations that would prevent a conflict, and
 cleanup of the data files a losing transaction already wrote to object storage.
 
+## Compute lifecycle and provisioned usage
+
+`GET /v1/compute` uses the same fleet-read permission as `/v1/workers` and reports
+up to 500 recent lifecycle records. Each includes the authenticated principal,
+pool, worker/boot identity, state, failure kind, requested/provisioning/ready/
+activity/termination timestamps, execution duration, and measured
+`cpu_seconds`, `gib_seconds`, `startup_ms`, `idle_ms`, and utilization. Standing
+persistent capacity appears alongside isolated sessions, including failed
+provisioning. The `estimated_provider_cost` object uses the deployment rate card
+and is explicitly `estimate_only_not_reconciled_provider_billing`; it is not an
+AWS invoice, node-packing allocation, or minimum cloud charge. This is separate
+from the immutable query rate-card events in `/v1/usage`.
+
+`DUCKFLEET_COMPUTE_POLICY_JSON` (chart `computePolicy`) optionally bounds total
+and per-principal CPU, memory, and ephemeral disk before an isolated pod is
+created. Reservation and lifecycle insert commit atomically under a database
+advisory lock, so competing opens cannot oversubscribe an allowance. `max_cpu`,
+`max_memory_bytes`, and `max_disk_bytes` are deployment ceilings;
+`max_principal_*` applies to one authenticated principal. Refusals happen before
+provisioning and are visible without starting a worker. No ceilings are imposed
+by default.
+
+`idle_timeout_seconds` stops an idle worker only when no query is active.
+`max_lifetime_seconds` bounds the whole worker, interrupting active SQL; closing
+the session rolls back uncommitted work. Both accept 1–86400 seconds and are
+unset by default. The existing isolated `maxSessionSeconds` kubelet backstop and
+statement/query deadlines remain in force. Failed provisioning, cancellation,
+and confirmed pod removal settle reservations once; an unresolved owner does not
+release capacity early. The platform schema is version 6.
+
+`artifacts/cold-start.json` records the named warm/cold fixture and its lifecycle
+usage/cost, including persistent open, isolated cold open and warm-node open.
+The PostgreSQL fixture covers competing opens at a one-CPU cap, failed
+provisioning, repeated settlement, and report fields.
+
 ## Metering and budgets
 
 Every accepted execution is metered. Admission reserves funds before any SQL runs,

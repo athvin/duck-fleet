@@ -230,6 +230,9 @@ pub(super) fn remove_job_fixture_schema(client: &mut Client) -> Result<()> {
     let current: i32 = client
         .query_one("SELECT MAX(version) FROM platform_schema_migrations", &[])?
         .get(0);
+    if current >= 6 {
+        client.batch_execute("DROP TABLE compute_lifecycles,compute_reservations,compute_policies; DELETE FROM platform_schema_migrations WHERE version=6;")?;
+    }
     if current < 5 {
         return Ok(());
     }
@@ -634,8 +637,157 @@ fn checks_in_schema(client: &mut Client, config: &postgres::Config) -> Result<()
     maintenance_lock_failure(client, config, &cfg)?;
     retention_checks(client, &cfg)?;
     maintenance_fairness(client, config)?;
+    compute_lifecycle_checks(client, config)?;
     concurrent_accounting(client, config, &cfg)?;
     startup_scaling(client, config)?;
+    Ok(())
+}
+
+fn compute_lifecycle_checks(client: &mut Client, config: &postgres::Config) -> Result<()> {
+    client.batch_execute("DELETE FROM compute_reservations; DELETE FROM compute_lifecycles")?;
+    crate::compute_lifecycle::publish_policy(
+        client,
+        &crate::compute_lifecycle::Policy {
+            max_cpu: Some(1),
+            max_memory_bytes: Some(1 << 30),
+            max_disk_bytes: Some(2 << 30),
+            max_principal_cpu: Some(1),
+            max_principal_memory_bytes: Some(1 << 30),
+            max_principal_disk_bytes: Some(2 << 30),
+            idle_timeout_seconds: Some(1),
+            max_lifetime_seconds: Some(60),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error.1))?;
+    let resources = crate::compute::Resources::default();
+    let first_id = format!("lifecycle-{}", Uuid::new_v4());
+    let mut first = client.transaction()?;
+    crate::compute_lifecycle::reserve(
+        &mut first,
+        &first_id,
+        Some("principal-a"),
+        "isolated",
+        resources,
+    )
+    .map_err(|error| anyhow::anyhow!(error.1))?;
+    first.commit()?;
+    let mut repeated = client.transaction()?;
+    crate::compute_lifecycle::reserve(
+        &mut repeated,
+        &first_id,
+        Some("principal-a"),
+        "isolated",
+        resources,
+    )
+    .map_err(|error| anyhow::anyhow!(error.1))?;
+    repeated.commit()?;
+    require(
+        client.query_one(
+            "SELECT count(*) FROM compute_reservations WHERE lifecycle_id=$1 AND released_at IS NULL",
+            &[&first_id],
+        )?.get::<_, i64>(0) == 1,
+        "a dispatcher retry duplicated its lifecycle reservation",
+    )?;
+    let mut other = config.connect(NoTls)?;
+    let mut competing = other.transaction()?;
+    let second_id = format!("lifecycle-{}", Uuid::new_v4());
+    let refused = crate::compute_lifecycle::reserve(
+        &mut competing,
+        &second_id,
+        Some("principal-b"),
+        "isolated",
+        resources,
+    )
+    .expect_err("a concurrent open must not oversubscribe the one-CPU cap");
+    require(
+        refused.0.kind == crate::failure::CAPACITY.kind,
+        "wrong resource refusal kind",
+    )?;
+    drop(competing);
+    crate::compute_lifecycle::ready(client, &first_id, "isolated-fixture", "boot-fixture")
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    crate::compute_lifecycle::activity(client, &first_id, true)
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    crate::compute_lifecycle::activity(client, &first_id, false)
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    crate::compute_lifecycle::finish(client, &first_id, Some("failed_provisioning"))
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    crate::compute_lifecycle::finish(client, &first_id, None)
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    let mut retry = other.transaction()?;
+    crate::compute_lifecycle::reserve(
+        &mut retry,
+        &second_id,
+        Some("principal-b"),
+        "isolated",
+        resources,
+    )
+    .map_err(|error| anyhow::anyhow!(error.1))?;
+    retry.commit()?;
+    crate::compute_lifecycle::ready(client, &second_id, "restart-fixture", "boot-before-restart")
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    crate::compute_lifecycle::finish_worker(client, "restart-fixture")
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    crate::compute_lifecycle::finish_worker(client, "restart-fixture")
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    let restarted = client.query_one(
+        "SELECT state,failure_kind FROM compute_lifecycles WHERE lifecycle_id=$1",
+        &[&second_id],
+    )?;
+    require(
+        restarted.get::<_, String>(0) == "terminated"
+            && restarted.get::<_, Option<String>>(1).as_deref() == Some("worker_restarted"),
+        "restart recovery did not settle the previous boot exactly once",
+    )?;
+    let active: i64 = client
+        .query_one(
+            "SELECT count(*) FROM compute_reservations WHERE released_at IS NULL",
+            &[],
+        )?
+        .get(0);
+    require(active == 0, "lifecycle settlement leaked a reservation")?;
+    let reports = crate::compute_lifecycle::report(client, &rate())
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    let first = reports
+        .iter()
+        .find(|report| report["lifecycle_id"] == first_id)
+        .context("missing lifecycle report")?;
+    require(
+        first["failure_kind"] == "failed_provisioning",
+        "failure evidence missing",
+    )?;
+    require(
+        first["measured_usage"]["cpu_seconds"].is_number(),
+        "missing measured CPU-seconds",
+    )?;
+    require(
+        first["measured_usage"]["gib_seconds"].is_number(),
+        "missing measured GiB-seconds",
+    )?;
+    require(
+        first["measured_usage"]["startup_ms"].is_number(),
+        "missing startup duration",
+    )?;
+    require(
+        first["measured_usage"]["idle_ms"].is_number(),
+        "missing idle duration",
+    )?;
+    require(
+        first["execution_ms"].is_number(),
+        "missing execution duration",
+    )?;
+    require(
+        first["measured_usage"]["utilization"].is_number(),
+        "missing utilization",
+    )?;
+    require(
+        first["estimated_provider_cost"]["basis"]
+            == "estimate_only_not_reconciled_provider_billing",
+        "estimated cost was presented as reconciled billing",
+    )?;
+    println!(
+        "PASS: competing compute admission, failed provisioning, idle deadlines, idempotent settlement and lifecycle reporting"
+    );
     Ok(())
 }
 

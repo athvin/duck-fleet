@@ -177,8 +177,13 @@ impl Isolation {
     /// No path here falls back to a persistent worker. A caller asking for isolation
     /// is asking for a guarantee, and quietly serving it from shared compute would
     /// void that guarantee while looking like success.
-    pub async fn start(&self, wanted: Resources, authority: Authority) -> Result<Pod, ApiError> {
-        let name = format!("{PREFIX}{}", uuid::Uuid::new_v4());
+    pub async fn start(
+        &self,
+        wanted: Resources,
+        lifecycle_id: uuid::Uuid,
+        authority: Authority,
+    ) -> Result<Pod, ApiError> {
+        let name = format!("{PREFIX}{lifecycle_id}");
         let spec = specify_with_authority(&self.template, &self.owner, &name, wanted, authority)
             .map_err(|error| {
                 tracing::error!(%error, "could not build a session pod from the template");
@@ -403,10 +408,21 @@ impl Isolation {
             }
             let phase = pod["status"]["phase"].as_str().unwrap_or("");
             if phase == "Failed" || phase == "Succeeded" {
+                match self.kube.pod_log(name).await {
+                    Ok(log) => {
+                        tracing::error!(pod = name, %log, "session pod stopped before readiness")
+                    }
+                    Err(error) => tracing::warn!(
+                        pod = name,
+                        error = format!("{error:#}"),
+                        "could not retain failed session pod log"
+                    ),
+                }
                 return Err(ApiError::new(
                     failure::NOT_PLACEABLE,
                     format!(
-                        "the session pod stopped before it was ready ({phase}); no statement ran"
+                        "the session pod stopped before it was ready ({phase}); no statement ran: {}",
+                        pod["status"]["containerStatuses"][0]["lastState"]
                     ),
                 ));
             }
@@ -631,6 +647,7 @@ fn specify_with_authority(
             secret["valueFrom"]["secretKeyRef"]["key"] = json!("CATALOG_READER_DSN");
         }
     }
+    environment.push(json!({"name":"DUCKFLEET_LIFECYCLE_ID","value":name}));
     // cpu, memory and disk are all sized per session; requests equal limits because a
     // dedicated pod has no neighbour to borrow headroom from. Anything else the
     // release asked for is left exactly as it was rendered.
