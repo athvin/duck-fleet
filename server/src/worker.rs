@@ -218,6 +218,53 @@ fn catalog_attach_pending(message: &str) -> bool {
         && message.contains("key (typname, typnamespace)=(ducklake_metadata,")
 }
 
+const EXPECTED_DUCKDB_VERSION: &str = "v2.0.1";
+const EXPECTED_EXTENSIONS: &[(&str, &str)] = &[
+    ("aws", "9ba41b09a0"),
+    ("ducklake", "08089b16dc"),
+    ("httpfs", "f71cfdb4bf"),
+    ("icu", "v2.0.1"),
+    ("postgres_scanner", "8b9d0bbe8d"),
+];
+
+fn verify_engine_manifest(conn: &Connection) -> Result<()> {
+    let version: String = conn.query_row("SELECT version()", [], |row| row.get(0))?;
+    anyhow::ensure!(
+        version == EXPECTED_DUCKDB_VERSION,
+        "unexpected DuckDB engine {version}"
+    );
+    for (name, expected) in EXPECTED_EXTENSIONS {
+        let (version, loaded): (String, bool) = conn.query_row(
+            "SELECT extension_version, loaded FROM duckdb_extensions() WHERE extension_name=?",
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        anyhow::ensure!(
+            loaded && version == *expected,
+            "unexpected {name} extension {version}"
+        );
+    }
+    let repositories: String = conn.query_row(
+        "SELECT current_setting('allow_extension_repositories')",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        repositories == "forbidden",
+        "extension repositories are not forbidden"
+    );
+    let catalog: String = conn.query_row(
+        "SELECT value FROM lake.options() WHERE option_name='version'",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        catalog == "1.0",
+        "unexpected DuckLake catalog version {catalog}"
+    );
+    Ok(())
+}
+
 /// Retries an attempt that cannot succeed until a dependency is listening.
 ///
 /// DNS and PostgreSQL can both be unready when a pod starts. Exiting makes the
@@ -607,6 +654,9 @@ impl Worker {
             "disabling data inlining",
             "CALL ducklake_set_option('lake', 'data_inlining_row_limit', 0)",
         )?;
+        startup.inspect("verifying the engine and catalog manifest", |conn| {
+            verify_engine_manifest(conn)
+        })?;
         let root = startup.into_connection();
         placement["duckdb_threads"] = json!(root.query_row(
             "SELECT current_setting('threads')::BIGINT",

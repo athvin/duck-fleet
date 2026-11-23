@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parent.parent
 IMAGES = {
@@ -296,6 +297,92 @@ def recovery_drill(base, env, baseline_tag, candidate_tag, directory):
         (directory / "recovery.json").write_text(json.dumps(evidence, indent=2) + "\n")
 
 
+def cli_json(base, env, args):
+    command = base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", *args]
+    result = run(command, env=env, check=False)
+    if result.returncode:
+        raise RuntimeError(f"CLI command failed: {args}: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def cutover_drill(base, env, baseline_tag, candidate_tag, directory, skip_dbt):
+    evidence = {"drained_statement": False, "old_writers": 0, "passed": False}
+    log = directory / "cutover.log"
+    process = None
+    try:
+        run(["bash", str(ROOT / "scripts/backup-catalog.sh"), "compose", str(directory / "cutover-point")], env=env, log=log)
+        with log.open("a") as handle:
+            process = subprocess.Popen(
+                base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", "SELECT sum(sin(i)) FROM range(100000000000) AS source(i)"],
+                cwd=ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT,
+            )
+        observed = False
+        for _ in range(30):
+            workers = cli_json(base, env, ["workers"])["workers"]
+            if any(worker.get("active_queries", 0) > 0 for worker in workers):
+                observed = True
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.5)
+        if not observed:
+            raise RuntimeError("the cutover statement never became active")
+        run(["bash", str(ROOT / "scripts/stop-compute.sh"), "compose"], env=env, log=log)
+        result = process.wait(timeout=120)
+        process = None
+        if result != 0:
+            raise RuntimeError(f"the active statement did not drain successfully: {result}; see {log}")
+        evidence["drained_statement"] = True
+        refused = run(base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", "SELECT 1"], env=env, check=False)
+        if refused.returncode == 0:
+            raise RuntimeError("stopped compute accepted new SQL")
+
+        env["DUCKFLEET_IMAGE_TAG"] = candidate_tag
+        env["DUCKFLEET_DBT_IMAGE_TAG"] = candidate_tag
+        env["DUCKFLEET_API_IMAGE_TAG"] = candidate_tag
+        run(base + ["up", "-d", "--wait", "server"], env=env, log=log)
+        cli_scalar(base, env, "SELECT version() AS value", "v2.0.1")
+        cli_scalar(base, env, "SELECT value FROM lake.options() WHERE option_name='version'", "1.0")
+        workers = cli_json(base, env, ["workers"])["workers"]
+        if not workers or any(worker.get("duckdb_version") != "v2.0.1" for worker in workers):
+            raise RuntimeError(f"an old or unknown engine remains after cutover: {workers}")
+
+        expected_image = image_evidence(candidate_tag)["duckfleet-worker:" + candidate_tag]["id"]
+        ids = output(base + ["ps", "--status", "running", "--quiet"], env=env).split()
+        old = []
+        for container in ids:
+            inspected = json.loads(output(["docker", "inspect", container]))[0]
+            environment = dict(item.split("=", 1) for item in inspected["Config"].get("Env", []) if "=" in item)
+            if (environment.get("DUCKFLEET_ROLE") == "gateway" or "DUCKFLEET_WORKER_ID" in environment) and inspected["Image"] != expected_image:
+                old.append(inspected["Name"])
+        if old:
+            raise RuntimeError(f"1.5.4 writers remain after cutover: {old}")
+        evidence["old_writers"] = 0
+
+        pgwire_checks(base, env, directory)
+        smoke = ["http", "pgwire"]
+        if not skip_dbt:
+            run(base + ["run", "--rm", "dbt", "dbt", "debug"], env=env, log=log)
+            run(base + ["run", "--rm", "dbt", "duckfleet-server", "--jobs"], env=env, log=log)
+            smoke.extend(["dbt", "jobs", "artifacts"])
+        run(base + ["run", "--rm", "dbt", "duckfleet-server", "--maintenance"], env=env, log=log)
+        run(base + ["run", "--rm", "dbt", "duckfleet-server", "--rbac"], env=env, log=log)
+        cli_json(base, env, ["history", "--limit", "5"])
+        evidence["smoke"] = smoke + ["maintenance", "rbac", "history"]
+        evidence["engine"] = "v2.0.1"
+        evidence["catalog_version"] = "1.0"
+        evidence["passed"] = True
+        return evidence
+    except Exception as error:
+        evidence["error"] = str(error)
+        raise
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        (directory / "cutover.json").write_text(json.dumps(evidence, indent=2) + "\n")
+
+
 def run_lane(name, project, tag, version, directory, override, corpus_tag, skip_dbt):
     directory.mkdir(parents=True, exist_ok=True)
     artifacts = directory / "artifacts"
@@ -409,10 +496,14 @@ def main():
         summary["recovery"] = recovery_drill(
             *runtime["candidate"], args.baseline_tag, args.candidate_tag, output / "candidate"
         )
+        summary["cutover"] = cutover_drill(
+            *runtime["candidate"], args.baseline_tag, args.candidate_tag, output / "candidate", args.skip_dbt
+        )
         summary["passed"] = bool(
             summary["isolation"]["passed"]
             and summary["comparison"]["passed"]
             and summary["recovery"]["passed"]
+            and summary["cutover"]["passed"]
             and all(lane.get("passed") for lane in summary["lanes"].values())
         )
         print(json.dumps({"passed": summary["passed"], "output": str(output)}))
