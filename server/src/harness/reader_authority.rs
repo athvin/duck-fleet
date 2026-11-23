@@ -164,11 +164,7 @@ pub async fn checks(ctx: &Ctx) -> Result<()> {
         &format!("COPY (SELECT 1 AS id) TO '{data_path}reader-escape.parquet' (FORMAT PARQUET)"),
     )
     .await?;
-    sql(
-        &reader,
-        "SET allow_extension_repositories='forbidden'",
-    )
-    .await?;
+    sql(&reader, "SET allow_extension_repositories='forbidden'").await?;
     denied(&reader, "INSTALL fts").await?;
     sql(
         &reader,
