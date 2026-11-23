@@ -564,11 +564,11 @@ for listener in listeners:
 print(*(listener.getsockname()[1] for listener in listeners))
 for listener in listeners:
     listener.close()')
-"${team[@]}" port-forward "svc/server:$team_port:8080" > /dev/null 2>&1 &
+"${team[@]}" port-forward "svc/server:$team_port:8080" > artifacts/kind/team-port-forward.log 2>&1 &
 team_forward=$!
-"${KUBE[@]}" port-forward "svc/server:$source_port:8080" > /dev/null 2>&1 &
+"${KUBE[@]}" port-forward "svc/server:$source_port:8080" > artifacts/kind/source-port-forward.log 2>&1 &
 source_forward=$!
-python3 - "$team_port" "$source_port" <<'PY'
+if ! python3 - "$team_port" "$source_port" <<'PY'
 import sys, time, urllib.request
 ports = set(map(int, sys.argv[1:]))
 deadline = time.monotonic() + 60
@@ -585,6 +585,12 @@ while ports and time.monotonic() < deadline:
 if ports:
     raise SystemExit(f"gateway port-forwards did not become ready: {sorted(ports)}")
 PY
+then
+  kill -0 "$team_forward" 2> /dev/null || wait "$team_forward" || true
+  kill -0 "$source_forward" 2> /dev/null || wait "$source_forward" || true
+  cat artifacts/kind/team-port-forward.log artifacts/kind/source-port-forward.log
+  exit 1
+fi
 python3 scripts/kind/team_namespace_probe.py --port "$team_port" \
   --source-port "$source_port" --context "$CONTEXT" --namespace "$TEAM" --source-namespace "$NS"
 kill "$team_forward" 2> /dev/null || true
