@@ -166,7 +166,7 @@ pub async fn checks(ctx: &Ctx) -> Result<()> {
     .await?;
     sql(
         &reader,
-        "SET allow_extension_repositories='https://community-extensions.duckdb.org'",
+        "SET allow_extension_repositories='forbidden'",
     )
     .await?;
     denied(&reader, "INSTALL fts").await?;
