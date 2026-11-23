@@ -157,6 +157,9 @@ def main():
         gateways.append(second)
         print("PASS: a stale epoch was fenced and only an expired lease permitted orphan cleanup")
 
+        first.stop()
+        first = Gateway(context, namespace, wait_gateways(context, namespace)[0], token)
+        gateways.append(first)
         kubectl(context, namespace, ["scale", "statefulset/duckfleet-postgres", "--replicas=0"])
         time.sleep(2)
         expect_status(503, first.open)
@@ -188,7 +191,7 @@ def main():
             try:
                 owner.json("POST", f"/v1/sessions/{commit_session}/queries", {
                     "request_id": request_id,
-                    "sql": "INSERT INTO api_demo.ha_commit SELECT count(*) FROM range(4000000000) WHERE range % 7 = 3",
+                    "sql": "INSERT INTO api_demo.ha_commit SELECT count(*) FROM range(40000000000) WHERE range % 7 = 3",
                     "timeout_seconds": 58,
                 }, timeout=70)
             except Exception as error:
@@ -196,19 +199,33 @@ def main():
 
         thread = threading.Thread(target=write)
         thread.start()
-        time.sleep(3)
+        for _ in range(100):
+            state = sql(context, namespace,
+                        f"SELECT status FROM query_history WHERE query_id='{request_id}'")
+            if state == "running":
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the write did not reach running before the gateway kill")
         kubectl(context, namespace, ["delete", "pod", owner.name, "--grace-period=0", "--force", "--wait=false"])
         thread.join(timeout=75)
         assert outcome["error"] is not None, "an interrupted commit unexpectedly succeeded"
         wait_absent(context, namespace, commit_worker)
         for _ in range(120):
-            record = json.loads(call(second.port, token, "GET", f"/v1/queries/{request_id}"))
+            try:
+                record = json.loads(call(second.port, token, "GET", f"/v1/queries/{request_id}"))
+            except (urllib.error.URLError, ConnectionError):
+                time.sleep(1)
+                continue
             if record.get("status") not in {"running", "queued", "pending"}:
                 break
             time.sleep(1)
         attempts = sql(context, namespace,
                        f"SELECT count(*) FROM query_history WHERE query_id='{request_id}'")
         assert attempts == "1", attempts
+        second.stop()
+        second = Gateway(context, namespace, wait_gateways(context, namespace)[1], token)
+        gateways.append(second)
         probe = second.json("POST", "/v1/sessions", {})
         probe_id = probe["session_id"]
         second.query(probe_id, "SELECT CASE WHEN (SELECT count(*) FROM api_demo.ha_commit)=0 "
