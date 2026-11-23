@@ -112,7 +112,7 @@ def stop_compose():
                if container_role(item) == role and item['State']['Running']]
         if ids:
             # Project-scoped IDs include retired optional service names too.
-            run(['docker', 'stop', '-t', '90', *ids])
+            run(['docker', 'stop', '-t', '630', *ids])
     if any(container_role(item) and item['State']['Running'] for item in compose_containers()):
         raise ValueError('compute restarted during shutdown; do not migrate')
 
