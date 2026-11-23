@@ -129,7 +129,7 @@ impl Kube {
         let (status, body) = self
             .send(
                 Method::PATCH,
-                &format!("{}/{name}", self.deployments),
+                &format!("{}/{name}/scale", self.deployments),
                 Some(&patch),
             )
             .await?;
@@ -158,13 +158,14 @@ impl Kube {
             .bearer_auth(self.token()?)
             .header(reqwest::header::ACCEPT, "application/json");
         if let Some(body) = body {
-            request = request.json(body);
-        }
-        if method == Method::PATCH {
-            request = request.header(
-                reqwest::header::CONTENT_TYPE,
-                "application/merge-patch+json",
-            );
+            if method == Method::PATCH {
+                request = request.body(serde_json::to_vec(body)?).header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/merge-patch+json",
+                );
+            } else {
+                request = request.json(body);
+            }
         }
         let response = request.send().await.context("calling the Kubernetes API")?;
         let status = response.status();
@@ -516,6 +517,23 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn deployment_scaling_uses_the_scale_subresource() {
+        use axum::{http::HeaderMap, routing::patch};
+        let router = axum::Router::new().route(
+            "/apis/apps/v1/namespaces/test/deployments/pool/scale",
+            patch(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers[reqwest::header::CONTENT_TYPE],
+                    "application/merge-patch+json"
+                );
+                StatusCode::OK
+            }),
+        );
+        let api = test_support::FakeKube::serve(router).await;
+        api.kube.scale_deployment("pool", 1).await.unwrap();
     }
 
     #[tokio::test]
