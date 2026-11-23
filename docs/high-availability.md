@@ -14,9 +14,10 @@ error instead of deleting the worker. Worker-confirmed closure is safe to clean
 up through either replica.
 
 Startup cleanup deletes only unowned work, durable jobs, and sessions whose lease
-has expired. A second gateway starting does not delete a live sibling's isolated
-pod. Admission and credential policy remain in PostgreSQL rather than becoming
-independent per-process allowances.
+has expired. A five-second reconciliation retries expired leases after a replacement
+starts; it does not sweep newly starting, unregistered pods. A second gateway does
+not delete a live sibling's isolated pod. Admission and credential policy remain in
+PostgreSQL rather than becoming independent per-process allowances.
 
 ## Availability boundary
 
