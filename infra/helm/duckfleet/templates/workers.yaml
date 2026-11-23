@@ -42,7 +42,7 @@ spec:
       labels: {app: duckfleet-worker, size: {{ $size }}, duckfleet-pool: {{ $size }}, worker-index: {{ $index | quote }}}
     spec:
       {{- include "duckfleet.termination" . | nindent 6 }}
-      serviceAccountName: duckfleet-worker
+      serviceAccountName: {{ ternary "duckfleet-reader" "duckfleet-worker" (eq $pool.authority "reader") }}
       {{- include "duckfleet.placement" $ | nindent 6 }}
       securityContext:
         {{- include "duckfleet.podSecurity" . | nindent 8 }}
@@ -59,7 +59,7 @@ spec:
             requests: {cpu: {{ $cpu | quote }}, memory: {{ $pool.memory | quote }}, ephemeral-storage: {{ $pool.disk | quote }}}
             limits: {cpu: {{ $cpu | quote }}, memory: {{ $pool.memory | quote }}, ephemeral-storage: {{ include "duckfleet.diskLimit" $pool.disk | quote }}}
           env:
-            {{- include "duckfleet.workerEnv" (dict "root" $ "id" $id "pool" $size "cpu" $cpu "memory" $pool.memory "disk" $pool.disk "maxSessions" $pool.maxSessionsPerWorker) | nindent 12 }}
+            {{- include "duckfleet.workerEnv" (dict "root" $ "id" $id "pool" $size "cpu" $cpu "memory" $pool.memory "disk" $pool.disk "maxSessions" $pool.maxSessionsPerWorker "authority" $pool.authority) | nindent 12 }}
           {{- include "duckfleet.health" . | nindent 10 }}
           volumeMounts:
             - {name: tmp, mountPath: /tmp}

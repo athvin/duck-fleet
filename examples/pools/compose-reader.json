@@ -1,0 +1,21 @@
+{
+  "default_pool": "small",
+  "pools": {
+    "small": {
+      "cpu": 1,
+      "memory": "1Gi",
+      "disk": "2Gi",
+      "authority": "writer",
+      "endpoints": ["http://worker-small:8080"],
+      "max_sessions_per_worker": 32
+    },
+    "small-reader": {
+      "cpu": 1,
+      "memory": "1Gi",
+      "disk": "2Gi",
+      "authority": "reader",
+      "endpoints": ["http://worker-small-reader:8080"],
+      "max_sessions_per_worker": 32
+    }
+  }
+}

@@ -48,7 +48,6 @@ persistent_workers = {name: value for (kind, name), value in by_name.items()
 for name, worker in persistent_workers.items():
     assert worker['spec']['strategy']['type'] == 'Recreate'
     pod = worker['spec']['template']['spec']
-    assert pod['serviceAccountName'] == 'duckfleet-worker'
     container = pod['containers'][0]
     # The same rule the deploy verification applies to live pods, so the rendered
     # release and what actually runs cannot disagree about what is legal.
@@ -77,6 +76,14 @@ for name, worker in persistent_workers.items():
     # request the chart renders, or the worker would trust a size the pod does not have.
     assert declared['DUCKFLEET_WORKER_DISK'] == container['resources']['requests']['ephemeral-storage'], declared.get('DUCKFLEET_WORKER_DISK')
     env = {e['name']:e.get('value') for e in container['env']}
+    authority = env.get('DUCKFLEET_AUTHORITY', 'writer')
+    assert authority in {'reader', 'writer'}
+    assert pod['serviceAccountName'] == ('duckfleet-reader' if authority == 'reader' else 'duckfleet-worker')
+    if authority == 'reader':
+        assert 'CATALOG_READER_DSN' in env and 'CATALOG_DSN' not in env
+        assert not any(key.startswith('DUCKFLEET_RESULT_') for key in env)
+    else:
+        assert 'CATALOG_DSN' in env and 'CATALOG_READER_DSN' not in env
     assert env['S3_AUTH_MODE'] == 'pod_identity'
     assert env['AWS_EC2_METADATA_DISABLED'] == 'true'
     assert 'S3_SECRET_KEY' not in env

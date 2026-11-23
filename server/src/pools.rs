@@ -12,7 +12,7 @@ use serde_json::json;
 
 use crate::{
     ApiError,
-    compute::{ComputeRequest, Mode, Placement, Resources, Selection, valid_pool_name},
+    compute::{Authority, ComputeRequest, Mode, Placement, Resources, Selection, valid_pool_name},
     job_policy::{JobDefaults, JobLimits},
     query::{AdmissionLimits, AdmissionLimitsOverride},
 };
@@ -20,6 +20,7 @@ use crate::{
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Pool {
     pub resources: Resources,
+    pub authority: Authority,
     pub endpoints: Vec<String>,
     pub max_sessions_per_worker: usize,
     pub admission: AdmissionLimits,
@@ -129,6 +130,8 @@ struct PoolConfiguration {
     cpu: u16,
     memory: String,
     disk: String,
+    #[serde(default)]
+    authority: Authority,
     endpoints: Vec<String>,
     #[serde(default = "default_sessions")]
     max_sessions_per_worker: usize,
@@ -317,6 +320,7 @@ impl PoolRegistry {
                 name.clone(),
                 Pool {
                     resources,
+                    authority: configured.authority,
                     endpoints: members,
                     max_sessions_per_worker: configured.max_sessions_per_worker,
                     admission,
@@ -363,18 +367,61 @@ impl PoolRegistry {
     }
 
     pub fn resolve(&self, request: &ComputeRequest) -> Result<Placement, ApiError> {
+        self.resolve_for(request, Authority::Writer)
+    }
+
+    pub fn resolve_for(
+        &self,
+        request: &ComputeRequest,
+        authority: Authority,
+    ) -> Result<Placement, ApiError> {
         let resolved = match request.selection()? {
             Selection::Isolated(resources) => Placement {
                 mode: Mode::Isolated,
                 pool: None,
                 resources,
+                authority,
             },
             Selection::Persistent { pool, minimum } => {
-                let name = pool.unwrap_or_else(|| self.default_pool.clone());
+                let name = match pool {
+                    Some(name) => name,
+                    None if self.pools[&self.default_pool].authority == authority => {
+                        self.default_pool.clone()
+                    }
+                    None => {
+                        let mut eligible = self
+                            .pools
+                            .iter()
+                            .filter(|(_, pool)| pool.authority == authority)
+                            .map(|(name, _)| name.clone());
+                        let only = eligible.next().ok_or_else(|| {
+                            ApiError::new(
+                                crate::failure::FORBIDDEN,
+                                format!(
+                                    "no {} pool is configured for this principal",
+                                    authority.name()
+                                ),
+                            )
+                        })?;
+                        if eligible.next().is_some() {
+                            return Err(ApiError::bad(format!(
+                                "select a {} pool explicitly",
+                                authority.name()
+                            )));
+                        }
+                        only
+                    }
+                };
                 let configured = self
                     .pools
                     .get(&name)
                     .ok_or_else(|| ApiError::bad(format!("unknown persistent pool {name:?}")))?;
+                if configured.authority != authority {
+                    return Err(ApiError::bad(format!(
+                        "pool {name:?} does not have {} authority",
+                        authority.name()
+                    )));
+                }
                 if !minimum.satisfied_by(configured.resources) {
                     return Err(ApiError::bad(format!(
                         "pool {name:?} does not satisfy the requested minimum resources"
@@ -384,6 +431,7 @@ impl PoolRegistry {
                     mode: Mode::Persistent,
                     pool: Some(name),
                     resources: configured.resources,
+                    authority,
                 }
             }
         };
@@ -620,5 +668,45 @@ mod tests {
         let reloaded = registry.reloaded(&source.to_string()).unwrap();
         assert_ne!(registry.revision, reloaded.revision);
         assert_eq!(registry.admission_policies(), reloaded.admission_policies());
+    }
+
+    #[test]
+    fn authority_selects_a_distinct_pool_and_never_crosses_profiles() {
+        let mut source = config();
+        source["pools"]["reader"] = json!({
+            "cpu":1,"memory":"1Gi","disk":"2Gi","authority":"reader",
+            "endpoints":["http://reader:8080"]
+        });
+        let registry = PoolRegistry::from_json(&source.to_string()).unwrap();
+        let reader = registry
+            .resolve_for(&ComputeRequest::default(), Authority::Reader)
+            .unwrap();
+        assert_eq!(reader.pool.as_deref(), Some("reader"));
+        assert_eq!(reader.authority, Authority::Reader);
+        assert!(
+            registry
+                .resolve_for(&request(json!({"pool":"small"})), Authority::Reader)
+                .is_err()
+        );
+        let isolated = registry
+            .resolve_for(&request(json!({"cpu":2})), Authority::Reader)
+            .unwrap();
+        assert_eq!(isolated.authority, Authority::Reader);
+
+        source["pools"]["reader-two"] = source["pools"]["reader"].clone();
+        source["pools"]["reader-two"]["endpoints"] = json!(["http://reader-two:8080"]);
+        let registry = PoolRegistry::from_json(&source.to_string()).unwrap();
+        assert!(
+            registry
+                .resolve_for(&ComputeRequest::default(), Authority::Reader)
+                .is_err(),
+            "multiple reader pools require an explicit choice"
+        );
+        assert!(
+            registry
+                .resolve_for(&ComputeRequest::default(), Authority::Writer)
+                .is_ok(),
+            "reader pools never displace the writer default"
+        );
     }
 }

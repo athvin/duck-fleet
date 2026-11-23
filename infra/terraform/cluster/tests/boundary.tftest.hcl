@@ -117,6 +117,38 @@ run "worker_identity_reaches_lake_and_result_prefixes_only" {
   }
 }
 
+run "reader_identity_cannot_write_lake_or_results" {
+  command = plan
+
+  assert {
+    condition = alltrue(flatten([
+      for statement in jsondecode(aws_iam_role_policy.reader.policy).Statement : [
+        for action in statement.Action : action == "s3:GetObject" || action == "s3:ListBucket"
+      ]
+    ]))
+    error_message = "Reader lake access must not include PutObject, DeleteObject, or multipart writes."
+  }
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.reader.policy).Statement :
+      !can(regex("/results/", statement.Resource))
+    ])
+    error_message = "Readers receive no result-write or result-read credentials."
+  }
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.reader.policy).Statement :
+      can(statement.Condition.StringLike["s3:prefix"])
+      if can(regex("ListBucket", jsonencode(statement.Action)))
+    ])
+    error_message = "Reader listing must remain bounded to the lake prefix."
+  }
+  assert {
+    condition     = aws_eks_pod_identity_association.reader.service_account == "duckfleet-reader"
+    error_message = "Only the separate reader service account may assume the read-only role."
+  }
+}
+
 run "result_identity_cannot_read_lake_or_write_results" {
   command = plan
   assert {

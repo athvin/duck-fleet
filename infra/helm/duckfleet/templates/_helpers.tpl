@@ -72,6 +72,9 @@ seccompProfile:
 {{- end -}}
 {{- range $name, $definition := .Values.persistentPools -}}
 {{- $pool := deepCopy $definition -}}
+{{- $authority := get $pool "authority" | default "writer" -}}
+{{- if not (has $authority (list "reader" "writer")) -}}{{- fail (printf "pool %s authority must be reader or writer" $name) -}}{{- end -}}
+{{- $_ := set $pool "authority" $authority -}}
 {{- if not (hasKey $pool "workers") -}}{{- $_ := set $pool "workers" 1 -}}{{- end -}}
 {{- if not (hasKey $pool "maxSessionsPerWorker") -}}{{- $_ := set $pool "maxSessionsPerWorker" $.Values.workerMaxSessions -}}{{- end -}}
 {{- if lt (include "duckfleet.quantityBytes" $pool.memory | int64) 268435456 -}}
@@ -83,7 +86,7 @@ seccompProfile:
 {{- $_ := set $pools $name $pool -}}
 {{- end -}}
 {{- else -}}
-{{- $_ := set $pools "small" (dict "cpu" 1 "memory" "1Gi" "disk" "2Gi" "workers" (dig "small" 1 (.Values.workerReplicas | default dict)) "maxSessionsPerWorker" .Values.workerMaxSessions) -}}
+{{- $_ := set $pools "small" (dict "cpu" 1 "memory" "1Gi" "disk" "2Gi" "workers" (dig "small" 1 (.Values.workerReplicas | default dict)) "maxSessionsPerWorker" .Values.workerMaxSessions "authority" "writer") -}}
 {{- end -}}
 {{- if not (hasKey $pools .Values.defaultPool) -}}{{- fail "defaultPool must name a configured persistent pool" -}}{{- end -}}
 {{- $identities := dict -}}
@@ -116,7 +119,7 @@ seccompProfile:
 {{- define "duckfleet.poolConfig" -}}
 {{- $pools := dict -}}
 {{- range $name, $pool := include "duckfleet.pools" . | fromJson -}}
-{{- $configured := dict "cpu" $pool.cpu "memory" $pool.memory "disk" $pool.disk "endpoints" (include "duckfleet.poolEndpoints" (dict "name" $name "workers" $pool.workers) | fromJsonArray) "max_sessions_per_worker" $pool.maxSessionsPerWorker -}}
+{{- $configured := dict "cpu" $pool.cpu "memory" $pool.memory "disk" $pool.disk "authority" $pool.authority "endpoints" (include "duckfleet.poolEndpoints" (dict "name" $name "workers" $pool.workers) | fromJsonArray) "max_sessions_per_worker" $pool.maxSessionsPerWorker -}}
 {{- if hasKey $pool "jobLimits" -}}
 {{- include "duckfleet.validateJobLimits" (dict "limits" $pool.jobLimits "ceiling" ($.Values.jobPolicy.ceilings | default dict)) -}}
 {{- $_ := set $configured "job_limits" $pool.jobLimits -}}
@@ -201,10 +204,12 @@ credentials, are sent to the gateway for the same runtime overlap validation. */
 
 {{- define "duckfleet.workerEnv" -}}
 {{- $ := .root -}}
+{{- $authority := .authority | default "writer" -}}
 {{- if gt (add $.Values.catalogWaitSeconds $.Values.platformWaitSeconds) 600 -}}
 {{- fail "catalogWaitSeconds + platformWaitSeconds must fit the 600-second startup probe budget" -}}
 {{- end -}}
 - {name: DUCKFLEET_WORKER_ID, value: {{ .id | quote }}}
+- {name: DUCKFLEET_AUTHORITY, value: {{ $authority | quote }}}
 {{- if hasKey . "pool" }}
 - {name: DUCKFLEET_POOL, value: {{ .pool | quote }}}
 {{- end }}
@@ -221,7 +226,9 @@ credentials, are sent to the gateway for the same runtime overlap validation. */
 # cpu and memory, in the isolated pod template before creating a sized session.
 - {name: DUCKFLEET_WORKER_DISK, value: {{ .disk | quote }}}
 - {name: S3_AUTH_MODE, value: pod_identity}
+{{- if eq $authority "writer" }}
 {{ include "duckfleet.resultEnv" $ }}
+{{- end }}
 - {name: DUCKFLEET_PROFILING, value: {{ $.Values.profiling | quote }}}
 - {name: DUCKFLEET_CATALOG_WAIT_SECONDS, value: {{ $.Values.catalogWaitSeconds | quote }}}
 - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ $.Values.platformWaitSeconds | quote }}}
@@ -237,9 +244,15 @@ credentials, are sent to the gateway for the same runtime overlap validation. */
 - name: DUCKFLEET_INTERNAL_TOKEN
   valueFrom:
     secretKeyRef: {name: {{ $.Values.secretName }}, key: DUCKFLEET_INTERNAL_TOKEN}
+{{- if eq $authority "reader" }}
+- name: CATALOG_READER_DSN
+  valueFrom:
+    secretKeyRef: {name: {{ $.Values.secretName }}, key: CATALOG_READER_DSN}
+{{- else }}
 - name: CATALOG_DSN
   valueFrom:
     secretKeyRef: {name: {{ $.Values.secretName }}, key: CATALOG_DSN}
+{{- end }}
 - name: PLATFORM_DSN
   valueFrom:
     secretKeyRef: {name: {{ $.Values.secretName }}, key: PLATFORM_WORKER_DSN}
@@ -337,9 +350,9 @@ startupProbe:
 {{- $prefix := printf "df_%s_%s" (.Release.Namespace | replace "-" "_" | trunc 36) (.Release.Namespace | sha256sum | trunc 8) -}}
 {{- $roles := dict -}}
 {{- $seen := dict -}}
-{{- range $part := list "migrator" "gateway" "worker" "maintainer" "catalog" -}}
+{{- range $part := list "migrator" "gateway" "worker" "maintainer" "catalog" "catalog_reader" -}}
 {{- $name := default (printf "%s_%s" $prefix $part) (index $.Values.databaseRoles $part) -}}
-{{- if hasKey $seen $name -}}{{ fail "databaseRoles must name five distinct roles" }}{{- end -}}
+{{- if hasKey $seen $name -}}{{ fail "databaseRoles must name six distinct roles" }}{{- end -}}
 {{- $_ := set $seen $name true -}}{{- $_ := set $roles $part $name -}}
 {{- end -}}
 {{ toJson $roles }}
@@ -360,7 +373,7 @@ startupProbe:
 {{- end -}}
 {{- define "duckfleet.databaseProvisionEnvironment" -}}
 {{- $roles := include "duckfleet.databaseRoles" . | fromJson -}}
-{{- range $part := list "migrator" "gateway" "worker" "maintainer" "catalog" }}
+{{- range $part := list "migrator" "gateway" "worker" "maintainer" "catalog" "catalog_reader" }}
 - {name: DUCKFLEET_DB_{{ upper $part }}_ROLE, value: {{ index $roles $part | quote }}}
 - name: DUCKFLEET_DB_{{ upper $part }}_PASSWORD
   valueFrom:

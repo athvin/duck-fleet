@@ -9,10 +9,10 @@ import json
 import re
 import secrets
 
-PARTS = ("migrator", "gateway", "worker", "maintainer", "catalog")
+PARTS = ("migrator", "gateway", "worker", "maintainer", "catalog", "catalog_reader")
 DSN_KEYS = {"migrator": "PLATFORM_MIGRATION_DSN", "gateway": "PLATFORM_GATEWAY_DSN",
             "worker": "PLATFORM_WORKER_DSN", "maintainer": "PLATFORM_MAINTENANCE_DSN",
-            "catalog": "CATALOG_DSN"}
+            "catalog": "CATALOG_DSN", "catalog_reader": "CATALOG_READER_DSN"}
 
 
 def role_names(namespace):

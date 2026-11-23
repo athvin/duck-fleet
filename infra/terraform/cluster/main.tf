@@ -335,6 +335,39 @@ resource "aws_eks_pod_identity_association" "worker" {
   role_arn        = aws_iam_role.worker.arn
 }
 
+resource "aws_iam_role" "reader" {
+  name               = "${var.cluster}-reader"
+  assume_role_policy = local.assume.worker
+}
+
+resource "aws_iam_role_policy" "reader" {
+  name = "lake-read"
+  role = aws_iam_role.reader.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "arn:aws:s3:::${var.lake_bucket}/${var.lake_prefix}/*"
+      },
+      {
+        Effect    = "Allow"
+        Action    = "s3:ListBucket"
+        Resource  = "arn:aws:s3:::${var.lake_bucket}"
+        Condition = { StringLike = { "s3:prefix" = ["${var.lake_prefix}/*", var.lake_prefix] } }
+      },
+    ]
+  })
+}
+
+resource "aws_eks_pod_identity_association" "reader" {
+  cluster_name    = aws_eks_cluster.main.name
+  namespace       = var.namespace
+  service_account = "duckfleet-reader"
+  role_arn        = aws_iam_role.reader.arn
+}
+
 # Metadata/result retrieval and cleanup need no lake read or result write grant.
 # Either gateway service account can use this role; only the isolated-compute
 # account has separately installed Kubernetes RBAC/token access.
@@ -366,6 +399,7 @@ output "gateway_results_role_arn" { value = aws_iam_role.gateway_results.arn }
 output "cluster_name" { value = aws_eks_cluster.main.name }
 output "cluster_endpoint" { value = aws_eks_cluster.main.endpoint }
 output "worker_role_arn" { value = aws_iam_role.worker.arn }
+output "reader_role_arn" { value = aws_iam_role.reader.arn }
 # What to put in scripts/aws/target.env once this has applied.
 output "target_env" {
   # REQUIRE_BOOTSTRAP stays true. This previously emitted false, on the reasoning that a

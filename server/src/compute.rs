@@ -43,6 +43,31 @@ impl Mode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Authority {
+    Reader,
+    #[default]
+    Writer,
+}
+
+impl Authority {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Writer => "writer",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "reader" => Ok(Self::Reader),
+            "writer" => Ok(Self::Writer),
+            _ => Err("DUCKFLEET_AUTHORITY must be reader or writer".into()),
+        }
+    }
+}
+
 /// A compute size. Memory is the **container cap**, not the engine's share. Disk is
 /// the pod's ephemeral-storage limit, which also bounds how far a query may spill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -204,12 +229,14 @@ pub(crate) enum Selection {
 
 /// A resolved policy. Resources are the allocation actually selected and billed,
 /// not the optional minimum requirements in the original request.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Placement {
     pub mode: Mode,
     pub pool: Option<String>,
     pub resources: Resources,
+    #[serde(default)]
+    pub authority: Authority,
 }
 
 pub(crate) fn valid_pool_name(name: &str) -> bool {
@@ -336,6 +363,7 @@ impl ComputeRequest {
         &self,
         pool: Option<&str>,
         resources: Resources,
+        authority: Authority,
     ) -> Result<Placement, ApiError> {
         let resolved = match self.selection()? {
             Selection::Persistent { .. } => Placement {
@@ -347,15 +375,17 @@ impl ComputeRequest {
                     .to_owned(),
                 ),
                 resources,
+                authority,
             },
             Selection::Isolated(resources) => Placement {
                 mode: Mode::Isolated,
                 pool: None,
                 resources,
+                authority,
             },
         };
         self.validate_resolved(&resolved)?;
-        resolved.validate_worker(pool, resources)?;
+        resolved.validate_worker(pool, resources, authority)?;
         Ok(resolved)
     }
 }
@@ -378,6 +408,7 @@ impl Placement {
         &self,
         pool: Option<&str>,
         resources: Resources,
+        authority: Authority,
     ) -> Result<(), ApiError> {
         if self.mode == Mode::Isolated && pool.is_some() {
             return Err(unavailable());
@@ -387,9 +418,13 @@ impl Placement {
         } else {
             Mode::Isolated
         };
-        if self.mode != mode || self.pool.as_deref() != pool || self.resources != resources {
+        if self.mode != mode
+            || self.pool.as_deref() != pool
+            || self.resources != resources
+            || self.authority != authority
+        {
             return Err(ApiError::bad(
-                "resolved compute does not match this worker's pool and resources",
+                "resolved compute does not match this worker's pool, resources, and authority",
             ));
         }
         self.resources.usable().map_err(ApiError::bad)
@@ -401,6 +436,7 @@ impl Placement {
         value["worker_id"] = json!(worker_id);
         value["compute"] = json!(self.mode.name());
         value["pool"] = json!(self.pool);
+        value["authority"] = json!(self.authority.name());
         value
     }
 }
@@ -467,9 +503,11 @@ mod tests {
         let request = request(value);
         match request.selection().unwrap() {
             Selection::Persistent { .. } => request
-                .resolve_local(Some("small"), Resources::default())
+                .resolve_local(Some("small"), Resources::default(), Authority::Writer)
                 .unwrap(),
-            Selection::Isolated(resources) => request.resolve_local(None, resources).unwrap(),
+            Selection::Isolated(resources) => request
+                .resolve_local(None, resources, Authority::Writer)
+                .unwrap(),
         }
     }
 
@@ -643,7 +681,7 @@ mod tests {
         let requested = request(json!({"pool":"interactive", "cpu":2}));
         let resources = Resources::parse("4", "16Gi", "20Gi").unwrap();
         let resolved = requested
-            .resolve_local(Some("interactive"), resources)
+            .resolve_local(Some("interactive"), resources, Authority::Writer)
             .unwrap();
         assert_eq!(
             serde_json::to_value(&requested).unwrap(),
@@ -667,7 +705,7 @@ mod tests {
         wrong.resources.disk_bytes /= 2;
         assert!(
             wrong
-                .validate_worker(Some("interactive"), resources)
+                .validate_worker(Some("interactive"), resources, Authority::Writer)
                 .is_err()
         );
     }
@@ -677,17 +715,17 @@ mod tests {
         let resources = Resources::parse("2", "512Mi", "1Gi").unwrap();
         assert!(
             request(json!({"mode":"persistent","cpu":2}))
-                .resolve_local(Some("tiny"), resources)
+                .resolve_local(Some("tiny"), resources, Authority::Writer)
                 .is_ok()
         );
         assert!(
             request(json!({"pool":"tiny","memory":"128Mi"}))
-                .resolve_local(Some("tiny"), resources)
+                .resolve_local(Some("tiny"), resources, Authority::Writer)
                 .is_ok()
         );
         assert!(
             request(json!({"pool":"tiny","disk":"2Gi"}))
-                .resolve_local(Some("tiny"), resources)
+                .resolve_local(Some("tiny"), resources, Authority::Writer)
                 .is_err()
         );
         assert!(
@@ -697,12 +735,12 @@ mod tests {
         );
         assert!(
             request(json!({"pool":"other"}))
-                .resolve_local(Some("tiny"), resources)
+                .resolve_local(Some("tiny"), resources, Authority::Writer)
                 .is_err()
         );
         assert!(
             request(json!({"cpu":2}))
-                .resolve_local(Some("tiny"), resources)
+                .resolve_local(Some("tiny"), resources, Authority::Writer)
                 .is_err()
         );
         assert_eq!(

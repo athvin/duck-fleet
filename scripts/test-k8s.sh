@@ -450,7 +450,7 @@ render --no-hooks \
   --set "isolatedCompute.apiServerCidrs[0]=$api_address/32" \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
-  --set-json 'persistentPools={"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1},"interactive":{"cpu":2,"memory":"3Gi","disk":"4Gi","workers":1}}' \
+  --set-json 'persistentPools={"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1},"interactive":{"cpu":2,"memory":"3Gi","disk":"4Gi","workers":1},"readers":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1,"authority":"reader"}}' \
   | python3 scripts/kind/localize.py \
   --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod \
   > "$work/release-pools.yaml"
@@ -461,6 +461,9 @@ python3 scripts/kind/assert_limits.py --context "$CONTEXT" --namespace "$NS" \
   > artifacts/kind/pool-worker-limits.jsonl
 harness duckfleet-pools 'duckfleet-server --pools-isolated' 900
 harness duckfleet-queue 'duckfleet-server --queue-isolated' 900
+reader_dsn=$("${KUBE[@]}" get secret duckfleet-dev -o jsonpath='{.data.CATALOG_READER_DSN}' | base64 -d)
+harness duckfleet-reader-authority 'duckfleet-server --reader-authority' 600 \
+  --env DUCKFLEET_READER_POOL=readers --env "DUCKFLEET_READER_DSN=$reader_dsn"
 await_no_isolated_pods
 python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release.yaml"

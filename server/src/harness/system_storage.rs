@@ -130,6 +130,7 @@ fn session(
         mode: Mode::Persistent,
         pool: Some("small".into()),
         resources: Resources::default(),
+        authority: crate::compute::Authority::Writer,
     };
     let dimensions = api(metadata::capture_session(
         &original,

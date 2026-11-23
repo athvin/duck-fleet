@@ -1,6 +1,6 @@
 use crate::{
     ApiError, Envelope, Operation, Output, Reply, artifacts, authz,
-    compute::{Mode, Placement, Resources, WorkerSessionRequest},
+    compute::{Authority, Mode, Placement, Resources, WorkerSessionRequest},
     credentials::{self, Identity},
     engine_stream, failure, job_artifacts, jobs, pricing, query, queue, queue_service, requests,
     secrets::{Redactor, Startup},
@@ -133,6 +133,7 @@ pub(crate) struct Worker {
     resources: Resources,
     placement: Value,
     pool: Option<String>,
+    authority: Authority,
     max_sessions: usize,
     /// True when this process is a pod created for a single isolated session, which
     /// bounds what it will admit below.
@@ -209,13 +210,16 @@ fn catalog_attach_pending(message: &str) -> bool {
         return true;
     }
     let message = message.to_ascii_lowercase();
-    message.contains("failed to initialize ducklake:")
-        && message.contains(r#"failed to execute query "create table "#)
-        && message.contains(r#""."ducklake_metadata"("#)
-        && message.contains(
-            r#"duplicate key value violates unique constraint "pg_type_typname_nsp_index""#,
-        )
-        && message.contains("key (typname, typnamespace)=(ducklake_metadata,")
+    (message.contains("existing ducklake")
+        && message.contains("does not exist")
+        && message.contains("creating a new ducklake is explicitly disabled"))
+        || message.contains("failed to initialize ducklake:")
+            && message.contains(r#"failed to execute query "create table "#)
+            && message.contains(r#""."ducklake_metadata"("#)
+            && message.contains(
+                r#"duplicate key value violates unique constraint "pg_type_typname_nsp_index""#,
+            )
+            && message.contains("key (typname, typnamespace)=(ducklake_metadata,")
 }
 
 const EXPECTED_DUCKDB_VERSION: &str = "v2.0.1";
@@ -549,11 +553,16 @@ impl Worker {
             pool.as_deref().is_none_or(crate::compute::valid_pool_name),
             "invalid DUCKFLEET_POOL name"
         );
+        let authority = Authority::parse(
+            &std::env::var("DUCKFLEET_AUTHORITY").unwrap_or_else(|_| "writer".into()),
+        )
+        .map_err(anyhow::Error::msg)?;
         let max_sessions = crate::configured_limit("DUCKFLEET_WORKER_MAX_SESSIONS", 32, 1024)?;
         let mut placement = Placement {
             mode,
             resources,
             pool: pool.clone(),
+            authority,
         }
         .describe(&worker_id);
         placement["max_sessions"] = json!(if dedicated { 1 } else { max_sessions });
@@ -593,10 +602,16 @@ impl Worker {
         )?;
         startup.run("loading extensions", " SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; SET allow_extension_repositories='forbidden'; LOAD icu; LOAD httpfs; LOAD postgres; LOAD ducklake; LOAD aws;")?;
         match std::env::var("S3_AUTH_MODE").as_deref().unwrap_or("local") {
-            "local" => startup.run("creating the object store secret", &format!(
-                "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');",
-                literal(&required("S3_ACCESS_KEY")?), literal(&required("S3_SECRET_KEY")?), literal(&required("S3_ENDPOINT")?)
-            ))?,
+            "local" => {
+                let (key, secret) = match authority {
+                    Authority::Reader => ("S3_READER_ACCESS_KEY", "S3_READER_SECRET_KEY"),
+                    Authority::Writer => ("S3_ACCESS_KEY", "S3_SECRET_KEY"),
+                };
+                startup.run("creating the object store secret", &format!(
+                    "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');",
+                    literal(&required(key)?), literal(&required(secret)?), literal(&required("S3_ENDPOINT")?)
+                ))?
+            }
             "pod_identity" => {
                 // Fail closed without the EKS-injected container credential provider.
                 // IMDS is disabled in the chart; no static keys are deployed.
@@ -610,7 +625,10 @@ impl Worker {
             _ => anyhow::bail!("unsupported S3_AUTH_MODE"),
         }
         let wait = catalog_wait()?;
-        let catalog_dsn = required("CATALOG_DSN")?;
+        let catalog_dsn = required(match authority {
+            Authority::Reader => "CATALOG_READER_DSN",
+            Authority::Writer => "CATALOG_DSN",
+        })?;
         let catalog_started = Instant::now();
         let mut catalog_config: postgres::Config =
             redactor.guard("parsing catalog connection", catalog_dsn.parse())?;
@@ -633,12 +651,16 @@ impl Worker {
                 redactor.guard("bounding catalog validation",catalog.batch_execute("SET statement_timeout=3000; SET lock_timeout=1000; SET idle_in_transaction_session_timeout=3000"))?;
                 redactor.guard(
                     "validating scoped catalog role",
-                    crate::db_roles::validate_catalog(&mut catalog, &platform_database),
+                    crate::db_roles::validate_catalog(&mut catalog, &platform_database, authority),
                 )
             },
         )?;
+        let read_only = match authority {
+            Authority::Reader => ", READ_ONLY",
+            Authority::Writer => "",
+        };
         let attach = format!(
-            "ATTACH {} AS lake (DATA_PATH {}, DUCKLAKE_VERSION '1.0'); USE lake;",
+            "ATTACH {} AS lake (DATA_PATH {}, DUCKLAKE_VERSION '1.0'{read_only}); USE lake;",
             literal(&format!("ducklake:postgres:{catalog_dsn}")),
             literal(&required("S3_DATA_PATH")?)
         );
@@ -649,11 +671,13 @@ impl Worker {
             catalog_attach_pending,
             || startup.run("attaching the DuckLake catalog", &attach),
         )?;
-        // Keep real Parquet objects in the harness, even for tiny seed data.
-        startup.run(
-            "disabling data inlining",
-            "CALL ducklake_set_option('lake', 'data_inlining_row_limit', 0)",
-        )?;
+        if authority == Authority::Writer {
+            // Keep real Parquet objects in the harness, even for tiny seed data.
+            startup.run(
+                "disabling data inlining",
+                "CALL ducklake_set_option('lake', 'data_inlining_row_limit', 0)",
+            )?;
+        }
         startup.inspect("verifying the engine and catalog manifest", |conn| {
             verify_engine_manifest(conn)
         })?;
@@ -754,6 +778,7 @@ impl Worker {
             resources,
             placement,
             pool,
+            authority,
             max_sessions,
             dedicated,
             served: 0,
@@ -778,9 +803,12 @@ impl Worker {
                 _ => anyhow::bail!("DUCKFLEET_PROFILING must be true or false"),
             },
             redactor,
-            result_store: artifacts::StoreConfig::from_env()?
-                .map(artifacts::StoreConfig::build)
-                .transpose()?,
+            result_store: match authority {
+                Authority::Reader => None,
+                Authority::Writer => artifacts::StoreConfig::from_env()?
+                    .map(artifacts::StoreConfig::build)
+                    .transpose()?,
+            },
             status,
             queue,
             ownership,
@@ -955,9 +983,11 @@ impl Worker {
                 let (mut request, placement, revision) = match *request {
                     WorkerSessionRequest::Direct(request) => {
                         request.validate()?;
-                        let placement = request
-                            .compute
-                            .resolve_local(self.pool.as_deref(), self.resources)?;
+                        let placement = request.compute.resolve_local(
+                            self.pool.as_deref(),
+                            self.resources,
+                            self.authority,
+                        )?;
                         (request, placement, None)
                     }
                     WorkerSessionRequest::Forwarded(forwarded) => {
@@ -974,7 +1004,7 @@ impl Worker {
                         )
                     }
                 };
-                placement.validate_worker(self.pool.as_deref(), self.resources)?;
+                placement.validate_worker(self.pool.as_deref(), self.resources, self.authority)?;
                 request.context["requested_compute"] =
                     serde_json::to_value(&request.compute).map_err(|_| ApiError::internal())?;
                 let mut diagnostics = self.placement.clone();
@@ -1038,6 +1068,7 @@ impl Worker {
                     authority: identity,
                     context: request.context,
                     compute: json!({"mode":placement.mode.name(),"pool":placement.pool,
+                        "authority":placement.authority.name(),
                         "cpu":resources.cpu,"memory_bytes":resources.memory_bytes,"disk_bytes":resources.disk_bytes}),
                     placement: diagnostics.clone(),
                     scope: self
@@ -1109,7 +1140,7 @@ impl Worker {
         }
         claim
             .placement
-            .validate_worker(self.pool.as_deref(), self.resources)?;
+            .validate_worker(self.pool.as_deref(), self.resources, self.authority)?;
         if (claim.placement.mode == Mode::Isolated) != self.dedicated {
             return Err(crate::compute::unavailable());
         }

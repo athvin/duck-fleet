@@ -147,8 +147,9 @@ pub(crate) fn scope(placement: &Placement) -> String {
     }
 }
 pub(crate) fn flat_compute(placement: &Placement) -> Value {
-    json!({"mode":placement.mode.name(),"pool":placement.pool,"cpu":placement.resources.cpu,
-        "memory_bytes":placement.resources.memory_bytes,"disk_bytes":placement.resources.disk_bytes})
+    json!({"mode":placement.mode.name(),"pool":placement.pool,"authority":placement.authority.name(),
+        "cpu":placement.resources.cpu,"memory_bytes":placement.resources.memory_bytes,
+        "disk_bytes":placement.resources.disk_bytes})
 }
 pub(crate) fn pool_policy(
     tx: &mut Transaction<'_>,
@@ -1252,6 +1253,7 @@ mod tests {
             mode: Mode::Persistent,
             pool: Some("small".into()),
             resources: Default::default(),
+            authority: crate::compute::Authority::Writer,
         }
     }
     fn policy() -> AcceptedJobPolicy {
@@ -1266,10 +1268,15 @@ mod tests {
     fn job_hash_freezes_semantics_and_excludes_retry_and_diagnostics() {
         let original = input();
         let hash = fingerprint(&original, &placement(), &policy()).unwrap();
+        // Data authority is part of the execution policy: the same SQL under a
+        // reader and a writer is not the same accepted job.
         assert_eq!(
             hash,
-            "1efc51fe31b85364bd5bcc6c38ca07dc5a8f977fd4108c345f2b8b9613e5a84c"
+            "6405a14d47375450d5cc846799e16f565e647bce4863e2ef3a8746d930682fd9"
         );
+        let mut reader = placement();
+        reader.authority = crate::compute::Authority::Reader;
+        assert_ne!(hash, fingerprint(&original, &reader, &policy()).unwrap());
         let mut retry = original.request().clone();
         retry.request_id = Uuid::new_v4();
         retry.retry_of = Some(original.request().request_id);

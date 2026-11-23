@@ -6,11 +6,13 @@
 \getenv worker DUCKFLEET_DB_WORKER_ROLE
 \getenv maintainer DUCKFLEET_DB_MAINTAINER_ROLE
 \getenv catalog DUCKFLEET_DB_CATALOG_ROLE
+\getenv catalog_reader DUCKFLEET_DB_CATALOG_READER_ROLE
 \getenv migrator_password DUCKFLEET_DB_MIGRATOR_PASSWORD
 \getenv gateway_password DUCKFLEET_DB_GATEWAY_PASSWORD
 \getenv worker_password DUCKFLEET_DB_WORKER_PASSWORD
 \getenv maintainer_password DUCKFLEET_DB_MAINTAINER_PASSWORD
 \getenv catalog_password DUCKFLEET_DB_CATALOG_PASSWORD
+\getenv catalog_reader_password DUCKFLEET_DB_CATALOG_READER_PASSWORD
 \getenv platform_db DUCKFLEET_PLATFORM_DATABASE
 \getenv lake_db DUCKFLEET_LAKE_DATABASE
 \getenv adopt DUCKFLEET_ADOPT_DATABASE_OWNER
@@ -24,17 +26,18 @@ SELECT :'platform_db'<>:'lake_db'
     DO $refused$ BEGIN RAISE EXCEPTION 'database provisioning refused; see preceding diagnostic'; END $refused$;
 \endif
 BEGIN;
-SELECT count(*)=5 AND count(DISTINCT name)=5 AND count(DISTINCT password)=5
+SELECT count(*)=6 AND count(DISTINCT name)=6 AND count(DISTINCT password)=6
     AND bool_and(name ~ '^[a-z_][a-z0-9_]{0,62}$' AND length(password)>=16) AS valid_inputs
 FROM (VALUES (:'migrator',:'migrator_password'),(:'gateway',:'gateway_password'),
-    (:'worker',:'worker_password'),(:'maintainer',:'maintainer_password'),(:'catalog',:'catalog_password')) v(name,password) \gset
+    (:'worker',:'worker_password'),(:'maintainer',:'maintainer_password'),(:'catalog',:'catalog_password'),
+    (:'catalog_reader',:'catalog_reader_password')) v(name,password) \gset
 \if :valid_inputs
 \else
     \echo 'Refusing invalid/distinctness/password inputs for database roles'
     DO $refused$ BEGIN RAISE EXCEPTION 'database provisioning refused; see preceding diagnostic'; END $refused$;
 \endif
 SELECT NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname IN
-    (:'migrator',:'gateway',:'worker',:'maintainer',:'catalog') AND
+    (:'migrator',:'gateway',:'worker',:'maintainer',:'catalog',:'catalog_reader') AND
     (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls
      OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=pg_roles.oid))) AS safe_existing_roles \gset
 \if :safe_existing_roles
@@ -43,11 +46,12 @@ SELECT NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname IN
     DO $refused$ BEGIN RAISE EXCEPTION 'database provisioning refused; see preceding diagnostic'; END $refused$;
 \endif
 SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS', name)
-FROM (VALUES (:'migrator'),(:'gateway'),(:'worker'),(:'maintainer'),(:'catalog')) v(name)
+FROM (VALUES (:'migrator'),(:'gateway'),(:'worker'),(:'maintainer'),(:'catalog'),(:'catalog_reader')) v(name)
 WHERE NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=name) \gexec
 SELECT format('ALTER ROLE %I LOGIN PASSWORD %L', name, password)
 FROM (VALUES (:'migrator',:'migrator_password'),(:'gateway',:'gateway_password'),
-    (:'worker',:'worker_password'),(:'maintainer',:'maintainer_password'),(:'catalog',:'catalog_password')) v(name,password) \gexec
+    (:'worker',:'worker_password'),(:'maintainer',:'maintainer_password'),(:'catalog',:'catalog_password'),
+    (:'catalog_reader',:'catalog_reader_password')) v(name,password) \gexec
 COMMIT;
 SELECT format('CREATE DATABASE %I OWNER %I', :'platform_db', :'migrator')
 WHERE NOT EXISTS(SELECT 1 FROM pg_database WHERE datname=:'platform_db') \gexec
@@ -66,7 +70,7 @@ SELECT pg_get_userbyid(datdba)=:'migrator' AS owner_matches FROM pg_database WHE
 \endif
 BEGIN;
 ALTER DATABASE :"platform_db" OWNER TO :"migrator";
-REVOKE ALL ON DATABASE :"platform_db" FROM PUBLIC,:"catalog";
+REVOKE ALL ON DATABASE :"platform_db" FROM PUBLIC,:"catalog",:"catalog_reader";
 GRANT CONNECT ON DATABASE :"platform_db" TO :"gateway",:"worker",:"maintainer";
 -- System SQL can aggregate only bounded sources; bound external-sort spill too.
 -- This setting requires the administrator and cannot be raised by the gateway.
@@ -102,7 +106,9 @@ SELECT pg_get_userbyid(datdba)=:'catalog' AS owner_matches FROM pg_database WHER
 BEGIN;
 ALTER DATABASE :"lake_db" OWNER TO :"catalog";
 REVOKE ALL ON DATABASE :"lake_db" FROM PUBLIC,:"migrator",:"gateway",:"worker",:"maintainer";
-REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT CONNECT ON DATABASE :"lake_db" TO :"catalog_reader";
+REVOKE ALL ON SCHEMA public FROM PUBLIC,:"catalog_reader";
+GRANT USAGE ON SCHEMA public TO :"catalog_reader";
 ALTER SCHEMA public OWNER TO :"catalog";
 SELECT format('ALTER %s public.%I OWNER TO %I', CASE relkind WHEN 'S' THEN 'SEQUENCE' WHEN 'v' THEN 'VIEW'
     WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END, relname, :'catalog')
@@ -114,4 +120,11 @@ WHERE n.nspname='public' AND relkind IN ('r','p','S','v','m')
 SELECT format('ALTER FUNCTION public.%I(%s) OWNER TO %I', proname,pg_get_function_identity_arguments(p.oid),:'catalog')
 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public'
   AND NOT EXISTS(SELECT 1 FROM pg_depend d WHERE d.classid='pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e') \gexec
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM :"catalog_reader";
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM :"catalog_reader";
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC,:"catalog_reader";
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO :"catalog_reader";
+ALTER DEFAULT PRIVILEGES FOR ROLE :"catalog" IN SCHEMA public REVOKE ALL ON TABLES FROM :"catalog_reader";
+ALTER DEFAULT PRIVILEGES FOR ROLE :"catalog" IN SCHEMA public GRANT SELECT ON TABLES TO :"catalog_reader";
+ALTER DEFAULT PRIVILEGES FOR ROLE :"catalog" IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC,:"catalog_reader";
 COMMIT;

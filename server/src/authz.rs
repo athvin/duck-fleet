@@ -1,9 +1,9 @@
-//! Small platform authorization model. SQL execution remains trusted until the
-//! query process is isolated from service credentials (the separate data boundary).
+//! Small platform authorization model. Reader and trusted-writer data authority
+//! is enforced by separate query processes and their provisioned credentials.
 pub(crate) use crate::credentials::ActorKind;
 use crate::{
     ApiError, audit,
-    compute::{Mode, Placement, Resources},
+    compute::{Authority, Mode, Placement, Resources},
     credentials::{self, Identity},
     failure,
     job_policy::{AcceptedJobPolicy, JobDefaults, JobLimits, JobPoolPolicy, ValidatedJobRequest},
@@ -253,6 +253,19 @@ pub(crate) struct MetadataAccess {
     pub usage: Option<Scope>,
 }
 impl Access {
+    pub fn authority(&self) -> Authority {
+        if self.actor.kind == ActorKind::Named
+            && !self
+                .roles
+                .iter()
+                .any(|role| matches!(role, Role::Admin | Role::Operator | Role::Analyst))
+        {
+            Authority::Reader
+        } else {
+            Authority::Writer
+        }
+    }
+
     pub fn scope(&self, action: Action) -> Option<Scope> {
         if self.actor.kind != ActorKind::Named {
             return Some(Scope::All);
@@ -287,7 +300,11 @@ impl Access {
                     _ => None,
                 },
                 Role::Viewer => match action {
-                    Action::HistoryRead | Action::UsageRead => Some(Scope::Own),
+                    Action::QueryExecute
+                    | Action::QueryCancel
+                    | Action::SessionClose
+                    | Action::HistoryRead
+                    | Action::UsageRead => Some(Scope::Own),
                     _ => None,
                 },
             };
@@ -335,6 +352,12 @@ impl Access {
             return Err(denied("session belongs to another principal"));
         }
         self.require(operation.action(), owner_id)?;
+        let authority = compute["authority"].as_str().unwrap_or("writer");
+        if authority != self.authority().name() {
+            return Err(denied(
+                "data authority changed; close this session and open a new one with the current role",
+            ));
+        }
         self.require_compute(compute)
     }
     #[cfg(test)]
@@ -781,6 +804,17 @@ pub(crate) fn lock_actor_in(tx: &mut Transaction<'_>, identity: &Identity) -> Re
     }
     Ok(())
 }
+pub(crate) fn execution_authority(
+    client: &mut Client,
+    identity: &Identity,
+) -> Result<Authority, ApiError> {
+    let mut tx = client.transaction().map_err(unavailable)?;
+    bounded(&mut tx).map_err(unavailable)?;
+    let authority = resolve_in(&mut tx, identity)?.authority();
+    tx.commit().map_err(unavailable)?;
+    Ok(authority)
+}
+
 pub(crate) fn authorize_execution(
     client: &mut Client,
     identity: &Identity,
@@ -1084,11 +1118,12 @@ mod tests {
         }
     }
     #[test]
-    fn system_entry_accepts_own_metadata_without_execution_or_compute() {
+    fn system_entry_accepts_own_metadata_independently_of_compute() {
         let viewer = access(Role::Viewer);
         assert!(viewer.require_metadata_access().is_ok());
         assert!(viewer.require(Action::HistoryRead, None).is_err());
-        assert!(viewer.require(Action::QueryExecute, Some("owner")).is_err());
+        assert!(viewer.require(Action::QueryExecute, Some("owner")).is_ok());
+        assert!(viewer.require(Action::QueryExecute, Some("other")).is_err());
         assert!(viewer.compute.is_empty());
         let mut custom = access(Role::Viewer);
         custom.roles.clear();
@@ -1118,8 +1153,20 @@ mod tests {
         let admin = access(Role::Admin);
         assert!(admin.require(Action::QueryExecute, Some("other")).is_err());
         let viewer = access(Role::Viewer);
+        assert_eq!(viewer.authority(), Authority::Reader);
+        assert_eq!(admin.authority(), Authority::Writer);
         assert!(viewer.require(Action::HistoryRead, Some("owner")).is_ok());
         assert!(viewer.require(Action::HistoryRead, Some("other")).is_err());
+        assert!(
+            admin
+                .require_execution(
+                    Some("owner"),
+                    &json!({"authority":"reader"}),
+                    &TrustedOperation::Sql,
+                )
+                .is_err(),
+            "a writer cannot reuse or open a reader-authority session"
+        );
     }
     #[test]
     fn compute_requires_one_complete_envelope() {
@@ -1150,6 +1197,7 @@ mod tests {
             mode: Mode::Persistent,
             pool: Some("small".into()),
             resources: Resources::default(),
+            authority: Authority::Writer,
         }
     }
     fn job_request(options: Value) -> ValidatedJobRequest {

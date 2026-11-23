@@ -4,7 +4,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${DUCKFLEET_DATABASE_ADMIN_DSN:?set administrator DSN; it is never mounted in compute or migration}"
-for part in MIGRATOR GATEWAY WORKER MAINTAINER CATALOG; do
+for part in MIGRATOR GATEWAY WORKER MAINTAINER CATALOG CATALOG_READER; do
   role="DUCKFLEET_DB_${part}_ROLE"
   password="DUCKFLEET_DB_${part}_PASSWORD"
   [[ -n "${!role:-}" && -n "${!password:-}" ]] || { echo "Set $role and $password" >&2; exit 64; }
