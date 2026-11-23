@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{credentials, metering, pricing::RateCard, requests};
 
-pub(crate) const SCHEMA_VERSION: i32 = 5;
+pub(crate) const SCHEMA_VERSION: i32 = 6;
 const MIGRATION_LOCK: i64 = 4_283_121;
 const POLL: Duration = Duration::from_millis(250);
 const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
@@ -206,7 +206,7 @@ pub(crate) fn wait_schema(dsn: &str, wait: Duration) -> Result<Client> {
         })();
         match attempt {
             Ok((client, Some(current))) if current == SCHEMA_VERSION => return Ok(client),
-            Ok((_, Some(1..=4))) => {}
+            Ok((_, Some(1..=5))) => {}
             Ok((_, Some(current))) => {
                 supported(current)?;
             }
@@ -296,7 +296,7 @@ fn migrate_with_roles(
             });
         }
         anyhow::ensure!(
-            matches!(current, 1..=4),
+            matches!(current, 1..=5),
             "unsupported migration source version {current}"
         );
     }
@@ -315,7 +315,7 @@ fn migrate_with_roles(
         });
     }
     anyhow::ensure!(
-        current.is_none() || matches!(current, Some(1..=4)),
+        current.is_none() || matches!(current, Some(1..=5)),
         "unsupported migration source version"
     );
     if current.is_none() {
@@ -365,11 +365,20 @@ fn migrate_with_roles(
         crate::metadata::migrate_system(&mut transaction)?;
         transaction.execute("INSERT INTO platform_schema_migrations(version,name) VALUES(4,'typed-system-metadata')",&[])?;
     }
-    crate::jobs::migrate(&mut transaction)?;
-    transaction.execute(
-        "INSERT INTO platform_schema_migrations(version,name) VALUES(5,'durable-jobs')",
-        &[],
-    )?;
+    if current.is_none() || current.is_some_and(|v| v < 5) {
+        crate::jobs::migrate(&mut transaction)?;
+        transaction.execute(
+            "INSERT INTO platform_schema_migrations(version,name) VALUES(5,'durable-jobs')",
+            &[],
+        )?;
+    }
+    if current.is_none() || current.is_some_and(|v| v < 6) {
+        crate::compute_lifecycle::migrate(&mut transaction)?;
+        transaction.execute(
+            "INSERT INTO platform_schema_migrations(version,name) VALUES(6,'compute-lifecycle')",
+            &[],
+        )?;
+    }
     if let Some(roles) = roles {
         crate::db_roles::grant_runtime(&mut transaction, roles)?;
     }
@@ -398,6 +407,8 @@ pub(crate) fn worker_startup(
 ) -> Result<WorkerStartup> {
     let started = Instant::now();
     check_schema(client)?;
+    crate::compute_lifecycle::finish_worker(client, worker_id)
+        .map_err(|error| anyhow::anyhow!(error.1))?;
     let queued_recovered = crate::queue::recover_worker(
         client,
         &crate::queue::WorkerEpoch {

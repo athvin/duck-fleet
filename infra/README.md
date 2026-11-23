@@ -128,6 +128,13 @@ The current pinned dbt adapter supports its existing resource fields but silentl
 drops pool/mode fields; use HTTP or the CLI for explicit pool selection until the
 coordinated adapter release described in the root README is available.
 
+`computePolicy` renders `DUCKFLEET_COMPUTE_POLICY_JSON` on the gateway and every
+worker. Its optional deployment/principal CPU, memory and disk ceilings are
+checked before isolated provisioning; `idle_timeout_seconds` and
+`max_lifetime_seconds` bound idle and total worker lifetime. Empty retains the
+fixed-capacity default. `/v1/compute` reports lifecycle usage and rate-card
+estimates separately from query billing.
+
 `workerMaxSessions` defaults to 32; a named pool's `maxSessionsPerWorker` overrides
 it (1–1024). `workerQueueCapacity` defaults to 64 queued worker operations and
 `gatewayMaxSessions` to 64 backend sessions (both 1–4096). More open sessions do
@@ -325,9 +332,9 @@ the migration Job.
 After stopping compute, rerun administrator database provisioning. Schema 4 requires
 the gateway role to have a finite `temp_file_limit` of at most 16MB; the bundled
 provisioner sets 16MB, and an external database administrator must apply the same
-setting. The gateway cannot raise this setting. Then apply the schema 5 chart/image with a fresh
+setting. The gateway cannot raise this setting. Then apply the schema 6 chart/image with a fresh
 `platformMigration.runId` and wait for migration/rollout; new compute cannot become
-usable before schema 5, its runtime grants, and its admission policy exist. For Compose, build/pull the
+usable before schema 6, its runtime grants, and its admission policy exist. For Compose, build/pull the
 desired image, run `scripts/migrate-platform.sh compose`, then explicitly start
 the desired services. Bare Helm/template-apply users must follow the same stop/apply
 sequence. Do not automatically roll back the binary after migration commits.
@@ -335,7 +342,7 @@ sequence. Do not automatically roll back the binary after migration commits.
 Restore also uses this stop flow, restores both databases under their dedicated
 owners with backup ACLs discarded, runs a fresh migration and explicit
 `platform-grants` repair, and leaves compute stopped for explicit restart. A schema 1–4 backup is upgraded to 5
-by the current image. `migrate-platform.sh kube` requires the current schema 5 Job
+by the current image. `migrate-platform.sh kube` requires the current schema 6 Job
 template; cloning an old schema 1–4 image cannot perform this upgrade. Apply the
 desired chart only after old compute has stopped. Same-image DB reset/retarget
 still requires a fresh Job/runId; prior completion does not prove the new database.
@@ -409,7 +416,7 @@ public/internal tokens, and set `postgres.bundled=false`, reviewed external CIDR
 and `databaseRoles` to your chosen names. External database deployments do not need
 the administrator or `DATABASE_*_PASSWORD` seed keys in their chart Secret. Apply
 the chart after provisioning; the migration installs explicit table/column grants
-in the same transaction as schema 5. Ordinary current-version migration remains
+in the same transaction as schema 6. Ordinary current-version migration remains
 read-only. For an intentional grant repair after restoring or changing role names:
 
 ```sh

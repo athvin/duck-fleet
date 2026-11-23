@@ -620,6 +620,16 @@ class NamedPoolPackagingTests(unittest.TestCase):
         self.assertFalse(any(name.startswith('DUCKFLEET_RESULT_') for name in names))
         self.assertEqual(next(item['value'] for item in env if item['name'] == 'DUCKFLEET_AUTHORITY'),
                          'reader')
+    def test_compute_policy_renders_and_validates(self):
+        policy = {'max_cpu': 2, 'max_principal_cpu': 1, 'idle_timeout_seconds': 30,
+                  'max_lifetime_seconds': 300}
+        objects = self.render(self.POOLS, '--set-json', 'computePolicy='+json.dumps(policy))
+        for name in ('server', 'worker-small'):
+            env = objects['Deployment', name]['spec']['template']['spec']['containers'][0]['env']
+            rendered = next(item['value'] for item in env if item['name'] == 'DUCKFLEET_COMPUTE_POLICY_JSON')
+            self.assertEqual(json.loads(rendered), policy)
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.render(self.POOLS, '--set', 'computePolicy.max_cpu=0')
 
     def test_named_small_preserves_legacy_immutable_selectors(self):
         named = self.render()
@@ -745,7 +755,7 @@ if 'pg_restore' in sys.argv:
     def test_manual_kube_migration_clones_configuration_with_a_new_job_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            source = {'metadata': {'annotations': {'duckfleet.io/platform-schema':'5'}},
+            source = {'metadata': {'annotations': {'duckfleet.io/platform-schema':'6'}},
                       'spec': {'selector': {'matchLabels': {'controller-uid': 'old'}},
                                'manualSelector': False, 'activeDeadlineSeconds': 390,
                                'backoffLimit': 0,
@@ -1196,7 +1206,9 @@ class OwnershipBoundaryTests(unittest.TestCase):
 
     def test_the_grant_is_pods_in_one_namespace_and_nothing_else(self):
         role = next(d for d in self.render() if d['kind'] == 'Role')
-        self.assertEqual([rule['resources'] for rule in role['rules']], [['pods']])
+        self.assertEqual([rule['resources'] for rule in role['rules']], [['pods'], ['pods/log']])
+        self.assertEqual(role['rules'][0]['verbs'], ['create', 'get', 'list', 'watch', 'delete'])
+        self.assertEqual(role['rules'][1]['verbs'], ['get'])
         # The gateway must not be able to widen its own grant, read the catalog
         # credential, or raise the quota that caps it. Asserted rather than reviewed:
         # this Role is applied by an identity that could grant all three.

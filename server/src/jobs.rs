@@ -50,6 +50,7 @@ pub(crate) struct BindingToken {
 #[derive(Clone, Debug)]
 pub(crate) struct BindingClaim {
     pub bound: bool,
+    pub principal_id: Option<String>,
     pub token: BindingToken,
     pub placement: Placement,
     pub policy: AcceptedJobPolicy,
@@ -466,11 +467,12 @@ pub(crate) fn claim_binding(client: &mut Client, owner: Uuid) -> Result<Option<B
     }
     tx.execute("UPDATE query_jobs SET dispatcher_owner=$2,dispatcher_lease_until=clock_timestamp()+interval '10 seconds' WHERE request_id=$1",&[&id,&owner.to_string()])?;
     tx.execute("UPDATE job_dispatch_fairness SET last_turn=nextval('job_dispatch_turn') WHERE scope=$1 AND principal=$2",&[&scope,&principal])?;
-    let r=tx.query_one("SELECT j.request_id,j.binding_generation,b.session_id,b.open_span_id,b.endpoint,b.pod_name,j.policy_json,j.resolved_compute_json FROM query_jobs j JOIN job_bindings b ON b.request_id=j.request_id AND b.generation=j.binding_generation WHERE j.request_id=$1",&[&id])?;
+    let r=tx.query_one("SELECT j.request_id,j.binding_generation,b.session_id,b.open_span_id,b.endpoint,b.pod_name,j.policy_json,j.resolved_compute_json,r.owner_principal_id FROM query_jobs j JOIN job_bindings b ON b.request_id=j.request_id AND b.generation=j.binding_generation JOIN requests r ON r.request_id=j.request_id WHERE j.request_id=$1",&[&id])?;
     let endpoint = r.get::<_, Option<String>>(4);
     let pod_name = r.get::<_, Option<String>>(5);
     let claim = BindingClaim {
         bound: false,
+        principal_id: r.get(8),
         token: token_row(&r, owner)?,
         placement: serde_json::from_str(r.get::<_, &str>(7))?,
         policy: serde_json::from_str(r.get::<_, &str>(6))?,
@@ -1033,6 +1035,7 @@ pub(crate) fn binding_for_worker(
     )?;
     let claim = BindingClaim {
         bound,
+        principal_id: r.get(6),
         token: token.clone(),
         placement,
         policy,
