@@ -186,15 +186,13 @@ pub(crate) fn spawn(
                     }
                 };
                 let current = deployment["spec"]["replicas"].as_u64().unwrap_or(0) as u16;
-                let expected_current = if scaling_down {
-                    desired + 1
-                } else {
-                    desired - 1
-                };
-                if current != expected_current
-                    || observed_workers != expected_current
-                    || desired > pool.endpoints.len() as u16
-                {
+                if !transition_is_current(
+                    current,
+                    observed_workers,
+                    desired,
+                    scaling_down,
+                    pool.endpoints.len() as u16,
+                ) {
                     tracing::warn!(
                         pool = pool_name,
                         current,
@@ -242,6 +240,22 @@ pub(crate) fn spawn(
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     })))
+}
+
+fn transition_is_current(
+    current: u16,
+    observed: u16,
+    desired: u16,
+    scaling_down: bool,
+    endpoints: u16,
+) -> bool {
+    let expected = if scaling_down {
+        desired + 1
+    } else {
+        desired - 1
+    };
+    let starting_standby = !scaling_down && desired > 1 && current == 0 && observed == 0;
+    desired <= endpoints && (starting_standby || (current == expected && observed == expected))
 }
 
 fn deployment_name(pool: &str, index: u16) -> String {
@@ -332,6 +346,17 @@ mod tests {
             decide(&policy, observed),
             Decision::Hold("stable_or_cooldown")
         );
+    }
+
+    #[test]
+    fn a_zero_replica_standby_can_start_but_partial_transitions_wait() {
+        assert!(transition_is_current(0, 0, 2, false, 2));
+        assert!(transition_is_current(1, 1, 2, false, 2));
+        assert!(!transition_is_current(1, 0, 2, false, 2));
+        assert!(!transition_is_current(0, 1, 2, false, 2));
+        assert!(transition_is_current(2, 2, 1, true, 2));
+        assert!(!transition_is_current(0, 0, 1, true, 2));
+        assert!(!transition_is_current(0, 0, 3, false, 2));
     }
 
     #[test]
