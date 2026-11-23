@@ -1,5 +1,6 @@
 """Initialize or verify the local S3 fixture. No AWS credentials are consulted."""
 import json
+import os
 import subprocess
 import sys
 import time
@@ -10,12 +11,14 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 client = boto3.client(
     "s3", endpoint_url="http://object-store:9000", region_name="us-east-1",
-    aws_access_key_id="DUCKFLEETLOCAL", aws_secret_access_key="local-object-store-password",
+    aws_access_key_id=os.environ.get("DUCKFLEET_OBJECT_ACCESS_KEY", "DUCKFLEETLOCAL"),
+    aws_secret_access_key=os.environ.get("DUCKFLEET_OBJECT_SECRET_KEY", "local-object-store-password"),
     config=Config(connect_timeout=2, read_timeout=5, retries={"max_attempts": 0}),
 )
 reader = boto3.client(
     "s3", endpoint_url="http://object-store:9000", region_name="us-east-1",
-    aws_access_key_id="DUCKFLEETREADER", aws_secret_access_key="local-lake-reader-object-password",
+    aws_access_key_id="DUCKFLEETREADER",
+    aws_secret_access_key=os.environ.get("DUCKFLEET_READER_OBJECT_SECRET_KEY", "local-lake-reader-object-password"),
     config=Config(connect_timeout=2, read_timeout=5, retries={"max_attempts": 0}),
 )
 
@@ -29,8 +32,11 @@ def rc(*args, exists_ok=False):
 
 
 def provision_reader():
-    rc("alias", "set", "local", "http://object-store:9000", "DUCKFLEETLOCAL", "local-object-store-password")
-    rc("admin", "user", "add", "local", "DUCKFLEETREADER", "local-lake-reader-object-password", exists_ok=True)
+    rc("alias", "set", "local", "http://object-store:9000",
+       os.environ.get("DUCKFLEET_OBJECT_ACCESS_KEY", "DUCKFLEETLOCAL"),
+       os.environ.get("DUCKFLEET_OBJECT_SECRET_KEY", "local-object-store-password"))
+    rc("admin", "user", "add", "local", "DUCKFLEETREADER",
+       os.environ.get("DUCKFLEET_READER_OBJECT_SECRET_KEY", "local-lake-reader-object-password"), exists_ok=True)
     policy = {
         "Version": "2012-10-17",
         "Statement": [

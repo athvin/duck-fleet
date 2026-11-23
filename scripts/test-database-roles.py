@@ -3,12 +3,11 @@
 Only PostgreSQL/provisioning run; no application builds or existing project volumes
 are touched. Connect through service DNS so SCRAM is tested, not local trust auth.
 """
+import json
 import os
 from pathlib import Path
 import subprocess
 import uuid
-
-import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -16,14 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     project = 'duckfleet-provision-test-' + uuid.uuid4().hex[:12]
     base = ['docker', 'compose', '-f', str(ROOT/'compose.yaml'), '-p', project]
-    settings = yaml.safe_load((ROOT/'compose.yaml').read_text())['services']['platform-provision']['environment']
-    passwords = [settings['DUCKFLEET_DB_'+role+'_PASSWORD'] for role in
-                 ('MIGRATOR','GATEWAY','WORKER','MAINTAINER','CATALOG')]
     # A developer's existing-volume admin override must not influence this fresh
     # fixture or make the test inherit a real password unnecessarily.
     environment = dict(os.environ)
     environment['DUCKFLEET_POSTGRES_ADMIN_PASSWORD'] = 'local-administrator-password'
     environment['DUCKFLEET_ADOPT_DATABASE_OWNER'] = 'no'
+    resolved = subprocess.run(base+['config','--format','json'], cwd=ROOT, env=environment,
+                              text=True, capture_output=True, check=True, timeout=60)
+    settings = json.loads(resolved.stdout)['services']['platform-provision']['environment']
+    passwords = [settings['DUCKFLEET_DB_'+role+'_PASSWORD'] for role in
+                 ('MIGRATOR','GATEWAY','WORKER','MAINTAINER','CATALOG')]
 
     def redacted(text):
         for password in passwords:

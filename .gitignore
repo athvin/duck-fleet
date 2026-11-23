@@ -25,6 +25,7 @@ rustc-ice-*.txt
 
 # Local harness output and credentials
 artifacts/
+.duckfleet/
 .env
 __pycache__/
 *.egg-info/

@@ -96,7 +96,7 @@ def container_role(container):
 
 def check_compose_state(containers):
     for container in containers:
-        if not container_role(container):
+        if not container_role(container) or not container['State']['Running']:
             continue
         marker = (container['Config'].get('Labels') or {}).get(SCHEMA_MARKER)
         if not schema_matches(marker) and container['State']['Running']:

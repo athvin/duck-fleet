@@ -46,7 +46,10 @@ image, a legal S3 bucket name, a real region — so another organization install
 against its own account by supplying its own. The development lane's specific
 values are pinned where that pin belongs: once, in `scripts/aws/target.env`, built
 into the images and the deploy, and asserted by `tests/test_aws_ci.py`. The chart
-itself names no account.
+itself names no account. `values-aws.yaml` supplies this lane's bucket, region,
+secret, `gp3` class and EKS placement explicitly; `deploy.sh` always applies that
+overlay before the generated immutable image values. Generic renders use the
+provider-neutral defaults and retain only the Linux OS selector.
 
 ## Back up the catalog
 

@@ -90,6 +90,7 @@ render() {
   # The RBAC continuity fixture exercises the PostgreSQL wire listener. Keep it
   # enabled across this test's rerenders; ordinary deployments remain opt-in.
   helm template duckfleet infra/helm/duckfleet --namespace "$NS" \
+    --set secretName=duckfleet-dev \
     --set pgwire.enabled=true \
     --set results.enabled=true \
     --set "workerImage=$REGISTRY/worker@sha256:$digest" \
@@ -119,7 +120,7 @@ render --no-hooks \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
   | python3 scripts/kind/localize.py \
-  --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod \
+  --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port,isolated-pod \
   > "$work/release.yaml"
 python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release.yaml"
@@ -148,7 +149,7 @@ harness() { # harness <job-name> <command> [timeout] [extra harness_job.py args.
   local name="$1" command="$2" timeout="${3:-1200}"
   shift $(($# < 3 ? $# : 3))
   render --show-only templates/harness.yaml \
-    | python3 scripts/kind/localize.py --expect image,cpu-request,s3-path,node-selector \
+    | python3 scripts/kind/localize.py --expect image,cpu-request,s3-path \
     | python3 scripts/kind/harness_job.py --name "$name" --command "$command" \
       --artifacts-claim duckfleet-harness-artifacts "$@" \
     > "$work/$name.yaml"
@@ -454,7 +455,7 @@ render --no-hooks \
   --set isolatedCompute.readySeconds=180 \
   --set-json 'persistentPools={"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1},"interactive":{"cpu":2,"memory":"3Gi","disk":"4Gi","workers":1},"readers":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1,"authority":"reader"}}' \
   | python3 scripts/kind/localize.py \
-  --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod \
+  --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port,isolated-pod \
   > "$work/release-pools.yaml"
 python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release-pools.yaml"
@@ -511,7 +512,7 @@ render --no-hooks \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
   | python3 scripts/kind/localize.py \
-  --expect image,cpu-request,s3-auth,s3-path,node-selector,object-store-port,isolated-pod \
+  --expect image,cpu-request,s3-auth,s3-path,object-store-port,isolated-pod \
   > "$work/release-external.yaml"
 python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release-external.yaml"
@@ -540,7 +541,7 @@ echo 'PASS: the release ran a full workflow against an external PostgreSQL, bund
 # first feels nothing.
 TEAM=duckfleet-team-b
 DUCKFLEET_KUBE_CONTEXT="$CONTEXT" \
-DUCKFLEET_PROVISION_TRANSFORM="python3 scripts/kind/localize.py --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port --data-path s3://duckfleet/$TEAM/lake/" \
+DUCKFLEET_PROVISION_TRANSFORM="python3 scripts/kind/localize.py --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port --data-path s3://duckfleet/$TEAM/lake/" \
   bash scripts/provision-namespace.sh "$TEAM" \
   --set "workerImage=$REGISTRY/worker@sha256:$digest" \
   --set "dbtImage=$REGISTRY/dbt@sha256:$digest"
@@ -551,13 +552,36 @@ team=(kubectl --context "$CONTEXT" -n "$TEAM")
 "${team[@]}" apply -f infra/kind/object-store.yaml
 "${team[@]}" rollout status deployment/object-store --timeout=240s
 "${team[@]}" wait --for=condition=complete job/bucket-init --timeout=240s
-"${team[@]}" port-forward svc/server 18081:8080 > /dev/null 2>&1 &
+read -r team_port source_port < <(python3 -c 'import socket
+listeners = [socket.socket() for _ in range(2)]
+for listener in listeners:
+    listener.bind(("127.0.0.1", 0))
+print(*(listener.getsockname()[1] for listener in listeners))
+for listener in listeners:
+    listener.close()')
+"${team[@]}" port-forward "svc/server:$team_port:8080" > /dev/null 2>&1 &
 team_forward=$!
-"${KUBE[@]}" port-forward svc/server 18080:8080 > /dev/null 2>&1 &
+"${KUBE[@]}" port-forward "svc/server:$source_port:8080" > /dev/null 2>&1 &
 source_forward=$!
-sleep 3
-python3 scripts/kind/team_namespace_probe.py --port 18081 \
-  --source-port 18080 --context "$CONTEXT" --namespace "$TEAM" --source-namespace "$NS"
+python3 - "$team_port" "$source_port" <<'PY'
+import sys, time, urllib.request
+ports = set(map(int, sys.argv[1:]))
+deadline = time.monotonic() + 60
+while ports and time.monotonic() < deadline:
+    for port in list(ports):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1) as response:
+                if response.status == 200:
+                    ports.remove(port)
+        except Exception:
+            pass
+    if ports:
+        time.sleep(0.5)
+if ports:
+    raise SystemExit(f"gateway port-forwards did not become ready: {sorted(ports)}")
+PY
+python3 scripts/kind/team_namespace_probe.py --port "$team_port" \
+  --source-port "$source_port" --context "$CONTEXT" --namespace "$TEAM" --source-namespace "$NS"
 kill "$team_forward" 2> /dev/null || true
 kill "$source_forward" 2> /dev/null || true
 DUCKFLEET_CONFIRM_DEPROVISION=yes DUCKFLEET_KUBE_CONTEXT="$CONTEXT" \
