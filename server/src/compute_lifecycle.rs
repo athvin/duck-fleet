@@ -244,9 +244,27 @@ pub(crate) fn ready(
         &[&lifecycle_id, &worker_id, &boot_id],
     ).map_err(database_error)?;
     if changed != 1 {
+        let state = client
+            .query_opt(
+                "SELECT l.state,l.terminated_at IS NOT NULL,r.released_at IS NOT NULL
+                 FROM compute_lifecycles l LEFT JOIN compute_reservations r USING(lifecycle_id)
+                 WHERE l.lifecycle_id=$1",
+                &[&lifecycle_id],
+            )
+            .ok()
+            .flatten()
+            .map(|row| {
+                format!(
+                    "{}; terminated={}; reservation_released={:?}",
+                    row.get::<_, String>(0),
+                    row.get::<_, bool>(1),
+                    row.get::<_, Option<bool>>(2)
+                )
+            });
         tracing::warn!(
             lifecycle_id,
             worker_id,
+            state,
             "compute lifecycle reservation is missing or terminated"
         );
         return Err(ApiError::internal());

@@ -44,6 +44,11 @@ cleanup() {
               now()-a.state_change AS state_age,l.classid,l.objid,l.objsubid,l.granted
        FROM pg_stat_activity a LEFT JOIN pg_locks l ON l.pid=a.pid AND l.locktype='advisory'
        WHERE a.datname='platform' ORDER BY a.pid" > artifacts/kind/platform-connections.txt 2>&1 || true
+    "${KUBE[@]}" exec statefulset/duckfleet-postgres -- env PGOPTIONS='-c statement_timeout=3000' \
+      psql -U duckfleet -d platform -P pager=off \
+      -c "SELECT lifecycle_id,worker_id,state,failure_kind,requested_at,ready_at,terminated_at FROM compute_lifecycles ORDER BY requested_at DESC LIMIT 30" \
+      -c "SELECT lifecycle_id,principal_id,pool,created_at,released_at FROM compute_reservations ORDER BY created_at DESC LIMIT 30" \
+      > artifacts/kind/compute-lifecycles.txt 2>&1 || true
   fi
   rm -rf "$work"
   [[ "${DUCKFLEET_KEEP_CLUSTER:-false}" == true ]] || kind delete cluster --name "$CLUSTER" > /dev/null 2>&1 || true
