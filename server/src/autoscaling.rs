@@ -254,7 +254,7 @@ fn transition_is_current(
     } else {
         desired - 1
     };
-    let starting_standby = !scaling_down && desired > 1 && current == 0 && observed == 0;
+    let starting_standby = !scaling_down && desired > 1 && current == 0 && observed <= expected;
     desired <= endpoints && (starting_standby || (current == expected && observed == expected))
 }
 
@@ -353,7 +353,8 @@ mod tests {
         assert!(transition_is_current(0, 0, 2, false, 2));
         assert!(transition_is_current(1, 1, 2, false, 2));
         assert!(!transition_is_current(1, 0, 2, false, 2));
-        assert!(!transition_is_current(0, 1, 2, false, 2));
+        assert!(transition_is_current(0, 1, 2, false, 2));
+        assert!(!transition_is_current(0, 2, 2, false, 2));
         assert!(transition_is_current(2, 2, 1, true, 2));
         assert!(!transition_is_current(0, 0, 1, true, 2));
         assert!(!transition_is_current(0, 0, 3, false, 2));
