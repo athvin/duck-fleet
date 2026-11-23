@@ -319,7 +319,7 @@ pub(super) fn remove_authz_fixture_schema(client: &mut Client) -> Result<()> {
         ALTER TABLE credentials DROP COLUMN principal_id;
         DROP TABLE audit_events,authz_legacy_owners,principal_roles,permission_grants,compute_grants,principals,authz_defaults,platform_namespace;
         DROP FUNCTION immutable_audit_event();
-        DELETE FROM platform_schema_migrations WHERE version=3;")?;
+        DELETE FROM platform_schema_migrations WHERE version>=3;")?;
     Ok(())
 }
 
