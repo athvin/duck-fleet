@@ -39,6 +39,7 @@ mod system_admission;
 mod system_query;
 mod system_result;
 mod system_sql;
+mod telemetry;
 mod usage;
 mod worker;
 mod worker_ownership;

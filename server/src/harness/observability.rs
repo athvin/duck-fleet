@@ -136,6 +136,32 @@ pub(super) async fn checks(ctx: &Ctx) -> anyhow::Result<()> {
         401,
     )?;
 
+    let metrics = client
+        .request(Method::GET, "/metrics", None, STATUS_TIMEOUT)
+        .await?;
+    let metrics = String::from_utf8(metrics)?;
+    for expected in [
+        "duckfleet_active_queries",
+        "duckfleet_execution_duration_milliseconds_count",
+        "duckfleet_provisioning_duration_milliseconds_count",
+        "duckfleet_profile_capture_failures_total",
+        "duckfleet_maintenance_last_result",
+        "duckfleet_worker_observed_oom_terminations_total 0",
+    ] {
+        require(
+            metrics.contains(expected),
+            format!("missing metric {expected}"),
+        )?;
+    }
+    require(
+        !metrics.contains(&run) && !metrics.contains("observability"),
+        "unbounded request identifiers became metric labels",
+    )?;
+    super::expect_status(
+        request_json(&wrong, Method::GET, "/metrics", None).await,
+        401,
+    )?;
+
     write_artifact("profile-query-id.txt", &first_id);
     let mut connection = connection;
     connection.close().await?;

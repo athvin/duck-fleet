@@ -2440,6 +2440,158 @@ async fn retention_report(
     Ok(Json(report))
 }
 
+async fn operational_metrics(
+    State(app): State<Gateway>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Response, ApiError> {
+    app.authorize_action(&identity, Action::FleetRead, None)
+        .await?;
+    let registry = app.registry();
+    let fleet = app.fleet_snapshot(&registry).await;
+    let active: u64 = fleet
+        .workers
+        .iter()
+        .map(|worker| worker.active_queries)
+        .sum();
+    let queued: u64 = fleet
+        .workers
+        .iter()
+        .map(|worker| worker.queued_queries)
+        .sum();
+    let oldest = fleet
+        .reported
+        .iter()
+        .filter_map(|worker| worker["oldest_queued_ms"].as_u64())
+        .max()
+        .unwrap_or(0);
+    let stored = app.control_db(|db| {
+        let execution = db.query_one(
+            "SELECT count(*),COALESCE(sum(elapsed_ms),0)::FLOAT8 FROM query_history WHERE elapsed_ms IS NOT NULL",
+            &[],
+        ).map_err(|_| ApiError::internal())?;
+        let provisioning = db.query_one(
+            "SELECT count(*),COALESCE(sum(EXTRACT(epoch FROM COALESCE(ready_at,terminated_at,now())-requested_at)*1000),0)::FLOAT8 FROM compute_lifecycles",
+            &[],
+        ).map_err(|_| ApiError::internal())?;
+        let profiles = db.query_one(
+            "SELECT count(*) FROM query_history WHERE profile_status IN ('io_error','invalid','too_large','not_emitted')",
+            &[],
+        ).map_err(|_| ApiError::internal())?;
+        let orphans = db.query_one(
+            "SELECT count(*),COALESCE(EXTRACT(epoch FROM max(now()-created_at)),0)::FLOAT8
+             FROM compute_reservations WHERE released_at IS NULL",
+            &[],
+        ).map_err(|_| ApiError::internal())?;
+        let denied = db.query(
+            "SELECT reason,count(*) FROM audit_events WHERE decision='denied' GROUP BY reason",
+            &[],
+        ).map_err(|_| ApiError::internal())?;
+        let maintenance = db.query(
+            "SELECT DISTINCT ON(r.task) r.task,r.status,COALESCE(r.backlog_remaining,false),
+                COALESCE(EXTRACT(epoch FROM now()-t.last_success_at),0)::FLOAT8
+             FROM platform_maintenance_runs r JOIN platform_maintenance_tasks t ON t.task=r.task
+             ORDER BY r.task,r.started_at DESC",
+            &[],
+        ).map_err(|_| ApiError::internal())?;
+        Ok((execution,provisioning,profiles,orphans,denied,maintenance))
+    }).await?;
+    let (execution, provisioning, profiles, orphans, denied, maintenance) = stored;
+    let mut text = String::from(
+        "# DuckFleet operational metrics; database counters are cumulative, not process-reset.\n\
+         # Observed OOM evidence is unavailable; unknown worker loss is not classified as OOM.\n",
+    );
+    text.push_str(&crate::telemetry::gauge(
+        "duckfleet_active_queries",
+        &[],
+        &active.to_string(),
+    ));
+    text.push_str(&crate::telemetry::gauge(
+        "duckfleet_queued_queries",
+        &[],
+        &queued.to_string(),
+    ));
+    text.push_str(&crate::telemetry::gauge(
+        "duckfleet_oldest_queued_milliseconds",
+        &[],
+        &oldest.to_string(),
+    ));
+    text.push_str(&crate::telemetry::counter(
+        "duckfleet_execution_duration_milliseconds_count",
+        &[],
+        execution.get::<_, i64>(0) as u64,
+    ));
+    text.push_str(&crate::telemetry::gauge(
+        "duckfleet_execution_duration_milliseconds_sum",
+        &[],
+        &execution.get::<_, f64>(1).to_string(),
+    ));
+    text.push_str(&crate::telemetry::counter(
+        "duckfleet_provisioning_duration_milliseconds_count",
+        &[],
+        provisioning.get::<_, i64>(0) as u64,
+    ));
+    text.push_str(&crate::telemetry::gauge(
+        "duckfleet_provisioning_duration_milliseconds_sum",
+        &[],
+        &provisioning.get::<_, f64>(1).to_string(),
+    ));
+    text.push_str(&crate::telemetry::counter(
+        "duckfleet_profile_capture_failures_total",
+        &[],
+        profiles.get::<_, i64>(0) as u64,
+    ));
+    text.push_str(&crate::telemetry::gauge(
+        "duckfleet_orphan_reservations",
+        &[],
+        &orphans.get::<_, i64>(0).to_string(),
+    ));
+    text.push_str(&crate::telemetry::gauge(
+        "duckfleet_oldest_orphan_reservation_seconds",
+        &[],
+        &orphans.get::<_, f64>(1).to_string(),
+    ));
+    text.push_str(&crate::telemetry::counter(
+        "duckfleet_worker_observed_oom_terminations_total",
+        &[],
+        0,
+    ));
+    for row in denied {
+        let count: i64 = row.get(1);
+        text.push_str(&crate::telemetry::counter(
+            "duckfleet_admission_rejections_total",
+            &[("reason", crate::telemetry::reason(row.get(0)))],
+            count as u64,
+        ));
+    }
+    for row in maintenance {
+        let task: &str = row.get(0);
+        let status: &str = row.get(1);
+        text.push_str(&crate::telemetry::gauge(
+            "duckfleet_maintenance_backlog",
+            &[("task", task)],
+            if row.get::<_, bool>(2) { "1" } else { "0" },
+        ));
+        text.push_str(&crate::telemetry::gauge(
+            "duckfleet_maintenance_last_success_seconds",
+            &[("task", task)],
+            &row.get::<_, f64>(3).to_string(),
+        ));
+        text.push_str(&crate::telemetry::gauge(
+            "duckfleet_maintenance_last_result",
+            &[("task", task), ("status", status)],
+            "1",
+        ));
+    }
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        text,
+    )
+        .into_response())
+}
+
 async fn compute_report(
     State(app): State<Gateway>,
     Extension(identity): Extension<Identity>,
@@ -2739,6 +2891,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/workers", get(workers))
         .route("/v1/compute", get(compute_report))
         .route("/v1/retention", get(retention_report))
+        .route("/metrics", get(operational_metrics))
         .route("/v1/pools", get(pool_discovery))
         .route("/v1/pools/reload", post(reload_pools))
         .route("/v1/principals", get(list_principals))
