@@ -12,7 +12,7 @@ bash scripts/aws/suspend.sh
   | "${KUBE[@]}" apply -f -
 
 render=(helm template duckfleet infra/helm/duckfleet --kube-context "$KUBE_CONTEXT"
-  --namespace "$NAMESPACE" -f artifacts/aws/values.json
+  --namespace "$NAMESPACE" -f infra/helm/duckfleet/values-aws.yaml -f artifacts/aws/values.json
   --set suspended=false --set legacyDatabaseUpgrade=true)
 "${render[@]}" --show-only templates/postgres.yaml | "${KUBE[@]}" apply -f -
 "${KUBE[@]}" rollout status statefulset/duckfleet-postgres --timeout=10m

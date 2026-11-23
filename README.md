@@ -32,6 +32,15 @@ simple-protocol drivers connect directly.
 
 The current engine is DuckDB 2.0.1. See the [release, cutover, and rollback guide](docs/duckdb-2.0.1-release.md) and [engine qualification procedure](docs/engine-upgrades.md).
 
+## Supported installation
+
+For a credentialed Linux installation without dbt or Kubernetes, follow the
+[single-host guide](docs/single-host.md) and run
+`bash scripts/install-single-host.sh`. The guide covers native architectures,
+persistent capacity, external storage, TLS, backup/restore, upgrades and local
+capacity measurement. `make test` below remains the disposable development
+harness with explicit fixture credentials.
+
 ## Run locally
 
 Requires Docker Engine with Compose v2 (Docker Desktop works). No host Rust,

@@ -1,0 +1,8 @@
+# Existing AWS development lane. Supply immutable images separately.
+bucket: duckfleet-dev-797781631727-us-east-2
+region: us-east-2
+secretName: duckfleet-dev
+storageClass: gp3
+nodeSelector:
+  kubernetes.io/os: linux
+  eks.amazonaws.com/compute-type: auto

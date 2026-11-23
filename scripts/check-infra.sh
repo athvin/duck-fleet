@@ -305,9 +305,9 @@ for script in scripts/*.sh scripts/aws/*.sh scripts/ci/*.sh; do bash -n "$script
 # The local Kubernetes harness renders the real chart, so a chart change that moves
 # something out from under the transform is caught here rather than in a cluster.
 for expect in \
-  'image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port:--no-hooks' \
-  'image,cpu-request,s3-path,node-selector:--show-only templates/harness.yaml' \
-  'image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod:--no-hooks --set isolatedCompute.enabled=true --set isolatedCompute.apiServerCidrs[0]=10.96.0.1/32'; do
+  'image,cpu-request,s3-auth,s3-path,storage-class,object-store-port:--no-hooks' \
+  'image,cpu-request,s3-path:--show-only templates/harness.yaml' \
+  'image,cpu-request,s3-auth,s3-path,storage-class,object-store-port,isolated-pod:--no-hooks --set isolatedCompute.enabled=true --set isolatedCompute.apiServerCidrs[0]=10.96.0.1/32'; do
   # shellcheck disable=SC2086
   helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
     --set results.enabled=true ${expect#*:} | python3 scripts/kind/localize.py --expect "${expect%%:*}" > /dev/null

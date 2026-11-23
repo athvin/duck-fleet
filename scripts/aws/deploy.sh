@@ -34,7 +34,8 @@ fi
 # or why, and spends the whole timeout before saying even that.
 migration_run=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 helm upgrade --install duckfleet infra/helm/duckfleet --kube-context "$KUBE_CONTEXT" \
-  --namespace "$NAMESPACE" -f artifacts/aws/values.json --set suspended=false \
+  --namespace "$NAMESPACE" -f infra/helm/duckfleet/values-aws.yaml \
+  -f artifacts/aws/values.json --set suspended=false \
   --set-string "platformMigration.runId=$migration_run" --timeout 5m
 python3 scripts/aws/wait-rollout.py --namespace "$NAMESPACE" --context "$KUBE_CONTEXT" --prune-migrations
 

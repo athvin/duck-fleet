@@ -1,9 +1,9 @@
 # Generated immutable image digests are supplied by scripts/aws/publish.sh.
 workerImage: ""
 dbtImage: ""
-bucket: duckfleet-dev-797781631727-us-east-2
-region: us-east-2
-secretName: duckfleet-dev
+bucket: duckfleet
+region: us-east-1
+secretName: duckfleet
 # Empty entries derive distinct namespace-scoped names. Provision roles separately;
 # the migration login owns platform objects but never receives CREATEROLE.
 databaseRoles: {}
@@ -14,7 +14,7 @@ authorization:
   # Reviewed seed for existing/new analysts, not a grant for every pool. Repeated
   # migrations preserve revoked grants. Custom defaults must set this explicitly.
   defaultPersistentGrant: {pool: small, cpu: 1, memory: 1Gi, disk: 2Gi}
-storageClass: gp3
+storageClass: standard
 # Where pods run. EKS Auto Mode nodes, on whatever pool the cluster offers.
 #
 # DuckFleet has a node pool of its own in infra/kubernetes/boundary/eks, and pinning it
@@ -31,7 +31,6 @@ storageClass: gp3
 # It is bundled with enabling isolated compute, whose apiServerCidrs likewise cannot be
 # a chart default — both are facts about the cluster, not the chart (duck-fleet#39).
 nodeSelector:
-  eks.amazonaws.com/compute-type: auto
   kubernetes.io/os: linux
 
 # What would let these pods onto the DuckFleet pool, which is tainted so nothing else

@@ -35,8 +35,13 @@ fi
 "${kube[@]}" get secret duckfleet-dev -o json | python3 scripts/database_roles.py "$ns" --check
 migration_run=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 helm template duckfleet infra/helm/duckfleet --namespace "$ns" \
+  --set secretName=duckfleet-dev \
   --set "lakePrefix=$ns/lake" --set "results.prefix=$ns/results" --set-string "platformMigration.runId=$migration_run" "$@" \
   | sh -c "$transform" \
   | "${kube[@]}" apply -f -
-python3 scripts/aws/wait-rollout.py --context "$context" --namespace "$ns" --prune-migrations
+if ! python3 scripts/aws/wait-rollout.py --context "$context" --namespace "$ns" --prune-migrations; then
+  "${kube[@]}" get pods -o wide || true
+  "${kube[@]}" logs -l app=duckfleet-platform-migrate --all-containers --prefix --tail=200 || true
+  exit 1
+fi
 echo "provisioned $ns: its own boundary, catalog, credentials, and lake prefix $ns/lake"

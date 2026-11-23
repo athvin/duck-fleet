@@ -7,8 +7,8 @@ x-result-environment: &result-environment
   DUCKFLEET_RESULT_AUTH_MODE: static
   DUCKFLEET_RESULT_ENDPOINT: http://object-store:9000
   DUCKFLEET_RESULT_ALLOW_HTTP: "true"
-  DUCKFLEET_RESULT_ACCESS_KEY: DUCKFLEETLOCAL
-  DUCKFLEET_RESULT_SECRET_KEY: local-object-store-password
+  DUCKFLEET_RESULT_ACCESS_KEY: ${DUCKFLEET_OBJECT_ACCESS_KEY:-DUCKFLEETLOCAL}
+  DUCKFLEET_RESULT_SECRET_KEY: ${DUCKFLEET_OBJECT_SECRET_KEY:-local-object-store-password}
   AWS_REGION: us-east-1
   AWS_EC2_METADATA_DISABLED: "true"
 services:
@@ -29,8 +29,8 @@ services:
   object-store:
     image: rustfs/rustfs:1.0.4
     environment:
-      RUSTFS_ACCESS_KEY: DUCKFLEETLOCAL
-      RUSTFS_SECRET_KEY: local-object-store-password
+      RUSTFS_ACCESS_KEY: ${DUCKFLEET_OBJECT_ACCESS_KEY:-DUCKFLEETLOCAL}
+      RUSTFS_SECRET_KEY: ${DUCKFLEET_OBJECT_SECRET_KEY:-local-object-store-password}
       RUSTFS_CONSOLE_ENABLE: 'false'
     volumes:
       - object-data:/data
@@ -39,6 +39,10 @@ services:
     build:
       context: .
       dockerfile: docker/s3.Dockerfile
+    environment:
+      DUCKFLEET_OBJECT_ACCESS_KEY: ${DUCKFLEET_OBJECT_ACCESS_KEY:-DUCKFLEETLOCAL}
+      DUCKFLEET_OBJECT_SECRET_KEY: ${DUCKFLEET_OBJECT_SECRET_KEY:-local-object-store-password}
+      DUCKFLEET_READER_OBJECT_SECRET_KEY: ${DUCKFLEET_READER_OBJECT_SECRET_KEY:-local-lake-reader-object-password}
     depends_on: [object-store]
 
   platform-provision:
@@ -54,12 +58,12 @@ services:
       DUCKFLEET_DB_MAINTAINER_ROLE: duckfleet_maintainer
       DUCKFLEET_DB_CATALOG_ROLE: duckfleet_catalog
       DUCKFLEET_DB_CATALOG_READER_ROLE: duckfleet_catalog_reader
-      DUCKFLEET_DB_MIGRATOR_PASSWORD: local-platform-migration-password
-      DUCKFLEET_DB_GATEWAY_PASSWORD: local-platform-gateway-password
-      DUCKFLEET_DB_WORKER_PASSWORD: local-platform-worker-password
-      DUCKFLEET_DB_MAINTAINER_PASSWORD: local-platform-maintainer-password
-      DUCKFLEET_DB_CATALOG_PASSWORD: local-lake-catalog-password
-      DUCKFLEET_DB_CATALOG_READER_PASSWORD: local-lake-reader-password
+      DUCKFLEET_DB_MIGRATOR_PASSWORD: ${DUCKFLEET_DB_MIGRATOR_PASSWORD:-local-platform-migration-password}
+      DUCKFLEET_DB_GATEWAY_PASSWORD: ${DUCKFLEET_DB_GATEWAY_PASSWORD:-local-platform-gateway-password}
+      DUCKFLEET_DB_WORKER_PASSWORD: ${DUCKFLEET_DB_WORKER_PASSWORD:-local-platform-worker-password}
+      DUCKFLEET_DB_MAINTAINER_PASSWORD: ${DUCKFLEET_DB_MAINTAINER_PASSWORD:-local-platform-maintainer-password}
+      DUCKFLEET_DB_CATALOG_PASSWORD: ${DUCKFLEET_DB_CATALOG_PASSWORD:-local-lake-catalog-password}
+      DUCKFLEET_DB_CATALOG_READER_PASSWORD: ${DUCKFLEET_DB_CATALOG_READER_PASSWORD:-local-lake-reader-password}
       # Explicit opt-in only after stop-compute for a pre-RBAC local volume.
       DUCKFLEET_ADOPT_DATABASE_OWNER: ${DUCKFLEET_ADOPT_DATABASE_OWNER:-no}
     volumes:
@@ -85,7 +89,7 @@ services:
       DUCKFLEET_AUTHZ_DEFAULT_CPU: "1"
       DUCKFLEET_AUTHZ_DEFAULT_MEMORY: 1Gi
       DUCKFLEET_AUTHZ_DEFAULT_DISK: 2Gi
-      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_migrator password=local-platform-migration-password
+      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_migrator password=${DUCKFLEET_DB_MIGRATOR_PASSWORD:-local-platform-migration-password}
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       DUCKFLEET_MIGRATION_TIMEOUT_SECONDS: "240"
     depends_on:
@@ -123,11 +127,11 @@ services:
       DUCKFLEET_RATE_CARD_VERSION: local-dev-1
       DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR: "100000"
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
-      CATALOG_DSN: host=postgres port=5432 dbname=lake user=duckfleet_catalog password=local-lake-catalog-password
-      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_worker password=local-platform-worker-password
+      CATALOG_DSN: host=postgres port=5432 dbname=lake user=duckfleet_catalog password=${DUCKFLEET_DB_CATALOG_PASSWORD:-local-lake-catalog-password}
+      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_worker password=${DUCKFLEET_DB_WORKER_PASSWORD:-local-platform-worker-password}
       S3_ENDPOINT: object-store:9000
-      S3_ACCESS_KEY: DUCKFLEETLOCAL
-      S3_SECRET_KEY: local-object-store-password
+      S3_ACCESS_KEY: ${DUCKFLEET_OBJECT_ACCESS_KEY:-DUCKFLEETLOCAL}
+      S3_SECRET_KEY: ${DUCKFLEET_OBJECT_SECRET_KEY:-local-object-store-password}
       S3_DATA_PATH: s3://duckfleet/lake/
     depends_on:
       platform-migrate:
@@ -185,11 +189,11 @@ services:
       DUCKFLEET_RATE_CARD_VERSION: local-dev-1
       DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR: "100000"
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
-      CATALOG_READER_DSN: host=postgres port=5432 dbname=lake user=duckfleet_catalog_reader password=local-lake-reader-password
+      CATALOG_READER_DSN: host=postgres port=5432 dbname=lake user=duckfleet_catalog_reader password=${DUCKFLEET_DB_CATALOG_READER_PASSWORD:-local-lake-reader-password}
       PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_worker password=local-platform-worker-password
       S3_ENDPOINT: object-store:9000
       S3_READER_ACCESS_KEY: DUCKFLEETREADER
-      S3_READER_SECRET_KEY: local-lake-reader-object-password
+      S3_READER_SECRET_KEY: ${DUCKFLEET_READER_OBJECT_SECRET_KEY:-local-lake-reader-object-password}
       S3_DATA_PATH: s3://duckfleet/lake/
     depends_on:
       platform-migrate:
@@ -219,8 +223,8 @@ services:
       DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
       # The wire front is exercised by the harness; the port stays internal.
       DUCKFLEET_PGWIRE: "true"
-      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_gateway password=local-platform-gateway-password
-      DUCKFLEET_MAINTENANCE_DSN: host=postgres port=5432 dbname=platform user=duckfleet_maintainer password=local-platform-maintainer-password
+      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_gateway password=${DUCKFLEET_DB_GATEWAY_PASSWORD:-local-platform-gateway-password}
+      DUCKFLEET_MAINTENANCE_DSN: host=postgres port=5432 dbname=platform user=duckfleet_maintainer password=${DUCKFLEET_DB_MAINTAINER_PASSWORD:-local-platform-maintainer-password}
       DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
       # The same card the workers price with; the gateway reports it on the budget.
       DUCKFLEET_RATE_CARD_VERSION: local-dev-1
@@ -282,8 +286,8 @@ services:
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       DUCKFLEET_HISTORY_RETENTION_DAYS: "365"
       DUCKFLEET_PGWIRE: "true"
-      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_gateway password=local-platform-gateway-password
-      DUCKFLEET_MAINTENANCE_DSN: host=postgres port=5432 dbname=platform user=duckfleet_maintainer password=local-platform-maintainer-password
+      PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_gateway password=${DUCKFLEET_DB_GATEWAY_PASSWORD:-local-platform-gateway-password}
+      DUCKFLEET_MAINTENANCE_DSN: host=postgres port=5432 dbname=platform user=duckfleet_maintainer password=${DUCKFLEET_DB_MAINTAINER_PASSWORD:-local-platform-maintainer-password}
       DUCKFLEET_TOKEN: ${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
       DUCKFLEET_RATE_CARD_VERSION: local-dev-1
       DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR: "100000"
