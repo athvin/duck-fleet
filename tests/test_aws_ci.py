@@ -891,7 +891,7 @@ class QueueDeploymentTests(unittest.TestCase):
              mock.patch.object(lifecycle,'run') as command:
             lifecycle.stop_compose()
         self.assertEqual([call.args[0] for call in command.call_args_list],
-                         [['docker','stop','-t','90','gateway'],['docker','stop','-t','90','old-optional-worker']])
+                         [['docker','stop','-t','630','gateway'],['docker','stop','-t','630','old-optional-worker']])
         with self.assertRaisesRegex(ValueError,'stop-compute'):
             lifecycle.check_compose_state(containers)
 

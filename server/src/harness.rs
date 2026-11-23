@@ -1186,13 +1186,14 @@ async fn maintenance_checks(ctx: &Ctx) -> anyhow::Result<()> {
         .await,
         400,
     )?;
-    request_json(
-        &admin,
-        Method::POST,
-        "/v1/lake/maintenance",
-        Some(&json!({"expire_older_than_days": 0, "compact": true, "cleanup": true})),
-    )
-    .await?;
+    admin
+        .request(
+            Method::POST,
+            "/v1/lake/maintenance",
+            Some(&json!({"expire_older_than_days": 0, "compact": true, "cleanup": true})),
+            client::STATEMENT_TIMEOUT,
+        )
+        .await?;
     let mut verify = ctx.open_named("maintenance-verify", None).await?;
     let rows = sql(&verify, "select count(*), sum(n) from api_demo.fragmented").await?;
     require(

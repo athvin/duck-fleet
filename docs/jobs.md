@@ -96,9 +96,9 @@ queued execution. Revocation or a reduced policy is checked before execution.
 Each job is a fresh autocommit session supporting one engine-parsed SELECT, INSERT,
 UPDATE, DELETE, CREATE, ALTER, or DROP statement. Scripts, explicit transactions,
 caller sessions, and MERGE are rejected before execution. A job cannot share a
-temporary table or transaction with another job. Native DuckDB 1.5.4 is retained;
-the small vendored Rust adapter adds checked streaming and strict single-statement
-preparation without upgrading the engine.
+temporary table or transaction with another job. DuckDB 2.0.1 is checked before
+worker readiness, and the vendored Rust adapter adds checked streaming and strict
+single-statement preparation.
 
 Hard ceilings are 3600 seconds execution, 1 GiB encoded result data, 10 million rows,
 4096 chunks, and 24 hours retention. Queue waiting defaults to 120 seconds with a

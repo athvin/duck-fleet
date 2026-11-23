@@ -30,6 +30,8 @@ CLI and a dbt adapter exist — and an opt-in
 [Postgres wire-protocol front](#the-postgres-wire-front) lets `psql` and
 simple-protocol drivers connect directly.
 
+The current engine is DuckDB 2.0.1. See the [release, cutover, and rollback guide](docs/duckdb-2.0.1-release.md) and [engine qualification procedure](docs/engine-upgrades.md).
+
 ## Run locally
 
 Requires Docker Engine with Compose v2 (Docker Desktop works). No host Rust,
@@ -72,7 +74,7 @@ This deletes the catalog, history, and object-store volumes.
 ## What the harness proves
 
 - A thin `type: duckfleet` dbt adapter sends SQL and bound parameters over HTTP to
-  an Axum gateway routing to workers embedding DuckDB 1.5.4. Arrow IPC preserves result types.
+  an Axum gateway routing to workers embedding DuckDB 2.0.1. Arrow IPC preserves result types.
 - DuckLake metadata lives in PostgreSQL; data lives in S3-compatible RustFS.
   A separate PostgreSQL database stores execution history. Workers attach the
   catalog and object store; the gateway reads the platform history database in
@@ -956,7 +958,7 @@ restart. `artifacts/query-profile.json` contains a real profiled dbt model query
 DuckLake detects a write conflict when a transaction **commits**, not while its
 statements run. The first transaction to commit wins, and a losing transaction is
 discarded whole rather than partly applied. Everything in this section was measured
-against DuckDB 1.5.4 with a DuckLake PostgreSQL catalog and is re-verified on every
+against DuckDB 2.0.1 with a DuckLake PostgreSQL catalog and is re-verified on every
 run by the harness `--concurrency` stage (`server/src/harness/concurrency.rs`), which
 interleaves two sessions on the persistent worker so the conflict window is exact
 instead of a race. Evidence is saved to

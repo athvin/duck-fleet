@@ -162,6 +162,13 @@ impl Startup {
     pub(crate) fn run(&self, step: &str, sql: &str) -> Result<()> {
         self.redactor.guard(step, self.conn.execute_batch(sql))
     }
+    pub(crate) fn inspect<T>(
+        &self,
+        step: &str,
+        inspect: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        self.redactor.guard(step, inspect(&self.conn))
+    }
     pub(crate) fn into_connection(self) -> Connection {
         self.conn
     }
