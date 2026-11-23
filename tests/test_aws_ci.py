@@ -1483,6 +1483,8 @@ class DatabaseRolePackagingTests(unittest.TestCase):
         document = roles.secret('fixture')
         roles.check_secret(document)
         data = document['stringData']
+        self.assertIn('dbname=lake', data['CATALOG_READER_DSN'])
+        self.assertNotIn('dbname=platform', data['CATALOG_READER_DSN'])
         passwords = [data['POSTGRES_PASSWORD'],data['DUCKFLEET_TOKEN'],data['DUCKFLEET_INTERNAL_TOKEN']]
         passwords += [data['DATABASE_'+part.upper()+'_PASSWORD'] for part in roles.PARTS]
         self.assertEqual(len(passwords),len(set(passwords)))

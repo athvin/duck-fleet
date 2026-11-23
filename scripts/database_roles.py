@@ -31,7 +31,7 @@ def secret(namespace, name="duckfleet-dev", host="postgres"):
     for part in PARTS:
         password = secrets.token_hex(32)
         values[f"DATABASE_{part.upper()}_PASSWORD"] = password
-        database = "lake" if part == "catalog" else "platform"
+        database = "lake" if part in ("catalog", "catalog_reader") else "platform"
         values[DSN_KEYS[part]] = f"host={host} port=5432 user={roles[part]} password={password} dbname={database}"
     return {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "namespace": namespace},
             "type": "Opaque", "stringData": values}
