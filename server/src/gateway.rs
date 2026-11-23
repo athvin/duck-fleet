@@ -1546,6 +1546,67 @@ impl Gateway {
         }
     }
 
+    async fn recover_expired(&self) {
+        let Some(isolation) = self.isolation.as_ref() else {
+            return;
+        };
+        let live = match self
+            .control_db(|db| crate::ownership::live_workers(db, crate::isolated::PREFIX))
+            .await
+        {
+            Ok(workers) => workers.into_iter().collect(),
+            Err(error) => {
+                tracing::warn!(kind = error.0.kind, "live gateway ownership refresh failed");
+                return;
+            }
+        };
+        let orphaned = match self
+            .control_db(|db| crate::ownership::expired_workers(db, crate::isolated::PREFIX))
+            .await
+        {
+            Ok(workers) => workers,
+            Err(error) => {
+                tracing::warn!(
+                    kind = error.0.kind,
+                    "expired gateway ownership refresh failed"
+                );
+                return;
+            }
+        };
+        if orphaned.is_empty() {
+            return;
+        }
+        let job_pods = match self
+            .control_db(|db| crate::jobs::live_job_pods(db).map_err(|_| ApiError::internal()))
+            .await
+        {
+            Ok(pods) => pods.into_iter().collect(),
+            Err(error) => {
+                tracing::warn!(kind = error.0.kind, "durable job ownership refresh failed");
+                return;
+            }
+        };
+        let swept = isolation.sweep_expired(&orphaned, &job_pods, &live).await;
+        self.finish_sweep(swept).await;
+    }
+
+    async fn finish_sweep(&self, swept: crate::isolated::SweepResult) {
+        self.retired_pods
+            .lock()
+            .await
+            .extend(swept.pending.into_iter().map(|pod| (pod, Instant::now())));
+        for pod in swept.confirmed_absent {
+            self.retired_pods
+                .lock()
+                .await
+                .entry(pod.clone())
+                .or_insert_with(Instant::now);
+            if self.finish_lifecycle(&pod, Some("gateway_restarted")).await {
+                self.recover_retired(pod).await;
+            }
+        }
+    }
+
     async fn retry_retired(&self) {
         let pods = {
             let mut retired = self.retired_pods.lock().await;
@@ -3005,20 +3066,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             .into_iter()
             .collect();
         let swept = isolation.sweep_excluding(&orphaned, &job_pods, &live).await;
-        app.retired_pods
-            .lock()
-            .await
-            .extend(swept.pending.into_iter().map(|pod| (pod, Instant::now())));
-        for pod in swept.confirmed_absent {
-            app.retired_pods
-                .lock()
-                .await
-                .entry(pod.clone())
-                .or_insert_with(Instant::now);
-            if app.finish_lifecycle(&pod, Some("gateway_restarted")).await {
-                app.recover_retired(pod).await;
-            }
-        }
+        app.finish_sweep(swept).await;
         tracing::info!("isolated compute is available");
     }
     let ownership_app = app.clone();
@@ -3110,6 +3158,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             tokio::join!(
                 cleanup.expire(),
                 cleanup.retry_retired(),
+                cleanup.recover_expired(),
                 cleanup.reconcile_job_pods()
             );
         }

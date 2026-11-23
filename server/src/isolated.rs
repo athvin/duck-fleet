@@ -473,7 +473,17 @@ impl Isolation {
         jobs: &BTreeSet<String>,
         live: &BTreeSet<String>,
     ) -> SweepResult {
-        self.sweep_filtered(orphaned, STOP_WAIT, SWEEP_WAIT, jobs, live)
+        self.sweep_filtered(orphaned, STOP_WAIT, SWEEP_WAIT, jobs, live, true)
+            .await
+    }
+
+    pub async fn sweep_expired(
+        &self,
+        orphaned: &[String],
+        jobs: &BTreeSet<String>,
+        live: &BTreeSet<String>,
+    ) -> SweepResult {
+        self.sweep_filtered(orphaned, STOP_WAIT, SWEEP_WAIT, jobs, live, false)
             .await
     }
 
@@ -484,25 +494,29 @@ impl Isolation {
         sweep_wait: Duration,
         jobs: &BTreeSet<String>,
         live: &BTreeSet<String>,
+        include_labelled: bool,
     ) -> SweepResult {
         let deadline = tokio::time::Instant::now() + sweep_wait;
         let mut names: BTreeSet<String> = orphaned.iter().cloned().collect();
         // Only expired ownership is orphaned. A live sibling gateway may still hold
         // the route when high availability is enabled; the durable lease selects it.
-        match tokio::time::timeout(stop_wait.min(sweep_wait), self.kube.pods_labelled(LABEL)).await
-        {
-            Ok(Ok(pods)) => {
-                for pod in &pods {
-                    if let Some(name) = pod["metadata"]["name"].as_str() {
-                        names.insert(name.to_owned());
+        if include_labelled {
+            match tokio::time::timeout(stop_wait.min(sweep_wait), self.kube.pods_labelled(LABEL))
+                .await
+            {
+                Ok(Ok(pods)) => {
+                    for pod in &pods {
+                        if let Some(name) = pod["metadata"]["name"].as_str() {
+                            names.insert(name.to_owned());
+                        }
                     }
                 }
+                Ok(Err(error)) => tracing::error!(
+                    error = format!("{error:#}"),
+                    "could not list session pods to sweep"
+                ),
+                Err(_) => tracing::warn!("timed out listing session pods to sweep"),
             }
-            Ok(Err(error)) => tracing::error!(
-                error = format!("{error:#}"),
-                "could not list session pods to sweep"
-            ),
-            Err(_) => tracing::warn!("timed out listing session pods to sweep"),
         }
         names.retain(|name| !jobs.contains(name) && !live.contains(name));
         let mut pending = names.clone();
@@ -889,6 +903,7 @@ mod tests {
                 Duration::from_secs(2),
                 &BTreeSet::new(),
                 &BTreeSet::from(["duckfleet-session-sibling-live".into()]),
+                true,
             )
             .await;
         assert_eq!(
@@ -899,6 +914,11 @@ mod tests {
             ]
         );
         assert_eq!(result.pending, ["duckfleet-session-label-live"]);
+        let expired = isolation
+            .sweep_expired(&[], &BTreeSet::new(), &BTreeSet::new())
+            .await;
+        assert!(expired.confirmed_absent.is_empty());
+        assert!(expired.pending.is_empty());
     }
 
     fn template() -> Value {

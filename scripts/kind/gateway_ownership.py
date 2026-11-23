@@ -78,7 +78,8 @@ def expect_status(expected, operation):
     try:
         operation()
     except urllib.error.HTTPError as error:
-        assert error.code == expected, (error.code, error.read().decode())
+        expected_codes = [expected] if isinstance(expected, int) else expected
+        assert error.code in expected_codes, (error.code, error.read().decode())
         return
     raise AssertionError(f"expected HTTP {expected}")
 
