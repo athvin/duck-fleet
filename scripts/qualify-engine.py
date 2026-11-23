@@ -215,7 +215,7 @@ def validate_extensions(report):
 
 
 def cli_sql(base, env, statement):
-    command = base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", statement, "--format", "json"]
+    command = base + ["run", "--rm", "--no-deps", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", statement, "--format", "json"]
     result = run(command, env=env, check=False)
     if result.returncode:
         raise RuntimeError(f"recovery SQL failed: {statement}: {result.stderr.strip()}")
@@ -264,7 +264,7 @@ def recovery_drill(base, env, baseline_tag, candidate_tag, directory):
         run(base + ["up", "-d", "--wait", "server"], env=env, log=recovery_log)
         cli_scalar(base, env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 1)
         cli_scalar(base, env, "SELECT value FROM lake.options() WHERE option_name='version'", "1.0")
-        run(base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "history", "--limit", "5"], env=env, log=recovery_log)
+        run(base + ["run", "--rm", "--no-deps", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "history", "--limit", "5"], env=env, log=recovery_log)
         evidence["restore_verified"] = True
         evidence["post_backup_write_discarded"] = True
         evidence["time_travel_snapshot"] = snapshot
@@ -283,7 +283,7 @@ def recovery_drill(base, env, baseline_tag, candidate_tag, directory):
         cli_scalar(base, rollback_env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 2)
         cli_sql(base, rollback_env, "INSERT INTO analytics.rollback_fixture VALUES (4)")
         cli_scalar(base, rollback_env, "SELECT count(*) AS value FROM analytics.rollback_fixture", 3)
-        run(base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "history", "--limit", "5"], env=rollback_env, log=recovery_log)
+        run(base + ["run", "--rm", "--no-deps", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "history", "--limit", "5"], env=rollback_env, log=recovery_log)
         evidence["rollback_verified"] = True
         evidence["rollback_engine"] = "v1.5.4"
         evidence["write_after_restore_engine"] = "v2.0.1"
@@ -298,7 +298,7 @@ def recovery_drill(base, env, baseline_tag, candidate_tag, directory):
 
 
 def cli_json(base, env, args):
-    command = base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", *args]
+    command = base + ["run", "--rm", "--no-deps", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", *args]
     result = run(command, env=env, check=False)
     if result.returncode:
         raise RuntimeError(f"CLI command failed: {args}: {result.stderr.strip()}")
@@ -306,14 +306,14 @@ def cli_json(base, env, args):
 
 
 def cutover_drill(base, env, baseline_tag, candidate_tag, directory, skip_dbt):
-    evidence = {"drained_statement": False, "old_writers": 0, "passed": False}
+    evidence = {"drained_statement": False, "old_writers": None, "passed": False}
     log = directory / "cutover.log"
     process = None
     try:
         run(["bash", str(ROOT / "scripts/backup-catalog.sh"), "compose", str(directory / "cutover-point")], env=env, log=log)
         with log.open("a") as handle:
             process = subprocess.Popen(
-                base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", "SELECT sum(sin(i)) FROM range(100000000000) AS source(i)"],
+                base + ["run", "--rm", "--no-deps", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", "SELECT sum(sin(i)) FROM range(100000000000) AS source(i)"],
                 cwd=ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT,
             )
         observed = False
@@ -326,14 +326,15 @@ def cutover_drill(base, env, baseline_tag, candidate_tag, directory, skip_dbt):
                 break
             time.sleep(0.5)
         if not observed:
-            raise RuntimeError("the cutover statement never became active")
+            exit_code = process.poll()
+            raise RuntimeError(f"the cutover statement never became active; CLI exit={exit_code}; see {log}")
         run(["bash", str(ROOT / "scripts/stop-compute.sh"), "compose"], env=env, log=log)
         result = process.wait(timeout=120)
         process = None
         if result != 0:
             raise RuntimeError(f"the active statement did not drain successfully: {result}; see {log}")
         evidence["drained_statement"] = True
-        refused = run(base + ["run", "--rm", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", "SELECT 1"], env=env, check=False)
+        refused = run(base + ["run", "--rm", "--no-deps", "--env", "DUCKFLEET_ROLE=cli", "api", "duckfleet-server", "sql", "SELECT 1"], env=env, check=False)
         if refused.returncode == 0:
             raise RuntimeError("stopped compute accepted new SQL")
 
@@ -362,11 +363,11 @@ def cutover_drill(base, env, baseline_tag, candidate_tag, directory, skip_dbt):
         pgwire_checks(base, env, directory)
         smoke = ["http", "pgwire"]
         if not skip_dbt:
-            run(base + ["run", "--rm", "dbt", "dbt", "debug"], env=env, log=log)
-            run(base + ["run", "--rm", "dbt", "duckfleet-server", "--jobs"], env=env, log=log)
+            run(base + ["run", "--rm", "--no-deps", "dbt", "dbt", "debug"], env=env, log=log)
+            run(base + ["run", "--rm", "--no-deps", "dbt", "duckfleet-server", "--jobs"], env=env, log=log)
             smoke.extend(["dbt", "jobs", "artifacts"])
-        run(base + ["run", "--rm", "dbt", "duckfleet-server", "--maintenance"], env=env, log=log)
-        run(base + ["run", "--rm", "dbt", "duckfleet-server", "--rbac"], env=env, log=log)
+        run(base + ["run", "--rm", "--no-deps", "dbt", "duckfleet-server", "--maintenance"], env=env, log=log)
+        run(base + ["run", "--rm", "--no-deps", "dbt", "duckfleet-server", "--rbac"], env=env, log=log)
         cli_json(base, env, ["history", "--limit", "5"])
         evidence["smoke"] = smoke + ["maintenance", "rbac", "history"]
         evidence["engine"] = "v2.0.1"
@@ -405,11 +406,11 @@ def run_lane(name, project, tag, version, directory, override, corpus_tag, skip_
         stages = [
             ("api", ["run", "--rm", "api"]),
             ("dbt", ["run", "--rm", "dbt"]),
-            ("scale", ["run", "--rm", "dbt", "duckfleet-server", "--scale"]),
-            ("concurrency", ["run", "--rm", "dbt", "duckfleet-server", "--concurrency"]),
-            ("jobs", ["run", "--rm", "dbt", "duckfleet-server", "--jobs"]),
+            ("scale", ["run", "--rm", "--no-deps", "dbt", "duckfleet-server", "--scale"]),
+            ("concurrency", ["run", "--rm", "--no-deps", "dbt", "duckfleet-server", "--concurrency"]),
+            ("jobs", ["run", "--rm", "--no-deps", "dbt", "duckfleet-server", "--jobs"]),
             ("engine-corpus", ["run", "--rm", "api", "duckfleet-server", "--engine-qualification"]),
-            ("observability", ["run", "--rm", "dbt", "duckfleet-server", "--observability"]),
+            ("observability", ["run", "--rm", "--no-deps", "dbt", "duckfleet-server", "--observability"]),
             ("pgwire", None),
         ]
         for stage, command in stages:
