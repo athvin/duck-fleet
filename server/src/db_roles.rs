@@ -71,6 +71,7 @@ const QUEUE_TABLES: &[&str] = &[
     "compute_lifecycles",
     "compute_reservations",
     "compute_policies",
+    "gateway_sessions",
 ];
 const POLICY_TABLES: &[&str] = &[
     "platform_namespace",

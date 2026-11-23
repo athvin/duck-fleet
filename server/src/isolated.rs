@@ -458,6 +458,21 @@ impl Isolation {
         }
     }
 
+    pub async fn endpoint(&self, name: &str) -> Result<String, ApiError> {
+        let pod = self
+            .kube
+            .pod(name)
+            .await
+            .map_err(|_| ApiError::internal())?
+            .filter(ready)
+            .ok_or_else(|| ApiError::new(failure::SESSION_LOST, "owning pod is not ready"))?;
+        let address = pod["status"]["podIP"]
+            .as_str()
+            .filter(|address| !address.is_empty())
+            .ok_or_else(|| ApiError::new(failure::SESSION_LOST, "owning pod has no endpoint"))?;
+        Ok(format!("http://{address}:8080"))
+    }
+
     pub async fn stop_confirmed(&self, name: &str) -> bool {
         confirm_stopped(&self.kube, name, STOP_WAIT).await
     }
@@ -471,19 +486,19 @@ impl Isolation {
         &self,
         orphaned: &[String],
         jobs: &BTreeSet<String>,
+        live: &BTreeSet<String>,
     ) -> SweepResult {
-        self.sweep_filtered(orphaned, STOP_WAIT, SWEEP_WAIT, jobs)
+        self.sweep_filtered(orphaned, STOP_WAIT, SWEEP_WAIT, jobs, live, true)
             .await
     }
 
-    #[cfg(test)]
-    async fn sweep_bounded(
+    pub async fn sweep_expired(
         &self,
         orphaned: &[String],
-        stop_wait: Duration,
-        sweep_wait: Duration,
+        jobs: &BTreeSet<String>,
+        live: &BTreeSet<String>,
     ) -> SweepResult {
-        self.sweep_filtered(orphaned, stop_wait, sweep_wait, &BTreeSet::new())
+        self.sweep_filtered(orphaned, STOP_WAIT, SWEEP_WAIT, jobs, live, false)
             .await
     }
 
@@ -493,28 +508,32 @@ impl Isolation {
         stop_wait: Duration,
         sweep_wait: Duration,
         jobs: &BTreeSet<String>,
+        live: &BTreeSet<String>,
+        include_labelled: bool,
     ) -> SweepResult {
         let deadline = tokio::time::Instant::now() + sweep_wait;
         let mut names: BTreeSet<String> = orphaned.iter().cloned().collect();
-        // Anything still labelled at startup is orphaned by definition: this gateway
-        // holds no route to it, and the chart runs a single gateway with `Recreate`,
-        // so there is no sibling that could still be using one.
-        match tokio::time::timeout(stop_wait.min(sweep_wait), self.kube.pods_labelled(LABEL)).await
-        {
-            Ok(Ok(pods)) => {
-                for pod in &pods {
-                    if let Some(name) = pod["metadata"]["name"].as_str() {
-                        names.insert(name.to_owned());
+        // Only expired ownership is orphaned. A live sibling gateway may still hold
+        // the route when high availability is enabled; the durable lease selects it.
+        if include_labelled {
+            match tokio::time::timeout(stop_wait.min(sweep_wait), self.kube.pods_labelled(LABEL))
+                .await
+            {
+                Ok(Ok(pods)) => {
+                    for pod in &pods {
+                        if let Some(name) = pod["metadata"]["name"].as_str() {
+                            names.insert(name.to_owned());
+                        }
                     }
                 }
+                Ok(Err(error)) => tracing::error!(
+                    error = format!("{error:#}"),
+                    "could not list session pods to sweep"
+                ),
+                Err(_) => tracing::warn!("timed out listing session pods to sweep"),
             }
-            Ok(Err(error)) => tracing::error!(
-                error = format!("{error:#}"),
-                "could not list session pods to sweep"
-            ),
-            Err(_) => tracing::warn!("timed out listing session pods to sweep"),
         }
-        names.retain(|name| !jobs.contains(name));
+        names.retain(|name| !jobs.contains(name) && !live.contains(name));
         let mut pending = names.clone();
         let mut remaining = names.into_iter();
         let mut checks = tokio::task::JoinSet::new();
@@ -848,7 +867,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_returns_only_proven_deaths_and_retains_unreserved_labeled_orphans() {
+    async fn endpoint_uses_the_ready_pod_ip() {
+        use axum::{Json, routing::get};
+        let router = axum::Router::new().route(
+            "/api/v1/namespaces/test/pods/duckfleet-session-route",
+            get(|| async {
+                Json(json!({"status":{
+                    "podIP":"10.42.0.17",
+                    "conditions":[{"type":"Ready","status":"True"}]
+                }}))
+            }),
+        );
+        let api = crate::kube::test_support::FakeKube::serve(router).await;
+        let isolation = Isolation {
+            kube: api.kube.clone(),
+            template: template(),
+            owner: owner("server", "owner"),
+            ready: Duration::from_secs(1),
+            provisioning: Duration::ZERO,
+            quota_wait: Duration::ZERO,
+        };
+        assert_eq!(
+            isolation.endpoint("duckfleet-session-route").await.unwrap(),
+            "http://10.42.0.17:8080"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_protects_live_siblings_and_retains_unconfirmed_orphans() {
         use axum::{
             Json,
             extract::Path,
@@ -862,7 +908,8 @@ mod tests {
                 get(|| async {
                     Json(json!({"items":[
                         {"metadata":{"name":"duckfleet-session-label-gone"}},
-                        {"metadata":{"name":"duckfleet-session-label-live"}}
+                        {"metadata":{"name":"duckfleet-session-label-live"}},
+                        {"metadata":{"name":"duckfleet-session-sibling-live"}}
                     ]}))
                 }),
             )
@@ -889,13 +936,16 @@ mod tests {
             quota_wait: Duration::ZERO,
         };
         let result = isolation
-            .sweep_bounded(
+            .sweep_filtered(
                 &[
                     "duckfleet-session-held-gone".into(),
                     "duckfleet-session-held-gone".into(),
                 ],
                 Duration::from_millis(100),
                 Duration::from_secs(2),
+                &BTreeSet::new(),
+                &BTreeSet::from(["duckfleet-session-sibling-live".into()]),
+                true,
             )
             .await;
         assert_eq!(
@@ -906,6 +956,11 @@ mod tests {
             ]
         );
         assert_eq!(result.pending, ["duckfleet-session-label-live"]);
+        let expired = isolation
+            .sweep_expired(&[], &BTreeSet::new(), &BTreeSet::new())
+            .await;
+        assert!(expired.confirmed_absent.is_empty());
+        assert!(expired.pending.is_empty());
     }
 
     fn template() -> Value {

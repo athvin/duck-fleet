@@ -230,6 +230,11 @@ pub(super) fn remove_job_fixture_schema(client: &mut Client) -> Result<()> {
     let current: i32 = client
         .query_one("SELECT MAX(version) FROM platform_schema_migrations", &[])?
         .get(0);
+    if current >= 8 {
+        client.batch_execute(
+            "DROP TABLE gateway_sessions; DELETE FROM platform_schema_migrations WHERE version=8;",
+        )?;
+    }
     if current >= 7 {
         client.batch_execute("ALTER TABLE query_history DROP COLUMN sql_status; ALTER TABLE query_history ALTER COLUMN sql SET NOT NULL; DELETE FROM platform_schema_migrations WHERE version=7;")?;
     }
@@ -314,7 +319,7 @@ pub(super) fn remove_authz_fixture_schema(client: &mut Client) -> Result<()> {
         ALTER TABLE credentials DROP COLUMN principal_id;
         DROP TABLE audit_events,authz_legacy_owners,principal_roles,permission_grants,compute_grants,principals,authz_defaults,platform_namespace;
         DROP FUNCTION immutable_audit_event();
-        DELETE FROM platform_schema_migrations WHERE version=3;")?;
+        DELETE FROM platform_schema_migrations WHERE version>=3;")?;
     Ok(())
 }
 

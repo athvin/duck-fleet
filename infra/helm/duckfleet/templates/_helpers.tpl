@@ -158,7 +158,7 @@ seccompProfile:
 {{- toJson $config -}}
 {{- end -}}
 {{/* Runtime exact-version checks remain authoritative; this marks rollout intent. */}}
-{{- define "duckfleet.platformSchema" -}}7{{- end -}}
+{{- define "duckfleet.platformSchema" -}}8{{- end -}}
 {{/* Supplied envelopes are complete (JSON schema); each pool remains inside the
 operator envelope. Defaults may exceed it because omitted request options clip. */}}
 {{- define "duckfleet.validateJobLimits" -}}

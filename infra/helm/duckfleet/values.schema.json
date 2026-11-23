@@ -146,6 +146,8 @@
     "profiling": {
       "type": "boolean"
     },
+    "highAvailability": {"type": "object", "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean"}}},
     "platformWaitSeconds": {
       "type": "integer", "minimum": 0, "maximum": 600
     },

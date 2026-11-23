@@ -1581,15 +1581,6 @@ pub(crate) fn recover_worker(
     }
     anyhow::bail!("worker recovery exceeded bounded live-queue batches")
 }
-pub(crate) fn orphan_workers(client: &mut Client, prefix: &str) -> Result<Vec<String>> {
-    let mut tx = client.transaction()?;
-    bounded(&mut tx)?;
-    let rows=tx.query("SELECT worker_id FROM requests WHERE state<>'terminal' AND starts_with(worker_id,$1)
-        UNION SELECT worker_id FROM queue_sessions WHERE closed_at IS NULL AND starts_with(worker_id,$1)
-        UNION SELECT worker_id FROM reservations WHERE state='held' AND starts_with(worker_id,$1)",&[&prefix])?;
-    tx.commit()?;
-    Ok(rows.into_iter().map(|r| r.get(0)).collect())
-}
 pub(crate) fn recover_isolated(
     client: &mut Client,
     worker_id: &str,

@@ -755,7 +755,7 @@ if 'pg_restore' in sys.argv:
     def test_manual_kube_migration_clones_configuration_with_a_new_job_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            source = {'metadata': {'annotations': {'duckfleet.io/platform-schema':'7'}},
+            source = {'metadata': {'annotations': {'duckfleet.io/platform-schema':'8'}},
                       'spec': {'selector': {'matchLabels': {'controller-uid': 'old'}},
                                'manualSelector': False, 'activeDeadlineSeconds': 390,
                                'backoffLimit': 0,

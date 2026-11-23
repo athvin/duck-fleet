@@ -270,7 +270,7 @@ fn upgrade(admin: &mut Client) -> Result<()> {
     let report = platform::migrate(admin, &seed)?;
     anyhow::ensure!(
         report.applied && report.version == platform::SCHEMA_VERSION,
-        "schema2 upgrade did not apply schema3"
+        "schema2 upgrade did not apply the current schema"
     );
     anyhow::ensure!(
         admin
