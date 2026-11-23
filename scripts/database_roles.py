@@ -9,10 +9,10 @@ import json
 import re
 import secrets
 
-PARTS = ("migrator", "gateway", "worker", "maintainer", "catalog")
+PARTS = ("migrator", "gateway", "worker", "maintainer", "catalog", "catalog_reader")
 DSN_KEYS = {"migrator": "PLATFORM_MIGRATION_DSN", "gateway": "PLATFORM_GATEWAY_DSN",
             "worker": "PLATFORM_WORKER_DSN", "maintainer": "PLATFORM_MAINTENANCE_DSN",
-            "catalog": "CATALOG_DSN"}
+            "catalog": "CATALOG_DSN", "catalog_reader": "CATALOG_READER_DSN"}
 
 
 def role_names(namespace):
@@ -31,7 +31,7 @@ def secret(namespace, name="duckfleet-dev", host="postgres"):
     for part in PARTS:
         password = secrets.token_hex(32)
         values[f"DATABASE_{part.upper()}_PASSWORD"] = password
-        database = "lake" if part == "catalog" else "platform"
+        database = "lake" if part in ("catalog", "catalog_reader") else "platform"
         values[DSN_KEYS[part]] = f"host={host} port=5432 user={roles[part]} password={password} dbname={database}"
     return {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "namespace": namespace},
             "type": "Opaque", "stringData": values}

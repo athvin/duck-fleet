@@ -76,10 +76,13 @@ class Localizer:
         by_name = {entry["name"]: entry for entry in env if "name" in entry}
         if by_name.get("S3_AUTH_MODE", {}).get("value") == "pod_identity":
             by_name["S3_AUTH_MODE"]["value"] = "local"
+            reader = by_name.get("DUCKFLEET_AUTHORITY", {}).get("value") == "reader"
             env.extend(
                 [
-                    {"name": "S3_ACCESS_KEY", "value": S3_ACCESS_KEY},
-                    {"name": "S3_SECRET_KEY", "value": S3_SECRET_KEY},
+                    {"name": "S3_READER_ACCESS_KEY" if reader else "S3_ACCESS_KEY",
+                     "value": "DUCKFLEETREADER" if reader else S3_ACCESS_KEY},
+                    {"name": "S3_READER_SECRET_KEY" if reader else "S3_SECRET_KEY",
+                     "value": "local-lake-reader-object-password" if reader else S3_SECRET_KEY},
                     {"name": "S3_ENDPOINT", "value": OBJECT_STORE},
                 ]
             )

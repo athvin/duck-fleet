@@ -150,6 +150,9 @@ persistentPools: {}
 #   small: {cpu: 1, memory: 1Gi, disk: 2Gi, workers: 1}
 #   interactive: {cpu: 2, memory: 3Gi, disk: 4Gi, workers: 2, maxSessionsPerWorker: 32}
 # Each pool may also specify a complete jobLimits envelope (snake_case fields).
+# authority defaults to writer. A reader pool uses only CATALOG_READER_DSN and the
+# duckfleet-reader Pod Identity; provision both before declaring it. Example:
+#   small-reader: {cpu: 1, memory: 1Gi, disk: 2Gi, workers: 1, authority: reader}
 # Deprecated legacy-only override. An empty map still means one small worker.
 # Clear inherited workerReplicas before adopting persistentPools with --reuse-values.
 workerReplicas: {}

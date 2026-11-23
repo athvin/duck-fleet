@@ -185,6 +185,7 @@ mod tests {
                 memory_bytes: 4 << 30,
                 disk_bytes: 8 << 30,
             },
+            authority: crate::compute::Authority::Writer,
         };
         let d = capture_session(&original, &selected, "v1.5.4", Some("registry-1")).unwrap();
         assert_eq!(d.requested_mode, None);

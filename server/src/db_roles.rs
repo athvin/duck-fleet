@@ -2,6 +2,8 @@
 //! boundary: these roles protect retained records from runtime edits and DDL.
 use anyhow::{Context, Result, ensure};
 use postgres::{Client, Transaction};
+
+use crate::compute::Authority;
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -327,7 +329,11 @@ pub(crate) fn validate_runtime(client: &mut Client, role: RuntimeRole) -> Result
 /// authority or be able to connect to the protected platform database. Catalog
 /// and platform can use separate PostgreSQL servers; absence of the platform
 /// database on the catalog server is therefore an ordinary supported case.
-pub(crate) fn validate_catalog(client: &mut Client, platform_database: &str) -> Result<()> {
+pub(crate) fn validate_catalog(
+    client: &mut Client,
+    platform_database: &str,
+    authority: Authority,
+) -> Result<()> {
     let safe: bool = client
         .query_one(
             "SELECT current_user=session_user
@@ -344,5 +350,25 @@ pub(crate) fn validate_catalog(client: &mut Client, platform_database: &str) -> 
         safe,
         "unsafe catalog database credential: use a dedicated nonsuperuser lake role without memberships or platform database access"
     );
+    if authority == Authority::Reader {
+        let write_free: bool = client
+            .query_one(
+                "SELECT NOT has_schema_privilege(current_user,current_schema(),'CREATE')
+            AND NOT has_database_privilege(current_user,current_database(),'CREATE')
+            AND NOT EXISTS (
+                SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname=current_schema() AND c.relkind IN ('r','p','v','m')
+                AND (has_table_privilege(current_user,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER')
+                    OR has_any_column_privilege(current_user,c.oid,'INSERT,UPDATE')
+                    OR pg_has_role(current_user,c.relowner,'MEMBER'))
+            )",
+                &[],
+            )?
+            .get(0);
+        ensure!(
+            write_free,
+            "reader catalog credential must have USAGE/SELECT only, without DDL, DML, or object ownership"
+        );
+    }
     Ok(())
 }

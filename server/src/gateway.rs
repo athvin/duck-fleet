@@ -2,7 +2,7 @@
 use crate::{
     ApiError,
     authz::{self, Action, TrustedOperation},
-    compute::{ForwardedSessionRequest, Mode, Placement, Resources, SessionRequest},
+    compute::{Authority, ForwardedSessionRequest, Mode, Placement, Resources, SessionRequest},
     credentials::{self, ActorKind, Identity},
     failure,
     isolated::Isolation,
@@ -1504,7 +1504,14 @@ impl Gateway {
         // One immutable snapshot governs selection, discovery, and forwarding even
         // if the operator reloads the registry while this open is awaiting a worker.
         let registry = self.registry();
-        let placement = registry.resolve(&request.compute)?;
+        let authority = if identity.kind == ActorKind::Named {
+            let authority_identity = identity.clone();
+            self.control_db(move |db| authz::execution_authority(db, &authority_identity))
+                .await?
+        } else {
+            Authority::Writer
+        };
+        let placement = registry.resolve_for(&request.compute, authority)?;
         self.authorize_execution(identity, &identity.principal, &placement, &operation)
             .await?;
         let open_span = Uuid::new_v4();
@@ -1609,7 +1616,9 @@ impl Gateway {
                     .isolation
                     .as_ref()
                     .ok_or_else(crate::compute::unavailable)?;
-                let started = isolation.start(placement.resources).await?;
+                let started = isolation
+                    .start(placement.resources, placement.authority)
+                    .await?;
                 // From here a session pod exists, so every exit below releases it. The
                 // worker's own response is still relayed unchanged on the way out: it
                 // says why it refused, and replacing that with a gateway error would
@@ -1974,10 +1983,18 @@ impl crate::pgwire::Platform for PgPlatform {
         if mode == crate::pgwire::ConnectionMode::System {
             return self.0.system.revalidate(identity).await;
         }
+        let authority = if identity.kind == ActorKind::Named {
+            let authority_identity = identity.clone();
+            self.0
+                .control_db(move |db| authz::execution_authority(db, &authority_identity))
+                .await?
+        } else {
+            Authority::Writer
+        };
         let placement = self
             .0
             .registry()
-            .resolve(&SessionRequest::default().compute)?;
+            .resolve_for(&SessionRequest::default().compute, authority)?;
         self.0
             .authorize_execution(
                 identity,
@@ -2921,6 +2938,7 @@ mod tests {
             mode: Mode::Persistent,
             pool: Some("small".into()),
             resources,
+            authority: crate::compute::Authority::Writer,
         }
     }
 

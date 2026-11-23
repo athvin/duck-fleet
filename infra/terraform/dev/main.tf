@@ -101,3 +101,4 @@ output "namespace" { value = local.namespace }
 output "bucket" { value = aws_s3_bucket.lake.id }
 output "image_repositories" { value = { for name, repo in aws_ecr_repository.images : name => repo.repository_url } }
 output "worker_role_arn" { value = "arn:aws:iam::797781631727:role/duckfleet-dev-worker" }
+output "reader_role_arn" { value = "arn:aws:iam::797781631727:role/duckfleet-dev-reader" }

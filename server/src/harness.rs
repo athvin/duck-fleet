@@ -33,6 +33,7 @@ mod queue_lifecycle;
 mod queue_storage;
 mod rbac;
 mod rbac_storage;
+mod reader_authority;
 mod request_identity;
 mod request_upgrade;
 mod system_api;
@@ -52,7 +53,9 @@ pub async fn run(args: Vec<String>) -> i32 {
     let ctx = Ctx { url, token };
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
-    let result: anyhow::Result<()> = if has("--engine-qualification") {
+    let result: anyhow::Result<()> = if has("--reader-authority") {
+        reader_authority::checks(&ctx).await
+    } else if has("--engine-qualification") {
         engine_qualification::checks(&ctx).await
     } else if has("--extension-security") {
         engine_qualification::security(&ctx).await

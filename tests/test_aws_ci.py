@@ -590,6 +590,7 @@ class NamedPoolPackagingTests(unittest.TestCase):
         config = json.loads(objects['ConfigMap', 'duckfleet-pools']['data']['pools.json'])
         self.assertEqual(config['pools']['interactive'], {
             'cpu': 2, 'memory': '3Gi', 'disk': '4Gi', 'max_sessions_per_worker': 7,
+            'authority': 'writer',
             'endpoints': ['http://worker-pool-interactive-0:8080',
                           'http://worker-pool-interactive-1:8080']})
         self.assertIn(('Deployment', 'worker-small-1'), objects)
@@ -602,6 +603,23 @@ class NamedPoolPackagingTests(unittest.TestCase):
         self.assertEqual(interactive['volumes'][0]['emptyDir']['sizeLimit'], '4Gi')
         fractional = objects['Deployment', 'worker-pool-small-1-0']['spec']['template']['spec']['containers'][0]
         self.assertEqual(fractional['resources']['limits']['ephemeral-storage'], '2560Mi')
+
+    def test_reader_pool_separates_identity_and_data_credentials(self):
+        pools = dict(self.POOLS)
+        pools['readers'] = {'cpu': 1, 'memory': '1Gi', 'disk': '2Gi', 'workers': 1,
+                            'authority': 'reader'}
+        objects = self.render(pools)
+        config = json.loads(objects['ConfigMap', 'duckfleet-pools']['data']['pools.json'])
+        self.assertEqual(config['pools']['readers']['authority'], 'reader')
+        pod = objects['Deployment', 'worker-pool-readers-0']['spec']['template']['spec']
+        self.assertEqual(pod['serviceAccountName'], 'duckfleet-reader')
+        env = pod['containers'][0]['env']
+        names = {item['name'] for item in env}
+        self.assertIn('CATALOG_READER_DSN', names)
+        self.assertNotIn('CATALOG_DSN', names)
+        self.assertFalse(any(name.startswith('DUCKFLEET_RESULT_') for name in names))
+        self.assertEqual(next(item['value'] for item in env if item['name'] == 'DUCKFLEET_AUTHORITY'),
+                         'reader')
 
     def test_named_small_preserves_legacy_immutable_selectors(self):
         named = self.render()
@@ -1400,7 +1418,7 @@ class DatabaseRolePackagingTests(unittest.TestCase):
                 for item in env if 'secretKeyRef' in item.get('valueFrom', {})}
         expected = {'PGPASSWORD': 'POSTGRES_PASSWORD'}
         expected.update({'DUCKFLEET_DB_'+part.upper()+'_PASSWORD': 'DATABASE_'+part.upper()+'_PASSWORD'
-                         for part in ('migrator', 'gateway', 'worker', 'maintainer', 'catalog')})
+                         for part in ('migrator', 'gateway', 'worker', 'maintainer', 'catalog', 'catalog_reader')})
         self.assertEqual(refs, expected)
         values = {item['name']: item.get('value') for item in env}
         self.assertEqual(values['DUCKFLEET_ADOPT_DATABASE_OWNER'], 'yes')
@@ -1448,13 +1466,13 @@ class DatabaseRolePackagingTests(unittest.TestCase):
                 self.assertTrue(any(path in error.exception.stderr for path in paths),
                                 error.exception.stderr)
         chart(['--set-json', 'databaseRoles='+json.dumps({
-            part: 'fixture_'+part for part in ('migrator','gateway','worker','maintainer','catalog')})])
+            part: 'fixture_'+part for part in ('migrator','gateway','worker','maintainer','catalog','catalog_reader')})])
 
     def test_namespace_roles_are_distinct_bounded_and_do_not_alias_sanitized_names(self):
         roles = load('database_roles', 'scripts/database_roles.py')
         first = roles.role_names('a-'+'b'*60)
         second = roles.role_names('a-'+'b'*59+'c')
-        self.assertEqual(len(set(first.values())), 5)
+        self.assertEqual(len(set(first.values())), 6)
         self.assertTrue(all(len(name)<=63 for name in first.values()))
         self.assertFalse(set(first.values()) & set(second.values()))
         with self.assertRaises(ValueError):
@@ -1465,6 +1483,8 @@ class DatabaseRolePackagingTests(unittest.TestCase):
         document = roles.secret('fixture')
         roles.check_secret(document)
         data = document['stringData']
+        self.assertIn('dbname=lake', data['CATALOG_READER_DSN'])
+        self.assertNotIn('dbname=platform', data['CATALOG_READER_DSN'])
         passwords = [data['POSTGRES_PASSWORD'],data['DUCKFLEET_TOKEN'],data['DUCKFLEET_INTERNAL_TOKEN']]
         passwords += [data['DATABASE_'+part.upper()+'_PASSWORD'] for part in roles.PARTS]
         self.assertEqual(len(passwords),len(set(passwords)))
@@ -1545,6 +1565,13 @@ class DatabaseRolePackagingTests(unittest.TestCase):
             self.assertNotIn('DUCKFLEET_MAINTENANCE_DSN',env)
             self.assertIn('user=duckfleet_worker ',env['PLATFORM_DSN'])
             self.assertIn('user=duckfleet_catalog ',env['CATALOG_DSN'])
+        reader = services['worker-small-reader']['environment']
+        self.assertEqual(reader['DUCKFLEET_AUTHORITY'], 'reader')
+        self.assertIn('user=duckfleet_catalog_reader ', reader['CATALOG_READER_DSN'])
+        self.assertNotIn('CATALOG_DSN', reader)
+        self.assertNotIn('S3_ACCESS_KEY', reader)
+        self.assertNotIn('S3_SECRET_KEY', reader)
+        self.assertFalse(any(key.startswith('DUCKFLEET_RESULT_') for key in reader))
         self.assertIn('user=duckfleet_migrator ',services['platform-migrate']['environment']['PLATFORM_DSN'])
         self.assertIn('DUCKFLEET_INTERNAL_TEST_TOKEN',services['dbt']['environment'])
 

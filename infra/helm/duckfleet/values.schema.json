@@ -74,6 +74,10 @@
         "catalog": {
           "type": "string",
           "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+        },
+        "catalog_reader": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$"
         }
       }
     },
@@ -205,6 +209,7 @@
           "disk": {"type": "string", "pattern": "^[1-9][0-9]{0,8}(Ki|Mi|Gi)$"},
           "workers": {"type": "integer", "minimum": 0, "maximum": 16},
           "maxSessionsPerWorker": {"type": "integer", "minimum": 1, "maximum": 1024},
+          "authority": {"type": "string", "enum": ["reader", "writer"]},
         "jobLimits": {"$ref": "#/definitions/jobLimits"},
           "admission": {"$ref": "#/definitions/admissionLimits"}
         }

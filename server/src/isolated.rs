@@ -14,7 +14,12 @@
 //!    garbage collector cascade the deletion;
 //! 3. `activeDeadlineSeconds` has the kubelet stop it even if both of those fail;
 //! 4. startup and retirement cleanup confirm absence before recovering durable work.
-use crate::{ApiError, compute::Resources, failure, kube::Kube};
+use crate::{
+    ApiError,
+    compute::{Authority, Resources},
+    failure,
+    kube::Kube,
+};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -172,12 +177,13 @@ impl Isolation {
     /// No path here falls back to a persistent worker. A caller asking for isolation
     /// is asking for a guarantee, and quietly serving it from shared compute would
     /// void that guarantee while looking like success.
-    pub async fn start(&self, wanted: Resources) -> Result<Pod, ApiError> {
+    pub async fn start(&self, wanted: Resources, authority: Authority) -> Result<Pod, ApiError> {
         let name = format!("{PREFIX}{}", uuid::Uuid::new_v4());
-        let spec = specify(&self.template, &self.owner, &name, wanted).map_err(|error| {
-            tracing::error!(%error, "could not build a session pod from the template");
-            ApiError::internal()
-        })?;
+        let spec = specify_with_authority(&self.template, &self.owner, &name, wanted, authority)
+            .map_err(|error| {
+                tracing::error!(%error, "could not build a session pod from the template");
+                ApiError::internal()
+            })?;
         self.create_waiting_out_quota(&spec).await?;
         match self.await_ready(&name).await {
             Ok(endpoint) => Ok(Pod { name, endpoint }),
@@ -567,6 +573,16 @@ fn specify(
     name: &str,
     wanted: Resources,
 ) -> anyhow::Result<Value> {
+    specify_with_authority(template, owner, name, wanted, Authority::Writer)
+}
+
+fn specify_with_authority(
+    template: &Value,
+    owner: &Value,
+    name: &str,
+    wanted: Resources,
+    authority: Authority,
+) -> anyhow::Result<Value> {
     patchable(template)?;
     let mut pod = template.clone();
     pod["metadata"]["name"] = json!(name);
@@ -577,6 +593,9 @@ fn specify(
         (PATCHED[2], wanted.memory()),
         (PATCHED[3], wanted.disk()),
     ];
+    if authority == Authority::Reader {
+        pod["spec"]["serviceAccountName"] = json!("duckfleet-reader");
+    }
     let environment = pod["spec"]["containers"][0]["env"]
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("no container environment"))?;
@@ -585,6 +604,31 @@ fn specify(
             if entry["name"] == json!(variable) {
                 entry["value"] = json!(value);
             }
+        }
+        if entry["name"] == json!("DUCKFLEET_AUTHORITY") {
+            entry["value"] = json!(authority.name());
+        }
+    }
+    if authority == Authority::Reader {
+        let mut catalog = None;
+        environment.retain(|entry| {
+            let name = entry["name"].as_str().unwrap_or_default();
+            if name == "CATALOG_DSN" {
+                catalog = entry.get("valueFrom").cloned();
+                return false;
+            }
+            !name.starts_with("DUCKFLEET_RESULT_")
+        });
+        let value_from = catalog.ok_or_else(|| anyhow::anyhow!("no catalog secret to scope"))?;
+        environment.push(json!({
+            "name": "CATALOG_READER_DSN",
+            "valueFrom": value_from,
+        }));
+        if let Some(secret) = environment
+            .iter_mut()
+            .find(|entry| entry["name"] == json!("CATALOG_READER_DSN"))
+        {
+            secret["valueFrom"]["secretKeyRef"]["key"] = json!("CATALOG_READER_DSN");
         }
     }
     // cpu, memory and disk are all sized per session; requests equal limits because a
@@ -864,6 +908,8 @@ mod tests {
                     },
                     "env": [
                         {"name": "DUCKFLEET_WORKER_ID", "value": "replaced-per-session"},
+                        {"name": "DUCKFLEET_AUTHORITY", "value": "writer"},
+                        {"name": "DUCKFLEET_RESULT_ACCESS_KEY", "value": "writer-result-key"},
                         {"name": "DUCKFLEET_WORKER_CPU", "value": "1"},
                         {"name": "DUCKFLEET_WORKER_MEMORY", "value": "1Gi"},
                         {"name": "DUCKFLEET_WORKER_DISK", "value": "2Gi"},
@@ -980,6 +1026,37 @@ mod tests {
         assert_eq!(
             secret["valueFrom"]["secretKeyRef"]["key"],
             json!("CATALOG_DSN")
+        );
+    }
+
+    #[test]
+    fn reader_pods_receive_only_reader_data_credentials() {
+        let pod = specify_with_authority(
+            &template(),
+            &owner("server-abc", "11111111-2222-3333-4444-555555555555"),
+            "duckfleet-session-reader",
+            Resources::default(),
+            Authority::Reader,
+        )
+        .unwrap();
+        assert_eq!(pod["spec"]["serviceAccountName"], "duckfleet-reader");
+        let env = environment(&pod);
+        assert_eq!(env["DUCKFLEET_AUTHORITY"], "reader");
+        assert!(!env.contains_key("CATALOG_DSN"));
+        assert!(!env.contains_key("DUCKFLEET_RESULT_ACCESS_KEY"));
+        let entries = pod["spec"]["containers"][0]["env"].as_array().unwrap();
+        assert!(entries.iter().all(|entry| {
+            entry["name"]
+                .as_str()
+                .is_none_or(|name| name != "CATALOG_DSN" && !name.starts_with("DUCKFLEET_RESULT_"))
+        }));
+        let secret = entries
+            .iter()
+            .find(|entry| entry["name"] == "CATALOG_READER_DSN")
+            .unwrap();
+        assert_eq!(
+            secret["valueFrom"]["secretKeyRef"]["key"],
+            "CATALOG_READER_DSN"
         );
     }
 

@@ -453,7 +453,7 @@ explicit grants can add a specific capability without a policy service:
 | Preset | Execute | Cancel / close | History / usage | SQL text / raw profiles | Administration |
 | --- | --- | --- | --- | --- | --- |
 | `analyst` | Own sessions, granted compute | Own | Own | Own | None |
-| `viewer` | No | No | Own | Hidden | None |
+| `viewer` | Own sessions, reader pools only | Own | Own | Hidden | None |
 | `operator` | Fixed maintenance only, granted compute | All | All | Hidden | Fleet/budget reads and maintenance |
 | `admin` | Own sessions, granted compute | All | All | All | Credentials, grants, budgets, pool reload, audit |
 
@@ -461,6 +461,36 @@ explicit grants can add a specific capability without a policy service:
 cancellation does not transfer ownership. Organization-wide history access does
 not let a named administrator execute SQL in someone else's session or claim
 their request ID or retry chain. Bootstrap recovery is a separate actor kind.
+
+### Reader and writer data authority
+
+`viewer`, `analyst`, `operator`, and `admin` presets also select a data-authority
+profile. Viewers without a broader role are **readers**; the other presets and the
+bootstrap recovery actor are **trusted writers**. A pool declares
+`authority: reader` or `writer` (the default). A reader with no explicit pool uses
+the default only when it is a reader pool; otherwise exactly one reader pool must
+be configured, and multiple reader pools require an explicit choice. Changing
+roles cannot move or recreate an existing session: the next operation refuses the
+authority mismatch and the client must close and reopen with current grants.
+
+Reader workers are separate processes, not sessions cloned from a writer engine.
+They receive only `CATALOG_READER_DSN` and reader storage credentials, never the
+writer/migrator DSNs or result-write credentials. PostgreSQL grants `USAGE` on the
+catalog schema and `SELECT` on current and future catalog tables; storage policy
+allows lake reads and denies writes/deletes. `READ_ONLY` attachment is defense in
+depth, not the authorization mechanism. Reader durable-job result storage is
+disabled. Writers remain trusted catalog actors and need their existing DDL/DML
+and object-write privileges; migrations and maintenance use their documented
+operator identities.
+
+This is coarse namespace/catalog authority, not table grants, column masking, row
+policies, or hostile multitenancy. Readers can see catalog metadata and any data
+inlined into it. With inlining disabled, the storage policy protects Parquet data.
+Direct `ATTACH`/`COPY`, alternate object paths, extension/configuration changes,
+and credential-discovery attempts cannot elevate a correctly provisioned reader
+into a writer. Compose starts an isolated proof on port 18082 with
+`docker compose --profile readers up -d --wait server-readers`; its registry is
+`examples/pools/compose-reader.json`.
 
 Row visibility, SQL visibility, and profile visibility are separate decisions.
 SQL permission covers SQL text, arbitrary context/model tags, and raw error text.

@@ -20,6 +20,12 @@ metadata:
   name: duckfleet-no-aws
 automountServiceAccountToken: false
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckfleet-reader
+automountServiceAccountToken: false
+---
 # The one identity here that holds a token, and the only one the gateway uses when
 # isolated compute is wired up; otherwise it uses duckfleet-results when enabled
 # or duckfleet-no-aws, both without a Kubernetes token. Created by the chart because the deploy identity may create

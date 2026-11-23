@@ -116,6 +116,14 @@ A non-Helm gateway can use `DUCKFLEET_POOLS_JSON` for immutable inline configura
 instead of `DUCKFLEET_POOLS_FILE`; the two sources are mutually exclusive. With
 neither source it uses the historical `DUCKFLEET_WORKER_URLS` small pool. Pool
 membership is routing configuration, not data isolation or a separate budget.
+Pool `authority` is `writer` by default; `reader` uses the `duckfleet-reader`
+ServiceAccount and only `CATALOG_READER_DSN`. Provision the distinct reader role
+and Pod Identity before adding reader pools. The cluster Terraform's reader IAM
+allows `GetObject` and prefix-bounded `ListBucket`, never object writes or result
+writes. Existing writer pools and isolated sessions are unchanged. A reader
+request for isolated compute rewrites the pod to the reader ServiceAccount and
+catalog secret, and removes result-write environment values.
+
 The current pinned dbt adapter supports its existing resource fields but silently
 drops pool/mode fields; use HTTP or the CLI for explicit pool selection until the
 coordinated adapter release described in the root README is available.
