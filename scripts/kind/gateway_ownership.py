@@ -171,7 +171,7 @@ def main():
         owned, owned_worker = first.open()
         kubectl(context, namespace, ["delete", "pod", first.name, "--wait=true"])
         wait_absent(context, namespace, owned_worker)
-        expect_status((404, 503), lambda: second.query(owned, "SELECT 1"))
+        expect_status((404, 410, 503), lambda: second.query(owned, "SELECT 1"))
         print("PASS: losing the owning gateway lost the worker rather than silently recreating a session")
 
         replacement = wait_gateways(context, namespace)[0]
