@@ -58,6 +58,7 @@ spec:
             - {name: DUCKFLEET_ADMISSION_LIMITS_JSON, value: {{ include "duckfleet.admissionConfig" . | quote }}}
             - {name: DUCKFLEET_JOB_POLICY_JSON, value: {{ include "duckfleet.jobPolicy" . | quote }}}
             - {name: DUCKFLEET_COMPUTE_POLICY_JSON, value: {{ .Values.computePolicy | toJson | quote }}}
+            - {name: DUCKFLEET_AUTOSCALING_JSON, value: {{ .Values.autoscaling | toJson | quote }}}
             {{- if $resultsEnabled }}
             {{- include "duckfleet.resultEnv" . | nindent 12 }}
             - {name: AWS_REGION, value: {{ .Values.region | quote }}}

@@ -23,6 +23,7 @@ pub(crate) struct Kube {
     client: Client,
     /// Namespaced collection URL; every call this makes is a pod in one namespace.
     pods: String,
+    deployments: String,
     /// Where the API server answers questions about this identity's own access.
     reviews: String,
     namespace: String,
@@ -68,6 +69,9 @@ impl Kube {
         Ok(Self {
             client,
             pods: format!("https://{host}:{port}/api/v1/namespaces/{namespace}/pods"),
+            deployments: format!(
+                "https://{host}:{port}/apis/apps/v1/namespaces/{namespace}/deployments"
+            ),
             reviews: format!(
                 "https://{host}:{port}/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
             ),
@@ -113,6 +117,25 @@ impl Kube {
         Ok(())
     }
 
+    pub async fn deployment(&self, name: &str) -> Result<Value> {
+        let (status, body) = self
+            .send(Method::GET, &format!("{}/{name}", self.deployments), None)
+            .await?;
+        Self::expect_success(status, body, "reading a worker deployment")
+    }
+
+    pub async fn scale_deployment(&self, name: &str, replicas: u16) -> Result<Value> {
+        let patch = serde_json::json!({"spec":{"replicas":replicas}});
+        let (status, body) = self
+            .send(
+                Method::PATCH,
+                &format!("{}/{name}", self.deployments),
+                Some(&patch),
+            )
+            .await?;
+        Self::expect_success(status, body, "scaling a worker deployment")
+    }
+
     /// Read per call rather than cached. A projected token is rotated in place by the
     /// kubelet, so one read at startup stops authenticating after about an hour —
     /// which would present as a gateway that creates pods until it quietly cannot.
@@ -131,11 +154,17 @@ impl Kube {
     ) -> Result<(StatusCode, Value)> {
         let mut request = self
             .client
-            .request(method, url)
+            .request(method.clone(), url)
             .bearer_auth(self.token()?)
             .header(reqwest::header::ACCEPT, "application/json");
         if let Some(body) = body {
             request = request.json(body);
+        }
+        if method == Method::PATCH {
+            request = request.header(
+                reqwest::header::CONTENT_TYPE,
+                "application/merge-patch+json",
+            );
         }
         let response = request.send().await.context("calling the Kubernetes API")?;
         let status = response.status();
@@ -399,6 +428,7 @@ pub(crate) mod test_support {
                     .build()
                     .unwrap(),
                 pods: format!("{endpoint}/api/v1/namespaces/test/pods"),
+                deployments: format!("{endpoint}/apis/apps/v1/namespaces/test/deployments"),
                 reviews: format!("{endpoint}/reviews"),
                 namespace: "test".into(),
                 account: account.clone(),

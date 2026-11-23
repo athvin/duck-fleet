@@ -228,6 +228,21 @@ assert all('worker-index' in selector for selector in services.values()), \
 assert services['worker-small-1']['worker-index'] == '1', services['worker-small-1']
 PY
 echo 'PASS: a second same-size worker renders its own identity, Service, and endpoint entry'
+autoscaling="$validation_dir/autoscaling.yaml"
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set defaultPool=interactive \
+  --set authorization.defaultPersistentGrant.pool=interactive \
+  --set-json 'persistentPools={"interactive":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":2}}' \
+  --set-json 'autoscaling={"interactive":{"min_workers":1,"max_workers":2}}' > "$autoscaling"
+python3 scripts/check-chart.py "$autoscaling" > /dev/null
+python3 - "$autoscaling" <<'PY'
+import sys, yaml
+workers = {d['metadata']['name']: d for d in yaml.safe_load_all(open(sys.argv[1]))
+           if d and d['kind'] == 'Deployment' and d['metadata']['name'].startswith('worker-')}
+assert workers['worker-pool-interactive-0']['spec']['replicas'] == 1
+assert workers['worker-pool-interactive-1']['spec']['replicas'] == 0
+PY
+echo 'PASS: autoscaling starts only minimum capacity and retains bounded standby endpoints'
 # The #39 flip, as the AWS deploy computes it: isolated compute on, workers pinned to
 # the DuckFleet pool with the toleration its taint needs, the medium worker at its
 # full 2-CPU request. Chart defaults stay unpinned — the flip is a deploy-time overlay

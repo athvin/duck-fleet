@@ -1206,9 +1206,10 @@ class OwnershipBoundaryTests(unittest.TestCase):
 
     def test_the_grant_is_pods_in_one_namespace_and_nothing_else(self):
         role = next(d for d in self.render() if d['kind'] == 'Role')
-        self.assertEqual([rule['resources'] for rule in role['rules']], [['pods'], ['pods/log']])
+        self.assertEqual([rule['resources'] for rule in role['rules']], [['pods'], ['pods/log'], ['deployments']])
         self.assertEqual(role['rules'][0]['verbs'], ['create', 'get', 'list', 'watch', 'delete'])
         self.assertEqual(role['rules'][1]['verbs'], ['get'])
+        self.assertEqual(role['rules'][2]['verbs'], ['get', 'list', 'patch'])
         # The gateway must not be able to widen its own grant, read the catalog
         # credential, or raise the quota that caps it. Asserted rather than reviewed:
         # this Role is applied by an identity that could grant all three.

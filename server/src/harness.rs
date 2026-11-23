@@ -85,6 +85,10 @@ pub async fn run(args: Vec<String>) -> i32 {
         pools::checks(&ctx, has("--pools-isolated")).await
     } else if has("--platform-maintenance") {
         platform::checks().await
+    } else if has("--autoscaling") {
+        autoscaling_load(&ctx).await
+    } else if has("--autoscaling-idle") {
+        autoscaling_idle(&ctx).await
     } else if has("--spread") {
         spread_checks(&ctx).await
     } else if has("--spread-failover") {
@@ -1347,6 +1351,58 @@ async fn credentials_checks(ctx: &Ctx) -> anyhow::Result<()> {
     println!(
         "PASS: credentials are issued, attributed, revoked at once, and the analyst preset cannot manage credentials or budgets"
     );
+    Ok(())
+}
+
+// --- bounded autoscaling ---------------------------------------------------
+
+async fn interactive_members(ctx: &Ctx, wanted: usize) -> anyhow::Result<()> {
+    for _ in 0..120 {
+        let workers = request_json(&ctx.client()?, Method::GET, "/v1/workers", None).await?;
+        let actual = workers["workers"]
+            .as_array()
+            .map(|workers| {
+                workers
+                    .iter()
+                    .filter(|worker| worker["pool"] == "interactive" && worker["ready"] == true)
+                    .count()
+            })
+            .unwrap_or(0);
+        if actual == wanted {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    anyhow::bail!("interactive worker membership did not reach {wanted}")
+}
+
+async fn autoscaling_load(ctx: &Ctx) -> anyhow::Result<()> {
+    interactive_members(ctx, 1).await?;
+    let compute = json!({"pool":"interactive"});
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..17 {
+        let connection = ctx
+            .open_named("autoscaling-load", Some(compute.clone()))
+            .await?;
+        tasks.spawn(async move {
+            let result = connection.execute("SELECT pg_sleep(45)", vec![]).await;
+            (result, connection)
+        });
+    }
+    interactive_members(ctx, 2).await?;
+    println!("PASS: queued interactive work scaled one worker to two with live membership");
+    while let Some(joined) = tasks.join_next().await {
+        let (result, mut connection) = joined?;
+        result?;
+        connection.close().await?;
+    }
+    println!("PASS: every load statement completed and closed without duplicate execution");
+    Ok(())
+}
+
+async fn autoscaling_idle(ctx: &Ctx) -> anyhow::Result<()> {
+    interactive_members(ctx, 1).await?;
+    println!("PASS: idle interactive capacity drained back to one worker");
     Ok(())
 }
 

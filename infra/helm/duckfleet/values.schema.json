@@ -342,6 +342,7 @@
         }
       }
     },
+    "autoscaling": {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
     "computePolicy": {
       "type": "object",
       "additionalProperties": false,
