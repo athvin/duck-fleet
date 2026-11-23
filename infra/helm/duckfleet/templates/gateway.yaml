@@ -22,8 +22,9 @@ metadata:
     duckfleet.io/migration-job: {{ include "duckfleet.migrationJob" . | quote }}
   {{- end }}
 spec:
-  replicas: {{ ternary 0 1 .Values.suspended }}
-  strategy: {type: Recreate}
+  replicas: {{ ternary 0 (ternary 2 1 .Values.highAvailability.enabled) .Values.suspended }}
+  strategy:
+    type: {{ ternary "RollingUpdate" "Recreate" .Values.highAvailability.enabled }}
   selector:
     matchLabels: {app: duckfleet-gateway}
   template:

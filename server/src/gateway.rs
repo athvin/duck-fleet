@@ -492,6 +492,8 @@ struct Gateway {
     /// gateway has no engine slot to watch, so this count is its notion of busy.
     inflight: Arc<AtomicUsize>,
     authn: Arc<Authn>,
+    gateway_id: String,
+    gateway_epoch: Uuid,
     /// Pure routing fixtures inject a resolved policy; production always reads
     /// the current database policy and persists external-operation audits.
     #[cfg(test)]
@@ -1129,12 +1131,85 @@ impl Gateway {
         .await
         .map_err(|_| ApiError::internal())
     }
+    async fn recover_route(&self, id: Uuid, identity: &Identity) -> Result<(), ApiError> {
+        let Some(owner) = self
+            .control_db(move |db| crate::ownership::live_owner(db, id))
+            .await?
+        else {
+            return Err(ApiError::new(
+                failure::UNKNOWN_SESSION,
+                "unknown or expired session",
+            ));
+        };
+        let worker_id = owner.worker_id;
+        let owner_id = owner.principal_id;
+        let placement: Placement =
+            serde_json::from_value(owner.placement).map_err(|_| ApiError::internal())?;
+        let operation: TrustedOperation =
+            serde_json::from_str(&owner.operation).map_err(|_| ApiError::internal())?;
+        let registry = self.registry();
+        let endpoint = if worker_id.starts_with(crate::isolated::PREFIX) {
+            format!("http://{worker_id}:8080")
+        } else {
+            registry
+                .pools
+                .get(placement.pool.as_deref().unwrap_or("small"))
+                .and_then(|pool| {
+                    pool.endpoints
+                        .iter()
+                        .find(|endpoint| endpoint.contains(&worker_id))
+                        .cloned()
+                })
+                .ok_or_else(|| {
+                    ApiError::new(failure::SESSION_LOST, "owning worker is no longer routable")
+                })?
+        };
+        let permit = self
+            .capacity
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::internal())?;
+        self.routes.lock().await.insert(
+            id,
+            Route {
+                endpoint,
+                touched: Instant::now(),
+                owner_id,
+                placement,
+                operation,
+                identity: identity.clone(),
+                active: Arc::new(AtomicUsize::new(0)),
+                closing: false,
+                cleanup: None,
+                close_identity: None,
+                pod: worker_id
+                    .starts_with(crate::isolated::PREFIX)
+                    .then_some(worker_id),
+                _permit: permit,
+            },
+        );
+        Ok(())
+    }
+
+    async fn ensure_route(&self, id: Uuid, identity: &Identity) -> Result<(), ApiError> {
+        #[cfg(test)]
+        if self.resolved_access.is_some() {
+            return Ok(());
+        }
+        if !self.routes.lock().await.contains_key(&id) {
+            self.recover_route(id, identity).await?;
+        }
+        Ok(())
+    }
+
     async fn route(
         &self,
         id: Uuid,
         identity: &Identity,
         action: Action,
     ) -> Result<String, ApiError> {
+        self.ensure_route(id, identity).await?;
         let owner = self
             .routes
             .lock()
@@ -1156,6 +1231,7 @@ impl Gateway {
         id: Uuid,
         identity: &Identity,
     ) -> Result<(String, InFlight), ApiError> {
+        self.ensure_route(id, identity).await?;
         let (owner, placement, operation) = self
             .routes
             .lock()
@@ -1228,7 +1304,13 @@ impl Gateway {
         {
             worker.open_sessions = worker.open_sessions.saturating_sub(1);
         }
-        route.pod
+        let pod = route.pod;
+        let gateway_id = self.gateway_id.clone();
+        let epoch = self.gateway_epoch;
+        let _ = self
+            .control_db(move |db| crate::ownership::close(db, id, &gateway_id, epoch))
+            .await;
+        pod
     }
 
     /// Protocol-owned sessions retain their capacity until the worker confirms
@@ -1702,12 +1784,50 @@ impl Gateway {
             self.release(pod).await;
             return Err(ApiError::internal());
         };
+        let worker_id = info["placement"]["worker_id"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| pod.clone())
+            .ok_or_else(ApiError::internal)?;
+        let boot_id = info["placement"]["worker_boot_id"]
+            .as_str()
+            .ok_or_else(ApiError::internal)?
+            .to_owned();
+        let owner_principal = access.actor.principal_id.clone();
+        #[cfg(test)]
+        let needs_ownership = self.resolved_access.is_none();
+        #[cfg(not(test))]
+        let needs_ownership = true;
+        if needs_ownership {
+            let owner_principal_for_db = owner_principal.clone();
+            let gateway_id = self.gateway_id.clone();
+            let epoch = self.gateway_epoch;
+            let placement_json =
+                serde_json::to_value(&placement).map_err(|_| ApiError::internal())?;
+            self.control_db(move |db| {
+                let mut tx = db.transaction().map_err(|_| ApiError::internal())?;
+                crate::ownership::register(
+                    &mut tx,
+                    &crate::ownership::Registration {
+                        session_id: id,
+                        gateway_id: &gateway_id,
+                        epoch,
+                        worker_id: &worker_id,
+                        boot_id: &boot_id,
+                        principal_id: owner_principal_for_db.as_deref(),
+                        placement: &placement_json,
+                    },
+                )?;
+                tx.commit().map_err(|_| ApiError::internal())
+            })
+            .await?;
+        }
         self.routes.lock().await.insert(
             id,
             Route {
                 endpoint: endpoint.clone(),
                 touched: Instant::now(),
-                owner_id: access.actor.principal_id,
+                owner_id: owner_principal,
                 placement,
                 operation,
                 identity: identity.clone(),
@@ -2804,6 +2924,9 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             .retry(reqwest::retry::never())
             .build()?,
         authn: Authn::new(bootstrap, platform_dsn.clone()),
+        gateway_id: std::env::var("DUCKFLEET_POD_UID")
+            .unwrap_or_else(|_| Uuid::new_v4().to_string()),
+        gateway_epoch: Uuid::new_v4(),
         system,
         token,
         pools: Arc::new(RwLock::new(Arc::new(registry))),
@@ -2842,9 +2965,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
     // for one a previous gateway abandoned.
     if let Some(isolation) = app.isolation.as_ref() {
         let orphaned = app
-            .control_db(|db| {
-                queue::orphan_workers(db, crate::isolated::PREFIX).map_err(|_| ApiError::internal())
-            })
+            .control_db(|db| crate::ownership::expired_workers(db, crate::isolated::PREFIX))
             .await
             .map_err(|error| {
                 anyhow::anyhow!("cannot establish isolated recovery set: {}", error.1)
@@ -2855,7 +2976,15 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("cannot establish durable job pod recovery set"))?
             .into_iter()
             .collect();
-        let swept = isolation.sweep_excluding(&orphaned, &job_pods).await;
+        let live = app
+            .control_db(|db| crate::ownership::live_workers(db, crate::isolated::PREFIX))
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("cannot establish live gateway ownership set: {}", error.1)
+            })?
+            .into_iter()
+            .collect();
+        let swept = isolation.sweep_excluding(&orphaned, &job_pods, &live).await;
         app.retired_pods
             .lock()
             .await
@@ -2872,6 +3001,21 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         }
         tracing::info!("isolated compute is available");
     }
+    let ownership_app = app.clone();
+    let ownership_gateway_id = ownership_app.gateway_id.clone();
+    let ownership_epoch = ownership_app.gateway_epoch;
+    let ownership_heartbeat = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let gateway_id = ownership_gateway_id.clone();
+            let renewed = ownership_app
+                .control_db(move |db| crate::ownership::renew(db, &gateway_id, ownership_epoch))
+                .await;
+            if let Err(error) = renewed {
+                tracing::warn!(kind = error.0.kind, "gateway lease heartbeat failed");
+            }
+        }
+    });
     let api = Router::new()
         .route("/v1/jobs", post(job_api::submit))
         .route("/v1/jobs/{id}", get(job_api::detail))
@@ -2982,6 +3126,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
     })
     .await;
     maintenance.abort();
+    ownership_heartbeat.abort();
     job_dispatcher.abort();
     served?;
     Ok(())
@@ -3043,7 +3188,10 @@ mod tests {
                     let opens = handler_opens.clone();
                     async move {
                         opens.fetch_add(1, Ordering::SeqCst);
-                        Json(json!({"session_id": Uuid::new_v4()}))
+                        Json(json!({
+                            "session_id": Uuid::new_v4(),
+                            "placement": {"worker_id":"test-worker","worker_boot_id":"first-boot"}
+                        }))
                     }
                 }),
             )
@@ -3119,6 +3267,8 @@ mod tests {
                 .build()
                 .unwrap(),
             authn: Authn::new(token.clone(), dsn.into()),
+            gateway_id: "test-gateway".into(),
+            gateway_epoch: Uuid::new_v4(),
             system: crate::system_query::Service::new(
                 dsn,
                 token.clone(),

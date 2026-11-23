@@ -390,6 +390,13 @@ fn migrate_with_roles(
             &[],
         )?;
     }
+    if current.is_none() || current.is_some_and(|v| v < 8) {
+        crate::ownership::migrate(&mut transaction)?;
+        transaction.execute(
+            "INSERT INTO platform_schema_migrations(version,name) VALUES(8,'gateway-ownership')",
+            &[],
+        )?;
+    }
     if let Some(roles) = roles {
         crate::db_roles::grant_runtime(&mut transaction, roles)?;
     }

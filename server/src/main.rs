@@ -23,6 +23,7 @@ mod jobs;
 mod kube;
 mod metadata;
 mod metering;
+mod ownership;
 mod pgwire;
 mod platform;
 mod pools;

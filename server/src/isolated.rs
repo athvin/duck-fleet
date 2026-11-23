@@ -471,19 +471,9 @@ impl Isolation {
         &self,
         orphaned: &[String],
         jobs: &BTreeSet<String>,
+        live: &BTreeSet<String>,
     ) -> SweepResult {
-        self.sweep_filtered(orphaned, STOP_WAIT, SWEEP_WAIT, jobs)
-            .await
-    }
-
-    #[cfg(test)]
-    async fn sweep_bounded(
-        &self,
-        orphaned: &[String],
-        stop_wait: Duration,
-        sweep_wait: Duration,
-    ) -> SweepResult {
-        self.sweep_filtered(orphaned, stop_wait, sweep_wait, &BTreeSet::new())
+        self.sweep_filtered(orphaned, STOP_WAIT, SWEEP_WAIT, jobs, live)
             .await
     }
 
@@ -493,12 +483,12 @@ impl Isolation {
         stop_wait: Duration,
         sweep_wait: Duration,
         jobs: &BTreeSet<String>,
+        live: &BTreeSet<String>,
     ) -> SweepResult {
         let deadline = tokio::time::Instant::now() + sweep_wait;
         let mut names: BTreeSet<String> = orphaned.iter().cloned().collect();
-        // Anything still labelled at startup is orphaned by definition: this gateway
-        // holds no route to it, and the chart runs a single gateway with `Recreate`,
-        // so there is no sibling that could still be using one.
+        // Only expired ownership is orphaned. A live sibling gateway may still hold
+        // the route when high availability is enabled; the durable lease selects it.
         match tokio::time::timeout(stop_wait.min(sweep_wait), self.kube.pods_labelled(LABEL)).await
         {
             Ok(Ok(pods)) => {
@@ -514,7 +504,7 @@ impl Isolation {
             ),
             Err(_) => tracing::warn!("timed out listing session pods to sweep"),
         }
-        names.retain(|name| !jobs.contains(name));
+        names.retain(|name| !jobs.contains(name) && !live.contains(name));
         let mut pending = names.clone();
         let mut remaining = names.into_iter();
         let mut checks = tokio::task::JoinSet::new();
@@ -848,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_returns_only_proven_deaths_and_retains_unreserved_labeled_orphans() {
+    async fn sweep_protects_live_siblings_and_retains_unconfirmed_orphans() {
         use axum::{
             Json,
             extract::Path,
@@ -862,7 +852,8 @@ mod tests {
                 get(|| async {
                     Json(json!({"items":[
                         {"metadata":{"name":"duckfleet-session-label-gone"}},
-                        {"metadata":{"name":"duckfleet-session-label-live"}}
+                        {"metadata":{"name":"duckfleet-session-label-live"}},
+                        {"metadata":{"name":"duckfleet-session-sibling-live"}}
                     ]}))
                 }),
             )
@@ -889,13 +880,15 @@ mod tests {
             quota_wait: Duration::ZERO,
         };
         let result = isolation
-            .sweep_bounded(
+            .sweep_filtered(
                 &[
                     "duckfleet-session-held-gone".into(),
                     "duckfleet-session-held-gone".into(),
                 ],
                 Duration::from_millis(100),
                 Duration::from_secs(2),
+                &BTreeSet::new(),
+                &BTreeSet::from(["duckfleet-session-sibling-live".into()]),
             )
             .await;
         assert_eq!(

@@ -50,7 +50,7 @@ for label in ('controller-uid', 'job-name', 'batch.kubernetes.io/controller-uid'
 spec['ttlSecondsAfterFinished'] = 86400
 print(json.dumps({'apiVersion': 'batch/v1', 'kind': 'Job',
                   'metadata': {'name': sys.argv[2], 'labels': {'app': 'duckfleet-platform-migrate'},
-                               'annotations': {'duckfleet.io/platform-schema': '5'}},
+                               'annotations': {'duckfleet.io/platform-schema': '7'}},
                   'spec': spec}))
 PY
     deadline=$(python3 - "$work/template.json" <<'PY'

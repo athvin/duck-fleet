@@ -43,6 +43,9 @@ tolerations: []
 
 # Pause compute after testing; the PostgreSQL PVC and S3 data remain.
 suspended: false
+# Optional two-gateway rolling availability with durable lease/fenced ownership.
+highAvailability:
+  enabled: false
 
 profiling: true
 # Percentage of sessions whose raw profiles persist; metrics are still captured.
