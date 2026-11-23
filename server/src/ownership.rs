@@ -54,6 +54,29 @@ pub(crate) fn renew(client: &mut Client, gateway_id: &str, epoch: Uuid) -> Resul
         .map_err(|_| ApiError::internal())
 }
 
+pub(crate) fn close_permitted(
+    client: &mut Client,
+    session_id: Uuid,
+    gateway_id: &str,
+    epoch: Uuid,
+) -> Result<(), ApiError> {
+    let owner = client.query_opt(
+        "SELECT gateway_id,gateway_epoch,lease_until>now() FROM gateway_sessions WHERE session_id=$1",
+        &[&session_id.to_string()],
+    ).map_err(|_| ApiError::internal())?;
+    if owner.is_some_and(|row| {
+        row.get::<_, String>(0) != gateway_id
+            || row.get::<_, String>(1) != epoch.to_string()
+            || !row.get::<_, bool>(2)
+    }) {
+        return Err(ApiError::new(
+            failure::UNKNOWN_SESSION,
+            "session is owned by another gateway or its lease expired; close through the live owner",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn close(
     client: &mut Client,
     session_id: Uuid,
@@ -61,7 +84,9 @@ pub(crate) fn close(
     epoch: Uuid,
 ) -> Result<(), ApiError> {
     let changed = client.execute(
-        "DELETE FROM gateway_sessions WHERE session_id=$1 AND gateway_id=$2 AND gateway_epoch=$3 AND lease_until>now()",
+        "DELETE FROM gateway_sessions WHERE session_id=$1
+           AND ((gateway_id=$2 AND gateway_epoch=$3 AND lease_until>now())
+             OR EXISTS(SELECT 1 FROM queue_sessions WHERE session_id=$1 AND closed_at IS NOT NULL))",
         &[&session_id.to_string(),&gateway_id,&epoch.to_string()],
     ).map_err(|_| ApiError::internal())?;
     if changed != 1 {

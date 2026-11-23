@@ -1264,6 +1264,18 @@ impl Gateway {
         cleanup: Option<&Cleanup>,
         identity: Option<&Identity>,
     ) -> Result<(StatusCode, Value), ApiError> {
+        #[cfg(test)]
+        let needs_ownership = self.resolved_access.is_none();
+        #[cfg(not(test))]
+        let needs_ownership = true;
+        if needs_ownership {
+            let gateway_id = self.gateway_id.clone();
+            let epoch = self.gateway_epoch;
+            self.control_db(move |db| {
+                crate::ownership::close_permitted(db, id, &gateway_id, epoch)
+            })
+            .await?;
+        }
         let mut request = self
             .client
             .delete(format!("{endpoint}/v1/sessions/{id}"))
@@ -1804,23 +1816,31 @@ impl Gateway {
             let epoch = self.gateway_epoch;
             let placement_json =
                 serde_json::to_value(&placement).map_err(|_| ApiError::internal())?;
-            self.control_db(move |db| {
-                let mut tx = db.transaction().map_err(|_| ApiError::internal())?;
-                crate::ownership::register(
-                    &mut tx,
-                    &crate::ownership::Registration {
-                        session_id: id,
-                        gateway_id: &gateway_id,
-                        epoch,
-                        worker_id: &worker_id,
-                        boot_id: &boot_id,
-                        principal_id: owner_principal_for_db.as_deref(),
-                        placement: &placement_json,
-                    },
-                )?;
-                tx.commit().map_err(|_| ApiError::internal())
-            })
-            .await?;
+            let registration = self
+                .control_db(move |db| {
+                    let mut tx = db.transaction().map_err(|_| ApiError::internal())?;
+                    crate::ownership::register(
+                        &mut tx,
+                        &crate::ownership::Registration {
+                            session_id: id,
+                            gateway_id: &gateway_id,
+                            epoch,
+                            worker_id: &worker_id,
+                            boot_id: &boot_id,
+                            principal_id: owner_principal_for_db.as_deref(),
+                            placement: &placement_json,
+                        },
+                    )?;
+                    tx.commit().map_err(|_| ApiError::internal())
+                })
+                .await;
+            if let Err(error) = registration {
+                let _ = self
+                    .close_backend(id, &endpoint, None, Some(identity))
+                    .await;
+                self.release(pod).await;
+                return Err(error);
+            }
         }
         self.routes.lock().await.insert(
             id,

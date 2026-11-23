@@ -407,6 +407,23 @@ grep -q 'PASS: a reopen rode through the gateway replacement' artifacts/kind/duc
 grep -q 'PASS: a gateway replaced without grace left classified outcomes' artifacts/kind/duckfleet-gateway-replaced.log
 "${KUBE[@]}" rollout status deployment/server --timeout=420s
 
+render --no-hooks \
+  --set highAvailability.enabled=true \
+  --set isolatedCompute.enabled=true \
+  --set "isolatedCompute.apiServerCidrs[0]=$api_address/32" \
+  --set "isolatedCompute.apiServerPorts[0]=$api_port" \
+  --set isolatedCompute.readySeconds=180 \
+  | python3 scripts/kind/localize.py \
+  --expect image,cpu-request,s3-auth,s3-path,node-selector,object-store-port,isolated-pod \
+  > "$work/release-ha.yaml"
+python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
+"${KUBE[@]}" apply -f "$work/release-ha.yaml"
+python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+python3 scripts/kind/gateway_ownership.py --context "$CONTEXT" --namespace "$NS"
+python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
+"${KUBE[@]}" apply -f "$work/release.yaml"
+python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+
 "${KUBE[@]}" apply -f infra/kind/bucket-verify.yaml
 python3 scripts/kind/await_job.py --context "$CONTEXT" --namespace "$NS" \
   --job bucket-verify --timeout 300
