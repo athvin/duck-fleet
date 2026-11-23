@@ -564,9 +564,9 @@ for listener in listeners:
 print(*(listener.getsockname()[1] for listener in listeners))
 for listener in listeners:
     listener.close()')
-"${team[@]}" port-forward "svc/server:$team_port:8080" > artifacts/kind/team-port-forward.log 2>&1 &
+"${team[@]}" port-forward svc/server "$team_port:8080" > artifacts/kind/team-port-forward.log 2>&1 &
 team_forward=$!
-"${KUBE[@]}" port-forward "svc/server:$source_port:8080" > artifacts/kind/source-port-forward.log 2>&1 &
+"${KUBE[@]}" port-forward svc/server "$source_port:8080" > artifacts/kind/source-port-forward.log 2>&1 &
 source_forward=$!
 if ! python3 - "$team_port" "$source_port" <<'PY'
 import sys, time, urllib.request
