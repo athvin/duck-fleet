@@ -60,7 +60,8 @@ pub(crate) fn decide(policy: &PoolPolicy, observed: Observation) -> Decision {
     let within = additional <= policy.max_workers
         && observed.cpu <= policy.max_cpu
         && observed.memory_bytes <= policy.max_memory_bytes;
-    if observed.oldest_queued_ms >= policy.queue_wait_target_ms
+    if observed.oldest_queued_ms > 0
+        && observed.oldest_queued_ms >= policy.queue_wait_target_ms
         && observed.seconds_since_scale >= policy.scale_up_cooldown_seconds
     {
         if within {
@@ -322,6 +323,24 @@ mod tests {
                 }
             ),
             Decision::Hold("resource_ceiling")
+        );
+    }
+
+    #[test]
+    fn an_empty_queue_does_not_satisfy_a_zero_wait_target() {
+        let policy = PoolPolicy {
+            queue_wait_target_ms: 0,
+            ..PoolPolicy::default()
+        };
+        assert_eq!(
+            decide(
+                &policy,
+                Observation {
+                    oldest_queued_ms: 0,
+                    ..observation()
+                }
+            ),
+            Decision::Hold("stable_or_cooldown")
         );
     }
 
