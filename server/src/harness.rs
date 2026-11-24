@@ -1358,7 +1358,17 @@ async fn credentials_checks(ctx: &Ctx) -> anyhow::Result<()> {
 
 async fn interactive_members(ctx: &Ctx, wanted: usize) -> anyhow::Result<()> {
     for _ in 0..120 {
-        let workers = request_json(&ctx.client()?, Method::GET, "/v1/workers", None).await?;
+        let workers = match request_json(&ctx.client()?, Method::GET, "/v1/workers", None).await {
+            Ok(workers) => workers,
+            Err(error)
+                if error.retry_safe
+                    && error.failure_kind.as_deref() == Some(crate::failure::CAPACITY.kind) =>
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let actual = workers["workers"]
             .as_array()
             .map(|workers| {
@@ -1390,7 +1400,8 @@ async fn autoscaling_load(ctx: &Ctx) -> anyhow::Result<()> {
                 Ok(connection) => break connection,
                 Err(error)
                     if error.downcast_ref::<RemoteError>().is_some_and(|error| {
-                        error.failure_kind.as_deref() == Some(crate::failure::CAPACITY.kind)
+                        error.retry_safe
+                            && error.failure_kind.as_deref() == Some(crate::failure::CAPACITY.kind)
                     }) && attempts < 40 =>
                 {
                     attempts += 1;
@@ -1404,7 +1415,21 @@ async fn autoscaling_load(ctx: &Ctx) -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for connection in connections {
         tasks.spawn(async move {
-            let result = connection.execute("SELECT pg_sleep(45)", vec![]).await;
+            let mut attempts = 0;
+            let result = loop {
+                match connection.execute("SELECT pg_sleep(45)", vec![]).await {
+                    Err(error)
+                        if error.retry_safe
+                            && error.failure_kind.as_deref()
+                                == Some(crate::failure::CAPACITY.kind)
+                            && attempts < 40 =>
+                    {
+                        attempts += 1;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    result => break result,
+                }
+            };
             (result, connection)
         });
     }
