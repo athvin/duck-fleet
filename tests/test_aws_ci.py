@@ -1204,12 +1204,14 @@ class OwnershipBoundaryTests(unittest.TestCase):
                 self.assertEqual(document['metadata']['namespace'], 'duckfleet-elsewhere',
                                  document['metadata']['name'])
 
-    def test_the_grant_is_pods_in_one_namespace_and_nothing_else(self):
+    def test_the_grant_is_scoped_to_pods_and_worker_scaling_in_one_namespace(self):
         role = next(d for d in self.render() if d['kind'] == 'Role')
-        self.assertEqual([rule['resources'] for rule in role['rules']], [['pods'], ['pods/log'], ['deployments']])
+        self.assertEqual([rule['resources'] for rule in role['rules']],
+                         [['pods'], ['pods/log'], ['deployments'], ['deployments/scale']])
         self.assertEqual(role['rules'][0]['verbs'], ['create', 'get', 'list', 'watch', 'delete'])
         self.assertEqual(role['rules'][1]['verbs'], ['get'])
         self.assertEqual(role['rules'][2]['verbs'], ['get', 'list', 'patch'])
+        self.assertEqual(role['rules'][3]['verbs'], ['patch'])
         # The gateway must not be able to widen its own grant, read the catalog
         # credential, or raise the quota that caps it. Asserted rather than reviewed:
         # this Role is applied by an identity that could grant all three.
@@ -1389,7 +1391,7 @@ class OwnershipBoundaryTests(unittest.TestCase):
         self.assertIn('check-access.sh', workflow)
         access = (ROOT/'scripts/aws/check-access.sh').read_text()
         self.assertIn('auth can-i patch deployments.apps', access)
-        self.assertNotIn('subresource=scale', access)
+        self.assertIn('auth can-i patch deployments.apps --subresource=scale', access)
 
 
 class DatabaseRolePackagingTests(unittest.TestCase):

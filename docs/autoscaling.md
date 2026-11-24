@@ -42,7 +42,8 @@ statement execution and transaction affinity are never moved. Removed workers
 recover their reservation/history through their existing stable identity.
 
 The Kubernetes Role in `infra/kubernetes/boundary` must allow `get`, `list` and
-`patch` on `deployments` as well as the existing pod grant. The cluster must
+`patch` on `deployments`, `patch` on `deployments/scale`, and the existing pod
+grant. The cluster must
 actually provision the requested worker resources; DuckFleet does not create
 nodes or promise a cloud price. Capacity-provider refusal remains visible in the
 worker/provisioning state. Keep fixed mode on clusters without those permissions

@@ -1,4 +1,4 @@
-# The one grant isolated compute needs.
+# The Kubernetes grants isolated compute and persistent-pool scaling need.
 #
 # This is deliberately not in the Helm chart. The deploy identity cannot create Roles,
 # and scripts/aws/check-access.sh asserts it cannot — failing the deploy if that
@@ -19,10 +19,10 @@ kind: Role
 metadata:
   name: duckfleet-isolated-pods
   namespace: "${namespace}"
-# Pods in this namespace and nothing else. Notably absent: secrets, which the session
-# pods read through the kubelet rather than through the gateway; and roles and
-# rolebindings, so the gateway cannot widen its own grant even though the identity
-# that created this one could.
+# Session pods and persistent worker Deployments in this namespace and nothing else.
+# Notably absent: secrets, which the session pods read through the kubelet rather than
+# through the gateway; and roles and rolebindings, so the gateway cannot widen its own
+# grant even though the identity that created this one could.
 rules:
   - apiGroups: [""]
     resources: [pods]
@@ -33,6 +33,9 @@ rules:
   - apiGroups: [apps]
     resources: [deployments]
     verbs: [get, list, patch]
+  - apiGroups: [apps]
+    resources: [deployments/scale]
+    verbs: [patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

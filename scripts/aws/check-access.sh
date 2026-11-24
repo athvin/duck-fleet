@@ -9,6 +9,9 @@ done
 "${KUBE[@]}" auth can-i patch deployments.apps --quiet || {
   echo "Missing deploy permission: patch deployments (required for explicit stop-compute)" >&2; exit 1;
 }
+"${KUBE[@]}" auth can-i patch deployments.apps --subresource=scale --quiet || {
+  echo "Missing deploy permission: patch deployments/scale (required for bounded autoscaling)" >&2; exit 1;
+}
 for target in roles.rbac.authorization.k8s.io rolebindings.rbac.authorization.k8s.io resourcequotas; do
   answer=$("${KUBE[@]}" auth can-i create "$target") || [[ "$?" == 1 && "$answer" == no ]]
   if [[ "$answer" != no ]]; then
