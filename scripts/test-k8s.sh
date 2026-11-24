@@ -494,8 +494,8 @@ await_no_isolated_pods
 test "$("${KUBE[@]}" get deployment worker-pool-interactive-1 -o jsonpath='{.spec.replicas}')" == 0
 # Earlier pool/queue fixtures also create queued work; only the dedicated load below
 # may trigger scale-up on this memory-bounded single-node cluster.
-sed 's/\\"paused\\":true/\\"paused\\":false/' "$work/release-pools.yaml" > "$work/release-autoscaling.yaml"
-grep -q '\\"paused\\":false' "$work/release-autoscaling.yaml"
+sed 's/"paused":true/"paused":false/' "$work/release-pools.yaml" > "$work/release-autoscaling.yaml"
+grep -q '"paused":false' "$work/release-autoscaling.yaml"
 "${KUBE[@]}" apply -f "$work/release-autoscaling.yaml"
 python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
 harness duckfleet-autoscaling 'duckfleet-server --autoscaling' 900 &
