@@ -1417,7 +1417,11 @@ async fn autoscaling_load(ctx: &Ctx) -> anyhow::Result<()> {
         tasks.spawn(async move {
             let mut attempts = 0;
             let result = loop {
-                match connection.execute("SELECT pg_sleep(45)", vec![]).await {
+                match connection
+                    .execute_with_timeouts("SELECT pg_sleep(45)", vec![], 60, 60)
+                    .await
+                    .map(|(_, rows)| rows)
+                {
                     Err(error)
                         if error.retry_safe
                             && error.failure_kind.as_deref()
