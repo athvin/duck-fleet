@@ -1379,21 +1379,12 @@ async fn interactive_members(ctx: &Ctx, wanted: usize) -> anyhow::Result<()> {
 async fn autoscaling_load(ctx: &Ctx) -> anyhow::Result<()> {
     interactive_members(ctx, 1).await?;
     let compute = json!({"pool":"interactive"});
-    let mut openings = tokio::task::JoinSet::new();
-    for _ in 0..17 {
-        let url = ctx.url.clone();
-        let token = ctx.token.clone();
-        let compute = compute.clone();
-        openings.spawn(async move {
-            Ok::<_, anyhow::Error>(
-                RemoteConnection::open(&url, &token, "autoscaling-load", Some(compute), None, 90)
-                    .await?,
-            )
-        });
-    }
     let mut connections = Vec::new();
-    while let Some(opened) = openings.join_next().await {
-        connections.push(opened??);
+    for _ in 0..17 {
+        connections.push(
+            ctx.open_named("autoscaling-load", Some(compute.clone()))
+                .await?,
+        );
     }
     let mut tasks = tokio::task::JoinSet::new();
     for connection in connections {
