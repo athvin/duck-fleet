@@ -476,7 +476,7 @@ render --no-hooks \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
   --set-json 'persistentPools={"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1},"interactive":{"cpu":2,"memory":"3Gi","disk":"4Gi","workers":2},"readers":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1,"authority":"reader"}}' \
-  --set-json 'autoscaling={"interactive":{"min_workers":1,"max_workers":2,"max_cpu":4,"max_memory_bytes":8589934592,"queue_wait_target_ms":0,"scale_up_cooldown_seconds":0,"scale_down_cooldown_seconds":10,"idle_seconds":10,"paused":false}}' \
+  --set-json 'autoscaling={"interactive":{"min_workers":1,"max_workers":2,"max_cpu":4,"max_memory_bytes":8589934592,"queue_wait_target_ms":0,"scale_up_cooldown_seconds":0,"scale_down_cooldown_seconds":10,"idle_seconds":10,"paused":true}}' \
   | python3 scripts/kind/localize.py \
   --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port,isolated-pod \
   > "$work/release-pools.yaml"
@@ -492,6 +492,12 @@ harness duckfleet-reader-authority 'duckfleet-server --reader-authority' 600 \
   --env DUCKFLEET_READER_POOL=readers --env "DUCKFLEET_READER_DSN=$reader_dsn"
 await_no_isolated_pods
 test "$("${KUBE[@]}" get deployment worker-pool-interactive-1 -o jsonpath='{.spec.replicas}')" == 0
+# Earlier pool/queue fixtures also create queued work; only the dedicated load below
+# may trigger scale-up on this memory-bounded single-node cluster.
+sed 's/\\"paused\\":true/\\"paused\\":false/' "$work/release-pools.yaml" > "$work/release-autoscaling.yaml"
+grep -q '\\"paused\\":false' "$work/release-autoscaling.yaml"
+"${KUBE[@]}" apply -f "$work/release-autoscaling.yaml"
+python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
 harness duckfleet-autoscaling 'duckfleet-server --autoscaling' 900 &
 autoload=$!
 scaled_up=false
