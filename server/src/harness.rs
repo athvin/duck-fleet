@@ -1381,10 +1381,25 @@ async fn autoscaling_load(ctx: &Ctx) -> anyhow::Result<()> {
     let compute = json!({"pool":"interactive"});
     let mut connections = Vec::new();
     for _ in 0..17 {
-        connections.push(
-            ctx.open_named("autoscaling-load", Some(compute.clone()))
-                .await?,
-        );
+        let mut attempts = 0;
+        let connection = loop {
+            match ctx
+                .open_named("autoscaling-load", Some(compute.clone()))
+                .await
+            {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.downcast_ref::<RemoteError>().is_some_and(|error| {
+                        error.failure_kind.as_deref() == Some(crate::failure::CAPACITY.kind)
+                    }) && attempts < 40 =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        connections.push(connection);
     }
     let mut tasks = tokio::task::JoinSet::new();
     for connection in connections {
