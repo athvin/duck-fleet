@@ -420,7 +420,7 @@ render --no-hooks \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
   | python3 scripts/kind/localize.py \
-  --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod \
+  --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port,isolated-pod \
   > "$work/release-ha.yaml"
 python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release-ha.yaml"
