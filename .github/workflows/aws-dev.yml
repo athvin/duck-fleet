@@ -36,7 +36,7 @@ jobs:
   prepare:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 70
+    timeout-minutes: 80
     permissions:
       contents: read
       actions: read

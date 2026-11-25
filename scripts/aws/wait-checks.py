@@ -7,7 +7,7 @@ import time
 revision = os.environ['GITHUB_SHA']
 repo = os.environ['GITHUB_REPOSITORY']
 expected = {'local-harness.yml', 'infra.yml'}
-for attempt in range(240):
+for attempt in range(280):
     passed = set()
     for workflow in expected:
         runs = json.loads(subprocess.check_output([
