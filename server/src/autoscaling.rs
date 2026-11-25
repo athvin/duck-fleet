@@ -250,13 +250,16 @@ fn transition_is_current(
     scaling_down: bool,
     endpoints: u16,
 ) -> bool {
-    let expected = if scaling_down {
+    let expected_workers = if scaling_down {
         desired + 1
     } else {
         desired - 1
     };
-    let starting_standby = !scaling_down && desired > 1 && current == 0 && observed <= expected;
-    desired <= endpoints && (starting_standby || (current == expected && observed == expected))
+    let expected_replicas = u16::from(scaling_down);
+    let starting_standby =
+        !scaling_down && desired > 1 && current == 0 && observed <= expected_workers;
+    desired <= endpoints
+        && (starting_standby || (current == expected_replicas && observed == expected_workers))
 }
 
 fn deployment_name(pool: &str, index: u16) -> String {
@@ -370,11 +373,12 @@ mod tests {
     #[test]
     fn a_zero_replica_standby_can_start_but_partial_transitions_wait() {
         assert!(transition_is_current(0, 0, 2, false, 2));
-        assert!(transition_is_current(1, 1, 2, false, 2));
+        assert!(!transition_is_current(1, 1, 2, false, 2));
         assert!(!transition_is_current(1, 0, 2, false, 2));
         assert!(transition_is_current(0, 1, 2, false, 2));
         assert!(!transition_is_current(0, 2, 2, false, 2));
-        assert!(transition_is_current(2, 2, 1, true, 2));
+        assert!(transition_is_current(1, 2, 1, true, 2));
+        assert!(!transition_is_current(2, 2, 1, true, 2));
         assert!(!transition_is_current(0, 0, 1, true, 2));
         assert!(!transition_is_current(0, 0, 3, false, 2));
     }
