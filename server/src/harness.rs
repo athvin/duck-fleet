@@ -1426,7 +1426,7 @@ async fn autoscaling_query(
     let mut attempts = 0;
     let result = loop {
         match connection
-            .execute_with_timeouts("SELECT pg_sleep(5)", vec![], 60, 60)
+            .execute_with_timeouts("SELECT pg_sleep(2)", vec![], 60, 60)
             .await
             .map(|(_, rows)| rows)
         {
