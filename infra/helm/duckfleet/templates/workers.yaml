@@ -22,7 +22,7 @@ metadata:
     duckfleet.io/platform-schema: {{ include "duckfleet.platformSchema" $ | quote }}
 spec:
   # No concurrent writers with the same worker identity during upgrades.
-  replicas: {{ ternary 0 1 $.Values.suspended }}
+  replicas: {{ include "duckfleet.initialWorkerReplicas" (dict "root" $ "pool" $size "index" $index) }}
   strategy: {type: Recreate}
   selector:
     {{- if and (eq $size "small") (eq $index 0) }}

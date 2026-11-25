@@ -63,6 +63,15 @@ seccompProfile:
 {{- ternary "small" (printf "small-%d" (int .index)) (eq (int .index) 0) -}}
 {{- else -}}{{ printf "pool-%s-%d" .pool (int .index) }}{{- end -}}
 {{- end -}}
+{{- define "duckfleet.initialWorkerReplicas" -}}
+{{- if .root.Values.suspended -}}0
+{{- else -}}
+{{- $policy := get .root.Values.autoscaling .pool -}}
+{{- $minimum := 1 -}}
+{{- if $policy -}}{{- $minimum = get $policy "min_workers" | default 1 -}}{{- end -}}
+{{- ternary 0 1 (and (not (empty $policy)) (ge (int .index) (int $minimum))) -}}
+{{- end -}}
+{{- end -}}
 {{/* One validated pool map generates workers and gateway endpoints together. */}}
 {{- define "duckfleet.pools" -}}
 {{- $pools := dict -}}

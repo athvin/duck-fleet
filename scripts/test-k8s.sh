@@ -420,7 +420,7 @@ render --no-hooks \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
   | python3 scripts/kind/localize.py \
-  --expect image,cpu-request,s3-auth,s3-path,node-selector,storage-class,object-store-port,isolated-pod \
+  --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port,isolated-pod \
   > "$work/release-ha.yaml"
 python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release-ha.yaml"
@@ -475,7 +475,8 @@ render --no-hooks \
   --set "isolatedCompute.apiServerCidrs[0]=$api_address/32" \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
-  --set-json 'persistentPools={"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1},"interactive":{"cpu":2,"memory":"3Gi","disk":"4Gi","workers":1},"readers":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1,"authority":"reader"}}' \
+  --set-json 'persistentPools={"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1},"interactive":{"cpu":2,"memory":"3Gi","disk":"4Gi","workers":2},"readers":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1,"authority":"reader"}}' \
+  --set-json 'autoscaling={"interactive":{"min_workers":1,"max_workers":2,"max_cpu":4,"max_memory_bytes":8589934592,"queue_wait_target_ms":0,"scale_up_cooldown_seconds":0,"scale_down_cooldown_seconds":10,"idle_seconds":10,"paused":true}}' \
   | python3 scripts/kind/localize.py \
   --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port,isolated-pod \
   > "$work/release-pools.yaml"
@@ -490,12 +491,43 @@ reader_dsn=$("${KUBE[@]}" get secret duckfleet-dev -o jsonpath='{.data.CATALOG_R
 harness duckfleet-reader-authority 'duckfleet-server --reader-authority' 600 \
   --env DUCKFLEET_READER_POOL=readers --env "DUCKFLEET_READER_DSN=$reader_dsn"
 await_no_isolated_pods
+test "$("${KUBE[@]}" get deployment worker-pool-interactive-1 -o jsonpath='{.spec.replicas}')" == 0
+# Earlier pool/queue fixtures also create queued work; only the dedicated load below
+# may trigger scale-up on this memory-bounded single-node cluster.
+sed 's/"paused":true/"paused":false/' "$work/release-pools.yaml" > "$work/release-autoscaling.yaml"
+grep -q '"paused":false' "$work/release-autoscaling.yaml"
+"${KUBE[@]}" apply -f "$work/release-autoscaling.yaml"
+python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+harness duckfleet-autoscaling 'duckfleet-server --autoscaling' 900 &
+autoload=$!
+scaled_up=false
+for _ in $(seq 1 180); do
+  if [[ "$("${KUBE[@]}" get deployment worker-pool-interactive-1 -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" == 1 ]]; then
+    scaled_up=true
+    break
+  fi
+  sleep 2
+done
+[[ "$scaled_up" == true ]] || { echo 'autoscaling did not make the standby worker ready' >&2; exit 1; }
+wait "$autoload"
+scaled_down=false
+for _ in $(seq 1 180); do
+  if [[ "$("${KUBE[@]}" get deployment worker-pool-interactive-1 -o jsonpath='{.spec.replicas}')" == 0 ]]; then
+    scaled_down=true
+    break
+  fi
+  sleep 2
+done
+[[ "$scaled_down" == true ]] || { echo 'autoscaling did not drain the idle standby worker' >&2; exit 1; }
+harness duckfleet-autoscaling-idle 'duckfleet-server --autoscaling-idle' 300
 python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release.yaml"
 python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
-"${KUBE[@]}" delete deployment/worker-pool-interactive-0 service/worker-pool-interactive-0 configmap/duckfleet-pools
+"${KUBE[@]}" delete deployment/worker-pool-interactive-0 deployment/worker-pool-interactive-1 \
+  service/worker-pool-interactive-0 service/worker-pool-interactive-1 configmap/duckfleet-pools
 
 echo 'PASS: two persistent pools and isolated compute matched their declared allocations'
+echo 'PASS: queue pressure scaled up and idle cooldown drained a bounded persistent pool'
 
 # The external-catalog path, last because it swaps the catalog out from under the
 # release: the same chart pointed at a PostgreSQL it does not own, which is what

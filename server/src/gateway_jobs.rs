@@ -318,6 +318,12 @@ impl Gateway {
         };
         for candidate in candidates {
             let pod = candidate.cleanup;
+            // The target is persisted before the named pod is created. Until a UID
+            // proves that creation happened, absence cannot distinguish a dead pod
+            // from this ordinary provisioning window.
+            if !candidate.terminal && pod.pod_uid.is_none() {
+                continue;
+            }
             let absent = if candidate.terminal {
                 isolation
                     .stop_job_confirmed(&pod.pod_name, pod.pod_uid.as_deref())

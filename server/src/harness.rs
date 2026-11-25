@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context as _;
 use reqwest::Method;
 use serde_json::{Value, json};
 
@@ -85,6 +86,10 @@ pub async fn run(args: Vec<String>) -> i32 {
         pools::checks(&ctx, has("--pools-isolated")).await
     } else if has("--platform-maintenance") {
         platform::checks().await
+    } else if has("--autoscaling") {
+        autoscaling_load(&ctx).await
+    } else if has("--autoscaling-idle") {
+        autoscaling_idle(&ctx).await
     } else if has("--spread") {
         spread_checks(&ctx).await
     } else if has("--spread-failover") {
@@ -1347,6 +1352,144 @@ async fn credentials_checks(ctx: &Ctx) -> anyhow::Result<()> {
     println!(
         "PASS: credentials are issued, attributed, revoked at once, and the analyst preset cannot manage credentials or budgets"
     );
+    Ok(())
+}
+
+// --- bounded autoscaling ---------------------------------------------------
+
+async fn interactive_members(ctx: &Ctx, wanted: usize) -> anyhow::Result<()> {
+    for _ in 0..120 {
+        let workers = match request_json(&ctx.client()?, Method::GET, "/v1/workers", None).await {
+            Ok(workers) => workers,
+            Err(error)
+                if error.retry_safe
+                    && error.failure_kind.as_deref() == Some(crate::failure::CAPACITY.kind) =>
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let actual = workers["workers"]
+            .as_array()
+            .map(|workers| {
+                workers
+                    .iter()
+                    .filter(|worker| worker["pool"] == "interactive" && worker["ready"] == true)
+                    .count()
+            })
+            .unwrap_or(0);
+        if actual == wanted {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    anyhow::bail!("interactive worker membership did not reach {wanted}")
+}
+
+async fn autoscaling_open(ctx: &Ctx, compute: Value) -> anyhow::Result<RemoteConnection> {
+    let mut attempts = 0;
+    loop {
+        match ctx
+            .open_named("autoscaling-load", Some(compute.clone()))
+            .await
+        {
+            Ok(connection) => return Ok(connection),
+            Err(error)
+                if error.downcast_ref::<RemoteError>().is_some_and(|error| {
+                    error.retry_safe
+                        && error.failure_kind.as_deref() == Some(crate::failure::CAPACITY.kind)
+                }) && attempts < 40 =>
+            {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => {
+                let detail = error.downcast_ref::<RemoteError>().map(|error| {
+                    format!(
+                        "; status={:?}; kind={:?}; retry_safe={}; request_id={:?}",
+                        error.status, error.failure_kind, error.retry_safe, error.request_id
+                    )
+                });
+                return Err(error).context(format!(
+                    "autoscaling session admission failed{}",
+                    detail.unwrap_or_default()
+                ));
+            }
+        }
+    }
+}
+
+async fn autoscaling_query(
+    connection: RemoteConnection,
+) -> (Result<client::QueryResult, RemoteError>, RemoteConnection) {
+    let mut attempts = 0;
+    let result = loop {
+        match connection
+            .execute_with_timeouts("SELECT pg_sleep(2)", vec![], 60, 60)
+            .await
+            .map(|(_, rows)| rows)
+        {
+            Err(error)
+                if error.retry_safe
+                    && error.failure_kind.as_deref() == Some(crate::failure::CAPACITY.kind)
+                    && attempts < 40 =>
+            {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            result => break result,
+        }
+    };
+    (result, connection)
+}
+
+async fn autoscaling_load(ctx: &Ctx) -> anyhow::Result<()> {
+    interactive_members(ctx, 1).await?;
+    let compute = json!({"pool":"interactive"});
+    let mut connections = Vec::new();
+    for _ in 0..16 {
+        connections.push(autoscaling_open(ctx, compute.clone()).await?);
+    }
+    let first_worker = connections
+        .first()
+        .map(|connection| connection.placement["worker_id"].clone());
+    let mut tasks = tokio::task::JoinSet::new();
+    for connection in connections {
+        tasks.spawn(autoscaling_query(connection));
+    }
+    interactive_members(ctx, 2).await?;
+    println!("PASS: queued interactive work scaled one worker to two with live membership");
+    let last = autoscaling_open(ctx, compute).await?;
+    require(
+        Some(&last.placement["worker_id"]) != first_worker.as_ref(),
+        format!(
+            "the new session did not use the added worker: {}",
+            last.placement
+        ),
+    )?;
+    tasks.spawn(autoscaling_query(last));
+    while let Some(joined) = tasks.join_next().await {
+        let (result, mut connection) = joined?;
+        result.map_err(|error| {
+            anyhow::anyhow!(
+                "autoscaling statement failed: {}; status={:?}; kind={:?}; retry_safe={}; request_id={:?}",
+                error.message,
+                error.status,
+                error.failure_kind,
+                error.retry_safe,
+                error.request_id
+            )
+        })?;
+        connection.close().await?;
+    }
+    println!("PASS: every load statement completed and closed without duplicate execution");
+    Ok(())
+}
+
+async fn autoscaling_idle(ctx: &Ctx) -> anyhow::Result<()> {
+    interactive_members(ctx, 1).await?;
+    println!("PASS: idle interactive capacity drained back to one worker");
     Ok(())
 }
 

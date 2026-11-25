@@ -3,6 +3,7 @@ mod artifacts;
 #[allow(dead_code)]
 mod audit;
 mod authz;
+mod autoscaling;
 mod cli;
 #[allow(dead_code)]
 mod client;
@@ -377,6 +378,11 @@ fn worker_identity(headers: &HeaderMap) -> Result<credentials::Identity, ApiErro
 async fn info(State(app): State<App>) -> Reply {
     Ok(Output::Json(app.status.snapshot()))
 }
+async fn drain(State(app): State<App>) -> Reply {
+    app.draining.store(true, Ordering::Release);
+    app.queue.stop();
+    Ok(Output::Json(app.status.snapshot()))
+}
 async fn close(State(app): State<App>, Path(id): Path<Uuid>, headers: HeaderMap) -> Reply {
     let reason = match headers
         .get("x-duckfleet-close-reason")
@@ -713,6 +719,7 @@ async fn main() -> anyhow::Result<()> {
         .route_layer(middleware::from_fn_with_state(app.token.clone(), authorize));
     let router = Router::new()
         .route("/healthz", get(health))
+        .route("/v1/drain", post(drain))
         .merge(api)
         .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(app);

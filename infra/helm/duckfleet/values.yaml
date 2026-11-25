@@ -126,6 +126,8 @@ jobPolicy: {}
 # JSON field names. Idle timeout applies only with no active query; maximum
 # lifetime interrupts active work and rolls its session back on close.
 computePolicy: {}
+# Optional per-pool bounded autoscaling; empty preserves fixed-capacity workers.
+autoscaling: {}
 # Example:
 # computePolicy:
 #   max_cpu: 8

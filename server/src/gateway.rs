@@ -68,7 +68,7 @@ struct Route {
 /// own cgroup, so this is what the container actually got rather than what a label
 /// claims it should have.
 #[derive(Clone, Debug)]
-struct WorkerInfo {
+pub(crate) struct WorkerInfo {
     endpoint: String,
     cpu: u16,
     memory_bytes: u64,
@@ -101,12 +101,12 @@ impl WorkerInfo {
 /// class, the second is one that is degraded. Collapsing them would report a missing
 /// class every time a pod restarted.
 #[derive(Clone, Debug)]
-struct Fleet {
+pub(crate) struct Fleet {
     revision: String,
     workers: Vec<WorkerInfo>,
     unreachable: Vec<String>,
     discovered: Instant,
-    reported: Vec<Value>,
+    pub reported: Vec<Value>,
 }
 
 enum SessionOutcome {
@@ -451,7 +451,7 @@ async fn authenticate(
 }
 
 #[derive(Clone)]
-struct Gateway {
+pub(crate) struct Gateway {
     client: Client,
     token: Arc<str>,
     /// Worker endpoints, not classes. The gateway asks each one what it is, because
@@ -531,7 +531,7 @@ fn draining_refusal() -> ApiError {
     )
 }
 impl Gateway {
-    fn registry(&self) -> Arc<PoolRegistry> {
+    pub(crate) fn registry(&self) -> Arc<PoolRegistry> {
         self.pools.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -887,7 +887,7 @@ impl Gateway {
 
     /// Shared by placement and inspection, with short-lived load observations.
     /// Unreachable workers do not discard healthy siblings' observations.
-    async fn fleet_snapshot(&self, registry: &PoolRegistry) -> Fleet {
+    pub(crate) async fn fleet_snapshot(&self, registry: &PoolRegistry) -> Fleet {
         let fresh = |fleet: &Option<Fleet>| {
             fleet
                 .clone()
@@ -3015,7 +3015,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             .unwrap_or_else(|_| Uuid::new_v4().to_string()),
         gateway_epoch: Uuid::new_v4(),
         system,
-        token,
+        token: token.clone(),
         pools: Arc::new(RwLock::new(Arc::new(registry))),
         pools_file: pools_file.map(Arc::new),
         publishing: Arc::new(Mutex::new(())),
@@ -3090,6 +3090,7 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
             }
         }
     });
+    let autoscaling = crate::autoscaling::spawn(app.clone(), token.clone())?;
     let api = Router::new()
         .route("/v1/jobs", post(job_api::submit))
         .route("/v1/jobs/{id}", get(job_api::detail))
@@ -3202,6 +3203,9 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
     .await;
     maintenance.abort();
     ownership_heartbeat.abort();
+    if let Some(autoscaling) = autoscaling {
+        autoscaling.abort();
+    }
     job_dispatcher.abort();
     served?;
     Ok(())
