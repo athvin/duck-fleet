@@ -107,8 +107,8 @@ class AwsCiTests(unittest.TestCase):
         checks = next(i for i,s in enumerate(steps) if s.get('run') == 'python3 scripts/aws/wait-checks.py')
         credentials = next(i for i,s in enumerate(steps) if s.get('uses','').startswith('aws-actions/'))
         self.assertLess(checks, credentials)
-        self.assertGreaterEqual(prepare['timeout-minutes'], 70)
-        self.assertIn('range(240)', (ROOT/'scripts/aws/wait-checks.py').read_text())
+        self.assertGreaterEqual(prepare['timeout-minutes'], 80)
+        self.assertIn('range(280)', (ROOT/'scripts/aws/wait-checks.py').read_text())
         self.assertIn('always()', workflow['jobs']['suspend']['if'])
         self.assertIn('deployment_started', workflow['jobs']['suspend']['if'])
         for job in workflow['jobs'].values():
