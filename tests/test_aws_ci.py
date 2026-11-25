@@ -1405,6 +1405,7 @@ class DatabaseRolePackagingTests(unittest.TestCase):
 
     def test_suspension_rebases_legacy_releases_onto_current_defaults(self):
         script = (ROOT/'scripts/aws/suspend.sh').read_text()
+        self.assertIn('-f infra/helm/duckfleet/values-aws.yaml', script)
         self.assertIn('--reset-then-reuse-values', script)
         self.assertNotIn('--reuse-values --set', script)
 
