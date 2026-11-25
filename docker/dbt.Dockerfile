@@ -31,7 +31,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=du
 # ubuntu 24.04 for glibc >= 2.39, which the forked dbt binary (built on that
 # toolchain) requires. duckfleet-server (glibc 2.36, built on bookworm) runs here too.
 FROM ubuntu:24.04 AS runtime
-ARG DBT_RELEASE=duckfleet-v0.1.5
+ARG DBT_RELEASE=duckfleet-v0.1.6
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 && rm -rf /var/lib/apt/lists/*
 # The forked dbt-core binary (embeds AdapterType::DuckFleet).

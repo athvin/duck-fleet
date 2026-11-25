@@ -134,7 +134,7 @@ default. Defaults can be set under
 dbt's resolved config before its first SQL statement. Use `meta.platform.tags` for
 workload attribution — tags never size compute.
 
-The pinned `athvin/dbt` adapter release `duckfleet-v0.1.3` forwards only resource
+The pinned `athvin/dbt` adapter release `duckfleet-v0.1.6` forwards only resource
 selection (`cpu`, `memory`, `disk`); it silently drops `mode` and `pool` metadata.
 Use the HTTP API or CLI for explicit pool selection. Adding these fields to dbt
 models does not enable the feature: a coordinated follow-up in
