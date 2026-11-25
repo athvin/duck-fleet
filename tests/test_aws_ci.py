@@ -85,6 +85,15 @@ class AwsCiTests(unittest.TestCase):
         result = subprocess.check_output(['bash', '-c', command], env={'PATH': '/usr/bin:/bin', 'GITHUB_ACTIONS': 'true'}, text=True)
         self.assertEqual(result, 'unset')
 
+    def test_aws_harness_deadline_covers_the_full_suite(self):
+        objects = [item for item in yaml.safe_load_all(chart()) if item]
+        harness = next(item for item in objects if item['metadata']['name'] == 'duckfleet-harness')
+        self.assertEqual(harness['spec']['activeDeadlineSeconds'], 2400)
+        script = (ROOT/'scripts/aws/test.sh').read_text()
+        self.assertIn('--timeout 42m', script)
+        workflow = yaml.safe_load((ROOT/'.github/workflows/aws-dev.yml').read_text())
+        self.assertGreaterEqual(workflow['jobs']['deploy']['timeout-minutes'], 45)
+
     def test_workflow_boundary_and_cleanup(self):
         workflow = yaml.safe_load((ROOT/'.github/workflows/aws-dev.yml').read_text())
         self.assertFalse(workflow['concurrency']['cancel-in-progress'])

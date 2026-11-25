@@ -7,7 +7,7 @@ mkdir -p artifacts/aws
 # Capture independently of what the server reports about itself.
 "${KUBE[@]}" get pods -o json > artifacts/aws/pods.json
 status=0
-helm test duckfleet --kube-context "$KUBE_CONTEXT" --namespace "$NAMESPACE" --timeout 22m || status=$?
+helm test duckfleet --kube-context "$KUBE_CONTEXT" --namespace "$NAMESPACE" --timeout 42m || status=$?
 "${KUBE[@]}" logs job/duckfleet-harness -c dbt > artifacts/aws/harness.log || status=1
 "${KUBE[@]}" get events --sort-by=.lastTimestamp > artifacts/aws/events.txt
 [[ "$status" == 0 ]] || { cat artifacts/aws/harness.log; exit "$status"; }
