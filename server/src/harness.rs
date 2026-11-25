@@ -1386,62 +1386,85 @@ async fn interactive_members(ctx: &Ctx, wanted: usize) -> anyhow::Result<()> {
     anyhow::bail!("interactive worker membership did not reach {wanted}")
 }
 
+async fn autoscaling_open(ctx: &Ctx, compute: Value) -> anyhow::Result<RemoteConnection> {
+    let mut attempts = 0;
+    loop {
+        match ctx
+            .open_named("autoscaling-load", Some(compute.clone()))
+            .await
+        {
+            Ok(connection) => return Ok(connection),
+            Err(error)
+                if error.downcast_ref::<RemoteError>().is_some_and(|error| {
+                    error.retry_safe
+                        && error.failure_kind.as_deref() == Some(crate::failure::CAPACITY.kind)
+                }) && attempts < 40 =>
+            {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn autoscaling_query(
+    connection: RemoteConnection,
+) -> (Result<client::QueryResult, RemoteError>, RemoteConnection) {
+    let mut attempts = 0;
+    let result = loop {
+        match connection
+            .execute_with_timeouts("SELECT pg_sleep(45)", vec![], 60, 60)
+            .await
+            .map(|(_, rows)| rows)
+        {
+            Err(error)
+                if error.retry_safe
+                    && error.failure_kind.as_deref() == Some(crate::failure::CAPACITY.kind)
+                    && attempts < 40 =>
+            {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            result => break result,
+        }
+    };
+    (result, connection)
+}
+
 async fn autoscaling_load(ctx: &Ctx) -> anyhow::Result<()> {
     interactive_members(ctx, 1).await?;
     let compute = json!({"pool":"interactive"});
-    let mut connections = Vec::new();
-    for _ in 0..17 {
-        let mut attempts = 0;
-        let connection = loop {
-            match ctx
-                .open_named("autoscaling-load", Some(compute.clone()))
-                .await
-            {
-                Ok(connection) => break connection,
-                Err(error)
-                    if error.downcast_ref::<RemoteError>().is_some_and(|error| {
-                        error.retry_safe
-                            && error.failure_kind.as_deref() == Some(crate::failure::CAPACITY.kind)
-                    }) && attempts < 40 =>
-                {
-                    attempts += 1;
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        connections.push(connection);
-    }
     let mut tasks = tokio::task::JoinSet::new();
-    for connection in connections {
-        tasks.spawn(async move {
-            let mut attempts = 0;
-            let result = loop {
-                match connection
-                    .execute_with_timeouts("SELECT pg_sleep(45)", vec![], 60, 60)
-                    .await
-                    .map(|(_, rows)| rows)
-                {
-                    Err(error)
-                        if error.retry_safe
-                            && error.failure_kind.as_deref()
-                                == Some(crate::failure::CAPACITY.kind)
-                            && attempts < 40 =>
-                    {
-                        attempts += 1;
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-                    result => break result,
-                }
-            };
-            (result, connection)
-        });
+    let mut first_worker = None;
+    for _ in 0..16 {
+        let connection = autoscaling_open(ctx, compute.clone()).await?;
+        first_worker.get_or_insert_with(|| connection.placement["worker_id"].clone());
+        tasks.spawn(autoscaling_query(connection));
     }
     interactive_members(ctx, 2).await?;
     println!("PASS: queued interactive work scaled one worker to two with live membership");
+    let last = autoscaling_open(ctx, compute).await?;
+    require(
+        Some(&last.placement["worker_id"]) != first_worker.as_ref(),
+        format!(
+            "the new session did not use the added worker: {}",
+            last.placement
+        ),
+    )?;
+    tasks.spawn(autoscaling_query(last));
     while let Some(joined) = tasks.join_next().await {
         let (result, mut connection) = joined?;
-        result?;
+        result.map_err(|error| {
+            anyhow::anyhow!(
+                "autoscaling statement failed: {}; status={:?}; kind={:?}; retry_safe={}; request_id={:?}",
+                error.message,
+                error.status,
+                error.failure_kind,
+                error.retry_safe,
+                error.request_id
+            )
+        })?;
         connection.close().await?;
     }
     println!("PASS: every load statement completed and closed without duplicate execution");
