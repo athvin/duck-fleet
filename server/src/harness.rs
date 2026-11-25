@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context as _;
 use reqwest::Method;
 use serde_json::{Value, json};
 
@@ -1403,7 +1404,18 @@ async fn autoscaling_open(ctx: &Ctx, compute: Value) -> anyhow::Result<RemoteCon
                 attempts += 1;
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let detail = error.downcast_ref::<RemoteError>().map(|error| {
+                    format!(
+                        "; status={:?}; kind={:?}; retry_safe={}; request_id={:?}",
+                        error.status, error.failure_kind, error.retry_safe, error.request_id
+                    )
+                });
+                return Err(error).context(format!(
+                    "autoscaling session admission failed{}",
+                    detail.unwrap_or_default()
+                ));
+            }
         }
     }
 }
