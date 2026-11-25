@@ -98,6 +98,8 @@ class AwsCiTests(unittest.TestCase):
         checks = next(i for i,s in enumerate(steps) if s.get('run') == 'python3 scripts/aws/wait-checks.py')
         credentials = next(i for i,s in enumerate(steps) if s.get('uses','').startswith('aws-actions/'))
         self.assertLess(checks, credentials)
+        self.assertGreaterEqual(prepare['timeout-minutes'], 70)
+        self.assertIn('range(240)', (ROOT/'scripts/aws/wait-checks.py').read_text())
         self.assertIn('always()', workflow['jobs']['suspend']['if'])
         self.assertIn('deployment_started', workflow['jobs']['suspend']['if'])
         for job in workflow['jobs'].values():
@@ -1391,7 +1393,9 @@ class OwnershipBoundaryTests(unittest.TestCase):
         self.assertIn('check-access.sh', workflow)
         access = (ROOT/'scripts/aws/check-access.sh').read_text()
         self.assertIn('auth can-i patch deployments.apps', access)
-        self.assertIn('auth can-i patch deployments.apps --subresource=scale', access)
+        # Autoscaling is optional and disabled by default. Its scale grant belongs to
+        # the gateway Role asserted above, not to this deploy identity.
+        self.assertNotIn('--subresource=scale', access)
 
 
 class DatabaseRolePackagingTests(unittest.TestCase):
