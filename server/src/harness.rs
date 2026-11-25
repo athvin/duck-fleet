@@ -1435,11 +1435,15 @@ async fn autoscaling_query(
 async fn autoscaling_load(ctx: &Ctx) -> anyhow::Result<()> {
     interactive_members(ctx, 1).await?;
     let compute = json!({"pool":"interactive"});
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut first_worker = None;
+    let mut connections = Vec::new();
     for _ in 0..16 {
-        let connection = autoscaling_open(ctx, compute.clone()).await?;
-        first_worker.get_or_insert_with(|| connection.placement["worker_id"].clone());
+        connections.push(autoscaling_open(ctx, compute.clone()).await?);
+    }
+    let first_worker = connections
+        .first()
+        .map(|connection| connection.placement["worker_id"].clone());
+    let mut tasks = tokio::task::JoinSet::new();
+    for connection in connections {
         tasks.spawn(autoscaling_query(connection));
     }
     interactive_members(ctx, 2).await?;
