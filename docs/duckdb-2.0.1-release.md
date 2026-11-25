@@ -6,7 +6,7 @@
 
 The delivered engine is DuckDB `v2.0.1` with `aws` `9ba41b09a0`, `ducklake` `08089b16dc`, `httpfs` `f71cfdb4bf`, `icu` `v2.0.1`, and `postgres_scanner` `8b9d0bbe8d`. Both Linux architectures use the same reviewed manifest. Worker startup checks the native engine, loaded extension versions, forbidden custom repositories, and DuckLake catalog `1.0` before reporting ready. Persistent and isolated workers use the same immutable image digest; a mismatch prevents readiness rather than falling back to another engine.
 
-The dbt binary is the Rust `duckfleet-v0.1.4` release, which includes per-node transaction rollback. Its [adapter fix](https://github.com/athvin/dbt/pull/1) prevents a failed model from committing its pre-hook.
+The dbt binary is the Rust `duckfleet-v0.1.6` release, which includes per-node transaction rollback and per-session execution serialization. The [transaction fix](https://github.com/athvin/dbt/pull/1) prevents a failed model from committing its pre-hook, and the [session fix](https://github.com/athvin/dbt/pull/2) prevents overlapping statements on one gateway session.
 
 ## Evidence and sign-off
 
