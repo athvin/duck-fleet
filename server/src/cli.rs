@@ -10,6 +10,7 @@
 //! fixed for all statements passed to one invocation.
 
 use serde_json::{Map, Value, json};
+use std::io::IsTerminal;
 
 use crate::client::{Client, QueryResult, RemoteConnection, RemoteError};
 
@@ -88,6 +89,18 @@ pub async fn run(args: Vec<String>) -> i32 {
         return 2;
     };
 
+    if parsed.command == "shell" {
+        return crate::shell::run(crate::shell::ShellOptions {
+            url,
+            token,
+            compute: parsed.compute().expect("validated compute"),
+            queue_timeout: parsed.queue_timeout().expect("validated queue timeout"),
+            format: parsed.value("format").unwrap_or("table").to_owned(),
+            history: !parsed.flags.iter().any(|flag| flag == "no-history"),
+        })
+        .await;
+    }
+
     let result = match parsed.command.as_str() {
         "sql" => run_sql(&url, &token, &parsed).await,
         "system" => run_system(&url, &token, &parsed).await,
@@ -154,7 +167,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (init|config|version|dev|status|stop|reset|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -163,31 +176,30 @@ pub async fn run(args: Vec<String>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(error) => {
-            // The server's own classification, because it is what a caller acts
-            // on: whether the statement may be sent again is not this client's
-            // judgement.
-            let status = error
-                .status
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "-".to_owned());
-            let kind = error.failure_kind.as_deref().unwrap_or("error");
-            eprintln!("{kind} (HTTP {status}): {error}");
-            eprintln!("retry_safe: {}", error.retry_safe);
-            if error.failure_kind.as_deref() == Some("transport_failure") {
-                eprintln!(
-                    "next: run duckfleet config show and confirm the configured server is running"
-                );
-            }
-            if let Some(id) = &error.request_id {
-                eprintln!(
-                    "request_id: {id}; acceptance: {}",
-                    error.acceptance.as_deref().unwrap_or("unknown")
-                );
-                if let Some(url) = &error.status_url {
-                    eprintln!("status: {url}");
-                }
-            }
+            print_remote_error(&error);
             1
+        }
+    }
+}
+
+pub(crate) fn print_remote_error(error: &RemoteError) {
+    let status = error
+        .status
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let kind = error.failure_kind.as_deref().unwrap_or("error");
+    eprintln!("{kind} (HTTP {status}): {error}");
+    eprintln!("retry_safe: {}", error.retry_safe);
+    if error.failure_kind.as_deref() == Some("transport_failure") {
+        eprintln!("next: run duckfleet config show and confirm the configured server is running");
+    }
+    if let Some(id) = &error.request_id {
+        eprintln!(
+            "request_id: {id}; acceptance: {}",
+            error.acceptance.as_deref().unwrap_or("unknown")
+        );
+        if let Some(url) = &error.status_url {
+            eprintln!("status: {url}");
         }
     }
 }
@@ -560,7 +572,7 @@ async fn run_policy(url: &str, token: &str, parsed: &Parsed) -> Result<(), Remot
 }
 
 async fn run_sql(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
-    let compute = parsed.compute().map_err(|message| RemoteError {
+    let invalid = |message: String| RemoteError {
         request_id: None,
         acceptance: None,
         status_url: None,
@@ -568,7 +580,38 @@ async fn run_sql(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteEr
         failure_kind: Some("invalid_request".into()),
         retry_safe: true,
         message,
-    })?;
+    };
+    let compute = parsed.compute().map_err(invalid)?;
+    let statements = if let Some(path) = parsed.value("file") {
+        let text = if path == "-" {
+            read_stdin(&invalid)?
+        } else {
+            let metadata =
+                std::fs::metadata(path).map_err(|_| invalid("cannot read SQL file".into()))?;
+            if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+                return Err(invalid(
+                    "SQL file must be a regular file of at most one MiB".into(),
+                ));
+            }
+            std::fs::read_to_string(path)
+                .map_err(|_| invalid("cannot read SQL file as UTF-8".into()))?
+        };
+        crate::shell::read_statements(&text).map_err(invalid)?
+    } else if parsed.positionals.is_empty() {
+        if std::io::stdin().is_terminal() {
+            return Err(invalid(
+                "sql needs a statement, --file <path>, or piped stdin; use duckfleet shell for interactive input"
+                    .into(),
+            ));
+        }
+        let text = read_stdin(&invalid)?;
+        crate::shell::read_statements(&text).map_err(invalid)?
+    } else {
+        parsed.positionals.clone()
+    };
+    if statements.is_empty() {
+        return Ok(());
+    }
     let mut connection = RemoteConnection::open(url, token, "cli", compute, None, 90).await?;
     if parsed.flags.contains(&"placement".to_owned()) {
         eprintln!("{}", connection.placement);
@@ -579,11 +622,9 @@ async fn run_sql(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteEr
         .map(|p| Value::String(p.clone()))
         .collect();
     let format = parsed.value("format").unwrap_or("table");
-    // Closing rolls back anything uncommitted, which is the server's behaviour
-    // and the reason a failed load does not leave a half-written table behind —
-    // so close in both the success and the error path.
+    let continue_on_error = parsed.flags.iter().any(|flag| flag == "continue-on-error");
     let mut outcome = Ok(());
-    for statement in &parsed.positionals {
+    for statement in &statements {
         match connection
             .execute_with_queue_timeout(
                 statement,
@@ -594,8 +635,15 @@ async fn run_sql(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteEr
         {
             Ok((_, result)) => emit(&result, format),
             Err(error) => {
-                outcome = Err(error);
-                break;
+                let unknown = error.acceptance.as_deref() == Some("unknown")
+                    || error.failure_kind.as_deref() == Some("transport_failure")
+                    || error.failure_kind.as_deref() == Some("unknown_session");
+                if outcome.is_ok() {
+                    outcome = Err(error);
+                }
+                if unknown || !continue_on_error {
+                    break;
+                }
             }
         }
     }
@@ -608,6 +656,19 @@ async fn run_sql(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteEr
         let _ = connection.close().await;
     }
     outcome
+}
+
+fn read_stdin(invalid: &impl Fn(String) -> RemoteError) -> Result<String, RemoteError> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid("cannot read SQL from stdin".into()))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(invalid("stdin SQL must not exceed one MiB".into()));
+    }
+    String::from_utf8(bytes).map_err(|_| invalid("stdin SQL must be UTF-8".into()))
 }
 
 async fn get(url: &str, token: &str, path: &str) -> Result<(), RemoteError> {
@@ -633,13 +694,14 @@ async fn request(
     Ok(())
 }
 
-fn emit(result: &QueryResult, format: &str) {
+pub(crate) fn emit(result: &QueryResult, format: &str) {
     if result.columns.is_empty() {
         return;
     }
     match format {
         "json" => emit_json(result),
         "csv" => emit_csv(result),
+        "vertical" => print!("{}", crate::shell::result_to_vertical(result)),
         _ => emit_table(result),
     }
 }
@@ -804,7 +866,18 @@ impl Parsed {
         while index < args.len() {
             let arg = &args[index];
             if let Some(name) = arg.strip_prefix("--") {
-                if ["placement", "wait", "resume", "force", "demo", "yes"].contains(&name) {
+                if [
+                    "placement",
+                    "wait",
+                    "resume",
+                    "force",
+                    "demo",
+                    "yes",
+                    "no-history",
+                    "continue-on-error",
+                ]
+                .contains(&name)
+                {
                     flags.push(name.to_owned());
                     index += 1;
                 } else if name == "param"
@@ -836,7 +909,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <init|config|version|dev|status|stop|reset|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <init|config|version|dev|status|stop|reset|shell|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -863,10 +936,26 @@ impl Parsed {
         if parsed.flags.iter().any(|flag| flag == "yes") && parsed.command != "reset" {
             return Err("--yes applies only to reset".into());
         }
+        if parsed.command == "shell" && !parsed.positionals.is_empty() {
+            return Err("shell takes no positional arguments".into());
+        }
+        if parsed.command == "shell"
+            && parsed
+                .value("format")
+                .is_some_and(|format| !["table", "csv", "json", "vertical"].contains(&format))
+        {
+            return Err("shell --format must be table, csv, json, or vertical".into());
+        }
+        if parsed.flags.iter().any(|flag| flag == "no-history") && parsed.command != "shell" {
+            return Err("--no-history applies only to shell".into());
+        }
+        if parsed.flags.iter().any(|flag| flag == "continue-on-error") && parsed.command != "sql" {
+            return Err("--continue-on-error applies only to sql".into());
+        }
         if parsed.flags.iter().any(|flag| flag == "force") && parsed.command != "init" {
             return Err("--force applies only to init".into());
         }
-        if parsed.command != "sql"
+        if !matches!(parsed.command.as_str(), "sql" | "shell")
             && !parsed.is_job_submit()
             && parsed
                 .values
@@ -896,14 +985,20 @@ impl Parsed {
                 return Err("system --format must be table or json".into());
             }
         }
-        if parsed.command != "sql"
+        if !matches!(parsed.command.as_str(), "sql" | "shell")
             && !parsed.is_job_submit()
             && parsed.value("queue-timeout").is_some()
         {
             return Err("--queue-timeout applies only to sql or job submit".into());
         }
-        if parsed.value("file").is_some() && parsed.command != "policy" {
-            return Err("--file applies only to the policy command".into());
+        if parsed.value("file").is_some() && !matches!(parsed.command.as_str(), "policy" | "sql") {
+            return Err("--file applies only to the policy and sql commands".into());
+        }
+        if parsed.command == "sql"
+            && parsed.value("file").is_some()
+            && !parsed.positionals.is_empty()
+        {
+            return Err("sql --file cannot be combined with positional SQL statements".into());
         }
         if parsed.command == "policy"
             && (parsed.positionals.len() != 1
@@ -1204,6 +1299,8 @@ mod tests {
         assert!(parse(&["status"]).is_ok());
         assert!(parse(&["stop"]).is_ok());
         assert!(parse(&["reset", "--yes"]).is_ok());
+        assert!(parse(&["shell", "--no-history", "--format", "vertical"]).is_ok());
+        assert!(parse(&["sql", "--file", "load.sql", "--continue-on-error"]).is_ok());
         for args in [
             vec!["init", "unexpected"],
             vec!["config"],
@@ -1214,6 +1311,10 @@ mod tests {
             vec!["status", "--demo"],
             vec!["stop", "--yes"],
             vec!["reset", "--demo"],
+            vec!["shell", "unexpected"],
+            vec!["shell", "--format", "yaml"],
+            vec!["sql", "SELECT 1", "--no-history"],
+            vec!["workers", "--continue-on-error"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }

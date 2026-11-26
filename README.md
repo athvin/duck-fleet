@@ -270,6 +270,13 @@ duckfleet sql 'select region, count(*) from analytics.events group by region'
 duckfleet sql 'select * from analytics.events where region = ?' --param eu --format json
 ```
 
+Use `duckfleet shell` for a persistent multiline session with completion, secure history, transaction-aware prompts, table inspection, four output formats, and explicit Ctrl-C cancellation. `duckfleet sql --file <path>` and piped stdin provide the same session semantics for scripts; see the [CLI guide](docs/cli.md#interactive-sql-shell).
+
+```sh
+duckfleet shell
+duckfleet sql --file ./load.sql
+```
+
 The CLI uses the HTTP/Arrow client in `server/src/client.rs`. The external dbt
 adapter speaks the same API; its supported selection fields depend on the pinned
 adapter release described above.

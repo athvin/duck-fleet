@@ -28,6 +28,8 @@ jobs:
           make test-cli
       - name: Native CLI lifecycle and two-project isolation
         run: make test-dev
+      - name: Interactive shell PTY and SQL input lifecycle
+        run: make test-shell
       - name: Save test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

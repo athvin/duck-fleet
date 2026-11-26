@@ -58,6 +58,16 @@ pub fn resolve(flag_url: Option<&str>, flag_token: Option<&str>) -> Result<Resol
     )
 }
 
+pub fn shell_history_path() -> Result<PathBuf, String> {
+    let directory = std::env::current_dir()
+        .map_err(|_| "cannot determine the current directory for shell history".to_owned())?;
+    let root = directory
+        .ancestors()
+        .find(|parent| parent.join(PROJECT_FILE).is_file())
+        .unwrap_or(&directory);
+    Ok(root.join(STATE_DIR).join("shell_history"))
+}
+
 fn resolve_from(
     directory: &Path,
     flag_url: Option<&str>,

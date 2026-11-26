@@ -8,6 +8,8 @@ mod client;
 #[path = "../../src/dev.rs"]
 mod dev;
 mod protocol;
+#[path = "../../src/shell.rs"]
+mod shell;
 
 mod artifacts {
     pub(crate) use crate::protocol::{
