@@ -34,6 +34,24 @@ pub fn secret_values(context: &str, namespace: &str) -> Result<BTreeMap<String, 
 }
 
 pub fn catalog_probe(dsn: &str, namespace: &str) -> Result<String> {
+    let fields = catalog_fields(dsn, namespace)?;
+    let literal = fields
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "ATTACH '{literal}' AS qualification_catalog (TYPE postgres, READ_ONLY); SELECT COUNT(*) FROM qualification_catalog.public.ducklake_snapshot"
+    ))
+}
+
+/// The source catalog's cluster-qualified host and port.
+pub fn catalog_endpoint(dsn: &str, namespace: &str) -> Result<(String, String)> {
+    let fields = catalog_fields(dsn, namespace)?;
+    Ok((fields["host"].clone(), fields["port"].clone()))
+}
+
+fn catalog_fields(dsn: &str, namespace: &str) -> Result<BTreeMap<String, String>> {
     let mut fields = BTreeMap::new();
     for part in shell_words::split(dsn)? {
         let (key, value) = part
@@ -69,14 +87,34 @@ pub fn catalog_probe(dsn: &str, namespace: &str) -> Result<String> {
         bail!("catalog fixture DSN contains unsupported field characters");
     }
     fields.insert("connect_timeout".into(), "3".into());
-    let literal = fields
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Ok(format!(
-        "ATTACH '{literal}' AS qualification_catalog (TYPE postgres, READ_ONLY); SELECT COUNT(*) FROM qualification_catalog.public.ducklake_snapshot"
-    ))
+    Ok(fields)
+}
+
+/// Opens a TCP connection from inside a namespace's worker pod. Workers cannot
+/// attach databases from SQL (engine external access is disabled after
+/// startup), so the network boundary is probed at the socket instead.
+fn worker_reaches(context: &str, namespace: &str, host: &str, port: &str) -> Result<bool> {
+    ensure!(
+        regex::Regex::new(r"^[a-z0-9.-]+$")?.is_match(host)
+            && port.bytes().all(|b| b.is_ascii_digit()),
+        "invalid catalog endpoint"
+    );
+    let output = kubectl(
+        context,
+        namespace,
+        &[
+            "exec".into(),
+            "deployment/worker-small".into(),
+            "--".into(),
+            "timeout".into(),
+            "8".into(),
+            "bash".into(),
+            "-c".into(),
+            format!("exec 3<>/dev/tcp/{host}/{port}"),
+        ],
+        false,
+    )?;
+    Ok(output.status.success())
 }
 
 async fn response(
@@ -117,74 +155,12 @@ pub async fn call(
     Ok(body)
 }
 
-fn verify_denial(body: &Value, password: &str) -> Result<()> {
-    let message = util::text(body.get("error"));
-    ensure!(
-        !message.contains(password),
-        "the probe credential leaked into an error message"
-    );
-    if body["failure_kind"] == "timeout" {
-        return Ok(());
-    }
-    let network_failure =
-        regex::Regex::new(r"(?i)timed out|timeout|network is unreachable|no route to host")?
-            .is_match(message);
-    ensure!(
-        body["failure_kind"] == "sql_error" && network_failure,
-        "cross-namespace probe did not fail at the network/deadline"
-    );
-    Ok(())
-}
-
-async fn positive_control(port: u16, token: &str, probe: &str, password: &str) -> Result<()> {
-    let opened = call(
-        port,
-        token,
-        Method::POST,
-        "/v1/sessions",
-        Some(json!({})),
-        70,
-    )
-    .await?;
-    let opened: Value = serde_json::from_slice(&opened)?;
-    let session = util::text(opened.get("session_id")).to_owned();
-    let query = response(
-        port,
-        token,
-        Method::POST,
-        &format!("/v1/sessions/{session}/queries"),
-        Some(json!({"request_id":uuid::Uuid::new_v4(),"sql":probe,"timeout_seconds":25})),
-        70,
-    )
-    .await;
-    let close = call(
-        port,
-        token,
-        Method::DELETE,
-        &format!("/v1/sessions/{session}"),
-        None,
-        70,
-    )
-    .await;
-    let (status, body) = query?;
-    close?;
-    if !status.is_success() {
-        let body = String::from_utf8_lossy(&body);
-        ensure!(
-            !body.contains(password),
-            "the positive-control credential leaked"
-        );
-        bail!("positive-control catalog query failed: {body}");
-    }
-    Ok(())
-}
-
 pub async fn run_probe(args: Vec<String>) -> Result<()> {
     let mut args = args;
     let port = util::option(&mut args, "--port")
         .context("--port is required")?
         .parse()?;
-    let source_port = util::option(&mut args, "--source-port")
+    let source_port: u16 = util::option(&mut args, "--source-port")
         .context("--source-port is required")?
         .parse()?;
     let context = util::option(&mut args, "--context").context("--context is required")?;
@@ -196,13 +172,16 @@ pub async fn run_probe(args: Vec<String>) -> Result<()> {
     let team = secret_values(&context, &namespace)?;
     let token = team["DUCKFLEET_TOKEN"].clone();
     let probe = catalog_probe(&source["CATALOG_DSN"], &source_namespace)?;
-    positive_control(
-        source_port,
-        &source["DUCKFLEET_TOKEN"],
-        &probe,
-        &source["DATABASE_CATALOG_PASSWORD"],
-    )
-    .await?;
+    let (host, catalog_port) = catalog_endpoint(&source["CATALOG_DSN"], &source_namespace)?;
+    ensure!(
+        worker_reaches(&context, &source_namespace, &host, &catalog_port)?,
+        "positive control: the source worker cannot reach its own catalog"
+    );
+    ensure!(
+        !worker_reaches(&context, &namespace, &host, &catalog_port)?,
+        "the team worker reached the neighbour's catalog across the namespace boundary"
+    );
+    let _ = source_port;
 
     let fleet = call(port, &token, Method::GET, "/v1/workers", None, 70).await?;
     let fleet: Value = serde_json::from_slice(&fleet)?;
@@ -268,7 +247,17 @@ pub async fn run_probe(args: Vec<String>) -> Result<()> {
         )
         .await?;
         ensure!(!status.is_success(), "the first namespace's catalog answered across the boundary");
-        verify_denial(&serde_json::from_slice(&body)?, &source["DATABASE_CATALOG_PASSWORD"])
+        let body: Value = serde_json::from_slice(&body)?;
+        let message = util::text(body.get("error"));
+        ensure!(
+            !message.contains(source["DATABASE_CATALOG_PASSWORD"].as_str()),
+            "the probe credential leaked into an error message"
+        );
+        ensure!(
+            message.contains("disabled through configuration"),
+            "a team worker's SQL attach was not refused by the engine lockdown: {message}"
+        );
+        Ok::<(), anyhow::Error>(())
     }
     .await;
     let close = call(
@@ -835,19 +824,14 @@ mod tests {
         .unwrap();
         assert!(sql.contains("postgres.duckfleet-dev.svc.cluster.local"));
         assert!(sql.contains("connect_timeout=3"));
-        assert!(
-            verify_denial(
-                &json!({"failure_kind":"timeout","error":"deadline elapsed"}),
-                "abc123"
-            )
-            .is_ok()
-        );
-        assert!(
-            verify_denial(
-                &json!({"failure_kind":"sql_error","error":"password=abc123"}),
-                "abc123"
-            )
-            .is_err()
+        let (host, port) = catalog_endpoint(
+            "host=postgres port=5432 user=catalog password=abc123 dbname=lake",
+            "duckfleet-dev",
+        )
+        .unwrap();
+        assert_eq!(
+            (host.as_str(), port.as_str()),
+            ("postgres.duckfleet-dev.svc.cluster.local", "5432")
         );
     }
 }

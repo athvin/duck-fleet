@@ -710,6 +710,20 @@ impl Worker {
         startup.inspect("verifying the engine and catalog manifest", |conn| {
             verify_engine_manifest(conn)
         })?;
+        // Last: SQL may reach only the lake, private import staging, spill, and
+        // profile output. Local files (including /proc and the environment that
+        // holds platform credentials), stdio, arbitrary URLs, and other object
+        // prefixes are refused. DuckDB cannot re-enable access while running.
+        startup.run(
+            "restricting engine file access",
+            &engine_file_access(
+                &required("S3_DATA_PATH")?,
+                (authority == Authority::Writer)
+                    .then(|| std::env::var("DUCKFLEET_RESULT_DATA_PATH").ok())
+                    .flatten()
+                    .as_deref(),
+            ),
+        )?;
         let root = startup.into_connection();
         placement["duckdb_threads"] = json!(root.query_row(
             "SELECT current_setting('threads')::BIGINT",
@@ -1535,10 +1549,11 @@ impl Worker {
                 &format!("{cause:#}"),
             ));
         }
-        let mut error = result
-            .as_ref()
-            .err()
-            .map(|error| crate::secrets::scrub_passwords(&self.redactor.scrub(&error.to_string())));
+        let mut error = result.as_ref().err().map(|error| {
+            failure::explain(crate::secrets::scrub_passwords(
+                &self.redactor.scrub(&error.to_string()),
+            ))
+        });
         let not_executed = result.as_ref().err().is_some_and(JobError::not_executed);
         let known = completion == engine_stream::EngineCompletion::Succeeded;
         let failure = if known {
@@ -1729,10 +1744,11 @@ impl Worker {
         // masks the platform's own credentials; the generic pass masks the ones it
         // cannot know — a caller's connection string quoted back by the engine must
         // not put a live password into a durable history row.
-        let mut error = result
-            .as_ref()
-            .err()
-            .map(|e| crate::secrets::scrub_passwords(&self.redactor.scrub(&format!("{e:#}"))));
+        let mut error = result.as_ref().err().map(|e| {
+            failure::explain(crate::secrets::scrub_passwords(
+                &self.redactor.scrub(&format!("{e:#}")),
+            ))
+        });
         if reason == Some("ownership_lost") {
             error = Some(
                 "worker ownership lost; commit outcome may be unknown, do not blindly retry".into(),
@@ -2096,6 +2112,35 @@ fn parameter(value: &Value) -> Result<SqlValue> {
     })
 }
 
+/// The allowlist the engine keeps after startup. Directory entries end in a
+/// slash so a prefix never matches a sibling such as `lake-other/`.
+fn engine_file_access(lake: &str, staging: Option<&str>) -> String {
+    let directory = |path: &str| {
+        if path.ends_with('/') {
+            path.to_owned()
+        } else {
+            format!("{path}/")
+        }
+    };
+    let profiles = std::env::temp_dir().join("duckfleet-profiles");
+    let mut allowed = vec![
+        directory(lake),
+        "/tmp/duckfleet-spill/".to_owned(),
+        directory(&profiles.to_string_lossy()),
+    ];
+    if let Some(staging) = staging {
+        allowed.push(directory(staging));
+    }
+    format!(
+        "SET allowed_directories=[{}]; SET enable_external_access=false;",
+        allowed
+            .iter()
+            .map(|path| literal(path))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn execute(conn: &Connection, sql: &str, parameters: Vec<SqlValue>) -> Result<(Vec<u8>, i64)> {
     let mut statement = conn.prepare(sql)?;
     let batches = statement.query_arrow(params_from_iter(parameters.iter()))?;
@@ -2123,6 +2168,24 @@ fn execute(conn: &Connection, sql: &str, parameters: Vec<SqlValue>) -> Result<(V
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn engine_file_access_allows_only_platform_prefixes() {
+        let sql = engine_file_access("s3://bucket/lake", Some("s3://bucket/results/"));
+        assert!(sql.starts_with(
+            "SET allowed_directories=['s3://bucket/lake/', '/tmp/duckfleet-spill/', "
+        ));
+        assert!(sql.contains("'s3://bucket/results/'"));
+        assert!(sql.ends_with("SET enable_external_access=false;"));
+        assert!(!engine_file_access("s3://bucket/lake/", None).contains("results"));
+        assert!(
+            crate::failure::explain(
+                "Permission Error: Cannot access file \"/dev/stdout\" - file system operations are disabled by configuration".into()
+            )
+            .contains("duckfleet export")
+        );
+        assert_eq!(crate::failure::explain("other".into()), "other");
+    }
+
     use super::*;
 
     #[test]

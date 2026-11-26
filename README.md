@@ -712,7 +712,10 @@ typed OIDs (ints, floats, booleans, text, decimals, dates, microsecond
 timestamps); anything else says to cast to `VARCHAR`. A gateway rollout ends
 wire connections; reconnect and the session-recovery contract applies.
 
-## Exposure
+## Worker file access
+
+After startup, a worker's engine can reach only four places from SQL: the lake data path, the writer's private import staging prefix, its spill directory, and its profile output. The worker sets DuckDB's `allowed_directories` to exactly those prefixes and then sets `enable_external_access=false`, which DuckDB cannot re-enable while running. As a result, SQL from any principal, over HTTP, durable jobs, or pgwire, cannot read worker-local files. That includes `/proc/self/environ`, which holds platform credentials. SQL also cannot run `COPY ... TO STDOUT`/`FROM STDIN`, which would otherwise write rows to the worker's own stdout and logs, fetch arbitrary URLs, or touch object prefixes outside the lake. Refusals name `duckfleet export` and `duckfleet import` as the supported ways to move files. `make test-local-io` verifies this against real Compose.
+
 
 By default the API is a ClusterIP Service: reachable from inside the namespace
 and by `kubectl port-forward`, and from nowhere else. The chart's `exposure`
