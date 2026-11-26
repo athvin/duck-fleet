@@ -20,6 +20,7 @@ mod failure;
 mod gateway;
 mod harness;
 mod history;
+mod history_cli;
 mod http_transport;
 mod isolated;
 mod job_artifacts;

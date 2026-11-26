@@ -89,6 +89,33 @@ fn persistent_multiline_shell_and_active_cancellation() {
 
 #[test]
 #[ignore = "requires the real Compose stack"]
+fn history_watch_stops_on_ctrl_c() {
+    let binary = env!("CARGO_BIN_EXE_duckfleet");
+    let url = std::env::var("DUCKFLEET_URL").unwrap_or_else(|_| "http://127.0.0.1:18080".into());
+    let token = std::env::var("DUCKFLEET_TOKEN")
+        .unwrap_or_else(|_| "duckfleet-local-development-token".into());
+    let mut command = Command::new(binary);
+    command
+        .args([
+            "history",
+            "--watch",
+            "--interval",
+            "1",
+            "--url",
+            &url,
+            "--token",
+            &token,
+        ])
+        .env("TERM", "xterm-256color");
+    let mut watch = spawn_command(command, Some(20_000)).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    watch.send_control('c').unwrap();
+    watch.exp_string("history watch stopped").unwrap();
+    watch.exp_eof().unwrap();
+}
+
+#[test]
+#[ignore = "requires the real Compose stack"]
 fn history_is_private_persistent_and_filters_credentials() {
     let directory =
         std::env::temp_dir().join(format!("duckfleet-shell-history-{}", uuid::Uuid::new_v4()));

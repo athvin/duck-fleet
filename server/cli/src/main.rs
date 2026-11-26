@@ -9,6 +9,8 @@ mod cli_config;
 mod client;
 #[path = "../../src/dev.rs"]
 mod dev;
+#[path = "../../src/history_cli.rs"]
+mod history_cli;
 mod protocol;
 #[path = "../../src/shell.rs"]
 mod shell;

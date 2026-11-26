@@ -287,6 +287,16 @@ duckfleet describe analytics.events
 duckfleet preview analytics.events --limit 20
 ```
 
+History defaults to a SQL-free table with existing filters, cursor pagination, and bounded watch. Profiles expose readable operator and engine-metric evidence without confusing it for container memory or cost:
+
+```sh
+duckfleet history --status failed --worker-id small
+duckfleet history --watch --interval 2
+duckfleet profile <query-id>
+duckfleet profile <query-id> --metrics
+duckfleet profile <query-id> --raw
+```
+
 The CLI uses the HTTP/Arrow client in `server/src/client.rs`. The external dbt
 adapter speaks the same API; its supported selection fields depend on the pinned
 adapter release described above.

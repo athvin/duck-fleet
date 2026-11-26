@@ -700,6 +700,8 @@ fn recovery_drill(
                     "history",
                     "--limit",
                     "5",
+                    "--format",
+                    "json",
                 ]))
                 .collect::<Vec<_>>(),
             &util::root(),
@@ -790,6 +792,8 @@ fn recovery_drill(
                     "history",
                     "--limit",
                     "5",
+                    "--format",
+                    "json",
                 ]))
                 .collect::<Vec<_>>(),
             &util::root(),
@@ -1079,7 +1083,11 @@ fn cutover_drill(
             )?;
             smoke.push(stage);
         }
-        cli_json(base, &candidate, &strings(vec!["history", "--limit", "5"]))?;
+        cli_json(
+            base,
+            &candidate,
+            &strings(vec!["history", "--limit", "5", "--format", "json"]),
+        )?;
         if let Some(request_id) = evidence.get("request_id").and_then(Value::as_str) {
             cli_json(base, &candidate, &strings(vec!["request", request_id]))?;
             evidence["durable_request_readable"] = json!(true);

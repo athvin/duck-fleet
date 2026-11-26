@@ -32,6 +32,8 @@ jobs:
         run: make test-shell
       - name: Lake catalog discovery and reader authority
         run: make test-catalog
+      - name: History, real profiles, sampling, and metadata privacy
+        run: make test-history
       - name: Save test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

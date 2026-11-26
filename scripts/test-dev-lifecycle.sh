@@ -45,7 +45,7 @@ set -e
 "$binary" dev >/dev/null
 "$binary" sql 'select * from analytics.lifecycle_persist' > persisted.out
 [[ "$(<persisted.out)" == *42* ]]
-"$binary" history --limit 5 > history.json
+"$binary" history --limit 5 --format json > history.json
 [[ "$(<history.json)" == *lifecycle_persist* ]]
 
 project_a="$("$binary" config show | jq -r '.compose_project')"
