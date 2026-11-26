@@ -12,6 +12,7 @@ mod compute;
 mod compute_lifecycle;
 mod credentials;
 mod db_roles;
+mod dev;
 mod engine_security;
 mod engine_stream;
 mod failure;

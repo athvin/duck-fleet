@@ -5,6 +5,8 @@ mod cli_config;
 #[allow(dead_code)]
 #[path = "../../src/client.rs"]
 mod client;
+#[path = "../../src/dev.rs"]
+mod dev;
 mod protocol;
 
 mod artifacts {

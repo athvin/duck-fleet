@@ -1,5 +1,5 @@
 # Points dbt at the DuckFleet gateway over HTTP/Arrow, exactly like the platform's
-# own fixture. Identity is the platform credential; compute is chosen per model.
+# own fixture. Identity is the platform credential; models use the persistent pool.
 duckfleet:
   target: local
   outputs:

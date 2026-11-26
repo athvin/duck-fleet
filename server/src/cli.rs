@@ -65,6 +65,22 @@ pub async fn run(args: Vec<String>) -> i32 {
         );
         return 0;
     }
+    if matches!(parsed.command.as_str(), "dev" | "status" | "stop" | "reset") {
+        let settings = match crate::cli_config::development(&resolved) {
+            Ok(settings) => settings,
+            Err(message) => {
+                eprintln!("{message}");
+                return 2;
+            }
+        };
+        return crate::dev::run(
+            &parsed.command,
+            settings,
+            parsed.flags.iter().any(|flag| flag == "demo"),
+            parsed.flags.iter().any(|flag| flag == "yes"),
+        )
+        .await;
+    }
     let (Some(url), Some(token)) = (resolved.url, resolved.token) else {
         eprintln!(
             "missing DuckFleet URL or token; run duckfleet init, or set --url/--token or DUCKFLEET_URL/DUCKFLEET_TOKEN"
@@ -138,7 +154,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (init|config|version|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (init|config|version|dev|status|stop|reset|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -788,7 +804,7 @@ impl Parsed {
         while index < args.len() {
             let arg = &args[index];
             if let Some(name) = arg.strip_prefix("--") {
-                if ["placement", "wait", "resume", "force"].contains(&name) {
+                if ["placement", "wait", "resume", "force", "demo", "yes"].contains(&name) {
                     flags.push(name.to_owned());
                     index += 1;
                 } else if name == "param"
@@ -820,7 +836,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <init|config|version|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <init|config|version|dev|status|stop|reset|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -835,6 +851,17 @@ impl Parsed {
         }
         if parsed.command == "version" && !parsed.positionals.is_empty() {
             return Err("version takes no positional arguments".into());
+        }
+        if matches!(parsed.command.as_str(), "dev" | "status" | "stop" | "reset")
+            && !parsed.positionals.is_empty()
+        {
+            return Err(format!("{} takes no positional arguments", parsed.command));
+        }
+        if parsed.flags.iter().any(|flag| flag == "demo") && parsed.command != "dev" {
+            return Err("--demo applies only to dev".into());
+        }
+        if parsed.flags.iter().any(|flag| flag == "yes") && parsed.command != "reset" {
+            return Err("--yes applies only to reset".into());
         }
         if parsed.flags.iter().any(|flag| flag == "force") && parsed.command != "init" {
             return Err("--force applies only to init".into());
@@ -1172,12 +1199,21 @@ mod tests {
         assert!(parse(&["init", "--force", "--url", "http://localhost:18080"]).is_ok());
         assert!(parse(&["config", "show"]).is_ok());
         assert!(parse(&["version"]).is_ok());
+        assert!(parse(&["dev"]).is_ok());
+        assert!(parse(&["dev", "--demo"]).is_ok());
+        assert!(parse(&["status"]).is_ok());
+        assert!(parse(&["stop"]).is_ok());
+        assert!(parse(&["reset", "--yes"]).is_ok());
         for args in [
             vec!["init", "unexpected"],
             vec!["config"],
             vec!["config", "edit"],
             vec!["version", "unexpected"],
             vec!["sql", "SELECT 1", "--force"],
+            vec!["dev", "unexpected"],
+            vec!["status", "--demo"],
+            vec!["stop", "--yes"],
+            vec!["reset", "--demo"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }

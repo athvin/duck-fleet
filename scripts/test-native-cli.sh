@@ -3,9 +3,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 binary=${DUCKFLEET_BINARY:-"$root/server/target/debug/duckfleet"}
-if [[ ! -x "$binary" ]]; then
-  (cd "$root/server" && cargo build --locked -p duckfleet-cli)
-fi
+(cd "$root/server" && cargo build --locked -p duckfleet-cli)
 
 project=$(mktemp -d "${TMPDIR:-/tmp}/duckfleet-native-cli.XXXXXX")
 trap 'rm -rf "$project"' EXIT

@@ -38,12 +38,14 @@ Install the native `duckfleet` executable without Cargo or Docker, start the rea
 
 ```sh
 brew install athvin/duckfleet/duckfleet
-make up
-DUCKFLEET_TOKEN=duckfleet-local-development-token duckfleet init
+duckfleet init
+duckfleet dev
 duckfleet sql 'select 42'
 ```
 
 `duckfleet.json` is non-secret and committable; `.duckfleet/` holds protected local state and is gitignored. See the [native CLI installation, configuration, and release guide](docs/cli.md) for direct downloads, checksums, supported architectures, and configuration precedence. Existing `DUCKFLEET_URL` and `DUCKFLEET_TOKEN` environment-based invocations remain supported.
+
+Use `duckfleet dev --demo` to load the retail example once, `duckfleet status` to inspect readiness, `duckfleet stop` to retain data while stopping services, and `duckfleet reset` for confirmed project-scoped deletion.
 
 ## Supported installation
 
