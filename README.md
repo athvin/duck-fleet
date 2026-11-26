@@ -696,7 +696,10 @@ behave, and history, principal attribution, metering, and failure
 classification all hold with no wire-specific code: classified failures arrive
 as `ERROR` with a SQLSTATE a driver can act on (`40001` for a lost commit race,
 `57014` for a deadline, `42601` for SQL errors) and the platform's
-`failure_kind` in the message.
+`failure_kind` in the message. ReadyForQuery reports the real transaction
+state: `T` inside `BEGIN`, `E` after a failure aborts it, and `I` otherwise. Drivers
+such as psycopg therefore commit and roll back correctly. Statements in an aborted
+transaction fail with `25P02` until `ROLLBACK` or `COMMIT` ends it.
 
 Pgwire uses the configured default persistent pool when its backend session
 opens. This release has no per-connection pool selection mechanism; database

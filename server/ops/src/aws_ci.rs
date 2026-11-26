@@ -825,6 +825,9 @@ fn database_packaging() -> Result<()> {
     Ok(())
 }
 
+/// The repository's own tooling never needs Python. `compat/` is the one
+/// deliberate exception: programs that exercise third-party Python clients
+/// (psycopg, adbc-driver-manager), always run inside a pinned container.
 fn rust_only_tooling() -> Result<()> {
     fn visit(directory: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> {
         for entry in std::fs::read_dir(directory)? {

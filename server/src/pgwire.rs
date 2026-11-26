@@ -265,7 +265,7 @@ async fn established<P: Platform>(
     key_data.extend_from_slice(&1_i32.to_be_bytes());
     key_data.extend_from_slice(&1_i32.to_be_bytes());
     write_message(stream, b'K', &key_data).await?;
-    ready(stream).await?;
+    ready(stream, Transaction::Idle).await?;
 
     // The session opens on the first statement, so a client that connects and
     // leaves costs nothing; from then on the connection and the session live and
@@ -514,6 +514,7 @@ async fn connection_loop<P: Platform>(
     );
     auth_checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut bound = false;
+    let mut transaction = Transaction::Idle;
     loop {
         let Some((kind, body)) =
             read_authenticated(platform, stream, identity, mode, &mut auth_checks).await?
@@ -529,9 +530,17 @@ async fn connection_loop<P: Platform>(
                     return Ok(());
                 }
                 if kind == b'Q' {
-                    ready(stream).await?;
+                    ready(stream, transaction).await?;
                 } else {
-                    sync_to_ready(platform, stream, identity, mode, &mut auth_checks).await?;
+                    sync_to_ready(
+                        platform,
+                        stream,
+                        identity,
+                        mode,
+                        &mut auth_checks,
+                        transaction,
+                    )
+                    .await?;
                 }
                 continue;
             }
@@ -544,9 +553,18 @@ async fn connection_loop<P: Platform>(
                 if sql.trim().is_empty() {
                     write_message(stream, b'I', &[]).await?;
                 } else {
-                    run_statement(platform, stream, identity, mode, session, sql).await?;
+                    run_statement(
+                        platform,
+                        stream,
+                        identity,
+                        mode,
+                        session,
+                        sql,
+                        &mut transaction,
+                    )
+                    .await?;
                 }
-                ready(stream).await?;
+                ready(stream, transaction).await?;
             }
             Frontend::Parse(sql) => {
                 *prepared = Some(sql.to_owned());
@@ -556,7 +574,15 @@ async fn connection_loop<P: Platform>(
             Frontend::Bind => {
                 if prepared.is_none() {
                     error_response(stream, "26000", "no statement has been parsed").await?;
-                    sync_to_ready(platform, stream, identity, mode, &mut auth_checks).await?;
+                    sync_to_ready(
+                        platform,
+                        stream,
+                        identity,
+                        mode,
+                        &mut auth_checks,
+                        transaction,
+                    )
+                    .await?;
                 } else {
                     bound = true;
                     write_message(stream, b'2', &[]).await?;
@@ -566,7 +592,15 @@ async fn connection_loop<P: Platform>(
                 if (target == b'S' && prepared.is_none()) || (target == b'P' && !bound) {
                     error_response(stream, "26000", "no unnamed statement or portal exists")
                         .await?;
-                    sync_to_ready(platform, stream, identity, mode, &mut auth_checks).await?;
+                    sync_to_ready(
+                        platform,
+                        stream,
+                        identity,
+                        mode,
+                        &mut auth_checks,
+                        transaction,
+                    )
+                    .await?;
                 } else {
                     if target == b'S' {
                         write_message(stream, b't', &0_i16.to_be_bytes()).await?;
@@ -584,14 +618,31 @@ async fn connection_loop<P: Platform>(
                         write_message(stream, b'I', &[]).await?;
                         true
                     } else {
-                        run_statement(platform, stream, identity, mode, session, sql).await?
+                        run_statement(
+                            platform,
+                            stream,
+                            identity,
+                            mode,
+                            session,
+                            sql,
+                            &mut transaction,
+                        )
+                        .await?
                     }
                 } else {
                     false
                 };
                 bound = false;
                 if !ok {
-                    sync_to_ready(platform, stream, identity, mode, &mut auth_checks).await?;
+                    sync_to_ready(
+                        platform,
+                        stream,
+                        identity,
+                        mode,
+                        &mut auth_checks,
+                        transaction,
+                    )
+                    .await?;
                 }
             }
             Frontend::Close(target) => {
@@ -605,7 +656,7 @@ async fn connection_loop<P: Platform>(
                 if let Err(error) = platform.revalidate(identity, mode).await {
                     return refuse_access(stream, error).await;
                 }
-                ready(stream).await?;
+                ready(stream, transaction).await?;
             }
             Frontend::Flush => flush(stream).await?,
         }
@@ -619,6 +670,7 @@ async fn run_statement<P: Platform>(
     mode: ConnectionMode,
     session: &mut Option<Session>,
     sql: &str,
+    transaction: &mut Transaction,
 ) -> Result<bool> {
     if mode == ConnectionMode::System {
         // The system service owns admission and fresh authentication/policy/read
@@ -663,12 +715,14 @@ async fn run_statement<P: Platform>(
         .await
     {
         QueryOutcome::Rows(arrow) => {
+            *transaction = transaction.after_success(&transaction_effects(sql));
             tokio::time::timeout(WRITE_TIMEOUT, write_arrow(stream, sql, &arrow))
                 .await
                 .context("pgwire result write timed out")??;
             Ok(true)
         }
         QueryOutcome::Refused { kind, message } => {
+            *transaction = transaction.after_failure(&transaction_effects(sql), &kind);
             let message =
                 format!("{message}; request_id={request_id}; status=/v1/requests/{request_id}");
             if matches!(kind.as_str(), "unauthorized" | "forbidden") {
@@ -682,7 +736,13 @@ async fn run_statement<P: Platform>(
                 .context("pgwire refusal write timed out")??;
                 bail!("pgwire statement access refused [{kind}]");
             }
-            error_response(stream, sqlstate(&kind), &format!("{message} [{kind}]")).await?;
+            let code = if kind == "sql_error" && message.contains("Current transaction is aborted")
+            {
+                "25P02"
+            } else {
+                sqlstate(&kind)
+            };
+            error_response(stream, code, &format!("{message} [{kind}]")).await?;
             Ok(false)
         }
     }
@@ -974,8 +1034,119 @@ fn format_timestamp(micros: i64) -> String {
     )
 }
 
-async fn ready(stream: &mut BufStream<TcpStream>) -> Result<()> {
-    write_message(stream, b'Z', b"I").await?;
+/// Transaction state reported in ReadyForQuery. Drivers such as psycopg rely
+/// on it: a client told `I` inside a transaction treats `commit()` as a no-op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transaction {
+    Idle,
+    Open,
+    Failed,
+}
+
+impl Transaction {
+    fn byte(self) -> u8 {
+        match self {
+            Transaction::Idle => b'I',
+            Transaction::Open => b'T',
+            Transaction::Failed => b'E',
+        }
+    }
+
+    fn after_success(self, effects: &[Effect]) -> Self {
+        effects.iter().fold(self, |state, effect| match effect {
+            Effect::Begin => Transaction::Open,
+            Effect::End => Transaction::Idle,
+            Effect::Other => state,
+        })
+    }
+
+    /// A lost commit race discards the transaction. Any other failure inside
+    /// an explicit transaction, or in a batch that opened one, aborts it until
+    /// ROLLBACK or COMMIT; outside a transaction nothing stays open.
+    fn after_failure(self, effects: &[Effect], kind: &str) -> Self {
+        if matches!(
+            kind,
+            "transaction_conflict" | "unknown_session" | "session_lost"
+        ) {
+            Transaction::Idle
+        } else if self != Transaction::Idle || effects.contains(&Effect::Begin) {
+            Transaction::Failed
+        } else {
+            Transaction::Idle
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Effect {
+    Begin,
+    End,
+    Other,
+}
+
+/// The transaction-control effect of each top-level statement, ignoring
+/// comments and literals.
+fn transaction_effects(sql: &str) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let mut statement = String::new();
+    let mut chars = sql.chars().peekable();
+    let flush = |statement: &mut String, effects: &mut Vec<Effect>| {
+        let words: Vec<String> = statement
+            .split_whitespace()
+            .take(2)
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_ascii_alphabetic())
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        if let Some(first) = words.first().filter(|w| !w.is_empty()) {
+            effects.push(match (first.as_str(), words.get(1).map(String::as_str)) {
+                ("begin", _) | ("start", Some("transaction")) => Effect::Begin,
+                ("commit" | "end" | "rollback" | "abort", _) => Effect::End,
+                _ => Effect::Other,
+            });
+        }
+        statement.clear();
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                statement.push(' ');
+                for inner in chars.by_ref() {
+                    if inner == c {
+                        break;
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                for inner in chars.by_ref() {
+                    if inner == '\n' {
+                        break;
+                    }
+                }
+                statement.push(' ');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut previous = ' ';
+                for inner in chars.by_ref() {
+                    if previous == '*' && inner == '/' {
+                        break;
+                    }
+                    previous = inner;
+                }
+                statement.push(' ');
+            }
+            ';' => flush(&mut statement, &mut effects),
+            other => statement.push(other),
+        }
+    }
+    flush(&mut statement, &mut effects);
+    effects
+}
+
+async fn ready(stream: &mut BufStream<TcpStream>, transaction: Transaction) -> Result<()> {
+    write_message(stream, b'Z', &[transaction.byte()]).await?;
     flush(stream).await?;
     Ok(())
 }
@@ -988,6 +1159,7 @@ async fn sync_to_ready<P: Platform>(
     identity: &Identity,
     mode: ConnectionMode,
     auth_checks: &mut tokio::time::Interval,
+    transaction: Transaction,
 ) -> Result<()> {
     loop {
         let Some((kind, body)) =
@@ -1003,7 +1175,7 @@ async fn sync_to_ready<P: Platform>(
             if let Err(error) = platform.revalidate(identity, mode).await {
                 return refuse_access(stream, error).await;
             }
-            return ready(stream).await;
+            return ready(stream, transaction).await;
         }
         if kind == b'X' {
             bail!("terminated during error recovery");
@@ -1685,6 +1857,46 @@ mod tests {
         assert_eq!(format_decimal(42, 0), "42");
         assert_eq!(format_decimal(-42, -2), "-4200");
         assert_eq!(format_decimal(-1, 38), format!("-0.{}1", "0".repeat(37)));
+    }
+
+    #[test]
+    fn transaction_status_follows_statement_effects() {
+        use Effect::*;
+        assert_eq!(transaction_effects("BEGIN"), vec![Begin]);
+        assert_eq!(
+            transaction_effects("start transaction; insert into t values (1); commit;"),
+            vec![Begin, Other, End]
+        );
+        assert_eq!(
+            transaction_effects("-- begin\nselect 'commit; begin'"),
+            vec![Other]
+        );
+        assert_eq!(transaction_effects("/* rollback */ ROLLBACK"), vec![End]);
+        assert_eq!(transaction_effects("  "), vec![]);
+        let idle = Transaction::Idle;
+        assert_eq!(idle.after_success(&[Begin]), Transaction::Open);
+        assert_eq!(idle.after_success(&[Begin, Other, End]), Transaction::Idle);
+        assert_eq!(Transaction::Open.after_success(&[Other]), Transaction::Open);
+        assert_eq!(Transaction::Failed.after_success(&[End]), Transaction::Idle);
+        assert_eq!(idle.after_failure(&[Other], "sql_error"), Transaction::Idle);
+        assert_eq!(
+            idle.after_failure(&[Begin, Other], "sql_error"),
+            Transaction::Failed
+        );
+        assert_eq!(
+            Transaction::Open.after_failure(&[Other], "sql_error"),
+            Transaction::Failed
+        );
+        assert_eq!(
+            Transaction::Open.after_failure(&[End], "transaction_conflict"),
+            Transaction::Idle
+        );
+        assert_eq!(
+            Transaction::Open.after_failure(&[Other], "unknown_session"),
+            Transaction::Idle
+        );
+        assert_eq!(Transaction::Open.byte(), b'T');
+        assert_eq!(Transaction::Failed.byte(), b'E');
     }
 
     #[test]
