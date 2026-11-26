@@ -31,10 +31,8 @@ psql() {
   (cd "$root" && docker compose exec -T postgres psql -U duckfleet -d platform -v ON_ERROR_STOP=1 -qtAX -c "$1")
 }
 expect_cli_failure() {
-  set +e
-  "$@" >expected-failure.out 2>&1
-  local code=$?
-  set -e
+  local code=0
+  "$@" >expected-failure.out 2>&1 || code=$?
   [[ "$code" -ne 0 ]]
   [[ "$(<expected-failure.out)" != *local-object-store-password* ]]
 }
@@ -96,10 +94,8 @@ for _ in {1..100}; do
   sleep 0.1
 done
 kill -INT "$active_pid"
-set +e
-wait "$active_pid"
-cancel_code=$?
-set -e
+cancel_code=0
+wait "$active_pid" || cancel_code=$?
 active_pid=""
 if [[ "$cancel_code" -ne 0 ]]; then
   [[ "$(<cancel.err)" == *import_canceled* ]]
@@ -119,10 +115,8 @@ for _ in {1..100}; do
   sleep 0.1
 done
 (cd "$root" && docker compose kill -s SIGKILL worker-small >/dev/null)
-set +e
-wait "$active_pid"
-interrupt_code=$?
-set -e
+interrupt_code=0
+wait "$active_pid" || interrupt_code=$?
 active_pid=""
 (cd "$root" && docker compose up -d --wait worker-small server >/dev/null)
 "$binary" sql "select count(*)::bigint as rows from information_schema.tables where table_schema='import_fixture' and table_name='interrupted'" --format json > interrupted-table.json
@@ -165,7 +159,10 @@ jq -e --arg id "$staged_id" '.request_id == $id and .state == "staged" and (.sta
 [[ "$(curl -sS -o other-get.json -w '%{http_code}' -H "Authorization: Bearer $other_token" "$url/v1/imports/$staged_id")" == 404 ]]
 [[ "$(curl -sS -o other-delete.json -w '%{http_code}' -X DELETE -H "Authorization: Bearer $other_token" "$url/v1/imports/$staged_id")" == 404 ]]
 psql "update import_requests set expires_at=clock_timestamp()-interval '1 second' where request_id='$staged_id'" >/dev/null
-for _ in {1..45}; do
+# The gateway's maintenance tick is 60 seconds; make the artifacts task due now
+# so the next tick reclaims the expired upload instead of waiting two ticks.
+psql "update platform_maintenance_tasks set next_due_at=clock_timestamp() where task='artifacts'" >/dev/null
+for _ in {1..90}; do
   state=$(psql "select state from import_requests where request_id='$staged_id'")
   [[ "$state" == deleted ]] && break
   sleep 2
