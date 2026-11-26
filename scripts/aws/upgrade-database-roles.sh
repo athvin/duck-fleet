@@ -8,7 +8,7 @@ assert_cluster
 
 bash scripts/aws/suspend.sh
 "${KUBE[@]}" get secret duckfleet-dev -o json \
-  | python3 scripts/database_roles.py "$NAMESPACE" --upgrade \
+  | bash scripts/ops.sh database-roles "$NAMESPACE" --upgrade \
   | "${KUBE[@]}" apply -f -
 
 render=(helm template duckfleet infra/helm/duckfleet --kube-context "$KUBE_CONTEXT"

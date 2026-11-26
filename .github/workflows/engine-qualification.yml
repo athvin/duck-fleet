@@ -29,9 +29,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: bash scripts/ci/install-rust.sh
       - name: Build and compare isolated engine lanes
         run: >-
-          python3 scripts/qualify-engine.py
+          bash scripts/ops.sh qualify-engine
           --baseline-ref '${{ inputs.baseline_ref }}'
           --candidate-ref '${{ inputs.candidate_ref }}'
           --baseline-version '${{ inputs.baseline_version }}'

@@ -12,7 +12,7 @@
 # pods go nowhere else, and nothing else lands here. `limits` is the spend ceiling.
 #
 # Cluster-scoped, so it is an operator's to apply and not the deploy's — the same
-# reason the Role beside it is. scripts/check-chart.py asserts the chart never renders
+# reason the Role beside it is. `duckfleet-ops check-chart` asserts the chart never renders
 # a NodePool.
 apiVersion: karpenter.sh/v1
 kind: NodePool

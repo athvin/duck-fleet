@@ -7,10 +7,6 @@
 # image reuses that compile.
 # Generate the deterministic scale project at build time. The harness runtime
 # needs only dbt and the generated files, including on read-only Kubernetes pods.
-FROM python:3.12.12-slim-bookworm AS scale-fixture
-COPY tests/dbt/scale/generate.py /generate.py
-RUN python /generate.py /scale-project
-
 FROM rust:1.99.0-bookworm AS build
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends curl unzip && rm -rf /var/lib/apt/lists/*
@@ -21,12 +17,16 @@ RUN sh /tmp/install-extensions.sh
 ENV DUCKDB_LIB_DIR=/usr/local/lib LD_LIBRARY_PATH=/usr/local/lib
 WORKDIR /app/server
 COPY server/Cargo.toml server/Cargo.lock ./
+COPY server/ops ./ops
 COPY server/vendor ./vendor
 RUN mkdir src && echo 'fn main() {}' > src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=duckfleet-target-${TARGETARCH},target=/app/server/target cargo build --locked && cp target/debug/duckfleet-server /tmp/duckfleet-server
 COPY server/src ./src
 RUN touch src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=duckfleet-target-${TARGETARCH},target=/app/server/target cargo build --locked && cp target/debug/duckfleet-server /tmp/duckfleet-server
+
+FROM build AS scale-fixture
+RUN cargo run --quiet --locked --package duckfleet-ops -- scale-generate /scale-project
 
 # ubuntu 24.04 for glibc >= 2.39, which the forked dbt binary (built on that
 # toolchain) requires. duckfleet-server (glibc 2.36, built on bookworm) runs here too.

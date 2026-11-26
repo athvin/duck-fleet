@@ -12,4 +12,4 @@ helm test duckfleet --kube-context "$KUBE_CONTEXT" --namespace "$NAMESPACE" --ti
 "${KUBE[@]}" get events --sort-by=.lastTimestamp > artifacts/aws/events.txt
 [[ "$status" == 0 ]] || { cat artifacts/aws/harness.log; exit "$status"; }
 "${KUBE[@]}" get pods -o json > artifacts/aws/pods-after.json
-python3 scripts/aws/verify.py
+bash scripts/ops.sh aws-verify

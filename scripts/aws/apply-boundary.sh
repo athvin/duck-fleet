@@ -48,17 +48,13 @@ if ! "${KUBE[@]}" get nodeclass.eks.amazonaws.com "$DUCKFLEET_NODE_CLASS" > /dev
   exit 1
 fi
 
-boundary=$(python3 scripts/aws/render_boundary.py "$NAMESPACE" "$DUCKFLEET_NODE_CLASS")
+boundary=$(bash scripts/ops.sh aws-render-boundary "$NAMESPACE" "$DUCKFLEET_NODE_CLASS")
 cat <<EOF
 Applying the DuckFleet ownership boundary
   cluster    $DUCKFLEET_CLUSTER
   namespace  $NAMESPACE
   node class $DUCKFLEET_NODE_CLASS
-$(printf '%s\n' "$boundary" | python3 -c "
-import sys, yaml
-for document in yaml.safe_load_all(sys.stdin):
-    print(f\"  {document['kind'].lower():<13}{document['metadata']['name']}\")
-")
+$(printf '%s\n' "$boundary" | bash scripts/ops.sh boundary-summary)
 
 Idempotent, and additive: nothing here removes or narrows an existing object.
 EOF
@@ -78,25 +74,11 @@ printf '%s\n' "$boundary" | kubectl --context "$KUBE_CONTEXT" apply -f - > /dev/
 # Read as JSON and checked in Python rather than with a jsonpath filter: the grant is
 # the point of this script, so the check that it arrived intact should not rest on
 # kubectl's reduced jsonpath dialect.
-"${KUBE[@]}" get role duckfleet-isolated-pods -o json | python3 -c "
-import json, sys
-rules = json.load(sys.stdin)['rules']
-granted = {verb for rule in rules if 'pods' in rule['resources'] for verb in rule['verbs']}
-missing = {'create', 'get', 'list', 'watch', 'delete'} - granted
-if missing:
-    raise SystemExit(f'the pod grant is missing {sorted(missing)}; it has {sorted(granted)}')
-"
+"${KUBE[@]}" get role duckfleet-isolated-pods -o json | bash scripts/ops.sh check-role-grant
 # The node pool is cluster-scoped, so it is read without the namespace. Reported rather
 # than merely checked: whether it can provision the largest worker the release asks for
 # is the question this pool exists to answer, and `kubectl get` says nothing about it.
-kubectl --context "$KUBE_CONTEXT" get nodepool.karpenter.sh duckfleet -o json | python3 -c "
-import json, sys
-spec = json.load(sys.stdin)['spec']
-sizes = next(r['values'] for r in spec['template']['spec']['requirements']
-             if r['key'].endswith('instance-size'))
-taints = [f\"{t['key']}={t['value']}:{t['effect']}\" for t in spec['template']['spec']['taints']]
-print(f\"node pool: sizes {sorted(sizes)}, cpu ceiling {spec['limits']['cpu']}, taints {taints}\")
-"
+kubectl --context "$KUBE_CONTEXT" get nodepool.karpenter.sh duckfleet -o json | bash scripts/ops.sh report-nodepool
 
 # The gateway asks the API server about its own access once, at startup, so a grant
 # applied under a running gateway is not noticed until something replaces it. Restarted
@@ -116,28 +98,10 @@ fi
 # naming only the endpoints there blocks the gateway's call to the ClusterIP and the
 # pod create times out, exactly as DNS to 172.20.0.10 only works because its rule
 # names the Service CIDR. Recording both on the service port covers either CNI. The
-# deploy consumes this ConfigMap through deploy_values.py; refreshed on every apply.
+# deploy consumes this ConfigMap through `duckfleet-ops aws-deploy-values`; refreshed on every apply.
 service=$(kubectl --context "$KUBE_CONTEXT" -n default get service kubernetes -o json)
 api=$(kubectl --context "$KUBE_CONTEXT" -n default get endpoints kubernetes -o json)
-python3 - "$NAMESPACE" "$service" "$api" <<'PY' | "${KUBE[@]}" apply -f -
-import json, sys
-namespace, svc, described = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
-subsets = described.get("subsets", [])
-cidrs = {f"{a['ip']}/32" for s in subsets for a in s.get("addresses", [])}
-ports = {p["port"] for s in subsets for p in s.get("ports", [])}
-# The ClusterIP on the Service's own port: what the gateway actually connects to, and
-# what EKS's VPC CNI evaluates the egress rule against.
-cidrs.add(f"{svc['spec']['clusterIP']}/32")
-ports.update(p["port"] for p in svc["spec"].get("ports", []))
-cidrs, ports = sorted(cidrs), sorted(ports)
-if not cidrs or not ports:
-    raise SystemExit("the kubernetes Service resolves to no endpoints")
-print(json.dumps({
-    "apiVersion": "v1", "kind": "ConfigMap",
-    "metadata": {"name": "duckfleet-api-egress", "namespace": namespace},
-    "data": {"cidrs": json.dumps(cidrs), "ports": json.dumps(ports)},
-}))
-PY
+bash scripts/ops.sh api-egress-config "$NAMESPACE" <(printf '%s' "$service") <(printf '%s' "$api") | "${KUBE[@]}" apply -f -
 printf '%s\n' 'PASS: the boundary is established; the deploy may enable isolated compute'
 cat <<'EOF'
 

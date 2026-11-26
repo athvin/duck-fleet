@@ -23,10 +23,10 @@ storageClass: standard
 # default must render anywhere, and that pool is cluster-scoped, so a default that
 # selected it would leave every pod Pending on any cluster that lacks it.
 #
-# The pin is a deploy-time overlay instead (scripts/aws/deploy_values.py), applied once
+# The pin is a deploy-time overlay instead (`duckfleet-ops aws-deploy-values`), applied once
 # the ownership boundary exists — `scripts/aws/apply-boundary.sh` first. The overlay
 # adds `karpenter.sh/nodepool: duckfleet` here, the matching toleration below (the pool
-# is tainted; check-chart.py fails a render where one appears without the other), and
+# is tainted; `duckfleet-ops check-chart` fails a render where one appears without the other), and
 # raises the medium worker's request to its full 2 CPU, retiring the shared-pool shim.
 # It is bundled with enabling isolated compute, whose apiServerCidrs likewise cannot be
 # a chart default — both are facts about the cluster, not the chart (duck-fleet#39).
@@ -231,7 +231,7 @@ isolatedCompute:
   # the gateway refuses an unplaceable size immediately and names the shortfall. On a
   # cluster that adds nodes on demand (EKS Auto Mode / Karpenter) a pod is routinely
   # Unschedulable for the seconds a new node takes to join, so the deploy raises this
-  # (see scripts/aws/deploy_values.py): without the wait the gateway deletes the pod
+  # (see `duckfleet-ops aws-deploy-values`): without the wait the gateway deletes the pod
   # before Karpenter can provision for it, and no isolated session places (#90).
   provisioningSeconds: 0
   # How long a pod create refused by the namespace quota is retried before the refusal
@@ -249,7 +249,7 @@ isolatedCompute:
   # These describe the API server's *endpoints*, not its Service address. Egress policy
   # is evaluated after kube-proxy rewrites the destination, so a rule written against
   # the ClusterIP matches nothing — which denied the gateway outright the first time
-  # the local harness enforced policy at all. `scripts/aws/check-api-egress.py`
+  # the local harness enforced policy at all. ``duckfleet-ops aws-check-api-egress``
   # asserts these cover the cluster's real endpoints before a release is applied.
   apiServerCidrs: []
   apiServerPorts: [443]

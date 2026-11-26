@@ -45,7 +45,7 @@ and `secretName` as values whose schema pins only their shape — a digest-pinne
 image, a legal S3 bucket name, a real region — so another organization installs it
 against its own account by supplying its own. The development lane's specific
 values are pinned where that pin belongs: once, in `scripts/aws/target.env`, built
-into the images and the deploy, and asserted by `tests/test_aws_ci.py`. The chart
+into the images and the deploy, and asserted by `the Rust `aws-ci-test` suite`. The chart
 itself names no account. `values-aws.yaml` supplies this lane's bucket, region,
 secret, `gp3` class and EKS placement explicitly; `deploy.sh` always applies that
 overlay before the generated immutable image values. Generic renders use the
@@ -353,7 +353,7 @@ still requires a fresh Job/runId; prior completion does not prove the new databa
 Successful deployment helpers prune superseded successful migration Jobs and their
 completed Pods only after the current migration and workloads are ready. They
 preserve current references, unfinished and failed Jobs, and unrelated resources.
-Plain `wait-rollout.py` is read-only; cleanup requires `--prune-migrations`.
+Plain ``duckfleet-ops aws-wait-rollout`` is read-only; cleanup requires `--prune-migrations`.
 Helm retains its ordinary lifecycle and may remove superseded failed Jobs on the
 next upgrade or uninstall, so export failure logs before retrying a Helm release.
 Template/apply installations require explicit cleanup of failed Jobs. The current
@@ -393,7 +393,7 @@ in the database Pod, not a migration or compute Pod.
 `databaseRoles` may explicitly name `migrator`, `gateway`, `worker`, `maintainer`,
 and `catalog`. Defaults derive distinct names from the release namespace plus a
 hash, permitting multiple deployments on one PostgreSQL cluster. The supplied
-Secret must match those names. `scripts/database_roles.py <namespace>` generates a
+Secret must match those names. ``duckfleet-ops database-roles` <namespace>` generates a
 fresh development Secret for piping directly to `kubectl create -f -`; do not save
 its output in build logs or artifacts. Production credentials belong in the
 operator's secret manager.
@@ -461,7 +461,7 @@ Secret name as the deployment:
 
 ```sh
 kubectl --context "$DUCKFLEET_KUBE_CONTEXT" -n "$DUCKFLEET_NAMESPACE" get secret duckfleet-dev -o json \
-  | python3 scripts/database_roles.py "$DUCKFLEET_NAMESPACE" --upgrade \
+  | bash scripts/ops.sh database-roles "$DUCKFLEET_NAMESPACE" --upgrade \
   | kubectl --context "$DUCKFLEET_KUBE_CONTEXT" -n "$DUCKFLEET_NAMESPACE" apply -f -
 ```
 
@@ -580,7 +580,7 @@ identities. Keeping them apart is what lets the automated lane stay unable to wi
 own permissions, on a cluster DuckFleet owns as much as on one it shares.
 
 Once applied, nothing more is needed by hand: the next deploy computes the flip
-itself. `scripts/aws/deploy_values.py` reads the API server's live endpoints, enables
+itself. ``duckfleet-ops aws-deploy-values`` reads the API server's live endpoints, enables
 isolated compute with the egress CIDRs those endpoints require, pins the workers to the
 `duckfleet` pool with its toleration, and raises the medium worker to its full 2-CPU
 request — all as a deploy-time overlay on `values.json`, because the API-server address
@@ -692,7 +692,7 @@ plan guard rejects, but the clearer protection is simply not to reorder these.
 
 ## Checks without AWS
 
-Requires Terraform 1.11.4+, Helm 3, Python 3.10+ and PyYAML (`pip install PyYAML==6.0.3`).
+Requires Terraform 1.11.4+, Helm 3, and Rust 1.99. All chart and infrastructure assertions run through `duckfleet-ops`; no Python or PyYAML installation is needed.
 
 ```sh
 make check-infra

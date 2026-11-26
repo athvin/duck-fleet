@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$comment": "Shape, not identity. workerImage/dbtImage/bucket/region/secretName once pinned one AWS account's registry, bucket, and region as const — which made the chart uninstallable by anyone else, contradicting a self-hosted warehouse for any single organization. The security property kept is that images are digest-pinned (an immutable @sha256 reference, never a mutable tag); the identity is the operator's. The development lane's own account/bucket/region stay pinned at the deploy, single-sourced in scripts/aws/target.env and asserted by tests/test_aws_ci.py, which is where that pin belongs.",
+  "$comment": "Shape, not identity. workerImage/dbtImage/bucket/region/secretName once pinned one AWS account's registry, bucket, and region as const — which made the chart uninstallable by anyone else, contradicting a self-hosted warehouse for any single organization. The security property kept is that images are digest-pinned (an immutable @sha256 reference, never a mutable tag); the identity is the operator's. The development lane's own account/bucket/region stay pinned at the deploy, single-sourced in scripts/aws/target.env and asserted by the Rust aws-ci-test suite, which is where that pin belongs.",
   "type": "object",
   "required": [
     "workerImage",

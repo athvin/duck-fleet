@@ -1,3 +1,6 @@
+[workspace]
+members = ["ops"]
+
 [package]
 name = "duckfleet-server"
 version = "0.1.0"

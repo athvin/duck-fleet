@@ -34,7 +34,7 @@ spec:
       labels: {app: duckfleet-gateway}
     spec:
       # The gateway drains like a worker: proxied statements share the same 600-second
-      # cap, so the same grace period is what lets one finish. check-chart.py asserts
+      # cap, so the same grace period is what lets one finish. `duckfleet-ops check-chart` asserts
       # the coupling here as it does for the workers.
       {{- include "duckfleet.termination" . | nindent 6 }}
       # Identity follows capability: a gateway that creates pods needs a token, and

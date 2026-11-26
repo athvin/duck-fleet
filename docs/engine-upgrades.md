@@ -3,7 +3,7 @@
 Use the shadow qualification lane before changing DuckFleet's DuckDB engine. It builds immutable worker, dbt, and API image sets from two committed Git refs, starts isolated Compose projects, and compares their behavior. It does not use or attach to an existing deployment.
 
 ```bash
-python3 scripts/qualify-engine.py \
+bash scripts/ops.sh qualify-engine \
   --baseline-ref d30084c \
   --candidate-ref HEAD \
   --output artifacts/engine-upgrade/duckdb-2.0.1

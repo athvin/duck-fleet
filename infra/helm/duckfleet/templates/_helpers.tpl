@@ -11,7 +11,7 @@ Both halves are load-bearing and only work together: the selector sends DuckFlee
 to the node pool DuckFleet owns, and the toleration is what lets them land on it, since
 that pool is tainted so nothing else can. Emitting them separately is how a pod ends up
 with one and not the other — selector without toleration never schedules, toleration
-without selector consumes a neighbour's capacity. scripts/check-chart.py asserts the
+without selector consumes a neighbour's capacity. scripts/`duckfleet-ops check-chart` asserts the
 session pod template matches the persistent workers, so a caller asking for isolation
 cannot be placed somewhere the shared tier would not have been.
 */}}
@@ -245,7 +245,7 @@ credentials, are sent to the gateway for the same runtime overlap validation. */
 - {name: DUCKFLEET_PLATFORM_WAIT_SECONDS, value: {{ $.Values.platformWaitSeconds | quote }}}
 # The rate card rides with every role that prices work: workers admit and settle
 # with it, and each reservation copies it so recovery never reprices old work.
-# check-chart.py asserts the gateway carries the same pair.
+# `duckfleet-ops check-chart` asserts the gateway carries the same pair.
 - {name: DUCKFLEET_RATE_CARD_VERSION, value: {{ $.Values.rateCard.version | quote }}}
 - {name: DUCKFLEET_COMPUTE_MICRO_USD_PER_UNIT_HOUR, value: {{ $.Values.rateCard.computeMicroUsdPerUnitHour | quote }}}
 - {name: S3_DATA_PATH, value: {{ printf "s3://%s/%s/" $.Values.bucket $.Values.lakePrefix | quote }}}
@@ -329,7 +329,7 @@ How long the kubelet waits after SIGTERM before killing a worker.
 
 It must exceed the longest statement a caller may ask for, which the API caps at 600
 seconds. Unset it defaults to 30, so a query in its second half could never finish
-however well the drain was written — the two numbers are coupled, and check-chart.py
+however well the drain was written — the two numbers are coupled, and `duckfleet-ops check-chart`
 asserts it so a later change to either fails rather than silently truncating drains.
 The margin covers the engine rolling back and the final history write.
 */}}

@@ -11,6 +11,7 @@ mod compute;
 mod compute_lifecycle;
 mod credentials;
 mod db_roles;
+mod engine_security;
 mod engine_stream;
 mod failure;
 mod gateway;
@@ -586,6 +587,10 @@ async fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
+    if std::env::var("DUCKFLEET_ROLE").as_deref() == Ok("engine-security") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return engine_security::run(&args).await;
+    }
     // The `cli` role talks to a remote gateway and carries its own --token/
     // DUCKFLEET_TOKEN, so it runs before the server's own DUCKFLEET_TOKEN
     // requirement below (which a shell invocation of the CLI would not satisfy).
