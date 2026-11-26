@@ -6,6 +6,7 @@ WORKDIR /app/server
 COPY server/Cargo.toml server/Cargo.lock ./
 COPY server/ops ./ops
 COPY server/cli ./cli
+COPY server/sdk ./sdk
 COPY server/vendor ./vendor
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=duckfleet-target-${TARGETARCH},target=/app/server/target cargo build --locked --package duckfleet-ops && cp target/debug/duckfleet-ops /tmp/duckfleet-ops

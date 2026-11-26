@@ -363,131 +363,10 @@ pub(crate) async fn download_job_result(
     id: uuid::Uuid,
     directory: &str,
     resume: bool,
-) -> Result<crate::artifacts::Manifest, RemoteError> {
-    use tokio::io::AsyncWriteExt;
-    let value = client.job_result(id).await?;
-    if value["complete"] != true {
-        print_json(&value);
-        return Err(job_local_error(
-            Some(id),
-            "job result is not complete; inspect status before downloading",
-        ));
-    }
-    let manifest: crate::artifacts::Manifest = serde_json::from_value(value.clone())
-        .map_err(|_| job_local_error(Some(id), "invalid job result manifest"))?;
-    if manifest.request_id != id
-        || manifest.bytes > crate::job_policy::JobLimits::HARD.result_bytes
-        || manifest.rows > crate::job_policy::JobLimits::HARD.result_rows
-    {
-        return Err(job_local_error(
-            Some(id),
-            "job manifest identity or result bounds are invalid",
-        ));
-    }
-    let encoded_manifest = manifest
-        .encode()
-        .map_err(|_| job_local_error(Some(id), "job result manifest failed validation"))?;
-    let path = std::path::Path::new(directory);
-    if resume {
-        let meta = tokio::fs::symlink_metadata(path)
-            .await
-            .map_err(|_| job_local_error(Some(id), "cannot read result directory"))?;
-        if !meta.is_dir() {
-            return Err(job_local_error(
-                Some(id),
-                "result directory must be a real directory",
-            ));
-        }
-        let manifest_path = path.join("manifest.json");
-        let meta = tokio::fs::symlink_metadata(&manifest_path)
-            .await
-            .map_err(|_| job_local_error(Some(id), "resume needs the matching manifest.json"))?;
-        if !meta.is_file() || meta.len() > crate::artifacts::MAX_MANIFEST_BYTES as u64 {
-            return Err(job_local_error(
-                Some(id),
-                "resume manifest must be a bounded regular file",
-            ));
-        }
-        let stored = tokio::fs::read(manifest_path)
-            .await
-            .map_err(|_| job_local_error(Some(id), "resume needs the matching manifest.json"))?;
-        if stored.len() > crate::artifacts::MAX_MANIFEST_BYTES
-            || serde_json::from_slice::<Value>(&stored).ok().as_ref() != Some(&value)
-        {
-            return Err(job_local_error(
-                Some(id),
-                "resume manifest differs from the authorized result generation",
-            ));
-        }
-    } else {
-        tokio::fs::create_dir(path).await.map_err(|_| {
-            job_local_error(
-                Some(id),
-                "cannot create result directory; existing directories require --resume",
-            )
-        })?;
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path.join("manifest.json"))
-            .await
-            .map_err(|_| job_local_error(Some(id), "cannot create manifest.json"))?;
-        file.write_all(&encoded_manifest)
-            .await
-            .map_err(|_| job_local_error(Some(id), "cannot write result manifest"))?;
-        file.flush()
-            .await
-            .map_err(|_| job_local_error(Some(id), "cannot flush result manifest"))?;
-    }
-    for chunk in &manifest.chunks {
-        let final_path = path.join(format!("{:06}.arrow", chunk.chunk_id));
-        if resume && tokio::fs::symlink_metadata(&final_path).await.is_ok() {
-            verify_local_chunk(id, &final_path, chunk, &manifest.schema).await?;
-            continue;
-        }
-        let temporary = path.join(format!("{:06}.arrow.part", chunk.chunk_id));
-        if resume && let Ok(meta) = tokio::fs::symlink_metadata(&temporary).await {
-            if !meta.is_file() {
-                return Err(job_local_error(
-                    Some(id),
-                    "partial chunk must be a regular file",
-                ));
-            }
-            tokio::fs::remove_file(&temporary)
-                .await
-                .map_err(|_| job_local_error(Some(id), "cannot replace partial chunk"))?;
-        }
-        let mut output = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .await
-            .map_err(|_| job_local_error(Some(id), "cannot create partial chunk"))?;
-        client
-            .download_job_chunk(
-                id,
-                &chunk.chunk_id.to_string(),
-                chunk.bytes,
-                &chunk.sha256,
-                &mut output,
-            )
-            .await?;
-        drop(output);
-        verify_local_chunk(id, &temporary, chunk, &manifest.schema).await?;
-        // Publish without overwriting a path created concurrently or left by a
-        // different download. Both names are in the same output directory.
-        tokio::fs::hard_link(&temporary, &final_path)
-            .await
-            .map_err(|_| {
-                job_local_error(
-                    Some(id),
-                    "cannot publish chunk without replacing an existing file",
-                )
-            })?;
-        tokio::fs::remove_file(&temporary)
-            .await
-            .map_err(|_| job_local_error(Some(id), "cannot remove completed partial chunk"))?;
-    }
+) -> Result<duckfleet::protocol::Manifest, RemoteError> {
+    let manifest = client
+        .download_job_result(id, std::path::Path::new(directory), resume)
+        .await?;
     eprintln!(
         "downloaded {} rows in {} chunks to {}",
         manifest.rows,
@@ -495,71 +374,6 @@ pub(crate) async fn download_job_result(
         directory
     );
     Ok(manifest)
-}
-
-async fn verify_local_chunk(
-    id: uuid::Uuid,
-    path: &std::path::Path,
-    chunk: &crate::artifacts::ManifestChunk,
-    schema: &arrow_schema::Schema,
-) -> Result<(), RemoteError> {
-    let path = path.to_path_buf();
-    let expected_bytes = chunk.bytes;
-    let expected_rows = chunk.rows;
-    let checksum = chunk.sha256.clone();
-    let schema = schema.clone();
-    tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Seek};
-        let bad = || {
-            job_local_error(
-                Some(id),
-                "local chunk failed length, checksum, schema, or row-count validation",
-            )
-        };
-        let meta = std::fs::symlink_metadata(&path).map_err(|_| bad())?;
-        if !meta.is_file()
-            || meta.len() != expected_bytes
-            || expected_bytes > crate::artifacts::MAX_CHUNK_BYTES as u64
-        {
-            return Err(bad());
-        }
-        let mut file = std::fs::File::open(path).map_err(|_| bad())?;
-        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let n = file.read(&mut buffer).map_err(|_| bad())?;
-            if n == 0 {
-                break;
-            }
-            digest.update(&buffer[..n]);
-        }
-        let actual = digest
-            .finish()
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        if actual != checksum {
-            return Err(bad());
-        }
-        file.rewind().map_err(|_| bad())?;
-        let reader = arrow_ipc::reader::StreamReader::try_new(file, None).map_err(|_| bad())?;
-        if *reader.schema() != schema {
-            return Err(bad());
-        }
-        let mut rows = 0u64;
-        for batch in reader {
-            rows = rows
-                .checked_add(batch.map_err(|_| bad())?.num_rows() as u64)
-                .ok_or_else(bad)?;
-        }
-        if rows != expected_rows {
-            return Err(bad());
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|_| job_local_error(Some(id), "chunk verification task failed"))?
 }
 
 async fn run_catalog(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
@@ -1391,7 +1205,7 @@ impl Parsed {
     fn job_request(
         &self,
         generated_id: uuid::Uuid,
-    ) -> Result<crate::job_policy::JobRequest, String> {
+    ) -> Result<duckfleet::protocol::JobRequest, String> {
         let sql = match (self.value("sql"), self.positionals.as_slice()) {
             (Some(sql), [subcommand]) if subcommand == "submit" => sql.to_owned(),
             (None, [subcommand, sql]) if subcommand == "submit" => sql.clone(),
@@ -1409,7 +1223,7 @@ impl Parsed {
         &self,
         sql: String,
         generated_id: uuid::Uuid,
-    ) -> Result<crate::job_policy::JobRequest, String> {
+    ) -> Result<duckfleet::protocol::JobRequest, String> {
         let id = |name: &str| {
             self.value(name)
                 .map(|v| uuid::Uuid::parse_str(v).map_err(|_| format!("--{name} needs a UUID")))
@@ -1429,19 +1243,19 @@ impl Parsed {
             .filter(|_| self.command != "export")
             .map(|s| {
                 if s == "arrow_ipc_chunks" {
-                    Ok(crate::job_policy::ResultFormat::ArrowIpcChunks)
+                    Ok(duckfleet::protocol::ResultFormat::ArrowIpcChunks)
                 } else {
                     Err("job format must be arrow_ipc_chunks".to_owned())
                 }
             })
             .transpose()?;
-        let result = crate::job_policy::JobResultRequest {
+        let result = duckfleet::protocol::JobResultRequest {
             format,
             retention_seconds: number("result-retention")?,
             max_bytes: number("result-max-bytes")?,
             max_rows: number("result-max-rows")?,
         };
-        let request = crate::job_policy::JobRequest {
+        let request = duckfleet::protocol::JobRequest {
             request_id: id("request-id")?.unwrap_or(generated_id),
             retry_of: id("retry-of")?,
             sql,
@@ -1451,7 +1265,7 @@ impl Parsed {
                 .map_err(|_| "invalid compute selection".to_owned())?,
             timeout_seconds: number("timeout")?,
             queue_timeout_seconds: number("queue-timeout")?,
-            result: (result != crate::job_policy::JobResultRequest::default()).then_some(result),
+            result: (result != duckfleet::protocol::JobResultRequest::default()).then_some(result),
         };
         request.clone().validate().map_err(|e| e.1)?;
         Ok(request)
@@ -1503,8 +1317,9 @@ impl Parsed {
             Ok(None)
         } else {
             let value = Value::Object(map);
-            let request: crate::compute::ComputeRequest = serde_json::from_value(value.clone())
-                .map_err(|error| format!("invalid compute selection: {error}"))?;
+            let request: duckfleet::protocol::ComputeRequest =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid compute selection: {error}"))?;
             request.validate().map_err(|error| error.1)?;
             Ok(Some(value))
         }

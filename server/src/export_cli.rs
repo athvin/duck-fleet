@@ -33,7 +33,7 @@ impl Format {
 }
 
 pub enum Source {
-    Sql(Box<crate::job_policy::JobRequest>),
+    Sql(Box<duckfleet::protocol::JobRequest>),
     Job(Uuid),
 }
 
@@ -206,7 +206,7 @@ async fn deliver(
 ) -> Result<(), RemoteError> {
     let resume = options.resume && tokio::fs::symlink_metadata(partial).await.is_ok();
     let preview = client.job_result(id).await?;
-    if let Ok(manifest) = serde_json::from_value::<crate::artifacts::Manifest>(preview.clone()) {
+    if let Ok(manifest) = serde_json::from_value::<duckfleet::protocol::Manifest>(preview.clone()) {
         check_schema(options.format, &manifest.schema)
             .map_err(|message| job_error(id, "unsupported_export_type", &message))?;
     }

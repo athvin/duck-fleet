@@ -1,5 +1,5 @@
 [workspace]
-members = ["ops", "cli"]
+members = ["ops", "cli", "sdk"]
 
 [package]
 name = "duckfleet-server"
@@ -7,6 +7,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+duckfleet = { path = "sdk" }
 anyhow = "1.0.104"
 arrow-array = "60.0.0"
 arrow-cast = "60.0.0"

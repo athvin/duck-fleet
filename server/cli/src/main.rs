@@ -19,25 +19,14 @@ mod protocol;
 #[path = "../../src/shell.rs"]
 mod shell;
 
-mod artifacts {
-    pub(crate) use crate::protocol::{
-        MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, Manifest, ManifestChunk,
-    };
-}
-mod compute {
-    pub(crate) use crate::protocol::ComputeRequest;
-}
 mod credentials {
     pub(crate) use crate::protocol::valid_principal;
-}
-mod job_policy {
-    pub(crate) use crate::protocol::{JobLimits, JobRequest, JobResultRequest, ResultFormat};
 }
 mod metadata {
     pub(crate) use crate::protocol::find_relation;
 }
 mod query {
-    pub(crate) const DEFAULT_QUEUE_TIMEOUT: u64 = crate::protocol::DEFAULT_QUEUE_TIMEOUT;
+    pub(crate) const DEFAULT_QUEUE_TIMEOUT: u64 = duckfleet::protocol::DEFAULT_QUEUE_TIMEOUT;
 }
 
 #[tokio::main]

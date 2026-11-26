@@ -11,6 +11,7 @@ name = "duckfleet"
 path = "src/main.rs"
 
 [dependencies]
+duckfleet = { path = "../sdk", version = "0.1.0" }
 arrow-array = "60.0.0"
 arrow-cast = "60.0.0"
 arrow-ipc = "60.0.0"
