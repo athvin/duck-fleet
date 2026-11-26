@@ -26,20 +26,20 @@ cd "$ROOT"
 kube=(kubectl --context "$context" -n "$ns")
 
 # A rerun can be an upgrade. Check before applying a Job that changes schema.
-python3 scripts/compute_lifecycle.py check kube --context "$context" --namespace "$ns"
+bash scripts/ops.sh compute-lifecycle check kube --context "$context" --namespace "$ns"
 
-python3 scripts/aws/render_boundary.py "$ns" | kubectl --context "$context" apply -f -
+bash scripts/ops.sh aws-render-boundary "$ns" | kubectl --context "$context" apply -f -
 if ! "${kube[@]}" get secret duckfleet-dev > /dev/null 2>&1; then
-  python3 scripts/database_roles.py "$ns" | "${kube[@]}" create -f -
+  bash scripts/ops.sh database-roles "$ns" | "${kube[@]}" create -f -
 fi
-"${kube[@]}" get secret duckfleet-dev -o json | python3 scripts/database_roles.py "$ns" --check
-migration_run=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+"${kube[@]}" get secret duckfleet-dev -o json | bash scripts/ops.sh database-roles "$ns" --check
+migration_run=$(bash scripts/ops.sh random-id)
 helm template duckfleet infra/helm/duckfleet --namespace "$ns" \
   --set secretName=duckfleet-dev \
   --set "lakePrefix=$ns/lake" --set "results.prefix=$ns/results" --set-string "platformMigration.runId=$migration_run" "$@" \
   | sh -c "$transform" \
   | "${kube[@]}" apply -f -
-if ! python3 scripts/aws/wait-rollout.py --context "$context" --namespace "$ns" --prune-migrations; then
+if ! bash scripts/ops.sh aws-wait-rollout --context "$context" --namespace "$ns" --prune-migrations; then
   "${kube[@]}" get pods -o wide || true
   "${kube[@]}" logs -l app=duckfleet-platform-migrate --all-containers --prefix --tail=200 || true
   exit 1

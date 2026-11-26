@@ -43,8 +43,8 @@ harness with explicit fixture credentials.
 
 ## Run locally
 
-Requires Docker Engine with Compose v2 (Docker Desktop works). No host Rust,
-Python, dbt, Kubernetes, or AWS credentials are needed. Allow roughly 6 GiB of
+Requires Docker Engine with Compose v2 (Docker Desktop works) and Rust 1.99 for
+repository operations. No host Python, dbt, Kubernetes, or AWS credentials are needed. Allow roughly 6 GiB of
 Docker memory and internet access for the initial images, packages, and DuckDB
 extension downloads at image build time. Workers require Linux cgroup v2, as
 provided by the Docker Desktop and Ubuntu CI environments tested here. DuckDB and its required extensions
@@ -651,7 +651,7 @@ All three facts are required, not defaulted, because each belongs to the
 operator: the DNS name, the certificate (this chart never mints one — bring
 cert-manager or your own), and the controller's namespace, which the isolation
 NetworkPolicy otherwise keeps out. A bearer token must never cross plain HTTP:
-the render always carries the TLS block, `check-chart.py` asserts every exposed
+the render always carries the TLS block, ``duckfleet-ops check-chart`` asserts every exposed
 host terminates TLS, and the nginx-family `ssl-redirect` annotation is set by
 default — an operator running a different controller owns configuring its
 equivalent through `exposure.annotations`. The AWS development lane stays
@@ -763,8 +763,8 @@ response, inspect `request <id>` or call `cancel <id>`; the CLI retains this ID
 and reports `acceptance: unknown`. Results are not retained for later download.
 
 Reproduce the long-statement boundary on disposable Compose volumes with
-`python3 scripts/test-long-deadline.py --image <built-image> --output artifacts/long-deadline.json`
-(requires PyArrow). It delays a synthetic HTTP CSV response by 65 seconds,
+`bash scripts/ops.sh test-long-deadline --image <built-image> --output artifacts/long-deadline.json`
+(uses the Rust Arrow reader). It delays a synthetic HTTP CSV response by 65 seconds,
 checks success with a 120-second allowance and refusal with a one-second
 allowance, and rejects 601 seconds. External I/O can defer when DuckDB observes
 an interrupt; the report records actual elapsed time rather than claiming an

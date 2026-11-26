@@ -3,7 +3,7 @@
 # derived from requests that differ from limits, and pod replacement.
 #
 # The manifests come from the chart that actually deploys, rewritten for a local
-# cluster by scripts/kind/localize.py, so a chart change that breaks this is caught
+# cluster by scripts/kind/the Rust kind-localize transform, so a chart change that breaks this is caught
 # here rather than after a merge. No AWS credentials are used or needed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -18,7 +18,7 @@ CALICO_VERSION=${CALICO_VERSION:-v3.30.4}
 work=$(mktemp -d)
 mkdir -p artifacts/kind
 
-for tool in kind kubectl helm docker python3; do
+for tool in kind kubectl helm docker cargo; do
   command -v "$tool" > /dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
 
@@ -70,7 +70,7 @@ kubectl --context "$CONTEXT" -n kube-system rollout status daemonset/calico-node
 kubectl --context "$CONTEXT" wait --for=condition=Ready nodes --all --timeout=300s
 printf 'enforcing CNI (calico %s) ready in %ss\n' "$CALICO_VERSION" "$((SECONDS - cni_started))"
 
-# Built locally and loaded into the node; localize.py rewrites the chart's ECR
+# Built locally and loaded into the node; the Rust kind-localize transform rewrites the chart's ECR
 # digests to these tags with imagePullPolicy Never, so nothing is ever pulled.
 docker build --target runtime --tag duckfleet-worker:local -f docker/server.Dockerfile .
 docker build --tag duckfleet-dbt:local -f docker/dbt.Dockerfile .
@@ -82,9 +82,9 @@ kind load docker-image --name "$CLUSTER" duckfleet-worker:local duckfleet-dbt:lo
 # the quota that caps it. Applying the real thing is what makes this harness able to
 # catch a boundary that no longer matches the chart — a quota that rejected a pod, or a
 # grant missing a verb, would show up here instead of on a deploy.
-python3 scripts/aws/render_boundary.py "$NS" | kubectl --context "$CONTEXT" apply -f -
+bash scripts/ops.sh aws-render-boundary "$NS" | kubectl --context "$CONTEXT" apply -f -
 # Same shape the AWS deploy generates, created here rather than committed.
-python3 scripts/database_roles.py "$NS" | "${KUBE[@]}" create -f -
+bash scripts/ops.sh database-roles "$NS" | "${KUBE[@]}" create -f -
 
 "${KUBE[@]}" apply -f infra/kind/object-store.yaml
 "${KUBE[@]}" rollout status deployment/object-store --timeout=240s
@@ -124,25 +124,25 @@ render --no-hooks \
   --set "isolatedCompute.apiServerCidrs[0]=$api_address/32" \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
-  | python3 scripts/kind/localize.py \
+  | bash scripts/ops.sh kind-localize \
   --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port,isolated-pod \
   > "$work/release.yaml"
-python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
+bash scripts/ops.sh compute-lifecycle check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release.yaml"
 
 # A fresh install creates PostgreSQL, the ordinary migration Job, and compute
 # together. Schema readiness gates compute; no Helm hook has to run after readiness.
-python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+bash scripts/ops.sh aws-wait-rollout --context "$CONTEXT" --namespace "$NS" --prune-migrations
 echo 'PASS: a fresh release migrated platform before compute became ready'
 
-python3 scripts/kind/assert_limits.py --context "$CONTEXT" --namespace "$NS" \
+bash scripts/ops.sh kind-assert-limits --context "$CONTEXT" --namespace "$NS" \
   | tee artifacts/kind/worker-limits.jsonl
 
 # Isolation, actually enforced. Runs before the dbt harness because a cluster that
 # cannot resolve DNS or reach PostgreSQL would fail there in a way that looks like an
 # application problem — and because every pod above reaching ready is itself the proof
 # that the permitted paths work.
-python3 scripts/kind/check_networkpolicy.py --context "$CONTEXT" --namespace "$NS" \
+bash scripts/ops.sh kind-check-networkpolicy --context "$CONTEXT" --namespace "$NS" \
   --image duckfleet-worker:local --release "$work/release.yaml" \
   --evidence artifacts/kind/networkpolicy.json
 
@@ -150,16 +150,16 @@ python3 scripts/kind/check_networkpolicy.py --context "$CONTEXT" --namespace "$N
 # normally runs additionally asserts the real development bucket, which cannot be
 # true here; the Parquet check below covers the local equivalent.
 "${KUBE[@]}" apply -f infra/kind/harness-artifacts.yaml
-harness() { # harness <job-name> <command> [timeout] [extra harness_job.py args...]
+harness() { # harness <job-name> <command> [timeout] [extra kind-harness-job args...]
   local name="$1" command="$2" timeout="${3:-1200}"
   shift $(($# < 3 ? $# : 3))
   render --show-only templates/harness.yaml \
-    | python3 scripts/kind/localize.py --expect image,cpu-request,s3-path \
-    | python3 scripts/kind/harness_job.py --name "$name" --command "$command" \
+    | bash scripts/ops.sh kind-localize --expect image,cpu-request,s3-path \
+    | bash scripts/ops.sh kind-harness-job --name "$name" --command "$command" \
       --artifacts-claim duckfleet-harness-artifacts "$@" \
     > "$work/$name.yaml"
   "${KUBE[@]}" apply -f "$work/$name.yaml"
-  python3 scripts/kind/await_job.py --context "$CONTEXT" --namespace "$NS" \
+  bash scripts/ops.sh kind-await-job --context "$CONTEXT" --namespace "$NS" \
     --job "$name" --timeout "$timeout"
   "${KUBE[@]}" logs "job/$name" -c dbt > "artifacts/kind/$name.log"
   # Completed test pods still consume count/pods quota. Preserve their logs and
@@ -168,7 +168,7 @@ harness() { # harness <job-name> <command> [timeout] [extra harness_job.py args.
   "${KUBE[@]}" delete "job/$name" --cascade=foreground --wait=true --timeout=60s
 }
 
-python3 scripts/kind/assert_role_posture.py --context "$CONTEXT" --namespace "$NS" > artifacts/kind/role-secret-posture.json
+bash scripts/ops.sh kind-assert-role-posture --context "$CONTEXT" --namespace "$NS" > artifacts/kind/role-secret-posture.json
 harness duckfleet-rbac 'duckfleet-server --rbac' 900
 harness duckfleet-system 'duckfleet-server --system' 300
 # The jobs harness verifies private-session cleanup against the platform database
@@ -419,19 +419,19 @@ render --no-hooks \
   --set "isolatedCompute.apiServerCidrs[0]=$api_address/32" \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
-  | python3 scripts/kind/localize.py \
+  | bash scripts/ops.sh kind-localize \
   --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port,isolated-pod \
   > "$work/release-ha.yaml"
-python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
+bash scripts/ops.sh compute-lifecycle check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release-ha.yaml"
-python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
-python3 scripts/kind/gateway_ownership.py --context "$CONTEXT" --namespace "$NS"
-python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
+bash scripts/ops.sh aws-wait-rollout --context "$CONTEXT" --namespace "$NS" --prune-migrations
+bash scripts/ops.sh kind-gateway-ownership --context "$CONTEXT" --namespace "$NS"
+bash scripts/ops.sh compute-lifecycle check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release.yaml"
-python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+bash scripts/ops.sh aws-wait-rollout --context "$CONTEXT" --namespace "$NS" --prune-migrations
 
 "${KUBE[@]}" apply -f infra/kind/bucket-verify.yaml
-python3 scripts/kind/await_job.py --context "$CONTEXT" --namespace "$NS" \
+bash scripts/ops.sh kind-await-job --context "$CONTEXT" --namespace "$NS" \
   --job bucket-verify --timeout 300
 "${KUBE[@]}" logs job/bucket-verify > artifacts/kind/bucket-verify.log
 grep -q 'PASS:' artifacts/kind/bucket-verify.log
@@ -477,13 +477,13 @@ render --no-hooks \
   --set isolatedCompute.readySeconds=180 \
   --set-json 'persistentPools={"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1},"interactive":{"cpu":2,"memory":"3Gi","disk":"4Gi","workers":2},"readers":{"cpu":1,"memory":"1Gi","disk":"2Gi","workers":1,"authority":"reader"}}' \
   --set-json 'autoscaling={"interactive":{"min_workers":1,"max_workers":2,"max_cpu":4,"max_memory_bytes":8589934592,"queue_wait_target_ms":0,"scale_up_cooldown_seconds":0,"scale_down_cooldown_seconds":10,"idle_seconds":10,"paused":true}}' \
-  | python3 scripts/kind/localize.py \
+  | bash scripts/ops.sh kind-localize \
   --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port,isolated-pod \
   > "$work/release-pools.yaml"
-python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
+bash scripts/ops.sh compute-lifecycle check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release-pools.yaml"
-python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
-python3 scripts/kind/assert_limits.py --context "$CONTEXT" --namespace "$NS" \
+bash scripts/ops.sh aws-wait-rollout --context "$CONTEXT" --namespace "$NS" --prune-migrations
+bash scripts/ops.sh kind-assert-limits --context "$CONTEXT" --namespace "$NS" \
   > artifacts/kind/pool-worker-limits.jsonl
 harness duckfleet-pools 'duckfleet-server --pools-isolated' 900
 harness duckfleet-queue 'duckfleet-server --queue-isolated' 900
@@ -497,7 +497,7 @@ test "$("${KUBE[@]}" get deployment worker-pool-interactive-1 -o jsonpath='{.spe
 sed 's/"paused":true/"paused":false/' "$work/release-pools.yaml" > "$work/release-autoscaling.yaml"
 grep -q '"paused":false' "$work/release-autoscaling.yaml"
 "${KUBE[@]}" apply -f "$work/release-autoscaling.yaml"
-python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+bash scripts/ops.sh aws-wait-rollout --context "$CONTEXT" --namespace "$NS" --prune-migrations
 harness duckfleet-autoscaling 'duckfleet-server --autoscaling' 900 &
 autoload=$!
 scaled_up=false
@@ -520,9 +520,9 @@ for _ in $(seq 1 180); do
 done
 [[ "$scaled_down" == true ]] || { echo 'autoscaling did not drain the idle standby worker' >&2; exit 1; }
 harness duckfleet-autoscaling-idle 'duckfleet-server --autoscaling-idle' 300
-python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
+bash scripts/ops.sh compute-lifecycle check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release.yaml"
-python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+bash scripts/ops.sh aws-wait-rollout --context "$CONTEXT" --namespace "$NS" --prune-migrations
 "${KUBE[@]}" delete deployment/worker-pool-interactive-0 deployment/worker-pool-interactive-1 \
   service/worker-pool-interactive-0 service/worker-pool-interactive-1 configmap/duckfleet-pools
 
@@ -534,16 +534,9 @@ echo 'PASS: queue pressure scaled up and idle cooldown drained a bounded persist
 # running against RDS looks like scaled to kind. The in-namespace stand-in needs
 # no externalCidrs — the isolation policy already permits 5432 between this
 # namespace's pods; the out-of-namespace egress render is proven in check-infra.
-"${KUBE[@]}" get statefulset/duckfleet-postgres -o json | python3 -c '
-import json,sys,yaml
-source=json.load(sys.stdin)
-env=source["spec"]["template"]["spec"]["containers"][0]["env"]
-objects=list(yaml.safe_load_all(open("infra/kind/external-postgres.yaml")))
-for obj in objects:
-    if obj["kind"]=="Deployment":
-        obj["spec"]["template"]["spec"]["containers"][0]["env"]=env
-yaml.safe_dump_all(objects,sys.stdout)
-' | "${KUBE[@]}" apply -f -
+"${KUBE[@]}" get statefulset/duckfleet-postgres -o json \
+  | bash scripts/ops.sh external-postgres infra/kind/external-postgres.yaml \
+  | "${KUBE[@]}" apply -f -
 "${KUBE[@]}" rollout status deployment/external-postgres --timeout=240s
 # Quiesce every engine before changing the target of the shared Secret. Existing
 # process environments otherwise keep writing the old database during the switch.
@@ -552,12 +545,9 @@ DUCKFLEET_KUBE_CONTEXT="$CONTEXT" DUCKFLEET_NAMESPACE="$NS" scripts/stop-compute
 "${KUBE[@]}" get statefulset/duckfleet-postgres > /dev/null
 "${KUBE[@]}" get jobs -l app=duckfleet-platform-migrate -o name > artifacts/kind/stopped-migration-jobs.txt
 test -s artifacts/kind/stopped-migration-jobs.txt
-"${KUBE[@]}" get secret duckfleet-dev -o json | python3 -c '
-import json,sys
-sys.path.insert(0,"scripts")
-from database_roles import retarget
-print(json.dumps(retarget(json.load(sys.stdin),"external-postgres")))
-' | "${KUBE[@]}" patch secret duckfleet-dev --type merge --patch-file /dev/stdin
+"${KUBE[@]}" get secret duckfleet-dev -o json \
+  | bash scripts/ops.sh database-roles "$NS" --retarget external-postgres \
+  | "${KUBE[@]}" patch secret duckfleet-dev --type merge --patch-file /dev/stdin
 render --no-hooks \
   --set postgres.bundled=false \
   --set-string platformMigration.runId=external-empty-database \
@@ -565,15 +555,15 @@ render --no-hooks \
   --set "isolatedCompute.apiServerCidrs[0]=$api_address/32" \
   --set "isolatedCompute.apiServerPorts[0]=$api_port" \
   --set isolatedCompute.readySeconds=180 \
-  | python3 scripts/kind/localize.py \
+  | bash scripts/ops.sh kind-localize \
   --expect image,cpu-request,s3-auth,s3-path,object-store-port,isolated-pod \
   > "$work/release-external.yaml"
-python3 scripts/compute_lifecycle.py check kube --context "$CONTEXT" --namespace "$NS"
+bash scripts/ops.sh compute-lifecycle check kube --context "$CONTEXT" --namespace "$NS"
 "${KUBE[@]}" apply -f "$work/release-external.yaml"
 # apply does not prune, so the bundled instance is removed by name — exactly what
 # an operator migrating to an external catalog does after restoring into it.
 "${KUBE[@]}" delete statefulset/duckfleet-postgres service/postgres
-python3 scripts/aws/wait-rollout.py --context "$CONTEXT" --namespace "$NS" --prune-migrations
+bash scripts/ops.sh aws-wait-rollout --context "$CONTEXT" --namespace "$NS" --prune-migrations
 echo 'PASS: unchanged worker image migrated a fresh external platform database'
 # Two probes against the fresh external catalog: overlapping DuckLake writes from
 # both workers — commit races resolved through the catalog under test — and the
@@ -595,7 +585,7 @@ echo 'PASS: the release ran a full workflow against an external PostgreSQL, bund
 # first feels nothing.
 TEAM=duckfleet-team-b
 DUCKFLEET_KUBE_CONTEXT="$CONTEXT" \
-DUCKFLEET_PROVISION_TRANSFORM="python3 scripts/kind/localize.py --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port --data-path s3://duckfleet/$TEAM/lake/" \
+DUCKFLEET_PROVISION_TRANSFORM="bash scripts/ops.sh kind-localize --expect image,cpu-request,s3-auth,s3-path,storage-class,object-store-port --data-path s3://duckfleet/$TEAM/lake/" \
   bash scripts/provision-namespace.sh "$TEAM" \
   --set "workerImage=$REGISTRY/worker@sha256:$digest" \
   --set "dbtImage=$REGISTRY/dbt@sha256:$digest"
@@ -606,41 +596,19 @@ team=(kubectl --context "$CONTEXT" -n "$TEAM")
 "${team[@]}" apply -f infra/kind/object-store.yaml
 "${team[@]}" rollout status deployment/object-store --timeout=240s
 "${team[@]}" wait --for=condition=complete job/bucket-init --timeout=240s
-read -r team_port source_port < <(python3 -c 'import socket
-listeners = [socket.socket() for _ in range(2)]
-for listener in listeners:
-    listener.bind(("127.0.0.1", 0))
-print(*(listener.getsockname()[1] for listener in listeners))
-for listener in listeners:
-    listener.close()')
+read -r team_port source_port < <(bash scripts/ops.sh free-ports 2)
 "${team[@]}" port-forward svc/server "$team_port:8080" > artifacts/kind/team-port-forward.log 2>&1 &
 team_forward=$!
 "${KUBE[@]}" port-forward svc/server "$source_port:8080" > artifacts/kind/source-port-forward.log 2>&1 &
 source_forward=$!
-if ! python3 - "$team_port" "$source_port" <<'PY'
-import sys, time, urllib.request
-ports = set(map(int, sys.argv[1:]))
-deadline = time.monotonic() + 60
-while ports and time.monotonic() < deadline:
-    for port in list(ports):
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1) as response:
-                if response.status == 200:
-                    ports.remove(port)
-        except Exception:
-            pass
-    if ports:
-        time.sleep(0.5)
-if ports:
-    raise SystemExit(f"gateway port-forwards did not become ready: {sorted(ports)}")
-PY
+if ! bash scripts/ops.sh await-health "$team_port" "$source_port"
 then
   kill -0 "$team_forward" 2> /dev/null || wait "$team_forward" || true
   kill -0 "$source_forward" 2> /dev/null || wait "$source_forward" || true
   cat artifacts/kind/team-port-forward.log artifacts/kind/source-port-forward.log
   exit 1
 fi
-python3 scripts/kind/team_namespace_probe.py --port "$team_port" \
+bash scripts/ops.sh kind-team-namespace-probe --port "$team_port" \
   --source-port "$source_port" --context "$CONTEXT" --namespace "$TEAM" --source-namespace "$NS"
 kill "$team_forward" 2> /dev/null || true
 kill "$source_forward" 2> /dev/null || true

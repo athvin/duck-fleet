@@ -19,11 +19,7 @@ assert_cluster
 secret=${DUCKFLEET_SECRET:-$DUCKFLEET_NAMESPACE}
 # The Secret the chart reads. Named from the same configuration the release uses, so
 # this cannot rotate one deployment's credential while pointing at another's.
-secret=$(python3 -c "
-import re, sys
-values = open('infra/helm/duckfleet/values.yaml').read()
-print(re.search(r'^secretName:\s*(\S+)', values, re.M).group(1))
-")
+secret=$(bash scripts/ops.sh chart-secret-name)
 
 cat <<EOF
 Rotating the DuckLake catalog password
@@ -41,12 +37,12 @@ EOF
 }
 
 # Generated here and never echoed. The only copies are the database and the Secret.
-password=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+password=$(bash scripts/ops.sh random-id --token)
 
 # Read the existing DSNs so the rest of their contents — host, port, database, user —
 # survive rotation rather than being reconstructed and quietly changed.
 existing=$("${KUBE[@]}" get secret "$secret" -o json)
-rotated=$(DUCKFLEET_NEW_PASSWORD="$password" python3 scripts/aws/rotate_secret.py <<< "$existing")
+rotated=$(DUCKFLEET_NEW_PASSWORD="$password" bash scripts/ops.sh aws-rotate-secret <<< "$existing")
 
 # The database first. If this succeeds and the Secret write fails, the workers still
 # hold the old password and are broken until the Secret catches up — but the inverse,

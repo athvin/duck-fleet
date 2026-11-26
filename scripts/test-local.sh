@@ -4,8 +4,8 @@ cd "$(dirname "$0")/.."
 mkdir -p artifacts
 # Only this Compose project is touched. Volumes deliberately survive the test.
 trap 'result=$?; if [ "$result" -ne 0 ]; then docker compose --profile "*" logs --no-color > artifacts/compose-failure.log 2>&1; fi; exit "$result"' EXIT
-python3 scripts/compute_lifecycle.py check compose
-python3 scripts/test-database-roles.py
+bash scripts/ops.sh compute-lifecycle check compose
+bash scripts/ops.sh test-database-roles
 docker compose --profile test build
 docker compose up -d --wait server
 
@@ -201,7 +201,7 @@ unset DUCKFLEET_POOLS_DIRECTORY
 #     --gateway-drain-inflight harness stages + docker kill)
 #   - maintenance (--maintenance)
 # The backup/restore and engine rollback drill runs in the isolated qualification
-# lane (scripts/qualify-engine.py), which owns disposable volumes and image sets.
+# lane (`duckfleet-ops qualify-engine`), which owns disposable volumes and image sets.
 # The isolated-pod path (a sized model -> dedicated pod) is Kubernetes-only and is
 # exercised by scripts/test-k8s.sh, not here.
 # ---------------------------------------------------------------------------

@@ -23,4 +23,4 @@ for component in worker dbt; do
   printf '%s\n' "$digest" > "artifacts/aws/$component-digest.txt"
   docker buildx imagetools inspect --raw "$repository@$digest" > "artifacts/aws/$component-index.json"
 done
-python3 scripts/aws/image_values.py
+bash scripts/ops.sh aws-image-values

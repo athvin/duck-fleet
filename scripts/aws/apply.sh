@@ -15,5 +15,5 @@ terraform -chdir=infra/terraform/dev init -input=false \
   -backend-config="key=$DUCKFLEET_STATE_KEY" \
   -backend-config="region=$DUCKFLEET_REGION"
 terraform -chdir=infra/terraform/dev plan -input=false -lock-timeout=5m -out="$plan"
-terraform -chdir=infra/terraform/dev show -json "$plan" | python3 scripts/aws/plan_guard.py
+terraform -chdir=infra/terraform/dev show -json "$plan" | bash scripts/ops.sh aws-plan-guard
 terraform -chdir=infra/terraform/dev apply -input=false -lock-timeout=5m "$plan"

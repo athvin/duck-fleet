@@ -27,7 +27,7 @@ Timings are recorded as evidence rather than treated as hardware-independent thr
 3. Stop workers and isolated pods with `scripts/stop-compute.sh compose` or the explicit-context `kube` form. PostgreSQL and migration Jobs remain. Queued, uncertain, or in-flight writes are never replayed automatically; inspect their durable identities and restore instead when the outcome is uncertain.
 4. Start the approved 2.0.1 images and run the platform migration before compute. The startup guard verifies the engine, extensions, repository policy, and catalog version. While compute is stopped, SQL is honestly unavailable; supported control-plane metadata remains available without pretending queries ran.
 5. Verify every serving worker reports `v2.0.1`, no 1.5.4 writer remains, and the catalog is still 1.0. Run HTTP, pgwire, dbt, durable-job/artifact, maintenance, RBAC, history, budget, and concurrency checks before resuming normal admission.
-6. Record the delivered Compose, Kind, and AWS evidence and the product decision. `scripts/qualify-engine.py` includes the backup/drain/replacement/smoke rehearsal and writes `cutover.json`; it never performs this drill against the only copy of a catalog.
+6. Record the delivered Compose, Kind, and AWS evidence and the product decision. ``duckfleet-ops qualify-engine`` includes the backup/drain/replacement/smoke rehearsal and writes `cutover.json`; it never performs this drill against the only copy of a catalog.
 
 For Compose, the basic commands are:
 

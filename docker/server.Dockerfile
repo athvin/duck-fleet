@@ -9,6 +9,7 @@ RUN sh /tmp/install-extensions.sh
 ENV DUCKDB_LIB_DIR=/usr/local/lib LD_LIBRARY_PATH=/usr/local/lib
 WORKDIR /app/server
 COPY server/Cargo.toml server/Cargo.lock ./
+COPY server/ops ./ops
 COPY server/vendor ./vendor
 RUN mkdir src && echo 'fn main() {}' > src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=duckfleet-target-${TARGETARCH},target=/app/server/target cargo build --locked && cp target/debug/duckfleet-server /tmp/duckfleet-server
@@ -18,17 +19,13 @@ RUN touch src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=duckfleet-target-${TARGETARCH},target=/app/server/target cargo build --locked && cp target/debug/duckfleet-server /tmp/duckfleet-server
 
 FROM build AS check
+COPY infra/kubernetes/boundary /app/infra/kubernetes/boundary
 RUN rustup component add rustfmt clippy
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=duckfleet-target-${TARGETARCH},target=/app/server/target cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,id=duckfleet-target-${TARGETARCH},target=/app/server/target cargo fmt --check --all && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace
 
-FROM python:3.12.12-slim-bookworm AS aws-credentials-check
-RUN pip install --no-cache-dir duckdb==2.0.1
-COPY --from=build /opt/duckdb /opt/duckdb
-COPY tests/extension_bundle.py /app/extension_bundle.py
-RUN --network=none python /app/extension_bundle.py
-COPY tests/aws_credentials.py /app/aws_credentials.py
-COPY tests/s3_secret_scope.py /app/s3_secret_scope.py
-RUN python /app/aws_credentials.py && python /app/s3_secret_scope.py
+FROM build AS aws-credentials-check
+RUN --network=none DUCKFLEET_ROLE=engine-security /tmp/duckfleet-server --extension-bundle
+RUN DUCKFLEET_ROLE=engine-security /tmp/duckfleet-server --aws-credentials && DUCKFLEET_ROLE=engine-security /tmp/duckfleet-server --s3-secret-scope
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 && rm -rf /var/lib/apt/lists/* && useradd -m -u 10001 duckfleet

@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: bash scripts/ci/install-rust.sh
       - name: Rust checks in Docker
         run: make check
       - name: Real dbt integration and restart checks
@@ -37,6 +39,8 @@ jobs:
     timeout-minutes: 70
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: bash scripts/ci/install-rust.sh
       - run: bash scripts/ci/install-infra-tools.sh
       - run: bash scripts/ci/install-kind.sh
       - name: Kubernetes release and in-cluster dbt harness
