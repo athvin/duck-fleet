@@ -718,8 +718,7 @@ async fn run_statement<P: Platform>(
             *transaction = transaction.after_success(&transaction_effects(sql));
             tokio::time::timeout(WRITE_TIMEOUT, write_arrow(stream, sql, &arrow))
                 .await
-                .context("pgwire result write timed out")??;
-            Ok(true)
+                .context("pgwire result write timed out")?
         }
         QueryOutcome::Refused { kind, message } => {
             *transaction = transaction.after_failure(&transaction_effects(sql), &kind);
@@ -761,14 +760,15 @@ async fn run_system_statement<P: Platform>(
         Ok(result) => {
             // The result owns its output permit until all bytes have been flushed,
             // including the slow-peer path. No worker route or request notice exists.
-            tokio::time::timeout(WRITE_TIMEOUT, async {
-                write_arrow(stream, "SELECT", result.arrow()).await?;
-                flush(stream).await
+            let sent = tokio::time::timeout(WRITE_TIMEOUT, async {
+                let sent = write_arrow(stream, "SELECT", result.arrow()).await?;
+                flush(stream).await?;
+                Ok::<_, anyhow::Error>(sent)
             })
             .await
             .context("pgwire system result write timed out")??;
             drop(result);
-            Ok(true)
+            Ok(sent)
         }
         Err(error) => {
             if matches!(
@@ -814,10 +814,51 @@ fn sqlstate(kind: &str) -> &'static str {
     }
 }
 
-async fn write_arrow(stream: &mut BufStream<TcpStream>, sql: &str, arrow: &[u8]) -> Result<()> {
+/// Types with a text rendering on this wire; `text_value` handles exactly these.
+fn renderable(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Decimal128(..)
+            | DataType::Date32
+            | DataType::Timestamp(..)
+    )
+}
+
+/// Writes a result, or refuses it before any row with a classified error when
+/// a column has no wire rendering, so the connection and session stay usable.
+/// Returns whether the result was sent.
+async fn write_arrow(stream: &mut BufStream<TcpStream>, sql: &str, arrow: &[u8]) -> Result<bool> {
     let reader = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(arrow), None)
         .context("arrow stream")?;
     let schema = reader.schema();
+    if let Some(field) = schema.fields().iter().find(|f| !renderable(f.data_type())) {
+        error_response(
+            stream,
+            "0A000",
+            &format!(
+                "column {:?} has type {} with no pgwire text rendering; cast it to VARCHAR in SQL (for example {}::VARCHAR), or use the HTTP/Arrow API, which returns it natively [unsupported_type]",
+                field.name(),
+                field.data_type(),
+                field.name()
+            ),
+        )
+        .await?;
+        return Ok(false);
+    }
     let mut description = Vec::new();
     description.extend_from_slice(&i16::try_from(schema.fields().len())?.to_be_bytes());
     for field in schema.fields() {
@@ -849,7 +890,7 @@ async fn write_arrow(stream: &mut BufStream<TcpStream>, sql: &str, arrow: &[u8])
     let mut complete = tag.into_bytes();
     complete.push(0);
     write_message(stream, b'C', &complete).await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn write_batch(stream: &mut BufStream<TcpStream>, batch: &RecordBatch) -> Result<i64> {
@@ -1857,6 +1898,19 @@ mod tests {
         assert_eq!(format_decimal(42, 0), "42");
         assert_eq!(format_decimal(-42, -2), "-4200");
         assert_eq!(format_decimal(-1, 38), format!("-0.{}1", "0".repeat(37)));
+    }
+
+    #[test]
+    fn only_types_with_a_text_rendering_are_sent() {
+        assert!(renderable(&DataType::Int32));
+        assert!(renderable(&DataType::Timestamp(
+            TimeUnit::Microsecond,
+            None
+        )));
+        assert!(!renderable(&DataType::Binary));
+        assert!(!renderable(&DataType::List(std::sync::Arc::new(
+            arrow_schema::Field::new("item", DataType::Int32, true)
+        ))));
     }
 
     #[test]

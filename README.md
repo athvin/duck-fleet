@@ -712,7 +712,7 @@ COPY, LISTEN/NOTIFY, cursors, or CancelRequest, and SSLRequests are answered
 `N` — this listener is in-cluster plain TCP, off by default, and transport
 security belongs to the exposure layer. Results travel in text format with
 typed OIDs (ints, floats, booleans, text, decimals, dates, microsecond
-timestamps); anything else says to cast to `VARCHAR`. A gateway rollout ends
+timestamps). A result with any other column type (lists, structs, maps, blobs, and so on) is refused before any row with SQLSTATE `0A000`, naming the column and the `VARCHAR` cast, and the connection stays usable. A gateway rollout ends
 wire connections; reconnect and the session-recovery contract applies.
 
 ## Worker file access
