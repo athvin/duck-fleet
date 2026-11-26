@@ -41,6 +41,8 @@ jobs:
           tar -xzf /tmp/duckdb-cli.tar.gz -C /usr/local/bin duckdb
       - name: Private CSV and Parquet imports
         run: make test-import
+      - name: CSV, JSON, Arrow, and Parquet exports
+        run: make test-export
       - name: Save test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

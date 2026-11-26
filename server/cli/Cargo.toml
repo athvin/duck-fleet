@@ -11,11 +11,15 @@ name = "duckfleet"
 path = "src/main.rs"
 
 [dependencies]
+arrow-array = "60.0.0"
 arrow-cast = "60.0.0"
 arrow-ipc = "60.0.0"
+arrow-csv = "60.0.0"
+arrow-json = "60.0.0"
 arrow-schema = { version = "60.0.0", features = ["serde"] }
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
 ring = "0.17"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustyline = "19.0.0"
@@ -26,6 +30,5 @@ tokio-util = { version = "0.7", features = ["io"] }
 uuid = { version = "1.29.2", features = ["v4", "serde"] }
 
 [dev-dependencies]
-arrow-array = "60.0.0"
 axum = "0.8"
 rexpect = "0.7.1"
