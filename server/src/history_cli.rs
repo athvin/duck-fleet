@@ -14,10 +14,18 @@ pub struct HistoryOptions {
 
 pub async fn history(url: &str, token: &str, options: HistoryOptions) -> Result<(), RemoteError> {
     let client = Client::new(url, token)?;
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
     let mut previous = BTreeSet::new();
     loop {
         let path = history_path(&options);
-        let value = get_value(&client, &path).await?;
+        let value = tokio::select! {
+            result = get_value(&client, &path) => result?,
+            _ = &mut interrupt => {
+                eprintln!("history watch stopped");
+                return Ok(());
+            }
+        };
         if options.format == "json" {
             println!(
                 "{}",
@@ -50,7 +58,7 @@ pub async fn history(url: &str, token: &str, options: HistoryOptions) -> Result<
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(options.interval)) => {}
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut interrupt => {
                 eprintln!("history watch stopped");
                 return Ok(());
             }

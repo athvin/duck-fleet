@@ -45,12 +45,10 @@ wait
 page2="$("$binary" history --limit 5 --before "$next" --format json)"
 jq -n --argjson a "$page1" --argjson b "$page2" -e '($a.queries|map(.query_id)) as $ids | all($b.queries[]; .query_id as $id | $ids | index($id) | not)' >/dev/null
 
-"$binary" history --watch --interval 1 > watch.out 2>&1 &
-watch_pid=$!
-sleep 3
-kill -INT "$watch_pid"
-wait "$watch_pid"
-[[ "$(<watch.out)" == *'history watch stopped'* ]]
+cd "$root/server"
+DUCKFLEET_URL="$url" DUCKFLEET_TOKEN="$token" \
+  cargo test --locked -p duckfleet-cli --test shell_pty history_watch_stops_on_ctrl_c -- --ignored --test-threads=1
+cd "$project"
 
 set +e
 "$binary" sql 'select * from missing_history_fixture' >/dev/null 2>&1
