@@ -82,6 +82,9 @@ pub async fn run(args: Vec<String>) -> i32 {
         )
         .await;
     }
+    if parsed.command == "advise" && parsed.positionals.first().is_some_and(|s| s == "dbt") {
+        return run_advise_dbt(&parsed, resolved.url.as_deref(), resolved.token.as_deref()).await;
+    }
     let (Some(url), Some(token)) = (resolved.url, resolved.token) else {
         eprintln!(
             "missing DuckFleet URL or token; run duckfleet init, or set --url/--token or DUCKFLEET_URL/DUCKFLEET_TOKEN"
@@ -378,6 +381,69 @@ async fn run_job(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteEr
         _ => unreachable!("validated job command"),
     }
     Ok(())
+}
+
+/// Static dbt analysis needs no warehouse; `--history` adds an authorized,
+/// read-only lookup of recorded transaction conflicts. Exit 0 for a completed
+/// analysis, 1 for warnings under `--strict`, 2 for unusable artifacts.
+async fn run_advise_dbt(parsed: &Parsed, url: Option<&str>, token: Option<&str>) -> i32 {
+    let directory = std::path::PathBuf::from(parsed.value("project-dir").unwrap_or("."));
+    let mut report = match crate::advise_dbt::load(&directory)
+        .and_then(|manifest| crate::advise_dbt::analyze(&manifest))
+    {
+        Ok(report) => report,
+        Err(message) => {
+            eprintln!("invalid_dbt_artifacts: {message}");
+            return 2;
+        }
+    };
+    if parsed.flags.iter().any(|flag| flag == "history") {
+        let (Some(url), Some(token)) = (url, token) else {
+            eprintln!(
+                "--history needs a DuckFleet URL and token; the static analysis needs neither"
+            );
+            return 2;
+        };
+        let history = match Client::new(url, token) {
+            Ok(client) => client
+                .request(
+                    reqwest::Method::GET,
+                    "/v1/queries?failure_kind=transaction_conflict&limit=500",
+                    None,
+                    std::time::Duration::from_secs(15),
+                )
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()),
+            Err(_) => None,
+        };
+        match history {
+            Some(history) => {
+                crate::advise_dbt::correlate(&mut report, &history);
+                report["history_note"] = json!(
+                    "correlated with recorded transaction_conflict history by dbt node ID; model identity is shown only where this principal may see it"
+                );
+            }
+            None => {
+                report["history_note"] = json!(
+                    "history correlation unavailable for this principal; static warnings are unaffected"
+                );
+            }
+        }
+    }
+    if parsed.value("format") == Some("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        print!("{}", crate::advise_dbt::render(&report));
+    }
+    let warnings = report["warnings"].as_array().map_or(0, Vec::len);
+    if parsed.flags.iter().any(|flag| flag == "strict") && warnings > 0 {
+        return 1;
+    }
+    0
 }
 
 pub(crate) async fn download_job_result(
@@ -798,7 +864,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 35] = [
+    const VALUE_FLAGS: [&'static str; 36] = [
         "url",
         "token",
         "cpu",
@@ -834,6 +900,7 @@ impl Parsed {
         "from",
         "to",
         "thresholds",
+        "project-dir",
     ];
     const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
@@ -862,6 +929,8 @@ impl Parsed {
                     "create",
                     "append",
                     "no-header",
+                    "strict",
+                    "history",
                 ]
                 .contains(&name)
                 {
@@ -1013,10 +1082,30 @@ impl Parsed {
                 return Err("snapshot --format must be table, json, csv, or vertical".into());
             }
         }
-        if parsed.command == "advise" {
+        let advise_dbt =
+            parsed.command == "advise" && parsed.positionals.first().is_some_and(|s| s == "dbt");
+        if advise_dbt {
+            if parsed.positionals.len() != 1
+                || parsed.value("thresholds").is_some()
+                || parsed.value("limit").is_some()
+                || parsed
+                    .value("format")
+                    .is_some_and(|format| !["table", "json"].contains(&format))
+            {
+                return Err("usage: advise dbt [--project-dir <path>] [--strict] [--history] [--format table|json]".into());
+            }
+        } else if parsed.command == "advise" {
             parsed.advise_command()?;
         } else if parsed.value("thresholds").is_some() {
             return Err("--thresholds applies only to advise".into());
+        }
+        for flag in ["strict", "history"] {
+            if parsed.flags.iter().any(|value| value == flag) && !advise_dbt {
+                return Err(format!("--{flag} applies only to advise dbt"));
+            }
+        }
+        if parsed.value("project-dir").is_some() && !advise_dbt {
+            return Err("--project-dir applies only to advise dbt".into());
         }
         for flag in ["at", "from", "to"] {
             if parsed.value(flag).is_some() && parsed.command != "snapshot" {
@@ -1278,7 +1367,7 @@ impl Parsed {
             }
             _ => {
                 return Err(
-                    "usage: advise query <query-id> | advise model <dbt-node-id> [--limit N] [--thresholds name=value,...]".into(),
+                    "usage: advise query <query-id> | advise model <dbt-node-id> [--limit N] [--thresholds name=value,...] | advise dbt [--project-dir <path>] [--strict] [--history]".into(),
                 );
             }
         };
@@ -1633,6 +1722,38 @@ mod tests {
             vec!["workers", "--status", "failed"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn advise_dbt_arguments_are_offline_and_specific() {
+        assert!(parse(&["advise", "dbt"]).is_ok());
+        assert!(
+            parse(&[
+                "advise",
+                "dbt",
+                "--project-dir",
+                "p",
+                "--strict",
+                "--history",
+                "--format",
+                "json"
+            ])
+            .is_ok()
+        );
+        for args in [
+            vec!["advise", "dbt", "extra"],
+            vec!["advise", "dbt", "--limit", "5"],
+            vec!["advise", "dbt", "--format", "csv"],
+            vec!["advise", "dbt", "--thresholds", "cpu_share=0.5"],
+            vec!["sql", "SELECT 1", "--strict"],
+            vec!["history", "--history"],
+            vec!["sql", "SELECT 1", "--project-dir", "p"],
+        ] {
+            assert!(
+                parse(&args).is_err(),
+                "accepted invalid advise dbt arguments {args:?}"
+            );
         }
     }
 

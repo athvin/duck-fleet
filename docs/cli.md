@@ -252,6 +252,28 @@ Confidence is `supported`, `qualified`, or `none`. A recommendation is `qualifie
 
 The evidence is DuckDB engine metrics: peak buffer memory, temp-directory size, bytes spilled, and CPU time. They are not container RSS or provider cost, and the advisor never estimates cost or promises a speedup on other hardware. A metadata-only caller, such as the `operator` role, gets timing-based advice. It never sees SQL text or profile content, and without profile evidence a resource recommendation is never `supported`. The manual sizing contract is unchanged: you apply any change yourself by rerunning with explicit `--cpu`, `--memory`, `--disk`, `--mode`, or `--pool`, or through `meta.platform` in dbt.
 
+## dbt write-conflict warnings
+
+`duckfleet advise dbt` reads a compiled project's `target/manifest.json` and warns about independent DAG branches that may write the same DuckLake table concurrently. Static analysis needs no running warehouse, URL, or token:
+
+```sh
+dbt compile                                    # or any dbt command that writes target/manifest.json
+duckfleet advise dbt --project-dir .           # human-readable warnings and coverage
+duckfleet advise dbt --strict                  # CI gate: exit 1 when any warning exists
+duckfleet advise dbt --history --format json   # also correlate recorded transaction conflicts
+```
+
+DuckLake checks conflicts when a transaction commits, at **data-file granularity**. Two transactions that write one table conflict unless both only append (see [Concurrent writes and retry safety](../README.md#concurrent-writes-and-retry-safety)). For every model, seed, and snapshot, the advisor derives writes from:
+
+- the materialization: `table`, `view`, `seed`, `snapshot`, and `materialized_view` rewrite their own relation. `incremental` with `append`, or with no strategy and no `unique_key`, appends. `delete+insert`, `merge`, `insert_overwrite`, `microbatch`, or a `unique_key` with no strategy rewrites. `ephemeral` writes nothing.
+- literal SQL in `pre-hook`/`post-hook` and in compiled model SQL: `INSERT` (append, or rewrite with `OR REPLACE` or `ON CONFLICT DO UPDATE`), `COPY … FROM` (append), and `DELETE`, `UPDATE`, `MERGE`, `TRUNCATE`, `CREATE`, `DROP`, and `ALTER` (rewrite). Temporary tables are ignored. Names compare case-insensitively, quoted or not. A one-part name resolves to the `main` schema of the node's database and a two-part name to the node's database, the same way DuckFleet sessions resolve them.
+
+A warning names both models, the fully qualified relation, each model's write kind and its sources, why the DAG permits overlap, and a concrete remedy: an explicit `-- depends_on: {{ ref('…') }}` in the later model's file, or separate target tables. Models ordered by an actual dependency (direct or transitive), writers of different tables, pairs of appends, and read-only models do not warn. The command never edits project files, changes the DAG, serializes execution, or retries a model.
+
+Coverage is always reported. Hooks with unrendered Jinja, `EXECUTE`/`PREPARE`/`CALL`, models without compiled SQL, and unsupported materializations or incremental strategies show up as `UNKNOWN` rather than a false all-clear. The summary line gives the warning, analyzed, and unknown counts. Exit codes: `0` for a completed analysis (even with warnings), `1` under `--strict` when warnings exist, and `2` when `manifest.json` is missing or malformed.
+
+A warning is a static possibility, not proof that two writes will overlap at runtime. The writes may never run at the same moment, or they may touch rows in different data files. `--history` reads recorded `transaction_conflict` failures (`GET /v1/queries?failure_kind=transaction_conflict`) and attaches the ones whose dbt node ID matches a warned model, changing its confidence from `static_possibility` to `observed_race`. Model identity comes back only to principals allowed to see it. A metadata-only caller gets the static warnings with no observed conflicts and no SQL text. After a conflict, rerunning the whole model (for example `dbt retry`) replays its transaction. Nothing replays it automatically.
+
 ## SQL files and standard input
 
 `duckfleet sql --file <path>` and piped `duckfleet sql` execute all statements on one session. A final semicolon is optional for file/stdin input; input is UTF-8 and bounded to one MiB. Use `--file -` to name stdin explicitly.

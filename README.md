@@ -1109,7 +1109,9 @@ Conflict granularity is the **data file**, not the row: two writers that rewrite
 disjoint rows of one table still conflict. A dbt DAG that runs two `delete+insert`
 models against the same table concurrently will therefore lose one of them. Order
 those models or give them separate tables; do not rely on row ranges keeping them
-apart. A write becomes visible to the other worker as soon as it commits, including
+apart. `duckfleet advise dbt` finds such pairs statically from
+`target/manifest.json` and can correlate them with recorded conflicts; see the
+[dbt conflict guide](docs/cli.md#dbt-write-conflict-warnings). A write becomes visible to the other worker as soon as it commits, including
 to a transaction that starts after it, so a dependent model does not read a stale
 snapshot. A transaction that started earlier keeps the snapshot it opened with.
 

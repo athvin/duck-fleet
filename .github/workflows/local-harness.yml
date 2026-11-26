@@ -47,6 +47,8 @@ jobs:
         run: make test-snapshots
       - name: Evidence-based compute advice
         run: make test-advise
+      - name: dbt write-conflict advice on real artifacts
+        run: make test-advise-dbt
       - name: Rust SDK against real Compose (current and minimum Rust)
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
