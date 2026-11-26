@@ -103,6 +103,17 @@ pub async fn run(args: Vec<String>) -> i32 {
 
     let result = match parsed.command.as_str() {
         "sql" => run_sql(&url, &token, &parsed).await,
+        "advise" => {
+            let (subject, thresholds) = parsed.advise_command().expect("validated advise command");
+            crate::advise_cli::run(
+                &url,
+                &token,
+                subject,
+                thresholds,
+                parsed.value("format").unwrap_or("table"),
+            )
+            .await
+        }
         "snapshots" | "snapshot" => {
             crate::snapshot_cli::run(
                 &url,
@@ -268,7 +279,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|import|export|snapshots|snapshot|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|import|export|snapshots|snapshot|advise|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -787,7 +798,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 34] = [
+    const VALUE_FLAGS: [&'static str; 35] = [
         "url",
         "token",
         "cpu",
@@ -822,6 +833,7 @@ impl Parsed {
         "at",
         "from",
         "to",
+        "thresholds",
     ];
     const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
@@ -884,7 +896,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <init|config|version|dev|status|stop|reset|shell|sql|import|export|snapshots|snapshot|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <init|config|version|dev|status|stop|reset|shell|sql|import|export|snapshots|snapshot|advise|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -1000,6 +1012,11 @@ impl Parsed {
             {
                 return Err("snapshot --format must be table, json, csv, or vertical".into());
             }
+        }
+        if parsed.command == "advise" {
+            parsed.advise_command()?;
+        } else if parsed.value("thresholds").is_some() {
+            return Err("--thresholds applies only to advise".into());
         }
         for flag in ["at", "from", "to"] {
             if parsed.value(flag).is_some() && parsed.command != "snapshot" {
@@ -1234,6 +1251,38 @@ impl Parsed {
         }
         parsed.compute()?;
         Ok(parsed)
+    }
+
+    fn advise_command(
+        &self,
+    ) -> Result<(crate::advise_cli::Subject, crate::advise_cli::Thresholds), String> {
+        let thresholds = crate::advise_cli::Thresholds::parse(self.value("thresholds"))?;
+        let samples = crate::snapshot_cli::bounded("--limit", self.value("limit"), 20, 100)?;
+        if self
+            .value("format")
+            .is_some_and(|format| !["table", "json"].contains(&format))
+        {
+            return Err("advise --format must be table or json".into());
+        }
+        let positionals: Vec<&str> = self.positionals.iter().map(String::as_str).collect();
+        let subject = match positionals.as_slice() {
+            ["query", id] => crate::advise_cli::Subject::Query {
+                id: uuid::Uuid::parse_str(id).map_err(|_| "advise query needs a query ID")?,
+                samples,
+            },
+            ["model", id] if !id.is_empty() && id.len() <= 512 => {
+                crate::advise_cli::Subject::Model {
+                    id: (*id).to_owned(),
+                    samples,
+                }
+            }
+            _ => {
+                return Err(
+                    "usage: advise query <query-id> | advise model <dbt-node-id> [--limit N] [--thresholds name=value,...]".into(),
+                );
+            }
+        };
+        Ok((subject, thresholds))
     }
 
     fn snapshot_command(&self) -> Result<crate::snapshot_cli::Command, String> {
@@ -1584,6 +1633,40 @@ mod tests {
             vec!["workers", "--status", "failed"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn advise_arguments_are_read_only_and_bounded() {
+        let id = "7b4f2f97-6ea7-4b01-886d-2b26eac08bb9";
+        assert!(parse(&["advise", "query", id]).is_ok());
+        assert!(parse(&["advise", "model", "model.retail.orders", "--limit", "100"]).is_ok());
+        assert!(
+            parse(&[
+                "advise",
+                "query",
+                id,
+                "--thresholds",
+                "cpu_share=0.9",
+                "--format",
+                "json"
+            ])
+            .is_ok()
+        );
+        for args in [
+            vec!["advise"],
+            vec!["advise", "query", "not-a-uuid"],
+            vec!["advise", "query", id, "--limit", "101"],
+            vec!["advise", "query", id, "--thresholds", "cpu_share=3"],
+            vec!["advise", "query", id, "--format", "csv"],
+            vec!["advise", "query", id, "--pool", "small"],
+            vec!["advise", "pool", "small"],
+            vec!["sql", "SELECT 1", "--thresholds", "cpu_share=0.5"],
+        ] {
+            assert!(
+                parse(&args).is_err(),
+                "accepted invalid advise arguments {args:?}"
+            );
         }
     }
 

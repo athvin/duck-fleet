@@ -27,6 +27,8 @@ pub(crate) struct Filter {
     pub model_id: Option<String>,
     pub invocation_id: Option<String>,
     pub model_run_id: Option<String>,
+    /// Repeat runs of one normalized statement, for evidence-based advice.
+    pub fingerprint: Option<String>,
 }
 impl Default for Filter {
     fn default() -> Self {
@@ -39,6 +41,7 @@ impl Default for Filter {
             model_id: None,
             invocation_id: None,
             model_run_id: None,
+            fingerprint: None,
         }
     }
 }
@@ -76,6 +79,16 @@ impl Filter {
         }) {
             return Err(ApiError::bad(
                 "worker_id must be 1-63 characters of letters, digits, dashes or underscores",
+            ));
+        }
+        if self.fingerprint.as_deref().is_some_and(|f| {
+            f.len() != 64
+                || !f
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(ApiError::bad(
+                "fingerprint must be 64 lowercase hex characters",
             ));
         }
         if [&self.model_id, &self.invocation_id, &self.model_run_id]
@@ -176,7 +189,10 @@ pub(crate) fn list_in(
 ) -> Result<Value, ApiError> {
     filter.validate()?;
     let plan = metadata::relation_plan(access, Relation::History)?;
-    if filter.model_id.is_some() || filter.invocation_id.is_some() || filter.model_run_id.is_some()
+    if filter.model_id.is_some()
+        || filter.invocation_id.is_some()
+        || filter.model_run_id.is_some()
+        || filter.fingerprint.is_some()
     {
         plan.sensitive_filter()?;
     }
@@ -191,7 +207,8 @@ pub(crate) fn list_in(
         AND ($9::text IS NULL OR h.context::jsonb #>> '{{dbt,node_id}}'=$9)
         AND ($10::text IS NULL OR h.context::jsonb #>> '{{dbt,invocation_id}}'=$10)
         AND ($11::text IS NULL OR h.context::jsonb ->> 'model_run_id'=$11)
-        AND ($12::text IS NULL OR h.failure_kind=$12) ORDER BY h.history_id DESC LIMIT $13",
+        AND ($12::text IS NULL OR h.failure_kind=$12)
+        AND ($14::text IS NULL OR d.query_fingerprint=$14) ORDER BY h.history_id DESC LIMIT $13",
                 columns(&policy)
             ),
             &[
@@ -208,6 +225,7 @@ pub(crate) fn list_in(
                 &filter.model_run_id,
                 &filter.failure_kind,
                 &(filter.limit + 1),
+                &filter.fingerprint,
             ],
         )
         .map_err(|_| ApiError::internal())?;
@@ -300,6 +318,8 @@ mod tests {
             json!({"worker_id":"has spaces"}),
             json!({"worker_id":"a'b"}),
             json!({"model_id":""}),
+            json!({"fingerprint":"ABC"}),
+            json!({"fingerprint":"g".repeat(64)}),
             json!({"failure_kind":"made_up"}),
             // Rejection kinds never reach a history record, so they cannot be filtered.
             json!({"failure_kind":"capacity"}),

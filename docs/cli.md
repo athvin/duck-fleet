@@ -215,6 +215,43 @@ duckfleet sql "SELECT max(snapshot_id) AS id FROM ducklake_snapshots(current_cat
 duckfleet snapshot preview raw.events --at <id>
 ```
 
+## Compute advice from observed evidence
+
+`duckfleet advise` turns retained history and profile metrics into an advisory sizing recommendation. It only makes authorized metadata reads (`GET /v1/queries/<id>` and `GET /v1/queries`). It opens no session, creates no pod, and changes no allocation, pool, grant, or dbt metadata. It keeps working while execution workers are stopped, as long as the evidence is retained.
+
+```sh
+duckfleet query <query-id>                                  # history -> one record
+duckfleet profile <query-id> --metrics                      # profile -> engine evidence
+duckfleet advise query <query-id>                           # advice from this query and repeat runs of it
+duckfleet advise model model.retail.fct_orders --limit 50   # aggregate over a dbt model's recent runs
+duckfleet advise query <query-id> --thresholds queue_share=0.3,min_samples=5 --format json
+duckfleet sql --memory 2Gi --file model.sql                 # the explicit rerun the advice suggests
+```
+
+`advise query` uses the named query plus up to `--limit` (default 20, max 100) earlier successful runs with the same query fingerprint. Fingerprint matching needs SQL visibility. `advise model` uses recent successful runs whose dbt `node_id` matches. Samples are grouped by resolved allocation (mode, pool, CPU, memory, disk), and each group is assessed separately, so evidence from different compute is never blended. Every group reports its source query IDs, sample count, median phase times, evidence, a recommendation, the suggested next experiment, and its tradeoff.
+
+The phases are assessed separately:
+
+| Phase | Source | Notes |
+|---|---|---|
+| queue | `queued_at` → `selected_at` | Waiting for the worker's single execution slot. Time spent opening an interactive session before the request is accepted is not in history. |
+| preparation | `selected_at` → `engine_started_at` | Includes isolated pod startup for isolated compute |
+| engine | `engine_started_at` → `finished_at` | DuckDB execution |
+| delivery | — | Not measured in history, reported as unknown |
+
+Recommendations, checked in this order:
+
+1. `investigate_queueing`: queue wait is at least `queue_share` (0.5) of the observed time. Larger resources would not help, so look at pool capacity and concurrent work.
+2. `isolated_startup_dominated`: isolated preparation is at least `startup_share` (0.5) of the time. Startup is reported separately from SQL execution.
+3. `insufficient_evidence`: no captured, visible profile (sampled, expired, withheld from a metadata-only caller, or a failed run).
+4. `try_more_memory`: the engine spilled, or its peak buffer reached `memory_share` (0.8) of the DuckDB memory limit. The suggestion doubles memory.
+5. `try_more_cpu`: engine CPU time per allocated thread-second reached `cpu_share` (0.8) without memory pressure. The suggestion doubles CPU.
+6. `keep_current_allocation`: no threshold crossed.
+
+Confidence is `supported`, `qualified`, or `none`. A recommendation is `qualified` when there are fewer than `min_samples` (3) samples, when engine time varies with a coefficient of variation above `max_variation` (0.5), when history mixes allocations, or when memory evidence is not visible. All six thresholds can be changed with `--thresholds name=value,...`.
+
+The evidence is DuckDB engine metrics: peak buffer memory, temp-directory size, bytes spilled, and CPU time. They are not container RSS or provider cost, and the advisor never estimates cost or promises a speedup on other hardware. A metadata-only caller, such as the `operator` role, gets timing-based advice. It never sees SQL text or profile content, and without profile evidence a resource recommendation is never `supported`. The manual sizing contract is unchanged: you apply any change yourself by rerunning with explicit `--cpu`, `--memory`, `--disk`, `--mode`, or `--pool`, or through `meta.platform` in dbt.
+
 ## SQL files and standard input
 
 `duckfleet sql --file <path>` and piped `duckfleet sql` execute all statements on one session. A final semicolon is optional for file/stdin input; input is UTF-8 and bounded to one MiB. Use `--file -` to name stdin explicitly.

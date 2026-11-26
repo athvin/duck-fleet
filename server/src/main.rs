@@ -1,4 +1,5 @@
 //! Local, single-tenant DuckFleet SQL service. All DuckDB work stays on one worker thread.
+mod advise_cli;
 mod artifacts;
 #[allow(dead_code)]
 mod audit;
