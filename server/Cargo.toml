@@ -11,6 +11,8 @@ anyhow = "1.0.104"
 arrow-array = "60.0.0"
 arrow-cast = "60.0.0"
 arrow-ipc = "60.0.0"
+arrow-csv = "60.0.0"
+arrow-json = "60.0.0"
 arrow-schema = { version = "60.0.0", features = ["serde"] }
 axum = "0.8"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
@@ -24,6 +26,7 @@ postgres = "0.19.14"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
 # Already in the tree via rustls; used directly for credential hashing, so issued
 # tokens are stored and compared only as digests.
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
 ring = "0.17"
 # The provider is named explicitly rather than taken by default: the default is
 # aws-lc, which needs cmake and a C toolchain, while ring is already in this tree

@@ -103,6 +103,33 @@ pub async fn run(args: Vec<String>) -> i32 {
 
     let result = match parsed.command.as_str() {
         "sql" => run_sql(&url, &token, &parsed).await,
+        "export" => {
+            let output = parsed.value("output").expect("validated output").to_owned();
+            let source = match parsed.value("job") {
+                Some(job) => crate::export_cli::Source::Job(
+                    uuid::Uuid::parse_str(job).expect("validated job ID"),
+                ),
+                None => crate::export_cli::Source::Sql(Box::new(
+                    parsed
+                        .job_request_for(parsed.positionals[0].clone(), uuid::Uuid::new_v4())
+                        .expect("validated export request"),
+                )),
+            };
+            crate::export_cli::run(
+                &url,
+                &token,
+                crate::export_cli::Options {
+                    source,
+                    format: crate::export_cli::infer_format(&output, parsed.value("format"))
+                        .expect("validated export format"),
+                    output,
+                    force: parsed.flags.iter().any(|flag| flag == "force"),
+                    resume: parsed.flags.iter().any(|flag| flag == "resume"),
+                    delimiter: parsed.value("delimiter").unwrap_or(",").as_bytes()[0],
+                },
+            )
+            .await
+        }
         "import" => {
             crate::import_cli::run(
                 &url,
@@ -230,7 +257,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|import|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|import|export|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -318,26 +345,25 @@ async fn run_job(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteEr
                 }
             }
         }
-        "result" => {
-            download_job_result(
-                &client,
-                id,
-                parsed.value("output").expect("validated output"),
-                parsed.flags.iter().any(|f| f == "resume"),
-            )
-            .await?
-        }
+        "result" => download_job_result(
+            &client,
+            id,
+            parsed.value("output").expect("validated output"),
+            parsed.flags.iter().any(|f| f == "resume"),
+        )
+        .await
+        .map(|_| ())?,
         _ => unreachable!("validated job command"),
     }
     Ok(())
 }
 
-async fn download_job_result(
+pub(crate) async fn download_job_result(
     client: &Client,
     id: uuid::Uuid,
     directory: &str,
     resume: bool,
-) -> Result<(), RemoteError> {
+) -> Result<crate::artifacts::Manifest, RemoteError> {
     use tokio::io::AsyncWriteExt;
     let value = client.job_result(id).await?;
     if value["complete"] != true {
@@ -468,7 +494,7 @@ async fn download_job_result(
         manifest.chunks.len(),
         directory
     );
-    Ok(())
+    Ok(manifest)
 }
 
 async fn verify_local_chunk(
@@ -932,7 +958,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 30] = [
+    const VALUE_FLAGS: [&'static str; 31] = [
         "url",
         "token",
         "cpu",
@@ -963,6 +989,7 @@ impl Parsed {
         "status",
         "table",
         "delimiter",
+        "job",
     ];
     const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
@@ -1025,7 +1052,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <init|config|version|dev|status|stop|reset|shell|sql|import|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <init|config|version|dev|status|stop|reset|shell|sql|import|export|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -1068,8 +1095,10 @@ impl Parsed {
         if parsed.flags.iter().any(|flag| flag == "continue-on-error") && parsed.command != "sql" {
             return Err("--continue-on-error applies only to sql".into());
         }
-        if parsed.flags.iter().any(|flag| flag == "force") && parsed.command != "init" {
-            return Err("--force applies only to init".into());
+        if parsed.flags.iter().any(|flag| flag == "force")
+            && !matches!(parsed.command.as_str(), "init" | "export")
+        {
+            return Err("--force applies only to init and export".into());
         }
         match parsed.command.as_str() {
             "schemas" if parsed.positionals.is_empty() => {}
@@ -1126,8 +1155,51 @@ impl Parsed {
         if parsed.value("table").is_some() && parsed.command != "import" {
             return Err("--table applies only to import".into());
         }
-        if parsed.value("delimiter").is_some() && parsed.command != "import" {
-            return Err("--delimiter applies only to import".into());
+        if parsed.value("delimiter").is_some()
+            && !matches!(parsed.command.as_str(), "import" | "export")
+        {
+            return Err("--delimiter applies only to import and export".into());
+        }
+        if parsed.command == "export" {
+            let output = parsed
+                .value("output")
+                .ok_or("export needs --output <file>")?;
+            let format = crate::export_cli::infer_format(output, parsed.value("format"))?;
+            if let Some(delimiter) = parsed.value("delimiter")
+                && (format != crate::export_cli::Format::Csv
+                    || delimiter.len() != 1
+                    || matches!(delimiter.as_bytes()[0], b'\r' | b'\n' | b'"' | 0)
+                    || !delimiter.is_ascii())
+            {
+                return Err(
+                    "--delimiter needs one ASCII character and applies only to CSV exports".into(),
+                );
+            }
+            match (parsed.value("job"), parsed.positionals.as_slice()) {
+                (Some(job), []) => {
+                    uuid::Uuid::parse_str(job).map_err(|_| "--job needs a UUID".to_owned())?;
+                    if !parsed.params.is_empty() || parsed.compute()?.is_some() {
+                        return Err("export --job reads a finished result and takes no SQL parameters or compute".into());
+                    }
+                    for flag in ["timeout", "queue-timeout"] {
+                        if parsed.value(flag).is_some() {
+                            return Err(format!("--{flag} does not apply to export --job"));
+                        }
+                    }
+                }
+                (None, [sql]) => {
+                    if parsed.flags.iter().any(|flag| flag == "resume") {
+                        return Err(
+                            "--resume needs --job <request-id>; SQL is never resubmitted to resume"
+                                .into(),
+                        );
+                    }
+                    parsed.job_request_for(sql.clone(), uuid::Uuid::nil())?;
+                }
+                _ => return Err("export needs one SQL argument or --job <request-id>".into()),
+            }
+        } else if parsed.value("job").is_some() {
+            return Err("--job applies only to export".into());
         }
         if parsed.command == "history" && !parsed.positionals.is_empty() {
             return Err("history takes no positional arguments".into());
@@ -1178,13 +1250,16 @@ impl Parsed {
             }
         }
         if !matches!(parsed.command.as_str(), "sql" | "shell")
+            && !(parsed.command == "export" && parsed.value("job").is_none())
             && !parsed.is_job_submit()
             && parsed
                 .values
                 .iter()
                 .any(|(name, _)| Self::COMPUTE_FLAGS.contains(&name.as_str()))
         {
-            return Err("compute selection flags apply only to sql or job submit".into());
+            return Err(
+                "compute selection flags apply only to sql, job submit, or SQL export".into(),
+            );
         }
         if parsed.command == "system" {
             let valid = match parsed.positionals.first().map(String::as_str) {
@@ -1208,6 +1283,7 @@ impl Parsed {
             }
         }
         if !matches!(parsed.command.as_str(), "sql" | "shell")
+            && !(parsed.command == "export" && parsed.value("job").is_none())
             && !parsed.is_job_submit()
             && parsed.value("queue-timeout").is_some()
         {
@@ -1269,18 +1345,23 @@ impl Parsed {
             "result-max-rows",
             "sql",
         ] {
-            if parsed.value(flag).is_some() && !parsed.is_job_submit() {
+            if parsed.value(flag).is_some()
+                && !parsed.is_job_submit()
+                && !(parsed.command == "export" && flag == "timeout")
+            {
                 return Err(format!("--{flag} applies only to job submit"));
             }
         }
         if parsed.value("output").is_some()
+            && parsed.command != "export"
             && !(parsed.command == "job"
                 && parsed.positionals.first().is_some_and(|s| s == "result"))
         {
-            return Err("--output applies only to job result".into());
+            return Err("--output applies only to job result and export".into());
         }
         for (flag, subcommand) in [("wait", "status"), ("resume", "result")] {
             if parsed.flags.iter().any(|f| f == flag)
+                && !(flag == "resume" && parsed.command == "export")
                 && !(parsed.command == "job"
                     && parsed.positionals.first().is_some_and(|s| s == subcommand))
             {
@@ -1320,6 +1401,15 @@ impl Parsed {
                 );
             }
         };
+        self.job_request_for(sql, generated_id)
+    }
+
+    /// Export submits the same durable job contract as `job submit`.
+    fn job_request_for(
+        &self,
+        sql: String,
+        generated_id: uuid::Uuid,
+    ) -> Result<crate::job_policy::JobRequest, String> {
         let id = |name: &str| {
             self.value(name)
                 .map(|v| uuid::Uuid::parse_str(v).map_err(|_| format!("--{name} needs a UUID")))
@@ -1333,8 +1423,10 @@ impl Parsed {
                 })
                 .transpose()
         };
+        // Export's --format names the local file format, not the job result.
         let format = self
             .value("format")
+            .filter(|_| self.command != "export")
             .map(|s| {
                 if s == "arrow_ipc_chunks" {
                     Ok(crate::job_policy::ResultFormat::ArrowIpcChunks)
@@ -1582,6 +1674,80 @@ mod tests {
             vec!["workers", "--status", "failed"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn export_arguments_never_resubmit_sql_and_validate_formats_before_running() {
+        let id = "7b4f2f97-6ea7-4b01-886d-2b26eac08bb9";
+        assert!(parse(&["export", "SELECT 1", "--output", "out.parquet"]).is_ok());
+        assert!(
+            parse(&[
+                "export", "SELECT 1", "--output", "o.bin", "--format", "json"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "export",
+                "SELECT 1",
+                "--output",
+                "o.csv",
+                "--delimiter",
+                "|",
+                "--force"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["export", "SELECT 1", "--output", "o.csv", "--pool", "small"]).is_ok());
+        assert!(parse(&["export", "--job", id, "--output", "o.csv", "--resume"]).is_ok());
+        let request = parse(&["export", "SELECT 1", "--output", "o.csv", "--format", "csv"])
+            .unwrap()
+            .job_request_for("SELECT 1".into(), uuid::Uuid::nil())
+            .unwrap();
+        assert!(
+            request.result.is_none(),
+            "export --format is not a job result format"
+        );
+        for args in [
+            vec!["export", "SELECT 1"],
+            vec!["export", "SELECT 1", "--output", "o.xlsx"],
+            vec!["export", "SELECT 1", "--output", "o.csv", "--resume"],
+            vec!["export", "--job", "nope", "--output", "o.csv"],
+            vec!["export", "SELECT 1", "--job", id, "--output", "o.csv"],
+            vec![
+                "export", "--job", id, "--output", "o.csv", "--pool", "small",
+            ],
+            vec![
+                "export",
+                "SELECT 1",
+                "--output",
+                "o.json",
+                "--delimiter",
+                "|",
+            ],
+            vec![
+                "export",
+                "SELECT 1",
+                "--output",
+                "o.csv",
+                "--delimiter",
+                "||",
+            ],
+            vec![
+                "export",
+                "SELECT 1",
+                "--output",
+                "o.csv",
+                "--request-id",
+                id,
+            ],
+            vec!["sql", "SELECT 1", "--job", id],
+        ] {
+            assert!(
+                parse(&args).is_err(),
+                "accepted invalid export arguments {args:?}"
+            );
         }
     }
 

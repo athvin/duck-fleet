@@ -297,6 +297,15 @@ duckfleet import ./legacy.data --format csv --delimiter '|' --no-header --table 
 
 Exactly one mode is required. Existing tables are never overwritten; schema/coercion and parse failures roll back the entire transaction. See the [CLI import guide](docs/cli.md#import-local-csv-and-parquet-files) for type inference, file limits, cancellation, and staging cleanup.
 
+Query results and finished durable jobs export to local CSV, JSON, Arrow, or Parquet through the durable-job path. Chunks are verified, the publish is atomic, existing files are never clobbered without `--force`, and interrupted downloads resume:
+
+```sh
+duckfleet export 'select * from raw.events' --output events.parquet
+duckfleet export --job <request-id> --output result.csv --resume
+```
+
+See the [CLI export guide](docs/cli.md#export-queries-and-durable-jobs).
+
 History defaults to a SQL-free table with existing filters, cursor pagination, and bounded watch. Profiles expose readable operator and engine-metric evidence without confusing it for container memory or cost:
 
 ```sh

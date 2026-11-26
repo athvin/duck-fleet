@@ -1,4 +1,4 @@
-.PHONY: up test check test-cli test-dev test-shell test-catalog test-history test-import down
+.PHONY: up test check test-cli test-dev test-shell test-catalog test-history test-import test-export down
 up:
 	docker compose build
 	docker compose up -d --wait server
@@ -20,6 +20,9 @@ test-history:
 
 test-import:
 	bash scripts/test-import.sh
+
+test-export:
+	bash scripts/test-export.sh
 
 .PHONY: check-infra
 check-infra:

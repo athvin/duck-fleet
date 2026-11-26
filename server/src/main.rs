@@ -16,6 +16,7 @@ mod db_roles;
 mod dev;
 mod engine_security;
 mod engine_stream;
+mod export_cli;
 mod failure;
 mod gateway;
 mod harness;

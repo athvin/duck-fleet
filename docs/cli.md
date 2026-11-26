@@ -157,6 +157,32 @@ The CLI hashes and streams one regular local file, up to 1 GiB, through an authe
 
 Transfer and execution progress are reported separately. After a verified transfer, create/append runs in one ordinary authorized session as an atomic transaction with optional schema creation. Parse errors, schema mismatches, constraints, cancellation, and commit failures leave no partial destination rows. A commit conflict or interrupted execution is never replayed automatically. Staged bytes are deleted after the attempt; failed and abandoned uploads are reclaimed by the existing fenced maintenance pass after 15 minutes. Import SQL is retained in ordinary query history and usage metering under the caller's principal, with the import request ID in its context.
 
+## Export queries and durable jobs
+
+`duckfleet export` writes one local CSV, JSON, Arrow, or Parquet file from a query or a finished durable job:
+
+```sh
+duckfleet export 'select * from raw.events' --output events.parquet
+duckfleet export 'select id, name from raw.users' --output users.psv --format csv --delimiter '|'
+duckfleet export --job 7b4f2f97-6ea7-4b01-886d-2b26eac08bb9 --output result.json
+duckfleet export --job 7b4f2f97-6ea7-4b01-886d-2b26eac08bb9 --output result.json --resume
+```
+
+The format comes from the extension (`.csv`, `.json`, `.arrow`/`.arrows`/`.ipc`/`.feather`, `.parquet`), or from an explicit `--format`. SQL exports always run as durable jobs, so a result above the interactive 100,000-row / 16 MiB caps exports without changing those caps. Durable-job limits, result retention, and `result.read` authorization apply to every manifest and chunk request. `--param` and the compute flags (`--cpu`, `--memory`, `--disk`, `--mode`, `--pool`, `--timeout`, `--queue-timeout`) behave as they do for `job submit`.
+
+The CLI prints the job's `request_id` before submitting, and reports SQL completion separately from export completion. Verified Arrow chunks download into a sibling `<output>.duckfleet-partial/` directory. Each chunk is length-, SHA-256-, schema-, and row-checked against the manifest, then converted one chunk at a time, so peak memory is bounded by a chunk plus, for Parquet, one row group. The final file is published only after every chunk verifies. Without `--force` the publish is a no-clobber hard link, and an existing destination is refused before any SQL is submitted. With `--force`, the named file is replaced by a rename only after the complete file exists. If the SQL succeeded but the download or conversion failed, the command exits non-zero and keeps the request ID. Rerun with `--job <id> --resume` to reuse the chunks that already verified. Resume compares the stored manifest with the server's current result generation and refuses any mismatch. The SQL is never resubmitted, and a failed delivery never makes a write safe to retry. Ctrl-C while the job runs requests job cancellation and publishes nothing.
+
+Format behavior:
+
+| Format | Types | Nulls | Empty result |
+|---|---|---|---|
+| Parquet | Arrow schema preserved, including decimals, timestamps, lists, and structs; Snappy-compressed | native | valid file with schema |
+| Arrow | Arrow IPC file (`ARROW1`) with the manifest schema | native | valid file with schema |
+| JSON | one JSON array of objects. Nested values stay nested, decimals are JSON numbers, and timestamps are ISO-8601 strings | key omitted | `[]` |
+| CSV | header row, `,` unless `--delimiter`, RFC 4180 quoting, ISO-8601 timestamps | empty field | header only |
+
+CSV refuses nested (list/struct/map) and dictionary columns before downloading. Cast them to `VARCHAR` in SQL, or choose another format.
+
 ## SQL files and standard input
 
 `duckfleet sql --file <path>` and piped `duckfleet sql` execute all statements on one session. A final semicolon is optional for file/stdin input; input is UTF-8 and bounded to one MiB. Use `--file -` to name stdin explicitly.
