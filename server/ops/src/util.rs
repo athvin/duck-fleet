@@ -67,10 +67,25 @@ pub fn yaml_documents_from_reader(reader: impl std::io::Read) -> Result<Vec<Valu
 }
 
 pub fn yaml_string(documents: &[Value]) -> Result<String> {
+    let value_line = regex::Regex::new(r"^(\s*(?:-\s+)?value:\s+)(.*)$")?;
     let mut output = String::new();
     for document in documents {
         output.push_str("---\n");
-        output.push_str(&serde_yaml::to_string(document)?);
+        let yaml = serde_yaml::to_string(document)?;
+        for line in yaml.lines() {
+            if let Some(captures) = value_line.captures(line) {
+                let value = captures[2].trim();
+                if !value.is_empty() && !value.starts_with(['\'', '"', '{', '[', '|', '>']) {
+                    output.push_str(&captures[1]);
+                    output.push('\'');
+                    output.push_str(&value.replace('\'', "''"));
+                    output.push_str("'\n");
+                    continue;
+                }
+            }
+            output.push_str(line);
+            output.push('\n');
+        }
     }
     Ok(output)
 }
@@ -267,4 +282,32 @@ pub fn string_set(value: Option<&Value>) -> BTreeSet<String> {
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_values_cannot_become_yaml_booleans_or_numbers() {
+        let document = serde_json::json!({
+            "spec": {"containers": [{"env": [
+                {"name": "ADOPT", "value": "no"},
+                {"name": "ENABLED", "value": "true"},
+                {"name": "COUNT", "value": "64"},
+                {"name": "ALREADY_QUOTED", "value": "off"},
+            ]}]}
+        });
+        let output = yaml_string(&[document]).unwrap();
+        assert!(output.contains("value: 'no'"));
+        assert!(output.contains("value: 'true'"));
+        assert!(output.contains("value: '64'"));
+        assert!(output.contains("value: 'off'"));
+        assert!(!output.contains("value: no\n"));
+        let reparsed = yaml_documents(&output).unwrap();
+        assert_eq!(
+            reparsed[0]["spec"]["containers"][0]["env"][0]["value"],
+            "no"
+        );
+    }
 }
