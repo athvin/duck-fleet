@@ -1,4 +1,4 @@
-.PHONY: up test check down
+.PHONY: up test check test-cli down
 up:
 	docker compose build
 	docker compose up -d --wait server
@@ -7,6 +7,8 @@ test:
 check:
 	docker build --target check -f docker/server.Dockerfile .
 	docker build --target aws-credentials-check -f docker/server.Dockerfile .
+test-cli:
+	bash scripts/test-native-cli.sh
 
 .PHONY: check-infra
 check-infra:

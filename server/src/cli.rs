@@ -23,16 +23,52 @@ pub async fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
-    let url = parsed
-        .value("url")
-        .map(str::to_owned)
-        .or_else(|| std::env::var("DUCKFLEET_URL").ok());
-    let token = parsed
-        .value("token")
-        .map(str::to_owned)
-        .or_else(|| std::env::var("DUCKFLEET_TOKEN").ok());
-    let (Some(url), Some(token)) = (url, token) else {
-        eprintln!("set --url/--token or DUCKFLEET_URL/DUCKFLEET_TOKEN");
+    if parsed.command == "version" {
+        println!(
+            "duckfleet {} ({}-{})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        if let Some(release) = option_env!("DUCKFLEET_RELEASE") {
+            println!("release: {release}");
+        }
+        return 0;
+    }
+    if parsed.command == "init" {
+        match crate::cli_config::init(
+            parsed.value("url"),
+            parsed.value("token"),
+            parsed.flags.iter().any(|flag| flag == "force"),
+        ) {
+            Ok(message) => {
+                println!("{message}");
+                return 0;
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                return 2;
+            }
+        }
+    }
+    let resolved = match crate::cli_config::resolve(parsed.value("url"), parsed.value("token")) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            eprintln!("{message}");
+            return 2;
+        }
+    };
+    if parsed.command == "config" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resolved.redacted()).unwrap_or_default()
+        );
+        return 0;
+    }
+    let (Some(url), Some(token)) = (resolved.url, resolved.token) else {
+        eprintln!(
+            "missing DuckFleet URL or token; run duckfleet init, or set --url/--token or DUCKFLEET_URL/DUCKFLEET_TOKEN"
+        );
         return 2;
     };
 
@@ -102,7 +138,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (init|config|version|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -121,6 +157,11 @@ pub async fn run(args: Vec<String>) -> i32 {
             let kind = error.failure_kind.as_deref().unwrap_or("error");
             eprintln!("{kind} (HTTP {status}): {error}");
             eprintln!("retry_safe: {}", error.retry_safe);
+            if error.failure_kind.as_deref() == Some("transport_failure") {
+                eprintln!(
+                    "next: run duckfleet config show and confirm the configured server is running"
+                );
+            }
             if let Some(id) = &error.request_id {
                 eprintln!(
                     "request_id: {id}; acceptance: {}",
@@ -747,7 +788,7 @@ impl Parsed {
         while index < args.len() {
             let arg = &args[index];
             if let Some(name) = arg.strip_prefix("--") {
-                if ["placement", "wait", "resume"].contains(&name) {
+                if ["placement", "wait", "resume", "force"].contains(&name) {
                     flags.push(name.to_owned());
                     index += 1;
                 } else if name == "param"
@@ -779,13 +820,25 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <init|config|version|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
             params,
             flags,
         };
+        if parsed.command == "init" && !parsed.positionals.is_empty() {
+            return Err("init takes no positional arguments".into());
+        }
+        if parsed.command == "config" && parsed.positionals != ["show"] {
+            return Err("config needs the show subcommand".into());
+        }
+        if parsed.command == "version" && !parsed.positionals.is_empty() {
+            return Err("version takes no positional arguments".into());
+        }
+        if parsed.flags.iter().any(|flag| flag == "force") && parsed.command != "init" {
+            return Err("--force applies only to init".into());
+        }
         if parsed.command != "sql"
             && !parsed.is_job_submit()
             && parsed
@@ -1111,6 +1164,23 @@ mod tests {
         }
         assert!(parse(&["request", "id", "--queue-timeout", "5"]).is_err());
         assert_eq!(parse(&["cancel", "id"]).unwrap().command, "cancel");
+    }
+
+    #[test]
+    fn project_commands_validate_before_resolving_configuration() {
+        assert!(parse(&["init"]).is_ok());
+        assert!(parse(&["init", "--force", "--url", "http://localhost:18080"]).is_ok());
+        assert!(parse(&["config", "show"]).is_ok());
+        assert!(parse(&["version"]).is_ok());
+        for args in [
+            vec!["init", "unexpected"],
+            vec!["config"],
+            vec!["config", "edit"],
+            vec!["version", "unexpected"],
+            vec!["sql", "SELECT 1", "--force"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
     }
 
     #[test]

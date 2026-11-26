@@ -20,6 +20,12 @@ jobs:
         run: make check
       - name: Real dbt integration and restart checks
         run: make test
+      - name: Native CLI project and real Compose smoke
+        run: |
+          cd server
+          cargo build --locked -p duckfleet-cli
+          cd ..
+          make test-cli
       - name: Save test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -731,7 +731,7 @@ mod tests {
             .submit_job(&request)
             .await
             .unwrap_err();
-        assert_eq!(error.status, Some(307));
+        assert_eq!(error.status, Some(307), "{error:?}");
         assert_eq!(error.request_id.as_deref(), Some(id.to_string().as_str()));
         assert_eq!(error.acceptance.as_deref(), Some("unknown"));
         assert!(!error.retry_safe);
