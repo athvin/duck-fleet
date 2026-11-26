@@ -1,0 +1,182 @@
+[
+  {
+    "workflow": "W1 adbc_driver_manager dbapi + pyarrow",
+    "capability": "extended bind: typed parameters and typed Arrow result",
+    "outcome": "works",
+    "detail": "{'answer': 'int32', 'name': 'string', 'price': 'decimal128(10, 2)', 'at': 'timestamp[us]'}"
+  },
+  {
+    "workflow": "W1 adbc_driver_manager dbapi + pyarrow",
+    "capability": "null and nested types",
+    "outcome": "works",
+    "detail": "{'n': 'int32', 'l': 'list<l: int32>', 's': 'struct<a: int32, b: string>', 'b': 'binary'}"
+  },
+  {
+    "workflow": "W1 adbc_driver_manager dbapi + pyarrow",
+    "capability": "large results (90k rows, interactive cap is 100k rows / 16 MiB)",
+    "outcome": "works",
+    "detail": "90000 rows within the interactive cap"
+  },
+  {
+    "workflow": "W1 adbc_driver_manager dbapi + pyarrow",
+    "capability": "results over the interactive cap (durable-job path not wired into ADBC)",
+    "outcome": "fails",
+    "detail": "ProgrammingError: INVALID_ARGUMENT: result exceeds local response limit (100000 rows / 16 MiB) (failure_kind: sql_error, retry_safe: false, request_id: 7428517a-52bc-4bfd-8a0f-ecae131837d3). SQLSTATE: 42601"
+  },
+  {
+    "workflow": "W1 adbc_driver_manager dbapi + pyarrow",
+    "capability": "transaction state",
+    "outcome": "works",
+    "detail": "commit/rollback through ADBC autocommit=false; temp table survived, rolled-back insert did not"
+  },
+  {
+    "workflow": "W1 adbc_driver_manager dbapi + pyarrow",
+    "capability": "native cancellation (AdbcStatementCancel -> session cancel)",
+    "outcome": "works",
+    "detail": "canceled after 1.6s: CANCELLED: INTERRUPT Error: Interrupted!: Error code 1: Unknown error code (failure_kind: canceled, retry_safe: false, request_id: 5f30d416-5e81-40d2-b678-acce5"
+  },
+  {
+    "workflow": "W1 adbc_driver_manager dbapi + pyarrow",
+    "capability": "classified failure: lost commit race",
+    "outcome": "works",
+    "detail": "sqlstate=40001: INVALID_STATE: TransactionContext Error: Failed to commit: Failed to commit DuckLake transaction.\nTransaction conflict - attempting to delete from file with ind"
+  },
+  {
+    "workflow": "W1 adbc_driver_manager dbapi + pyarrow",
+    "capability": "unsupported parameter type is explicit",
+    "outcome": "works",
+    "detail": "refused before sending: NOT_IMPLEMENTED: parameter type Binary cannot be bound exactly; bind it as text and cast in SQL"
+  },
+  {
+    "workflow": "W1 adbc_driver_manager dbapi + pyarrow",
+    "capability": "catalog metadata (AdbcConnectionGetObjects)",
+    "outcome": "fails",
+    "detail": "NotSupportedError: NOT_IMPLEMENTED: get_objects is not implemented by the DuckFleet ADBC prototype"
+  },
+  {
+    "workflow": "W2 pandas.read_sql over the ADBC connection",
+    "capability": "parameterized read_sql into a DataFrame",
+    "outcome": "fails",
+    "detail": "NotImplementedError: 'params' is not implemented for ADBC drivers"
+  },
+  {
+    "workflow": "W2 pandas.read_sql over the ADBC connection",
+    "capability": "pyarrow-backed dtypes keep integer nulls",
+    "outcome": "works",
+    "detail": "{'a': 'int64[pyarrow]', 'b': 'int32[pyarrow]'}"
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "connect and simple query",
+    "outcome": "works",
+    "detail": "(1,)"
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "extended bind (server-side parameters, psycopg default)",
+    "outcome": "fails",
+    "detail": "FeatureNotSupported: only unnamed parameterless prepared statements are supported"
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "client-side binding (ClientCursor, simple protocol)",
+    "outcome": "works",
+    "detail": "(42, \"o'k\")"
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "COPY TO STDOUT",
+    "outcome": "fails",
+    "detail": "ProgrammingError: copy() should be used only with COPY ... TO STDOUT or COPY ... FROM STDIN statements, got TUPLES_OK"
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "native cancellation (CancelRequest)",
+    "outcome": "fails",
+    "detail": "AssertionError: CancelRequest had no effect; the statement ran until its deadline after 63s (QueryCanceled)"
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "TLS (sslmode=require)",
+    "outcome": "fails",
+    "detail": "OperationalError: connection failed: connection to server at \"127.0.0.1\", port 15432 failed: server does not support SSL, but SSL was required"
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "pool selection via startup options",
+    "outcome": "ignored",
+    "detail": "a startup option naming the offline pool connects, but the backend session always uses the default persistent pool (documented: no per-connection pool selection)"
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "transaction state reporting (ReadyForQuery)",
+    "outcome": "fails",
+    "detail": "AssertionError: ReadyForQuery reported IDLE inside a transaction and IDLE after an error; psycopg therefore treats commit() as a no-op"
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "null and nested types",
+    "outcome": "fails",
+    "detail": "OperationalError: consuming input failed: server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request."
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "large results (90k rows)",
+    "outcome": "works",
+    "detail": "90000 rows"
+  },
+  {
+    "workflow": "W4 psycopg 3.3.9",
+    "capability": "classified failure: lost commit race",
+    "outcome": "fails",
+    "detail": "AssertionError: no conflict: with ReadyForQuery always IDLE, psycopg never sent COMMIT"
+  },
+  {
+    "workflow": "W3 psql 17.6",
+    "capability": "simple query",
+    "outcome": "works",
+    "detail": "exit 0 after 6s: simple_ok_42"
+  },
+  {
+    "workflow": "W3 psql 17.6",
+    "capability": "extended bind (\\bind)",
+    "outcome": "fails",
+    "detail": "exit 0 after 0s: ERROR:  named portals, parameters, and non-text results are not supported"
+  },
+  {
+    "workflow": "W3 psql 17.6",
+    "capability": "COPY TO STDOUT (\\copy)",
+    "outcome": "fails",
+    "detail": "no CopyOut reaches the client: the worker executes DuckDB COPY ... TO STDOUT itself, writing the rows to its own stdout (container logs), and returns only a row count. exit 0 after 2s: 1"
+  },
+  {
+    "workflow": "W3 psql 17.6",
+    "capability": "null and nested types",
+    "outcome": "fails",
+    "detail": "exit 2 after 2s: server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request.\nconnection to server was lost"
+  },
+  {
+    "workflow": "W3 psql 17.6",
+    "capability": "large results (90k rows)",
+    "outcome": "works",
+    "detail": "exit 0 after 3s: 0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n61\n62\n63\n64\n65\n66\n67\n68\n69\n70\n71\n72\n73\n74\n75\n76\n77\n78\n79\n80\n81\n82\n83\n84\n85\n86\n87\n88\n89\n90\n91\n92\n93\n94\n95\n96\n97\n98\n99\n100\n101\n10"
+  },
+  {
+    "workflow": "W3 psql 17.6",
+    "capability": "aborted-transaction SQLSTATE (25P02)",
+    "outcome": "fails",
+    "detail": "the engine enforces the aborted transaction, but the error is reported with SQLSTATE 42601 and ReadyForQuery stays I. exit 0 after 3s: ERROR:  Catalog Error: Table with name missing_relation does not exist!\nDid you mean \"pg_constraint\"?\n\nLINE 1: select * from missing_relation;\n                      ^^^^^^^^^^^^^^^^: Error code 1: Unknown error code; request_id=814f6d4a-4ffd-4f50-8beb-389464d7cd4c; status=/v1/requests/814f6d4a-4ffd-"
+  },
+  {
+    "workflow": "W3 psql 17.6",
+    "capability": "native cancellation (Ctrl-C sends CancelRequest)",
+    "outcome": "fails",
+    "detail": "exit 137 after 9s: Cancel request sent"
+  },
+  {
+    "workflow": "W3 psql 17.6",
+    "capability": "TLS (sslmode=require)",
+    "outcome": "fails",
+    "detail": "exit 2 after 1s: psql: error: connection to server at \"server\" (172.18.0.5), port 5432 failed: server does not support SSL, but SSL was required"
+  }
+]
