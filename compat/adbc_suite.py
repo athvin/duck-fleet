@@ -177,12 +177,106 @@ def _():
 
 @check("unimplemented features say NOT_IMPLEMENTED")
 def _():
+    import pyarrow
+
     cur = conn.cursor()
     try:
-        cur.adbc_execute_partitions("SELECT 1")
-        raise AssertionError("partitions accepted")
+        cur.adbc_ingest("adbc_ingest_target", pyarrow.table({"a": [1]}), mode="create")
+        raise AssertionError("bulk ingest accepted")
     except dbapi.NotSupportedError:
         pass
+
+
+LARGE = "SELECT i AS id, repeat('x', 100) AS payload FROM range(1000000) t(i) WHERE i >= ?"
+
+
+@check("partitioned execution streams 1M rows over durable-job chunks with bounded memory")
+def _():
+    import json
+    import resource
+
+    cur = conn.cursor()
+    try:
+        cur.execute(LARGE, (0,))
+        cur.fetch_arrow_table()
+        raise AssertionError("the interactive path accepted an over-cap result")
+    except dbapi.Error as error:
+        assert "local response limit" in str(error), error
+    partitions, schema = cur.adbc_execute_partitions(LARGE, (0,))
+    assert len(partitions) > 1 and schema.names == ["id", "payload"], (len(partitions), schema)
+    for descriptor in partitions:
+        text = descriptor.decode()
+        assert "s3://" not in text and "http" not in text and json.loads(text)["v"] == 1, text
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rows = 0
+    for descriptor in partitions:
+        cur.adbc_read_partition(descriptor)
+        rows += cur.fetch_arrow_table().num_rows
+    grown = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before
+    scale = 1 if sys.platform == "darwin" else 1024
+    assert rows == 1000000, rows
+    assert grown * scale < 256 * 1024 * 1024, f"reading partitions grew RSS by {grown * scale} bytes"
+    globals()["PARTITIONS"] = partitions
+
+
+@check("tampered, foreign, and expired partition descriptors are refused")
+def _():
+    import json
+    import urllib.request
+
+    descriptor = json.loads(PARTITIONS[0])
+    tampered = dict(descriptor, generation="00000000-0000-0000-0000-000000000000")
+    cur = conn.cursor()
+    for bad in (json.dumps(tampered).encode(), b"not a descriptor"):
+        try:
+            cur.adbc_read_partition(bad)
+            cur.fetch_arrow_table()
+            raise AssertionError("bad descriptor accepted")
+        except dbapi.Error:
+            pass
+    request = urllib.request.Request(
+        f"{URL}/v1/credentials",
+        data=json.dumps({"principal": f"adbc-other-{int(time.time())}"}).encode(),
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    issued = json.load(urllib.request.urlopen(request))
+    other = dbapi.connect(driver=DRIVER, entrypoint="AdbcDuckfleetInit", db_kwargs={"uri": URL, "password": issued["token"]})
+    try:
+        other.cursor().adbc_read_partition(PARTITIONS[0])
+        raise AssertionError("another principal read the partition")
+    except dbapi.Error as error:
+        assert "not found" in str(error).lower() or "forbidden" in str(error).lower(), error
+    finally:
+        other.close()
+        urllib.request.urlopen(urllib.request.Request(
+            f"{URL}/v1/credentials/{issued['credential_id']}", headers={"Authorization": f"Bearer {TOKEN}"}, method="DELETE"))
+    import psycopg
+
+    with psycopg.connect(os.environ["PLATFORM_ADMIN_DSN"], autocommit=True) as admin:
+        admin.execute(
+            "update query_jobs set result_expires_at=clock_timestamp()-interval '1 second' where request_id=%s",
+            (descriptor["job"],),
+        )
+    try:
+        cur.adbc_read_partition(PARTITIONS[0])
+        cur.fetch_arrow_table()
+        raise AssertionError("expired partition read")
+    except dbapi.Error:
+        pass
+
+
+@check("cancellation reaches a partitioned execution's durable job")
+def _():
+    cur = conn.cursor()
+    threading.Timer(2.0, cur.adbc_cancel).start()
+    started = time.time()
+    try:
+        cur.adbc_execute_partitions("SELECT sum(sin(range)) FROM range(100000000000)")
+        raise AssertionError("not canceled")
+    except dbapi.Error as error:
+        assert time.time() - started < 30, time.time() - started
+        assert "canceled" in str(error), error
 
 
 @check("pandas via the DB-API cursor")

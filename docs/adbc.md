@@ -43,11 +43,19 @@ Each ADBC connection is one DuckFleet session, so temporary tables persist acros
 ## Behavior
 
 - **Parameters** bind one row of scalars: integers, unsigned integers, floats, strings, booleans, and nulls. Bind decimals, dates, and timestamps as text and cast them in SQL (`?::DECIMAL(10,2)`). Other parameter types, and non-finite floats, are refused before sending.
-- **Results** stream the server's Arrow batches unchanged: decimals, microsecond timestamps, lists, structs, and binary. The interactive cap of 100,000 rows / 16 MiB applies. Larger results belong to durable jobs (#190).
+- **Results** stream the server's Arrow batches unchanged: decimals, microsecond timestamps, lists, structs, and binary. `execute` uses the interactive path, which is capped at 100,000 rows / 16 MiB.
+- **Partitioned execution** handles results over that cap. `adbc_execute_partitions` runs the statement as a durable job, with the connection's compute and bound parameters, and returns one opaque descriptor per verified result chunk: the job ID, result generation, chunk ID, length, and checksum, with no storage key or URL. `adbc_read_partition` re-reads the manifest under the caller's own `result.read` authority, streams that single chunk, and checks its length, SHA-256, schema, and row count. A descriptor from another principal, an expired or regenerated result, or a tampered descriptor is refused, and memory is bounded by one chunk. Cancelling while the job runs cancels the job.
+
+  ```python
+  partitions, schema = cur.adbc_execute_partitions("SELECT * FROM raw.events WHERE day >= ?", ("2026-01-01",))
+  for descriptor in partitions:
+      cur.adbc_read_partition(descriptor)
+      process(cur.fetch_arrow_table())
+  ```
 - **Transactions**: autocommit is on by default. Turning it off begins a transaction, and `commit()`/`rollback()` end it and begin the next.
 - **Cancellation**: `AdbcStatementCancel` / `cursor.adbc_cancel()` cancels through the session cancel endpoint.
 - **Failures** keep `failure_kind`, `retry_safe`, and the request ID in the message and map to SQLSTATE: `40001` lost commit race, `57014` canceled or timed out, `42601` SQL error, `28000` authentication, `42501` permission, `08006` uncertain transport or lost session. Nothing is resent automatically.
 - **Metadata**: `get_info` (driver, vendor, engine version), `get_table_types`, `get_objects` at every depth with ADBC search-pattern filters, and `get_table_schema`. All of them read the principal's authorized `information_schema`.
-- **Not implemented** (they return `NOT_IMPLEMENTED`): bulk ingest, partitioned execution, Substrait, statistics, multi-row parameter binding, and statement options.
+- **Not implemented** (they return `NOT_IMPLEMENTED`): bulk ingest, Substrait, statistics, multi-row parameter binding, and statement options.
 
 `make test-adbc` runs the real-client suite against Compose through adbc-driver-manager 1.13.0, pyarrow 26.0.1, and pandas 3.1.1.

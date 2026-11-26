@@ -21,4 +21,4 @@ docker run --rm --network "$network" \
   ghcr.io/astral-sh/uv:0.9.13-python3.12-bookworm-slim \
   uv run --quiet --no-project --with adbc-driver-manager==1.13.0 --with pyarrow==26.0.1 --with pandas==3.1.1 \
     --with 'psycopg[binary]==3.3.9' /compat/adbc_suite.py
-printf 'PASS: ADBC driver: typed parameters and results, transactions, cancellation, 40001, metadata, compute options, and explicit NOT_IMPLEMENTED\n'
+printf 'PASS: ADBC driver: typed parameters and results, transactions, cancellation, 40001, metadata, compute options, partitioned durable results, and explicit NOT_IMPLEMENTED\n'

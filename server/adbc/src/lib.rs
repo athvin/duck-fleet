@@ -10,6 +10,7 @@
 //! return NOT_IMPLEMENTED.
 
 mod metadata;
+mod partitions;
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{
@@ -212,6 +213,7 @@ impl adbc_core::Database for DuckFleetDatabase {
         let mut connection = DuckFleetConnection {
             session: Arc::new(session),
             autocommit: true,
+            compute: self.compute.clone(),
         };
         for (key, value) in opts {
             connection.set_option(key, value)?;
@@ -223,6 +225,7 @@ impl adbc_core::Database for DuckFleetDatabase {
 pub struct DuckFleetConnection {
     session: Arc<duckfleet::Session>,
     autocommit: bool,
+    compute: duckfleet::ComputeRequest,
 }
 
 impl DuckFleetConnection {
@@ -289,10 +292,18 @@ impl Optionable for DuckFleetConnection {
     }
 }
 
-struct SessionCancel(Arc<duckfleet::Session>);
+struct SessionCancel(Arc<duckfleet::Session>, Option<partitions::RunningJob>);
 
 impl CancelHandle for SessionCancel {
+    /// Cancels the durable job a partitioned execution is waiting on, or else
+    /// the session's running statement.
     fn try_cancel(&self) -> Result<()> {
+        if let Some(job) = self.1.as_ref().and_then(partitions::RunningJob::current) {
+            return runtime()
+                .block_on(self.0.client().cancel_job(job))
+                .map(|_| ())
+                .map_err(convert);
+        }
         runtime()
             .block_on(self.0.cancel())
             .map(|_| ())
@@ -308,15 +319,17 @@ impl adbc_core::Connection for DuckFleetConnection {
             session: self.session.clone(),
             sql: None,
             bound: None,
+            compute: self.compute.clone(),
+            job: Default::default(),
         })
     }
 
     fn cancel(&mut self) -> Result<()> {
-        SessionCancel(self.session.clone()).try_cancel()
+        SessionCancel(self.session.clone(), None).try_cancel()
     }
 
     fn get_cancel_handle(&self) -> Box<dyn CancelHandle> {
-        Box::new(SessionCancel(self.session.clone()))
+        Box::new(SessionCancel(self.session.clone(), None))
     }
 
     fn get_info(
@@ -419,9 +432,9 @@ impl adbc_core::Connection for DuckFleetConnection {
 
     fn read_partition(
         &self,
-        _partition: impl AsRef<[u8]>,
+        partition: impl AsRef<[u8]>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(unsupported("read_partition"))
+        partitions::read(&self.session, partition.as_ref())
     }
 }
 
@@ -429,6 +442,8 @@ pub struct DuckFleetStatement {
     session: Arc<duckfleet::Session>,
     sql: Option<String>,
     bound: Option<RecordBatch>,
+    compute: duckfleet::ComputeRequest,
+    job: partitions::RunningJob,
 }
 
 /// One bound row becomes DuckFleet's typed scalar parameters. Types the wire
@@ -549,8 +564,17 @@ impl adbc_core::Statement for DuckFleetStatement {
         schema
     }
 
+    /// Runs the statement as a durable job; each verified result chunk becomes
+    /// one partition, so results over the interactive cap stream chunk by chunk.
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
-        Err(unsupported("execute_partitions"))
+        let sql = self.sql.clone().ok_or_else(|| {
+            Error::with_message_and_status("set_sql_query was not called", Status::InvalidState)
+        })?;
+        let params = match &self.bound {
+            Some(batch) => parameters(batch)?,
+            None => Vec::new(),
+        };
+        partitions::execute(&self.session, &sql, params, &self.compute, &self.job)
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
@@ -571,11 +595,11 @@ impl adbc_core::Statement for DuckFleetStatement {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        SessionCancel(self.session.clone()).try_cancel()
+        SessionCancel(self.session.clone(), Some(self.job.clone())).try_cancel()
     }
 
     fn get_cancel_handle(&self) -> Box<dyn CancelHandle> {
-        Box::new(SessionCancel(self.session.clone()))
+        Box::new(SessionCancel(self.session.clone(), Some(self.job.clone())))
     }
 }
 

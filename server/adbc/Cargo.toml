@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 adbc_core = "0.25.0"
 adbc_ffi = "0.25.0"
 arrow-array = "60.0.0"
+arrow-ipc = "60.0.0"
 arrow-json = "60.0.0"
 arrow-schema = "60.0.0"
 duckfleet = { path = "../sdk" }

@@ -737,6 +737,7 @@ dependencies = [
  "adbc_core",
  "adbc_ffi",
  "arrow-array",
+ "arrow-ipc",
  "arrow-json",
  "arrow-schema",
  "duckfleet",
