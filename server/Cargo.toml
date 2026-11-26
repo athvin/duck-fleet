@@ -29,6 +29,7 @@ ring = "0.17"
 # aws-lc, which needs cmake and a C toolchain, while ring is already in this tree
 # by way of libduckdb-sys and so costs nothing to reuse.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustyline = "19.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 sqlparser = "=0.64.0"

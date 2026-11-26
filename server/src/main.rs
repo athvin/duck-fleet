@@ -39,6 +39,7 @@ mod queue;
 mod queue_service;
 mod requests;
 mod secrets;
+mod shell;
 mod sql_limits;
 mod system_admission;
 mod system_query;

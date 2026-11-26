@@ -591,7 +591,24 @@ impl RemoteConnection {
         timeout_seconds: u64,
         queue_timeout_seconds: u64,
     ) -> Result<(String, QueryResult), RemoteError> {
-        let request_id = uuid::Uuid::new_v4().to_string();
+        self.execute_with_timeouts_and_id(
+            sql,
+            parameters,
+            timeout_seconds,
+            queue_timeout_seconds,
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+    }
+
+    pub async fn execute_with_timeouts_and_id(
+        &self,
+        sql: &str,
+        parameters: Vec<Value>,
+        timeout_seconds: u64,
+        queue_timeout_seconds: u64,
+        request_id: String,
+    ) -> Result<(String, QueryResult), RemoteError> {
         let body = json!({
             "request_id": request_id, "sql": sql, "parameters": parameters,
             "context": self.context, "timeout_seconds": timeout_seconds,

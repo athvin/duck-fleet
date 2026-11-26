@@ -1,4 +1,4 @@
-.PHONY: up test check test-cli test-dev down
+.PHONY: up test check test-cli test-dev test-shell down
 up:
 	docker compose build
 	docker compose up -d --wait server
@@ -11,6 +11,8 @@ test-cli:
 	bash scripts/test-native-cli.sh
 test-dev:
 	bash scripts/test-dev-lifecycle.sh
+test-shell:
+	bash scripts/test-shell.sh
 
 .PHONY: check-infra
 check-infra:

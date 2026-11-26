@@ -14,11 +14,11 @@ duckfleet version
 To install a release archive directly, download the asset for your platform from the [DuckFleet releases page](https://github.com/athvin/duck-fleet/releases), then verify it against `SHA256SUMS` before extracting it:
 
 ```sh
-curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.2.0/duckfleet-0.2.0-aarch64-apple-darwin.tar.gz
-curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.2.0/SHA256SUMS
+curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.3.0/duckfleet-0.3.0-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.3.0/SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
-tar -xzf duckfleet-0.2.0-aarch64-apple-darwin.tar.gz
-install -m 0755 duckfleet-0.2.0-aarch64-apple-darwin/duckfleet /usr/local/bin/duckfleet
+tar -xzf duckfleet-0.3.0-aarch64-apple-darwin.tar.gz
+install -m 0755 duckfleet-0.3.0-aarch64-apple-darwin/duckfleet /usr/local/bin/duckfleet
 duckfleet version
 ```
 
@@ -67,6 +67,35 @@ The lifecycle commands orchestrate the same `compose.yaml` used by `make up`; th
 - `duckfleet reset` lists the selected Compose resources and named volumes before deletion. Interactive use requires typing the generated project name; automation requires `reset --yes`. It uses Compose's project namespace and never removes another project's resources. Connection settings are retained for the next `dev`, while durable volumes and the demo marker are removed.
 
 Startup failures name the relevant service and print a credential-free `docker compose ... logs` command. Existing `make up`, `make test`, and `make down` workflows remain available.
+
+## Interactive SQL shell
+
+Run `duckfleet shell` to open one remote session for the lifetime of the shell. Temporary tables and explicit transactions remain visible across statements; the prompt changes to `duckfleet(tx)>` after a successful `BEGIN`/`START TRANSACTION` until `COMMIT` or `ROLLBACK`. EOF and `\quit` close the session, rolling back uncommitted work.
+
+Finish SQL with a semicolon. Enter on an incomplete statement opens the `...> ` continuation prompt. Quoted semicolons, line/block comments, dollar-quoted strings, blank input, and multiple statements are handled by the shell's SQL splitter. The editor provides persistent history and SQL/meta-command completion.
+
+Meta-commands:
+
+- `\dt` lists lake tables through the caller's ordinary session and catalog authority.
+- `\d <schema.table>` shows column names, ordinals, types, and nullability.
+- `\timing` toggles total client latency and the server elapsed time when the retained query record provides it; unknown values are not reported as zero.
+- `\format table|csv|json|vertical` selects output without dropping rows; vertical output renders nulls as `NULL`.
+- `\help` and `\quit` display help and close the session.
+
+Ctrl-C during execution displays the caller-generated request ID and requests cancellation for that request; it never resubmits SQL. Ctrl-C at the prompt clears only the current input. Worker loss, expired credentials, unknown sessions, and uncertain transport outcomes preserve the server's failure classification and request identity. The shell does not automatically reconnect or replay a statement.
+
+History is stored as `.duckfleet/shell_history` beside the selected project, with user-only directory/file permissions. Credential-shaped input such as bearer tokens, `DUCKFLEET_TOKEN`, `--token`, passwords, and `CREATE SECRET` is not recorded. Use `duckfleet shell --no-history` to disable loading and saving history.
+
+## SQL files and standard input
+
+`duckfleet sql --file <path>` and piped `duckfleet sql` execute all statements on one session. A final semicolon is optional for file/stdin input; input is UTF-8 and bounded to one MiB. Use `--file -` to name stdin explicitly.
+
+```sh
+duckfleet sql --file ./load.sql
+printf 'create temporary table t (id int); insert into t values (42); select * from t;' | duckfleet sql
+```
+
+Execution stops at the first error by default and returns non-zero. `--continue-on-error` explicitly continues after classified SQL errors while retaining a failing exit status; it never continues after an unknown session, transport uncertainty, or other outcome where further execution could hide recovery requirements.
 
 ## Source-based development
 
