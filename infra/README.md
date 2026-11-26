@@ -224,10 +224,13 @@ Result objects live under `s3://<bucket>/<results.prefix>/`, separate from
 `lakePrefix`. Neither prefix may contain the other: DuckLake cleanup must never
 own result objects. Gateways receive the lake path only for this overlap check,
 through `DUCKFLEET_RESULT_LAKE_DATA_PATH`; they receive no lake credentials. The
-gateway needs `s3:GetObject` and `s3:DeleteObject` on the result prefix. Workers
-need `s3:PutObject` there in addition to their existing lake access. Neither role
-needs result-prefix listing. Clients retrieve authenticated chunks through the
-gateway; responses contain no bucket keys or presigned URLs.
+gateway needs `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and
+`s3:AbortMultipartUpload` on the result prefix for result retrieval, import
+uploads, and cleanup. Workers need `s3:GetObject` and `s3:PutObject` there in
+addition to their existing lake access. Neither role needs result-prefix listing.
+Clients retrieve authenticated result chunks through the gateway; responses
+contain no result bucket keys or presigned URLs. Import responses contain an
+unsigned server-selected staging URL, never storage credentials.
 
 The cluster Terraform module adds a result-only IAM role and Pod Identity
 associations for `duckfleet-results` and `duckfleet-gateway`. A gateway without

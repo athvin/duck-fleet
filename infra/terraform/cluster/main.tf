@@ -320,7 +320,7 @@ resource "aws_iam_role_policy" "worker" {
       },
       {
         Effect   = "Allow"
-        Action   = ["s3:PutObject"]
+        Action   = ["s3:GetObject", "s3:PutObject"]
         Resource = "arn:aws:s3:::${var.lake_bucket}/${var.results_prefix}/*"
       },
     ]
@@ -368,7 +368,7 @@ resource "aws_eks_pod_identity_association" "reader" {
   role_arn        = aws_iam_role.reader.arn
 }
 
-# Metadata/result retrieval and cleanup need no lake read or result write grant.
+# Metadata/result retrieval, private import upload, and cleanup need no lake grant.
 # Either gateway service account can use this role; only the isolated-compute
 # account has separately installed Kubernetes RBAC/token access.
 resource "aws_iam_role" "gateway_results" {
@@ -382,7 +382,7 @@ resource "aws_iam_role_policy" "gateway_results" {
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
-      Action   = ["s3:GetObject", "s3:DeleteObject"]
+      Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"]
       Resource = "arn:aws:s3:::${var.lake_bucket}/${var.results_prefix}/*"
     }]
   })

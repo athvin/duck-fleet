@@ -3,7 +3,7 @@ use arrow_array::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
 use axum::body::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{Stream, TryStreamExt};
 use object_store::{
     ClientOptions, ObjectStore, ObjectStoreExt, RetryConfig,
     aws::{AmazonS3Builder, AmazonS3ConfigKey},
@@ -217,7 +217,7 @@ impl StoreConfig {
             .with_connect_timeout(Duration::from_secs(3))
             .with_timeout(IO_TIMEOUT);
         let mut builder = AmazonS3Builder::new()
-            .with_bucket_name(self.bucket)
+            .with_bucket_name(self.bucket.clone())
             .with_region(self.region)
             .with_virtual_hosted_style_request(false)
             .with_client_options(options)
@@ -252,6 +252,7 @@ impl StoreConfig {
         Ok(Store {
             object: Arc::new(object),
             prefix: self.prefix,
+            bucket: self.bucket,
         })
     }
 }
@@ -260,7 +261,15 @@ impl StoreConfig {
 pub(crate) struct Store {
     object: Arc<dyn ObjectStore>,
     prefix: String,
+    bucket: String,
 }
+pub(crate) struct StreamPut<'a> {
+    pub relative: &'a str,
+    pub bytes: u64,
+    pub sha256: &'a str,
+    pub maximum_bytes: u64,
+}
+
 impl Store {
     fn key(&self, relative: &str) -> Result<Path> {
         // Journal-generated relative keys only. Defense in depth against corrupt
@@ -303,6 +312,128 @@ impl Store {
         })
         .await
     }
+    pub fn staging_url(&self, relative: &str) -> Result<String> {
+        self.key(relative)?;
+        Ok(format!("s3://{}/{}/{}", self.bucket, self.prefix, relative))
+    }
+
+    pub async fn put_stream<S>(
+        &self,
+        descriptor: StreamPut<'_>,
+        mut chunks: S,
+        deadline: Instant,
+        canceled: &AtomicBool,
+    ) -> Result<()>
+    where
+        S: Stream<Item = Result<Bytes>> + Unpin,
+    {
+        if descriptor.bytes > descriptor.maximum_bytes || descriptor.sha256.len() != 64 {
+            return Err(ArtifactError::TooLarge);
+        }
+        let key = self.key(descriptor.relative)?;
+        let mut upload = Some(
+            bounded(deadline, canceled, async {
+                self.object
+                    .put_multipart(&key)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(error = %error, "private staging multipart upload could not start");
+                        ArtifactError::Unavailable
+                    })
+            })
+            .await?,
+        );
+        let result = async {
+            let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+            let mut received = 0_u64;
+            let mut buffer = Vec::with_capacity(MAX_CHUNK_BYTES);
+            while let Some(chunk) = bounded(deadline, canceled, async {
+                chunks.try_next().await.map_err(|_| ArtifactError::Corrupt)
+            })
+            .await?
+            {
+                if chunk.is_empty() {
+                    continue;
+                }
+                if chunk.len() > MAX_CHUNK_BYTES {
+                    return Err(ArtifactError::TooLarge);
+                }
+                received = received
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(ArtifactError::TooLarge)?;
+                if received > descriptor.bytes || received > descriptor.maximum_bytes {
+                    return Err(ArtifactError::TooLarge);
+                }
+                digest.update(&chunk);
+                if !buffer.is_empty() && buffer.len() + chunk.len() > MAX_CHUNK_BYTES {
+                    let part = std::mem::replace(&mut buffer, Vec::with_capacity(MAX_CHUNK_BYTES));
+                    bounded(deadline, canceled, async {
+                        upload
+                            .as_mut()
+                            .expect("active upload")
+                            .put_part(part.into())
+                            .await
+                            .map_err(|error| {
+                                tracing::warn!(error = %error, "private staging multipart part failed");
+                                ArtifactError::Unavailable
+                            })
+                    })
+                    .await?;
+                }
+                buffer.extend_from_slice(&chunk);
+            }
+            if received != descriptor.bytes {
+                return Err(ArtifactError::Corrupt);
+            }
+            let actual = digest
+                .finish()
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if actual != descriptor.sha256 {
+                return Err(ArtifactError::Corrupt);
+            }
+            if !buffer.is_empty() || received == 0 {
+                bounded(deadline, canceled, async {
+                    upload
+                        .as_mut()
+                        .expect("active upload")
+                        .put_part(buffer.into())
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(error = %error, "private staging final multipart part failed");
+                            ArtifactError::Unavailable
+                        })
+                })
+                .await?;
+            }
+            bounded(deadline, canceled, async {
+                upload
+                    .take()
+                    .expect("active upload")
+                    .complete()
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(error = %error, "private staging multipart completion failed");
+                        ArtifactError::Unavailable
+                    })
+            })
+            .await?;
+            Ok(())
+        }
+        .await;
+        if result.is_err()
+            && let Some(mut upload) = upload
+        {
+            let _ = bounded(deadline, canceled, async {
+                upload.abort().await.map_err(|_| ArtifactError::Unavailable)
+            })
+            .await;
+        }
+        result
+    }
+
     pub async fn get(
         &self,
         relative: &str,
@@ -779,6 +910,7 @@ mod tests {
         let store = Store {
             object: Arc::new(object_store::memory::InMemory::new()),
             prefix: "results".into(),
+            bucket: "duckfleet".into(),
         };
         let canceled = AtomicBool::new(false);
         let bytes = Bytes::from_static(b"private-result");

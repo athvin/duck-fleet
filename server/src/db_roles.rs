@@ -153,6 +153,10 @@ pub(crate) fn grant_runtime(tx: &mut Transaction<'_>, roles: &RoleNames) -> Resu
             qualified(table)
         ))?;
     }
+    tx.batch_execute(&format!(
+        "GRANT SELECT,INSERT,UPDATE ON {} TO {gateway},{maintainer}",
+        qualified("import_requests")
+    ))?;
     for table in POLICY_TABLES {
         tx.batch_execute(&format!("GRANT SELECT ON {} TO {all}", qualified(table)))?;
     }

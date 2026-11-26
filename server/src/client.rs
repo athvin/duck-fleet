@@ -380,6 +380,30 @@ impl Client {
         Err(Self::classify(status, &bytes))
     }
 
+    pub async fn upload(
+        &self,
+        path: &str,
+        body: reqwest::Body,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, RemoteError> {
+        let response = self
+            .http
+            .post(format!("{}{}", self.endpoint, path))
+            .bearer_auth(&self.token)
+            .header("Content-Type", "application/octet-stream")
+            .body(body)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(RemoteError::transport)?;
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(RemoteError::transport)?;
+        if status.is_success() {
+            return Ok(bytes.to_vec());
+        }
+        Err(Self::classify(status, &bytes))
+    }
+
     fn classify(status: StatusCode, bytes: &[u8]) -> RemoteError {
         let mut error = RemoteError {
             request_id: None,

@@ -2,7 +2,7 @@ use crate::util;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
-const PLATFORM_SCHEMA: u32 = 8;
+const PLATFORM_SCHEMA: u32 = 9;
 const SCHEMA_MARKER: &str = "duckfleet.io/platform-schema";
 const GATEWAY: &str = "duckfleet-gateway";
 const WORKER: &str = "duckfleet-worker";
@@ -308,9 +308,9 @@ mod tests {
 
     #[test]
     fn schema_preflight_rejects_older_running_and_future_compute() {
-        assert!(schema_matches(Some(&json!("8"))).unwrap());
+        assert!(schema_matches(Some(&json!("9"))).unwrap());
         assert!(!schema_matches(Some(&json!("7"))).unwrap());
-        assert!(schema_matches(Some(&json!("9"))).is_err());
+        assert!(schema_matches(Some(&json!("10"))).is_err());
         let deployment = json!({"metadata":{"name":"worker-small"},"spec":{"replicas":1,"template":{"metadata":{"labels":{"app":"duckfleet-worker"},"annotations":{"duckfleet.io/platform-schema":"7"}}}}});
         assert!(check_kube_state(&[deployment], &[]).is_err());
     }

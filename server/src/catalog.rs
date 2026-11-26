@@ -275,6 +275,32 @@ pub fn validate_relation(name: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[derive(Debug)]
+pub struct Destination {
+    pub schema: String,
+    pub normalized: String,
+    pub qualified: String,
+}
+
+pub fn destination(input: &str) -> Result<Destination, String> {
+    let parsed = parse_relation(input).map_err(|error| error.to_string())?;
+    if parsed.catalog.is_some() || parsed.schema.is_none() {
+        return Err("import destination must be schema.table in the current catalog".into());
+    }
+    let schema = parsed.schema.unwrap();
+    let qualified = format!(
+        "{}.{}",
+        quote_identifier(&schema),
+        quote_identifier(&parsed.relation)
+    );
+    let normalized = format!("{schema}.{}", parsed.relation);
+    Ok(Destination {
+        schema,
+        normalized,
+        qualified,
+    })
+}
+
 fn parse_relation(input: &str) -> Result<RelationName, RemoteError> {
     let mut parts = Vec::new();
     let mut current = String::new();

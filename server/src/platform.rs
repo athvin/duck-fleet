@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{credentials, metering, pricing::RateCard, requests};
 
-pub(crate) const SCHEMA_VERSION: i32 = 8;
+pub(crate) const SCHEMA_VERSION: i32 = 9;
 const MIGRATION_LOCK: i64 = 4_283_121;
 const POLL: Duration = Duration::from_millis(250);
 const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
@@ -206,7 +206,7 @@ pub(crate) fn wait_schema(dsn: &str, wait: Duration) -> Result<Client> {
         })();
         match attempt {
             Ok((client, Some(current))) if current == SCHEMA_VERSION => return Ok(client),
-            Ok((_, Some(1..=7))) => {}
+            Ok((_, Some(1..=8))) => {}
             Ok((_, Some(current))) => {
                 supported(current)?;
             }
@@ -298,7 +298,7 @@ fn migrate_with_roles(
             });
         }
         anyhow::ensure!(
-            matches!(current, 1..=6),
+            matches!(current, 1..=8),
             "unsupported migration source version {current}"
         );
     }
@@ -317,7 +317,7 @@ fn migrate_with_roles(
         });
     }
     anyhow::ensure!(
-        current.is_none() || matches!(current, Some(1..=6)),
+        current.is_none() || matches!(current, Some(1..=8)),
         "unsupported migration source version"
     );
     if current.is_none() {
@@ -394,6 +394,13 @@ fn migrate_with_roles(
         crate::ownership::migrate(&mut transaction)?;
         transaction.execute(
             "INSERT INTO platform_schema_migrations(version,name) VALUES(8,'gateway-ownership')",
+            &[],
+        )?;
+    }
+    if current.is_none() || current.is_some_and(|v| v < 9) {
+        crate::imports::migrate(&mut transaction)?;
+        transaction.execute(
+            "INSERT INTO platform_schema_migrations(version,name) VALUES(9,'private-import-staging')",
             &[],
         )?;
     }
@@ -968,6 +975,33 @@ fn run_claimed_with_store(
                     );
                     bounded.lock_timeout = config.lock_timeout.min(bounded.statement_timeout);
                     crate::job_artifacts::ack_delete(client, lease, &bounded, &object)?;
+                }
+                let import_candidates =
+                    crate::imports::deletion_candidates(client, lease, config, 8)?;
+                for object in import_candidates {
+                    let remaining = config.pass_budget.saturating_sub(started.elapsed());
+                    if remaining < Duration::from_millis(1) {
+                        break;
+                    }
+                    if tokio::runtime::Handle::current()
+                        .block_on(store.delete(
+                            &object.relative_key,
+                            tokio::time::Instant::now() + remaining,
+                        ))
+                        .is_err()
+                    {
+                        failures += 1;
+                        continue;
+                    }
+                    let mut bounded = config.clone();
+                    bounded.statement_timeout = config.statement_timeout.min(
+                        config
+                            .pass_budget
+                            .saturating_sub(started.elapsed())
+                            .max(Duration::from_millis(1)),
+                    );
+                    bounded.lock_timeout = config.lock_timeout.min(bounded.statement_timeout);
+                    crate::imports::ack_delete(client, lease, &bounded, &object)?;
                 }
                 anyhow::ensure!(
                     failures == 0,

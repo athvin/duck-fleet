@@ -615,7 +615,22 @@ impl Worker {
                 startup.run("creating the object store secret", &format!(
                     "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');",
                     literal(&required(key)?), literal(&required(secret)?), literal(&required("S3_ENDPOINT")?)
-                ))?
+                ))?;
+                if authority == Authority::Writer
+                    && std::env::var("DUCKFLEET_RESULT_DATA_PATH").is_ok()
+                {
+                    let endpoint = required("DUCKFLEET_RESULT_ENDPOINT")?;
+                    let endpoint = endpoint.strip_prefix("http://").ok_or_else(|| {
+                        anyhow::anyhow!("local import staging requires an HTTP endpoint")
+                    })?;
+                    startup.run("creating the import staging object store secret", &format!(
+                        "CREATE SECRET import_results (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1', SCOPE {});",
+                        literal(&required("DUCKFLEET_RESULT_ACCESS_KEY")?),
+                        literal(&required("DUCKFLEET_RESULT_SECRET_KEY")?),
+                        literal(endpoint),
+                        literal(&required("DUCKFLEET_RESULT_DATA_PATH")?)
+                    ))?;
+                }
             }
             "pod_identity" => {
                 // Fail closed without the EKS-injected container credential provider.
@@ -626,6 +641,15 @@ impl Worker {
                     "CREATE SECRET aws_s3 (TYPE S3, PROVIDER credential_chain, REFRESH auto, REGION {}, SCOPE {});",
                     literal(&required("AWS_REGION")?), literal(&required("S3_DATA_PATH")?)
                 ))?;
+                if authority == Authority::Writer
+                    && std::env::var("DUCKFLEET_RESULT_DATA_PATH").is_ok()
+                {
+                    startup.run("creating the pod identity import staging secret", &format!(
+                        "CREATE SECRET import_results (TYPE S3, PROVIDER credential_chain, REFRESH auto, REGION {}, SCOPE {});",
+                        literal(&required("AWS_REGION")?),
+                        literal(&required("DUCKFLEET_RESULT_DATA_PATH")?)
+                    ))?;
+                }
             }
             _ => anyhow::bail!("unsupported S3_AUTH_MODE"),
         }

@@ -11,6 +11,8 @@ mod client;
 mod dev;
 #[path = "../../src/history_cli.rs"]
 mod history_cli;
+#[path = "../../src/import_cli.rs"]
+mod import_cli;
 mod protocol;
 #[path = "../../src/shell.rs"]
 mod shell;
