@@ -19,12 +19,15 @@ struct ProjectConfig {
 struct LocalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compose_project: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct Resolved {
     pub url: Option<String>,
     pub token: Option<String>,
+    pub compose_project: Option<String>,
     project_path: Option<PathBuf>,
     url_source: &'static str,
     token_source: &'static str,
@@ -37,6 +40,7 @@ impl Resolved {
             "url_source": self.url_source,
             "token": self.token.as_ref().map(|_| "<redacted>"),
             "token_source": self.token_source,
+            "compose_project": self.compose_project,
             "project": self.project_path,
         })
     }
@@ -110,6 +114,7 @@ fn resolve_from(
     Ok(Resolved {
         url,
         token,
+        compose_project: local.compose_project.clone(),
         project_path,
         url_source,
         token_source,
@@ -144,7 +149,37 @@ fn read_local(path: &Path) -> Result<LocalConfig, String> {
     if config.token.as_ref().is_some_and(|token| token.is_empty()) {
         return Err(format!("{} contains an empty token", path.display()));
     }
+    if config
+        .compose_project
+        .as_deref()
+        .is_some_and(|project| !valid_compose_project(project))
+    {
+        return Err(format!(
+            "{} contains an invalid Compose project",
+            path.display()
+        ));
+    }
     Ok(config)
+}
+
+fn valid_compose_project(project: &str) -> bool {
+    !project.is_empty()
+        && project.len() <= 63
+        && project.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn new_compose_project() -> String {
+    format!(
+        "duckfleet-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    )
+}
+
+#[cfg(test)]
+pub fn new_compose_project_for_test() -> String {
+    new_compose_project()
 }
 
 fn bounded_read(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
@@ -232,6 +267,7 @@ fn init_in(
     }
     let local = LocalConfig {
         token: flag_token.or(environment_token).map(str::to_owned),
+        compose_project: Some(new_compose_project()),
     };
     let encoded = serde_json::to_vec_pretty(&local)
         .map_err(|_| "cannot encode local configuration".to_owned())?;
@@ -242,6 +278,58 @@ fn init_in(
         project_path.display(),
         STATE_DIR
     ))
+}
+
+#[derive(Debug)]
+pub struct DevelopmentSettings {
+    pub root: PathBuf,
+    pub project: String,
+    pub token: String,
+    pub url: String,
+}
+
+pub fn development(resolved: &Resolved) -> Result<DevelopmentSettings, String> {
+    let project_path = resolved
+        .project_path
+        .as_ref()
+        .ok_or("no DuckFleet project is selected; run duckfleet init first")?;
+    let root = project_path
+        .parent()
+        .ok_or("the selected project has no parent directory")?
+        .to_path_buf();
+    let url = resolved
+        .url
+        .clone()
+        .ok_or("the selected project has no URL; run duckfleet init --force")?;
+    let local_path = root.join(STATE_DIR).join(LOCAL_FILE);
+    let mut local = if local_path.exists() {
+        read_local(&local_path)?
+    } else {
+        LocalConfig::default()
+    };
+    let token = local
+        .token
+        .clone()
+        .or_else(|| resolved.token.clone())
+        .unwrap_or_else(|| "duckfleet-local-development-token".to_owned());
+    let project = match local.compose_project.clone() {
+        Some(project) => project,
+        None => new_compose_project(),
+    };
+    local.token = Some(token.clone());
+    local.compose_project = Some(project.clone());
+    fs::create_dir_all(root.join(STATE_DIR)).map_err(|_| "cannot create .duckfleet".to_owned())?;
+    set_private_directory(&root.join(STATE_DIR))?;
+    let encoded = serde_json::to_vec_pretty(&local)
+        .map_err(|_| "cannot encode local development configuration".to_owned())?;
+    write_private(&local_path, &[encoded, b"\n".to_vec()].concat())?;
+    update_gitignore(&root)?;
+    Ok(DevelopmentSettings {
+        root,
+        project,
+        token,
+        url,
+    })
 }
 
 fn update_gitignore(directory: &Path) -> Result<(), String> {
@@ -357,6 +445,32 @@ mod tests {
             );
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn development_identity_is_stable_per_project_and_unique_between_projects() {
+        let first = temporary("development-first");
+        let second = temporary("development-second");
+        let mut identities = Vec::new();
+        for directory in [&first, &second] {
+            init_in(directory, None, None, None, None, false).unwrap();
+            let resolved = resolve_from(directory, None, None, None, None).unwrap();
+            let settings = development(&resolved).unwrap();
+            assert_eq!(settings.token, "duckfleet-local-development-token");
+            assert!(settings.project.starts_with("duckfleet-"));
+            let again =
+                development(&resolve_from(directory, None, None, None, None).unwrap()).unwrap();
+            assert_eq!(again.project, settings.project);
+            assert!(
+                !fs::read_to_string(directory.join(PROJECT_FILE))
+                    .unwrap()
+                    .contains(&settings.project)
+            );
+            identities.push(settings.project);
+        }
+        assert_ne!(identities[0], identities[1]);
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
     }
 
     #[test]

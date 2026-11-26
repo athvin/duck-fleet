@@ -17,15 +17,21 @@ orders ────┴─ stg_orders ────┴─ fct_orders ─┬─ cus
                                             └─ daily_revenue
 ```
 
-`fct_orders` (the join) and `revenue_by_region` (the regional rollup) request the
-**medium** class (2 CPU / 2Gi) through `meta.platform`; every other model takes the
-project default **small** class (1 CPU / 1Gi). The gateway routes each model to a
-worker reporting exactly those resources — `fct_orders` and `revenue_by_region`
-record `worker_threads = 2`, the rest `1`.
+All models use the default persistent pool on the local Compose stack. `fct_orders`
+and `revenue_by_region` record the worker's actual thread and memory settings, while
+`meta.platform.tags` provides workload attribution without changing compute selection.
 
 ## Run it
 
-From the repo root, with the stack up (`make up`):
+From the repo root, the native CLI starts the stack and loads this project once:
+
+```sh
+duckfleet init
+duckfleet dev --demo
+duckfleet sql 'select * from retail.revenue_by_region'
+```
+
+To run the dbt steps manually instead, with the stack already up (`make up`):
 
 ```sh
 export DUCKFLEET_TOKEN=duckfleet-local-development-token
@@ -41,7 +47,7 @@ docker compose run --rm api duckfleet sql 'select * from retail.revenue_by_regio
 docker compose run --rm api duckfleet sql 'select * from retail.customer_ltv order by lifetime_value desc'
 ```
 
-Re-run a model on a different size to watch routing change:
+Re-run a model after changing its SQL or seed data:
 
 ```sh
 docker compose run --rm -v "$DEMO":/demo dbt dbt run --select revenue_by_region \

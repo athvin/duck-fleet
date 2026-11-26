@@ -10,17 +10,12 @@ target-path: target
 # platform's own harness runs.
 query-comment: null
 
-# Every model defaults to the small persistent class (1 CPU / 1Gi). The two heavier
-# marts below override to the medium class (2 CPU / 2Gi) through meta.platform — that
-# per-model override is the point of the demo, and the gateway routes each model to a
-# worker reporting exactly those resources.
+# Every model uses the shared persistent pool on Compose. Tags remain workload
+# attribution and never size compute.
 models:
   retail_demo:
     +meta:
       platform:
-        compute: persistent
-        cpu: 1
-        memory: 1Gi
         tags:
           team: retail
 
