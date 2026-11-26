@@ -305,6 +305,59 @@ impl JobRequest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sdk_wire_types_deserialize_into_server_contracts() {
+        let sdk = duckfleet::protocol::JobRequest {
+            request_id: Uuid::new_v4(),
+            retry_of: Some(Uuid::new_v4()),
+            sql: "SELECT ?".into(),
+            parameters: vec![serde_json::json!(1)],
+            context: serde_json::json!({"connection_name": "sdk"}),
+            compute: duckfleet::protocol::ComputeRequest {
+                mode: Some(duckfleet::protocol::Mode::Isolated),
+                pool: None,
+                cpu: Some(2),
+                memory: Some("4Gi".into()),
+                disk: Some("10Gi".into()),
+            },
+            timeout_seconds: Some(60),
+            queue_timeout_seconds: Some(30),
+            result: Some(duckfleet::protocol::JobResultRequest {
+                format: Some(duckfleet::protocol::ResultFormat::ArrowIpcChunks),
+                retention_seconds: Some(600),
+                max_bytes: Some(1024),
+                max_rows: Some(10),
+            }),
+        };
+        let server: JobRequest = serde_json::from_value(serde_json::to_value(&sdk).unwrap())
+            .expect("SDK job request must be a valid server request");
+        assert_eq!(server.request_id, sdk.request_id);
+        assert_eq!(
+            serde_json::to_value(&server).unwrap()["compute"],
+            serde_json::to_value(&sdk).unwrap()["compute"]
+        );
+        assert_eq!(
+            duckfleet::protocol::JobLimits::HARD.result_bytes,
+            JobLimits::HARD.result_bytes
+        );
+        assert_eq!(
+            duckfleet::protocol::JobLimits::HARD.result_rows,
+            JobLimits::HARD.result_rows
+        );
+        assert_eq!(
+            duckfleet::protocol::MAX_CHUNK_BYTES,
+            crate::artifacts::MAX_CHUNK_BYTES
+        );
+        assert_eq!(
+            duckfleet::protocol::MAX_MANIFEST_BYTES,
+            crate::artifacts::MAX_MANIFEST_BYTES
+        );
+        assert_eq!(
+            duckfleet::protocol::DEFAULT_QUEUE_TIMEOUT,
+            crate::query::DEFAULT_QUEUE_TIMEOUT
+        );
+    }
+
     use super::*;
 
     fn request(extra: Value) -> JobRequest {

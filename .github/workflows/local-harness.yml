@@ -43,6 +43,12 @@ jobs:
         run: make test-import
       - name: CSV, JSON, Arrow, and Parquet exports
         run: make test-export
+      - name: Rust SDK against real Compose (current and minimum Rust)
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.89.0 --profile minimal
+          make test-sdk
+          DUCKFLEET_SDK_TOOLCHAIN=1.89.0 make test-sdk
       - name: Save test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

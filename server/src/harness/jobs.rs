@@ -1,9 +1,10 @@
 //! Durable jobs through real HTTP, DuckDB, PostgreSQL and object storage.
 use super::{ARTIFACTS, Ctx, expect_status, request_json, require, rows_eq, sql};
-use crate::{client::Client, job_policy::JobRequest};
+use crate::client::Client;
 use anyhow::{Context, Result};
 use arrow_array::{Array, Decimal128Array, Int64Array};
 use arrow_ipc::reader::StreamReader;
+use duckfleet::protocol::JobRequest;
 use reqwest::Method;
 use serde_json::{Value, json};
 use std::{

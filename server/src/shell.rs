@@ -675,6 +675,8 @@ mod tests {
             columns: vec!["id".into(), "value".into()],
             column_types: vec!["Int32".into(), "Utf8".into()],
             rows: vec![vec![Some("1".into()), None]],
+            schema: std::sync::Arc::new(arrow_schema::Schema::empty()),
+            batches: Vec::new(),
         };
         let rendered = result_to_vertical(&result);
         assert!(rendered.contains("RECORD 1"));

@@ -681,6 +681,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "duckfleet"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-cast",
+ "arrow-ipc",
+ "arrow-schema",
+ "axum",
+ "reqwest",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "duckfleet-cli"
 version = "0.6.0"
 dependencies = [
@@ -692,6 +710,7 @@ dependencies = [
  "arrow-schema",
  "axum",
  "chrono",
+ "duckfleet",
  "parquet",
  "reqwest",
  "rexpect",
@@ -744,6 +763,7 @@ dependencies = [
  "axum",
  "chrono",
  "duckdb",
+ "duckfleet",
  "futures-util",
  "object_store",
  "parquet",

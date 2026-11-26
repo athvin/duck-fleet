@@ -240,7 +240,7 @@ docker compose run --rm dbt dbt run --select fct_orders --full-refresh \
 ```text
 server/                 Rust gateway, workers, query history, and the cli + harness roles
 server/cli/             Native duckfleet executable, reusing the first-party CLI and client
-server/src/client.rs    HTTP/Arrow client the cli role and harness speak to the gateway with
+server/sdk/              The published `duckfleet` Rust crate: the HTTP/Arrow client the CLI, harness, and SDK users share
 server/src/harness.rs   The dbt + HTTP + Postgres + S3 integration gate (the harness role)
 compose.yaml            PostgreSQL, RustFS, gateway, the persistent worker, dbt and CLI runners
 docker/                 Images and initial PostgreSQL databases
@@ -251,6 +251,16 @@ tests/dbt/              Representative seed, view, table, incremental model, tes
 The dbt adapter itself is not in this repo: it is a first-class `AdapterType::DuckFleet`
 in a fork of dbt-core v2 (`athvin/dbt`), whose compiled `dbt` binary this repo downloads
 by pinned release. A model's `meta.platform` (cpu/memory/disk) is what asks for a pod.
+
+## Rust SDK
+
+The [`duckfleet`](server/sdk/README.md) crate is the supported Rust client. It provides explicit sessions with transactions, cancellation, and compute selection, typed bound parameters, Arrow `RecordBatch` results, durable jobs with verified resumable downloads, and a stable `ErrorKind` that never replays SQL. The CLI and the integration harness use the same crate. Its minimum supported Rust version is 1.89. `make test-sdk` runs its real-Compose suite, and a `duckfleet-sdk-v<version>` tag publishes it to crates.io after the gates pass.
+
+```rust,ignore
+let client = duckfleet::Client::new(url, token)?;
+let session = client.session(duckfleet::SessionOptions::named("app")).await?;
+let result = session.query("SELECT ?::BIGINT + 1", [41_i64]).await?;
+```
 
 ## Use it without dbt
 

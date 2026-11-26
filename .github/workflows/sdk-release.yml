@@ -1,0 +1,34 @@
+name: Rust SDK release
+on:
+  push:
+    tags: ["duckfleet-sdk-v*"]
+permissions:
+  contents: read
+jobs:
+  gates:
+    uses: ./.github/workflows/sdk.yml
+  publish:
+    needs: gates
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: bash scripts/ci/install-rust.sh && echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Tag matches the crate version and changelog
+        working-directory: server
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "duckfleet") | .version')
+          [[ "duckfleet-sdk-v$version" == "$GITHUB_REF_NAME" ]] || { echo "tag $GITHUB_REF_NAME does not match duckfleet $version" >&2; exit 1; }
+          grep -q "^## \[$version\]" sdk/CHANGELOG.md || { echo "CHANGELOG.md has no $version entry" >&2; exit 1; }
+      - name: Authenticate with crates.io trusted publishing
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: Publish
+        working-directory: server
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p duckfleet --locked
