@@ -145,36 +145,20 @@ pub async fn run(options: ShellOptions) -> i32 {
                     println!("timing {}", if timing { "on" } else { "off" });
                 }
                 "\\dt" => {
-                    let sql = "SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('information_schema', 'duckfleet_system') ORDER BY table_schema, table_name";
-                    if execute(
-                        &connection,
-                        sql,
-                        Vec::new(),
-                        options.queue_timeout,
-                        &format,
-                        timing,
-                    )
-                    .await
-                        == Outcome::Fatal
-                    {
+                    let rows = crate::catalog::tables(&connection, options.queue_timeout).await;
+                    if finish_catalog(rows, &format) == Outcome::Fatal {
                         fatal = true;
                         break;
                     }
                 }
                 _ if command.starts_with("\\d ") => {
-                    let relation = command[3..].trim();
-                    let (sql, parameters) = describe_query(relation);
-                    if execute(
+                    let rows = crate::catalog::describe(
                         &connection,
-                        &sql,
-                        parameters,
+                        command[3..].trim(),
                         options.queue_timeout,
-                        &format,
-                        timing,
                     )
-                    .await
-                        == Outcome::Fatal
-                    {
+                    .await;
+                    if finish_catalog(rows, &format) == Outcome::Fatal {
                         fatal = true;
                         break;
                     }
@@ -248,6 +232,29 @@ enum Outcome {
     Failed,
     Canceled,
     Fatal,
+}
+
+fn finish_catalog(
+    result: Result<QueryResult, crate::client::RemoteError>,
+    format: &str,
+) -> Outcome {
+    match result {
+        Ok(rows) => {
+            crate::cli::emit(&rows, format);
+            Outcome::Success
+        }
+        Err(error) => {
+            let fatal = error.failure_kind.as_deref() == Some("unknown_session")
+                || error.failure_kind.as_deref() == Some("transport_failure")
+                || error.acceptance.as_deref() == Some("unknown");
+            crate::cli::print_remote_error(&error);
+            if fatal {
+                Outcome::Fatal
+            } else {
+                Outcome::Failed
+            }
+        }
+    }
 }
 
 async fn execute(
@@ -342,20 +349,6 @@ fn update_transaction(statement: &str, open: &mut bool) {
         "BEGIN" | "START" => *open = true,
         "COMMIT" | "ROLLBACK" => *open = false,
         _ => {}
-    }
-}
-
-fn describe_query(relation: &str) -> (String, Vec<Value>) {
-    if let Some((schema, table)) = relation.rsplit_once('.') {
-        (
-            "SELECT column_name, ordinal_position, data_type, is_nullable FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position".into(),
-            vec![Value::String(schema.into()), Value::String(table.into())],
-        )
-    } else {
-        (
-            "SELECT column_name, ordinal_position, data_type, is_nullable FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ? ORDER BY ordinal_position".into(),
-            vec![Value::String(relation.into())],
-        )
     }
 }
 

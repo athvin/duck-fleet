@@ -277,6 +277,16 @@ duckfleet shell
 duckfleet sql --file ./load.sql
 ```
 
+Catalog discovery and bounded previews use the same authorized session and safely parsed identifiers:
+
+```sh
+duckfleet schemas
+duckfleet tables --schema analytics
+duckfleet views --schema analytics
+duckfleet describe analytics.events
+duckfleet preview analytics.events --limit 20
+```
+
 The CLI uses the HTTP/Arrow client in `server/src/client.rs`. The external dbt
 adapter speaks the same API; its supported selection fields depend on the pinned
 adapter release described above.
