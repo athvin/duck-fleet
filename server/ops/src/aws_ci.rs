@@ -133,6 +133,10 @@ fn workflow_and_operator_scripts() -> Result<()> {
         .iter()
         .position(|step| util::text(step.get("run")).contains("aws-wait-checks"))
         .context("wait-checks step missing")?;
+    ensure!(
+        util::text(steps[checks]["env"].get("GH_TOKEN")).contains("github.token"),
+        "the wait-checks step must authenticate gh with GH_TOKEN"
+    );
     let credentials = steps
         .iter()
         .position(|step| util::text(step.get("uses")).starts_with("aws-actions/"))
