@@ -33,13 +33,13 @@ jobs:
       - name: Install pinned Rust toolchain
         run: bash scripts/ci/install-rust.sh
       - name: Install release target
-        run: source "$HOME/.cargo/env" && rustup target add "${{ matrix.target }}"
+        run: export PATH="$HOME/.cargo/bin:$PATH" && rustup target add "${{ matrix.target }}"
       - name: Build native CLI
         env:
           TARGET: ${{ matrix.target }}
           DUCKFLEET_RELEASE: ${{ startsWith(github.ref_name, 'duckfleet-v') && github.ref_name || inputs.tag }}
         working-directory: server
-        run: source "$HOME/.cargo/env" && cargo build --locked --release -p duckfleet-cli --target "$TARGET"
+        run: export PATH="$HOME/.cargo/bin:$PATH" && cargo build --locked --release -p duckfleet-cli --target "$TARGET"
       - name: Package and exercise the extracted binary
         env:
           TARGET: ${{ matrix.target }}
