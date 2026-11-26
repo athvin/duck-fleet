@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 pub fn clone_job(source: &Value, name: &str, role: &str) -> Result<Value> {
     ensure!(
-        source["metadata"]["annotations"]["duckfleet.io/platform-schema"] == "8",
+        source["metadata"]["annotations"]["duckfleet.io/platform-schema"] == "9",
         "Current migration template predates schema 7; stop compute and apply the desired chart/image first"
     );
     ensure!(
@@ -47,7 +47,7 @@ pub fn clone_job(source: &Value, name: &str, role: &str) -> Result<Value> {
     spec["ttlSecondsAfterFinished"] = json!(86400);
     Ok(json!({
         "apiVersion":"batch/v1","kind":"Job",
-        "metadata":{"name":name,"labels":{"app":"duckfleet-platform-migrate"},"annotations":{"duckfleet.io/platform-schema":"8"}},
+        "metadata":{"name":name,"labels":{"app":"duckfleet-platform-migrate"},"annotations":{"duckfleet.io/platform-schema":"9"}},
         "spec":spec,
     }))
 }
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn manual_migration_clones_configuration_without_old_job_identity() {
         let source = json!({
-            "metadata":{"annotations":{"duckfleet.io/platform-schema":"8"}},
+            "metadata":{"annotations":{"duckfleet.io/platform-schema":"9"}},
             "spec":{"selector":{"matchLabels":{"controller-uid":"old"}},"manualSelector":false,"activeDeadlineSeconds":390,"backoffLimit":0,
                 "template":{"metadata":{"labels":{"app":"duckfleet-platform-migrate","controller-uid":"old","job-name":"old","batch.kubernetes.io/controller-uid":"old","batch.kubernetes.io/job-name":"old"}},
                     "spec":{"restartPolicy":"Never","containers":[{"name":"migrate","env":[{"name":"DUCKFLEET_ROLE","value":"migrate"}]}]}}}

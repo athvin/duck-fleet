@@ -84,10 +84,10 @@ run "worker_identity_reaches_lake_and_result_prefixes_only" {
   assert {
     condition = alltrue([
       for statement in jsondecode(aws_iam_role_policy.worker.policy).Statement :
-      toset(statement.Action) == toset(["s3:PutObject"])
+      toset(statement.Action) == toset(["s3:GetObject", "s3:PutObject"])
       if statement.Resource == "arn:aws:s3:::duckfleet-dev-797781631727-us-east-2/results/*"
     ])
-    error_message = "Worker artifact access must not grant result reads or deletes."
+    error_message = "Worker artifact access must grant result reads and import writes, but not deletes."
   }
   assert {
     condition     = aws_eks_pod_identity_association.worker.service_account == "duckfleet-worker"
@@ -151,9 +151,9 @@ run "result_identity_cannot_read_lake_or_write_results" {
     condition = alltrue([
       for statement in jsondecode(aws_iam_role_policy.gateway_results.policy).Statement :
       statement.Resource == "arn:aws:s3:::duckfleet-dev-797781631727-us-east-2/results/*" &&
-      toset(statement.Action) == toset(["s3:GetObject", "s3:DeleteObject"])
+      toset(statement.Action) == toset(["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"])
     ])
-    error_message = "Gateway result identity must have only result-prefix read/delete."
+    error_message = "Gateway result identity must have only result-prefix read/import-write/delete."
   }
   assert {
     condition     = toset(keys(aws_eks_pod_identity_association.gateway_results)) == toset(["duckfleet-gateway", "duckfleet-results"])

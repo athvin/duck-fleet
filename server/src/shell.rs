@@ -305,7 +305,7 @@ async fn execute(
                 Ok(_) => {
                     println!("cancellation requested for {request_id}; waiting for terminal status");
                     match wait_for_terminal(connection, &request_id).await {
-                        Ok(()) => {
+                        Ok(_) => {
                             if timing {
                                 println!("client_total_ms: {}", started.elapsed().as_millis());
                                 println!("server_elapsed_ms: unknown");
@@ -327,10 +327,10 @@ async fn execute(
     }
 }
 
-async fn wait_for_terminal(
+pub(crate) async fn wait_for_terminal(
     connection: &RemoteConnection,
     request_id: &str,
-) -> Result<(), crate::client::RemoteError> {
+) -> Result<Value, crate::client::RemoteError> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let bytes = connection
@@ -353,7 +353,7 @@ async fn wait_for_terminal(
                 status_url: Some(format!("/v1/requests/{request_id}").into()),
             })?;
         if value["state"] == "terminal" {
-            return Ok(());
+            return Ok(value);
         }
         if std::time::Instant::now() >= deadline {
             return Err(crate::client::RemoteError {

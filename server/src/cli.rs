@@ -103,6 +103,29 @@ pub async fn run(args: Vec<String>) -> i32 {
 
     let result = match parsed.command.as_str() {
         "sql" => run_sql(&url, &token, &parsed).await,
+        "import" => {
+            crate::import_cli::run(
+                &url,
+                &token,
+                crate::import_cli::Options {
+                    path: parsed.positionals[0].clone(),
+                    destination: parsed.value("table").expect("validated table").to_owned(),
+                    format: crate::import_cli::infer_format(
+                        &parsed.positionals[0],
+                        parsed.value("format"),
+                    )
+                    .expect("validated import format"),
+                    mode: if parsed.flags.iter().any(|flag| flag == "create") {
+                        crate::import_cli::Mode::Create
+                    } else {
+                        crate::import_cli::Mode::Append
+                    },
+                    delimiter: parsed.value("delimiter").unwrap_or(",").to_owned(),
+                    header: !parsed.flags.iter().any(|flag| flag == "no-header"),
+                },
+            )
+            .await
+        }
         "schemas" | "tables" | "views" | "describe" | "preview" => {
             run_catalog(&url, &token, &parsed).await
         }
@@ -207,7 +230,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|import|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -909,7 +932,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 28] = [
+    const VALUE_FLAGS: [&'static str; 30] = [
         "url",
         "token",
         "cpu",
@@ -938,6 +961,8 @@ impl Parsed {
         "model-run-id",
         "interval",
         "status",
+        "table",
+        "delimiter",
     ];
     const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
@@ -963,6 +988,9 @@ impl Parsed {
                     "watch",
                     "raw",
                     "metrics",
+                    "create",
+                    "append",
+                    "no-header",
                 ]
                 .contains(&name)
                 {
@@ -997,7 +1025,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <init|config|version|dev|status|stop|reset|shell|sql|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <init|config|version|dev|status|stop|reset|shell|sql|import|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -1070,6 +1098,36 @@ impl Parsed {
         }
         if parsed.command == "preview" {
             crate::catalog::validate_limit(parsed.value("limit"))?;
+        }
+        if parsed.command == "import" {
+            if parsed.positionals.len() != 1 || parsed.value("table").is_none() {
+                return Err("import needs one file and --table <schema.table>".into());
+            }
+            let create = parsed.flags.iter().any(|flag| flag == "create");
+            let append = parsed.flags.iter().any(|flag| flag == "append");
+            if create == append {
+                return Err("import requires exactly one of --create or --append".into());
+            }
+            crate::catalog::destination(parsed.value("table").expect("checked table"))?;
+            let format =
+                crate::import_cli::infer_format(&parsed.positionals[0], parsed.value("format"))?;
+            if format == "parquet"
+                && (parsed.value("delimiter").is_some()
+                    || parsed.flags.iter().any(|flag| flag == "no-header"))
+            {
+                return Err("CSV delimiter/header options do not apply to Parquet".into());
+            }
+        }
+        for flag in ["create", "append", "no-header"] {
+            if parsed.flags.iter().any(|value| value == flag) && parsed.command != "import" {
+                return Err(format!("--{flag} applies only to import"));
+            }
+        }
+        if parsed.value("table").is_some() && parsed.command != "import" {
+            return Err("--table applies only to import".into());
+        }
+        if parsed.value("delimiter").is_some() && parsed.command != "import" {
+            return Err("--delimiter applies only to import".into());
         }
         if parsed.command == "history" && !parsed.positionals.is_empty() {
             return Err("history takes no positional arguments".into());
@@ -1524,6 +1582,79 @@ mod tests {
             vec!["workers", "--status", "failed"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn import_arguments_are_specific_and_validated_before_transfer() {
+        assert!(parse(&["import", "events.csv", "--table", "raw.events", "--create"]).is_ok());
+        assert!(
+            parse(&[
+                "import",
+                "events.data",
+                "--table",
+                "raw.events",
+                "--append",
+                "--format",
+                "csv",
+                "--delimiter",
+                "|",
+                "--no-header"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "import",
+                "events.PARQUET",
+                "--table",
+                "raw.events",
+                "--append"
+            ])
+            .is_ok()
+        );
+        for args in [
+            vec!["import", "events.csv", "--table", "raw.events"],
+            vec![
+                "import",
+                "events.csv",
+                "--table",
+                "raw.events",
+                "--create",
+                "--append",
+            ],
+            vec![
+                "import",
+                "events.unknown",
+                "--table",
+                "raw.events",
+                "--create",
+            ],
+            vec!["import", "events.csv", "--table", "events", "--create"],
+            vec![
+                "import",
+                "events.parquet",
+                "--table",
+                "raw.events",
+                "--create",
+                "--delimiter",
+                "|",
+            ],
+            vec![
+                "import",
+                "events.parquet",
+                "--table",
+                "raw.events",
+                "--create",
+                "--no-header",
+            ],
+            vec!["sql", "SELECT 1", "--create"],
+            vec!["import", "events.csv", "--create"],
+        ] {
+            assert!(
+                parse(&args).is_err(),
+                "accepted invalid import arguments {args:?}"
+            );
         }
     }
 

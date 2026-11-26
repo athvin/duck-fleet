@@ -287,6 +287,16 @@ duckfleet describe analytics.events
 duckfleet preview analytics.events --limit 20
 ```
 
+Local CSV and Parquet files import into the remote lake without mounting a host directory into a worker. The CLI streams a bounded, checksummed file through private staging, then performs an atomic create or append with DuckDB's native ingestion semantics:
+
+```sh
+duckfleet import ./events.parquet --table raw.events --create
+duckfleet import ./more-events.csv --table raw.events --append
+duckfleet import ./legacy.data --format csv --delimiter '|' --no-header --table raw.legacy --create
+```
+
+Exactly one mode is required. Existing tables are never overwritten; schema/coercion and parse failures roll back the entire transaction. See the [CLI import guide](docs/cli.md#import-local-csv-and-parquet-files) for type inference, file limits, cancellation, and staging cleanup.
+
 History defaults to a SQL-free table with existing filters, cursor pagination, and bounded watch. Profiles expose readable operator and engine-metric evidence without confusing it for container memory or cost:
 
 ```sh
@@ -344,6 +354,9 @@ credential from the environment, or a credential it issued; see
 | POST | `/v1/sessions/{id}/queries` | Durably admit SQL and await Arrow; reports request ID, status URL and acceptance |
 | DELETE | `/v1/sessions/{id}` | Close connection and roll back any open transaction |
 | POST | `/v1/sessions/{id}/cancel` | Interrupt this session's currently executing statement |
+| POST | `/v1/imports/{request_id}/upload` | Stream one bounded, checksummed CSV or Parquet file into owner-fenced private staging |
+| GET | `/v1/imports/{request_id}` | Owner-only import metadata and staging state |
+| DELETE | `/v1/imports/{request_id}` | Owner-requested staged-object cleanup; maintenance retries failures |
 | GET | `/v1/queries` | Filtered history with cursor pagination; defaults to 500 records |
 | GET | `/v1/queries/{query_id}` | One durable record, metrics, and raw DuckDB profile when available |
 | POST | `/v1/requests/{request_id}/cancel` | Durably request cancellation independently of engine availability; authorized own/all cancellation |

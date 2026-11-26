@@ -621,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "duckfleet-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -637,6 +637,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -689,6 +690,7 @@ dependencies = [
  "sqlparser",
  "tokio",
  "tokio-postgres",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",

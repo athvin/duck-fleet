@@ -14,11 +14,11 @@ duckfleet version
 To install a release archive directly, download the asset for your platform from the [DuckFleet releases page](https://github.com/athvin/duck-fleet/releases), then verify it against `SHA256SUMS` before extracting it:
 
 ```sh
-curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.5.0/duckfleet-0.5.0-aarch64-apple-darwin.tar.gz
-curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.5.0/SHA256SUMS
+curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.6.0/duckfleet-0.6.0-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.6.0/SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
-tar -xzf duckfleet-0.5.0-aarch64-apple-darwin.tar.gz
-install -m 0755 duckfleet-0.5.0-aarch64-apple-darwin/duckfleet /usr/local/bin/duckfleet
+tar -xzf duckfleet-0.6.0-aarch64-apple-darwin.tar.gz
+install -m 0755 duckfleet-0.6.0-aarch64-apple-darwin/duckfleet /usr/local/bin/duckfleet
 duckfleet version
 ```
 
@@ -140,6 +140,22 @@ Meta-commands:
 Ctrl-C during execution displays the caller-generated request ID and requests cancellation for that request; it never resubmits SQL. Ctrl-C at the prompt clears only the current input. Worker loss, expired credentials, unknown sessions, and uncertain transport outcomes preserve the server's failure classification and request identity. The shell does not automatically reconnect or replay a statement.
 
 History is stored as `.duckfleet/shell_history` beside the selected project, with user-only directory/file permissions. Credential-shaped input such as bearer tokens, `DUCKFLEET_TOKEN`, `--token`, passwords, and `CREATE SECRET` is not recorded. Use `duckfleet shell --no-history` to disable loading and saving history.
+
+## Import local CSV and Parquet files
+
+Use `duckfleet import <file> --table <schema.table>` with exactly one of `--create` or `--append`:
+
+```sh
+duckfleet import ./events.parquet --table raw.events --create
+duckfleet import ./more-events.csv --table raw.events --append
+duckfleet import ./legacy.data --format csv --delimiter '|' --no-header --table raw.legacy --create
+```
+
+The format is inferred from a case-insensitive `.csv` or `.parquet` extension; `--format csv|parquet` overrides an unrecognized extension. CSV uses DuckDB's native `auto_detect` type inference. A header is expected by default; `--no-header` and `--delimiter <one ASCII character>` are explicit CSV options and cannot be combined with Parquet. Create mode uses DuckDB's native Parquet schema and inferred CSV columns. Append mode uses the destination's existing column order and DuckDB's checked insertion coercions; mismatches fail without changing existing rows. Existing tables are never replaced, and overwrite/truncate is deliberately not supported.
+
+The CLI hashes and streams one regular local file, up to 1 GiB, through an authenticated gateway endpoint. Directories, globs, arbitrary URLs, and caller-selected storage keys are not accepted. The gateway writes to its private result/staging prefix with an unpredictable request identity and verifies byte count and SHA-256 before execution. Workers use a result-prefix-scoped S3 secret; no local filesystem path is sent to a worker and no credentials or signed URLs are exposed.
+
+Transfer and execution progress are reported separately. After a verified transfer, create/append runs in one ordinary authorized session as an atomic transaction with optional schema creation. Parse errors, schema mismatches, constraints, cancellation, and commit failures leave no partial destination rows. A commit conflict or interrupted execution is never replayed automatically. Staged bytes are deleted after the attempt; failed and abandoned uploads are reclaimed by the existing fenced maintenance pass after 15 minutes. Import SQL is retained in ordinary query history and usage metering under the caller's principal, with the import request ID in its context.
 
 ## SQL files and standard input
 

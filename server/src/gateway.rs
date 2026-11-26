@@ -35,6 +35,8 @@ use std::{
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+#[path = "gateway_imports.rs"]
+mod import_api;
 #[path = "gateway_jobs.rs"]
 mod job_api;
 
@@ -3097,6 +3099,14 @@ pub(crate) async fn serve(token: String) -> anyhow::Result<()> {
         .route("/v1/jobs/{id}/cancel", post(request_cancel))
         .route("/v1/jobs/{id}/result", get(job_api::manifest))
         .route("/v1/jobs/{id}/result/chunks/{chunk}", get(job_api::chunk))
+        .route(
+            "/v1/imports/{id}/upload",
+            post(import_api::upload).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/v1/imports/{id}",
+            get(import_api::detail).delete(import_api::cleanup),
+        )
         .route("/v1/sessions", post(open))
         .route("/v1/sessions/{id}", axum::routing::delete(close))
         .route("/v1/sessions/{id}/queries", post(query))

@@ -232,7 +232,7 @@ pub(super) fn remove_job_fixture_schema(client: &mut Client) -> Result<()> {
         .get(0);
     if current >= 8 {
         client.batch_execute(
-            "DROP TABLE gateway_sessions; DELETE FROM platform_schema_migrations WHERE version=8;",
+            "DROP TABLE gateway_sessions; DROP TABLE import_requests; DELETE FROM platform_schema_migrations WHERE version IN (8,9);",
         )?;
     }
     if current >= 7 {
