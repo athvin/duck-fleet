@@ -699,7 +699,10 @@ as `ERROR` with a SQLSTATE a driver can act on (`40001` for a lost commit race,
 `failure_kind` in the message. ReadyForQuery reports the real transaction
 state: `T` inside `BEGIN`, `E` after a failure aborts it, and `I` otherwise. Drivers
 such as psycopg therefore commit and roll back correctly. Statements in an aborted
-transaction fail with `25P02` until `ROLLBACK` or `COMMIT` ends it.
+transaction fail with `25P02` until `ROLLBACK` or `COMMIT` ends it. Each connection
+receives random BackendKeyData. A CancelRequest carrying that key, such as psql's
+Ctrl-C or psycopg's `cancel()`, cancels the running statement through the
+ordinary session cancel path (`57014`). A forged or stale key cancels nothing.
 
 Pgwire uses the configured default persistent pool when its backend session
 opens. This release has no per-connection pool selection mechanism; database
@@ -708,7 +711,7 @@ sessions, while existing ones retain their worker and allocation.
 
 The honest limits, refused rather than fudged: no extended-protocol bind
 parameters (interpolate client-side, as `psql` and psycopg2 already do), no
-COPY, LISTEN/NOTIFY, cursors, or CancelRequest, and SSLRequests are answered
+COPY, LISTEN/NOTIFY, or cursors, and SSLRequests are answered
 `N` — this listener is in-cluster plain TCP, off by default, and transport
 security belongs to the exposure layer. Results travel in text format with
 typed OIDs (ints, floats, booleans, text, decimals, dates, microsecond

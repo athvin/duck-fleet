@@ -99,6 +99,44 @@ def _():
     conn.close()
 
 
+LONG = "SELECT sum(sin(range)) FROM range(100000000000)"
+
+
+@check("a forged CancelRequest cancels nothing; the real key cancels within seconds with 57014")
+def _():
+    import socket
+    import struct
+
+    conn = connect(autocommit=True)
+    outcome = {}
+
+    def run():
+        started = time.time()
+        try:
+            conn.execute(LONG)
+            outcome["result"] = "completed"
+        except psycopg.errors.QueryCanceled as error:
+            outcome["result"] = "canceled"
+            outcome["message"] = str(error)
+        outcome["elapsed"] = time.time() - started
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    time.sleep(1.5)
+    info = conn.info
+    with socket.create_connection((info.host, info.port), timeout=5) as raw:
+        raw.sendall(struct.pack("!iiii", 16, 80877102, info.backend_pid, 12345))
+    time.sleep(2)
+    assert worker.is_alive(), f"a forged key stopped the statement: {outcome}"
+    conn.cancel_safe()
+    worker.join(30)
+    assert not worker.is_alive(), "the real CancelRequest did not stop the statement"
+    assert outcome["result"] == "canceled", outcome
+    assert outcome["elapsed"] < 15, outcome
+    assert conn.execute("SELECT 1").fetchone() == (1,)
+    conn.close()
+
+
 setup.execute("DROP SCHEMA pgwire_clients CASCADE")
 setup.close()
 sys.exit(1 if failures else 0)

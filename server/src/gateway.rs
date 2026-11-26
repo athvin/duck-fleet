@@ -2365,6 +2365,33 @@ impl crate::pgwire::Platform for PgPlatform {
         }
     }
 
+    /// The same authorization and route as `POST /v1/sessions/{id}/cancel`, as
+    /// the connection's own principal.
+    async fn cancel(&self, identity: &Identity, session: &crate::pgwire::Session) {
+        let Ok(id) = Uuid::parse_str(&session.session_id) else {
+            return;
+        };
+        let Ok(endpoint) = self.0.route(id, identity, Action::QueryCancel).await else {
+            return;
+        };
+        if let Err(error) = self
+            .0
+            .send_as(
+                &endpoint,
+                Method::POST,
+                &format!("/v1/sessions/{id}/cancel"),
+                Bytes::new(),
+                identity,
+            )
+            .await
+        {
+            tracing::debug!(
+                kind = error.0.kind,
+                "pgwire cancel request was not forwarded"
+            );
+        }
+    }
+
     fn draining(&self) -> bool {
         self.0.draining.load(Ordering::Acquire)
     }

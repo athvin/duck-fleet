@@ -10,8 +10,9 @@
 //! `duckfleet_system` instead performs bounded metadata reads without a worker.
 //!
 //! The unsupported surface refuses rather than misbehaves: COPY, LISTEN/NOTIFY,
-//! cursors, CancelRequest, and extended-protocol bind parameters (interpolate
-//! client-side, as psql and psycopg2 already do). Results travel in text format.
+//! cursors, and extended-protocol bind parameters (interpolate client-side, as
+//! psql and psycopg2 already do). Results travel in text format. CancelRequest
+//! cancels the connection's running statement through the session cancel path.
 use anyhow::{Context, Result, bail};
 use arrow_array::{Array, RecordBatch, cast::AsArray, types};
 use arrow_schema::{DataType, TimeUnit};
@@ -84,12 +85,109 @@ pub(crate) trait Platform: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = std::result::Result<system_query::SystemResult, ApiError>>
     + Send;
     fn close_session(&self, session: Session) -> impl std::future::Future<Output = ()> + Send;
+    /// Cancels the session's running statement, as the original connection's
+    /// principal. Possession of the connection's secret key authorizes it.
+    fn cancel(
+        &self,
+        identity: &Identity,
+        session: &Session,
+    ) -> impl std::future::Future<Output = ()> + Send;
     fn draining(&self) -> bool;
 }
 
+#[derive(Clone)]
 pub(crate) struct Session {
     pub endpoint: String,
     pub session_id: String,
+}
+
+/// BackendKeyData for live connections, so a CancelRequest arriving on a new
+/// socket can find the session it targets. Keys are random per connection and
+/// removed when the connection ends; an unknown or mismatched key is ignored.
+mod cancel_keys {
+    use super::{Identity, Session};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    struct Target {
+        secret: i32,
+        identity: Identity,
+        session: Option<Session>,
+    }
+
+    fn targets() -> &'static Mutex<HashMap<i32, Target>> {
+        static TARGETS: OnceLock<Mutex<HashMap<i32, Target>>> = OnceLock::new();
+        TARGETS.get_or_init(Default::default)
+    }
+
+    pub(super) struct Registration {
+        pub pid: i32,
+        pub secret: i32,
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            targets()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.pid);
+        }
+    }
+
+    fn random_i32() -> i32 {
+        let bytes = uuid::Uuid::new_v4().into_bytes();
+        i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    pub(super) fn register(identity: Identity) -> Registration {
+        let mut map = targets().lock().unwrap_or_else(|e| e.into_inner());
+        let pid = loop {
+            let candidate = random_i32() & i32::MAX;
+            if candidate != 0 && !map.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let secret = random_i32();
+        map.insert(
+            pid,
+            Target {
+                secret,
+                identity,
+                session: None,
+            },
+        );
+        Registration { pid, secret }
+    }
+
+    pub(super) fn publish(pid: i32, session: &Session) {
+        if let Some(target) = targets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&pid)
+        {
+            target.session = Some(session.clone());
+        }
+    }
+
+    pub(super) fn find(pid: i32, secret: i32) -> Option<(Identity, Session)> {
+        let map = targets().lock().unwrap_or_else(|e| e.into_inner());
+        let target = map.get(&pid)?;
+        // Constant-time comparison of the 32-bit secret.
+        if (target.secret ^ secret) != 0 {
+            return None;
+        }
+        Some((target.identity.clone(), target.session.clone()?))
+    }
+}
+
+tokio::task_local! {
+    /// The BackendKeyData process ID of the connection a task serves.
+    static CANCEL_KEY: i32;
+}
+
+enum Startup {
+    Session(Vec<u8>),
+    Cancel { pid: i32, secret: i32 },
 }
 
 pub(crate) enum QueryOutcome {
@@ -138,10 +236,15 @@ async fn connection<P: Platform>(platform: Arc<P>, socket: TcpStream) -> Result<
         .await
         .context("pgwire startup timed out")??;
     let outcome = match startup {
-        // SSLRequest answered, CancelRequest dropped (no cancellation path over this
-        // front): both end the connection without a session.
-        None => Ok(()),
-        Some(rest) => established(platform, &mut stream, &rest).await,
+        // A CancelRequest gets no response, as in PostgreSQL. A matching key
+        // cancels through the ordinary session cancel path; SQL is never replayed.
+        Startup::Cancel { pid, secret } => {
+            if let Some((identity, session)) = cancel_keys::find(pid, secret) {
+                platform.cancel(&identity, &session).await;
+            }
+            Ok(())
+        }
+        Startup::Session(rest) => established(platform, &mut stream, &rest).await,
     };
     graceful_shutdown(&mut stream).await;
     outcome
@@ -168,7 +271,7 @@ async fn graceful_shutdown(stream: &mut BufStream<TcpStream>) {
 /// Reads the startup phase, returning the startup packet body once a v3 client
 /// speaks it, or `None` when the exchange ends without a session (an SSLRequest the
 /// client does not follow up, or a CancelRequest).
-async fn read_startup(stream: &mut BufStream<TcpStream>) -> Result<Option<Vec<u8>>> {
+async fn read_startup(stream: &mut BufStream<TcpStream>) -> Result<Startup> {
     // SSLRequests are answered 'N' (this listener is in-cluster plain TCP; transport
     // security is the exposure layer's concern), and a client may retry the startup
     // message afterwards.
@@ -181,11 +284,16 @@ async fn read_startup(stream: &mut BufStream<TcpStream>) -> Result<Option<Vec<u8
                 stream.write_all(b"N").await?;
                 flush(stream).await?;
             }
-            CANCEL_REQUEST => return Ok(None),
+            CANCEL_REQUEST => {
+                anyhow::ensure!(length == 16, "malformed CancelRequest");
+                let pid = stream.read_i32().await.context("cancel process id")?;
+                let secret = stream.read_i32().await.context("cancel secret")?;
+                return Ok(Startup::Cancel { pid, secret });
+            }
             PROTOCOL_V3 => {
                 let mut rest = vec![0; usize::try_from(length - 8)?];
                 stream.read_exact(&mut rest).await?;
-                return Ok(Some(rest));
+                return Ok(Startup::Session(rest));
             }
             _ => bail!("unsupported protocol {code}"),
         }
@@ -261,9 +369,10 @@ async fn established<P: Platform>(
         body.push(0);
         write_message(stream, b'S', &body).await?;
     }
+    let registration = cancel_keys::register(identity.clone());
     let mut key_data = Vec::new();
-    key_data.extend_from_slice(&1_i32.to_be_bytes());
-    key_data.extend_from_slice(&1_i32.to_be_bytes());
+    key_data.extend_from_slice(&registration.pid.to_be_bytes());
+    key_data.extend_from_slice(&registration.secret.to_be_bytes());
     write_message(stream, b'K', &key_data).await?;
     ready(stream, Transaction::Idle).await?;
 
@@ -273,15 +382,20 @@ async fn established<P: Platform>(
     let mut session: Option<Session> = None;
     // The unnamed prepared statement, for the parameterless extended protocol.
     let mut prepared: Option<String> = None;
-    let outcome = connection_loop(
-        platform.as_ref(),
-        stream,
-        &identity,
-        mode,
-        &mut session,
-        &mut prepared,
-    )
-    .await;
+    let outcome = CANCEL_KEY
+        .scope(
+            registration.pid,
+            connection_loop(
+                platform.as_ref(),
+                stream,
+                &identity,
+                mode,
+                &mut session,
+                &mut prepared,
+            ),
+        )
+        .await;
+    drop(registration);
     if let Some(open) = session {
         platform.close_session(open).await;
     }
@@ -685,7 +799,12 @@ async fn run_statement<P: Platform>(
     }
     if session.is_none() {
         match platform.open_session(identity).await {
-            Ok(opened) => *session = Some(opened),
+            Ok(opened) => {
+                if let Ok(pid) = CANCEL_KEY.try_with(|pid| *pid) {
+                    cancel_keys::publish(pid, &opened);
+                }
+                *session = Some(opened);
+            }
             Err(error) => {
                 if matches!(error.0.kind, "unauthorized" | "forbidden") {
                     return refuse_access(stream, error).await;
@@ -1365,6 +1484,7 @@ mod tests {
         checks: AtomicUsize,
         opened: AtomicUsize,
         closed: AtomicUsize,
+        canceled: AtomicUsize,
         statements: Mutex<Vec<String>>,
         request_ids: Mutex<Vec<Uuid>>,
         hold_open: bool,
@@ -1502,6 +1622,10 @@ mod tests {
 
         async fn close_session(&self, _session: Session) {
             self.closed.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn cancel(&self, _identity: &Identity, _session: &Session) {
+            self.canceled.fetch_add(1, Ordering::SeqCst);
         }
 
         fn draining(&self) -> bool {
@@ -1898,6 +2022,28 @@ mod tests {
         assert_eq!(format_decimal(42, 0), "42");
         assert_eq!(format_decimal(-42, -2), "-4200");
         assert_eq!(format_decimal(-1, 38), format!("-0.{}1", "0".repeat(37)));
+    }
+
+    #[test]
+    fn cancel_keys_match_only_a_live_connection_with_its_secret_and_session() {
+        let registration = cancel_keys::register(Identity::bootstrap());
+        let (pid, secret) = (registration.pid, registration.secret);
+        assert!(pid > 0);
+        assert!(cancel_keys::find(pid, secret).is_none(), "no session yet");
+        cancel_keys::publish(
+            pid,
+            &Session {
+                endpoint: "http://worker".into(),
+                session_id: "s".into(),
+            },
+        );
+        assert!(cancel_keys::find(pid, secret).is_some());
+        assert!(cancel_keys::find(pid, secret.wrapping_add(1)).is_none());
+        drop(registration);
+        assert!(
+            cancel_keys::find(pid, secret).is_none(),
+            "ended connections are forgotten"
+        );
     }
 
     #[test]
