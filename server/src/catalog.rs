@@ -25,10 +25,67 @@ struct RelationName {
 }
 
 #[derive(Debug)]
-struct ResolvedRelation {
-    catalog: String,
-    schema: String,
-    relation: String,
+pub(crate) struct ResolvedRelation {
+    pub catalog: String,
+    pub schema: String,
+    pub relation: String,
+}
+
+impl ResolvedRelation {
+    pub fn qualified(&self) -> String {
+        format!(
+            "{}.{}.{}",
+            quote_identifier(&self.catalog),
+            quote_identifier(&self.schema),
+            quote_identifier(&self.relation)
+        )
+    }
+
+    pub fn display(&self) -> String {
+        format!("{}.{}", self.schema, self.relation)
+    }
+}
+
+/// Resolves a base table in the current catalog. Time travel and change
+/// reads apply only to DuckLake tables, so a view or another catalog is
+/// refused before any scan.
+pub(crate) async fn resolve_table(
+    connection: &RemoteConnection,
+    name: &str,
+) -> Result<ResolvedRelation, RemoteError> {
+    let parsed = parse_relation(name)?;
+    let queue = crate::query::DEFAULT_QUEUE_TIMEOUT;
+    let current = query(connection, "SELECT current_catalog()", Vec::new(), queue).await?;
+    if let Some(catalog) = &parsed.catalog
+        && current.rows.first().and_then(|row| row[0].as_deref()) != Some(catalog.as_str())
+    {
+        return Err(local_error(
+            "cross_catalog",
+            format!("snapshots apply to the current DuckLake catalog, not {catalog:?}"),
+        ));
+    }
+    let relation = resolve(connection, &parsed, queue).await?;
+    let kind = query(
+        connection,
+        "SELECT table_type FROM information_schema.tables WHERE table_catalog = ? AND table_schema = ? AND table_name = ?",
+        vec![
+            Value::String(relation.catalog.clone()),
+            Value::String(relation.schema.clone()),
+            Value::String(relation.relation.clone()),
+        ],
+        queue,
+    )
+    .await?;
+    if kind.rows.first().and_then(|row| row[0].as_deref()) != Some("BASE TABLE") {
+        return Err(local_error(
+            "not_a_table",
+            format!(
+                "{} is not a DuckLake table; snapshots track tables, not views",
+                relation.display()
+            ),
+        ));
+    }
+    Ok(relation)
 }
 
 pub async fn run(
