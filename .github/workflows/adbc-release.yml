@@ -1,0 +1,78 @@
+name: ADBC driver release
+on:
+  push:
+    tags: ["duckfleet-adbc-v*"]
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            library: libadbc_duckfleet.dylib
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            library: libadbc_duckfleet.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            library: libadbc_duckfleet.so
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: bash scripts/ci/install-rust.sh && echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Tag matches the crate version
+        working-directory: server
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "duckfleet-adbc") | .version')
+          [[ "duckfleet-adbc-v$version" == "$GITHUB_REF_NAME" ]] || { echo "tag $GITHUB_REF_NAME does not match duckfleet-adbc $version" >&2; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - name: Build the shared library
+        working-directory: server
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo build --locked --release -p duckfleet-adbc --target "${{ matrix.target }}"
+      - name: Package, install, and load through adbc-driver-manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="duckfleet-adbc-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "server/target/${{ matrix.target }}/release/${{ matrix.library }}" packaging/adbc/install.sh LICENSE docs/adbc.md "dist/$name/"
+          echo "$VERSION" > "dist/$name/VERSION"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          mkdir smoke && tar -C smoke -xzf "dist/$name.tar.gz"
+          sh "smoke/$name/install.sh" --prefix "$PWD/smoke/drivers"
+          ADBC_DRIVER_PATH="$PWD/smoke/drivers" uv run --quiet --no-project --python 3.12 \
+            --with adbc-driver-manager==1.13.0 --with pyarrow==26.0.1 compat/adbc_load_smoke.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: adbc-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          path: dist
+      - name: Checksums and release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          find dist -name '*.tar.gz' -exec cp {} dist/ \;
+          (cd dist && sha256sum duckfleet-adbc-*.tar.gz > SHA256SUMS && sha256sum -c SHA256SUMS)
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/duckfleet-adbc-*.tar.gz dist/SHA256SUMS --clobber

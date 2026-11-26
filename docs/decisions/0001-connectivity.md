@@ -2,7 +2,7 @@
 
 - Status: accepted (2026-11-26)
 - Ticket: #172 (part of #163)
-- Evidence: `prototypes/connectivity/run.sh` regenerates `prototypes/connectivity/matrix.json` against the Compose stack.
+- Evidence: `prototypes/connectivity/run.sh` regenerates `prototypes/connectivity/matrix.json` against the Compose stack. The matrix was recorded with the prototype. The driver now lives in `server/adbc` (#189), and re-running the script measures that driver instead.
 
 ## Decision
 
@@ -21,7 +21,7 @@ Every run used the Compose stack (DuckDB v2.0.1 workers) with the local bootstra
 
 | ID | Client | Exact versions | Authentication | Path |
 |---|---|---|---|---|
-| W1 | Python DB-API over ADBC, results as Arrow | adbc-driver-manager 1.13.0, pyarrow 26.0.1, Python 3.12, prototype driver `prototypes/adbc-duckfleet` | ADBC `uri` + `password` (token) | HTTP/Arrow via the SDK |
+| W1 | Python DB-API over ADBC, results as Arrow | adbc-driver-manager 1.13.0, pyarrow 26.0.1, Python 3.12, prototype driver `prototypes/adbc-duckfleet` (now `server/adbc`) | ADBC `uri` + `password` (token) | HTTP/Arrow via the SDK |
 | W2 | pandas `read_sql` over the same ADBC connection | pandas 3.1.1 | same | same |
 | W3 | `psql` | psql 17.6 (`postgres:17.6-bookworm`) | password = token | pgwire, simple protocol |
 | W4 | psycopg | psycopg 3.3.9 (binary) | password = token | pgwire; default server-side binding and `ClientCursor` |

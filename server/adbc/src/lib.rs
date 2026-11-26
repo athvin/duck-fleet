@@ -1,11 +1,15 @@
-//! Prototype ADBC driver over DuckFleet's HTTP/Arrow API, built for the #172
-//! connectivity decision. It reuses the `duckfleet` SDK for sessions, typed
-//! parameters, Arrow results, cancellation, and classified failures, and adds
-//! only the ADBC surface: options, autocommit transactions, single-row
-//! parameter binding, and streamed `RecordBatchReader` results.
+//! The DuckFleet ADBC driver: ADBC over DuckFleet's HTTP/Arrow API, built on
+//! the `duckfleet` SDK (decision 0001). Sessions, typed parameters, Arrow
+//! results, cancellation, and classified failures are the SDK's; this crate
+//! adds the ADBC surface: database/connection options (URI, token, compute),
+//! autocommit transactions, single-row parameter binding, catalog metadata
+//! (`get_info`, `get_table_types`, `get_objects`, `get_table_schema`), and
+//! streamed `RecordBatchReader` results. SQL is never replayed.
 //!
-//! Not a supported driver: catalog metadata (`get_objects`, `get_info`), bulk
-//! ingest, partitions, Substrait, and multi-row binding are NotImplemented.
+//! Bulk ingest, partitions, Substrait, statistics, and multi-row binding
+//! return NOT_IMPLEMENTED.
+
+mod metadata;
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{
@@ -20,7 +24,7 @@ use duckfleet::{ErrorKind, Param, SessionOptions};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-fn runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -40,7 +44,7 @@ fn unsupported(what: &str) -> Error {
 
 /// Classified DuckFleet failures keep their identity: status, SQLSTATE, and a
 /// message that names `failure_kind`, `retry_safe`, and the request ID.
-fn convert(error: duckfleet::Error) -> Error {
+pub(crate) fn convert(error: duckfleet::Error) -> Error {
     let (status, sqlstate) = match error.kind() {
         ErrorKind::Sql => (Status::InvalidArguments, *b"42601"),
         ErrorKind::Conflict => (Status::InvalidState, *b"40001"),
@@ -96,6 +100,7 @@ impl adbc_core::Driver for DuckFleetDriver {
 pub struct DuckFleetDatabase {
     uri: Option<String>,
     token: Option<String>,
+    compute: duckfleet::ComputeRequest,
 }
 
 fn string(value: OptionValue) -> Result<String> {
@@ -117,6 +122,39 @@ impl Optionable for DuckFleetDatabase {
             OptionDatabase::Password => self.token = Some(string(value)?),
             OptionDatabase::Other(name) if name == "adbc.duckfleet.token" => {
                 self.token = Some(string(value)?)
+            }
+            OptionDatabase::Other(name) if name.starts_with("adbc.duckfleet.") => {
+                let text = string(value)?;
+                match &name["adbc.duckfleet.".len()..] {
+                    "pool" => self.compute.pool = Some(text),
+                    "memory" => self.compute.memory = Some(text),
+                    "disk" => self.compute.disk = Some(text),
+                    "cpu" => {
+                        self.compute.cpu = Some(text.parse().map_err(|_| {
+                            Error::with_message_and_status(
+                                "adbc.duckfleet.cpu must be a positive whole number",
+                                Status::InvalidArguments,
+                            )
+                        })?)
+                    }
+                    "mode" => {
+                        self.compute.mode = Some(match text.as_str() {
+                            "persistent" => duckfleet::Mode::Persistent,
+                            "isolated" => duckfleet::Mode::Isolated,
+                            _ => {
+                                return Err(Error::with_message_and_status(
+                                    "adbc.duckfleet.mode must be persistent or isolated",
+                                    Status::InvalidArguments,
+                                ));
+                            }
+                        })
+                    }
+                    other => {
+                        return Err(unsupported(&format!(
+                            "database option adbc.duckfleet.{other}"
+                        )));
+                    }
+                }
             }
             OptionDatabase::Username => {}
             other => return Err(unsupported(&format!("database option {}", other.as_ref()))),
@@ -159,8 +197,17 @@ impl adbc_core::Database for DuckFleetDatabase {
             ));
         };
         let client = duckfleet::Client::new(uri, token).map_err(convert)?;
+        let mut options = SessionOptions::named("adbc");
+        if self.compute.mode.is_some()
+            || self.compute.pool.is_some()
+            || self.compute.cpu.is_some()
+            || self.compute.memory.is_some()
+            || self.compute.disk.is_some()
+        {
+            options = options.compute(self.compute.clone());
+        }
         let session = runtime()
-            .block_on(client.session(SessionOptions::named("adbc")))
+            .block_on(client.session(options))
             .map_err(convert)?;
         let mut connection = DuckFleetConnection {
             session: Arc::new(session),
@@ -219,7 +266,10 @@ impl Optionable for DuckFleetConnection {
                 self.autocommit = enabled;
                 Ok(())
             }
-            other => Err(unsupported(&format!("connection option {}", other.as_ref()))),
+            other => Err(unsupported(&format!(
+                "connection option {}",
+                other.as_ref()
+            ))),
         }
     }
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
@@ -271,21 +321,38 @@ impl adbc_core::Connection for DuckFleetConnection {
 
     fn get_info(
         &self,
-        _codes: Option<HashSet<InfoCode>>,
+        codes: Option<HashSet<InfoCode>>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(unsupported("get_info"))
+        let version = runtime()
+            .block_on(self.session.execute("SELECT version()", Vec::new()))
+            .map_err(convert)?
+            .rows
+            .first()
+            .and_then(|row| row.first().cloned().flatten())
+            .unwrap_or_default();
+        metadata::info(codes, &version)
     }
 
     fn get_objects(
         &self,
-        _depth: ObjectDepth,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: Option<&str>,
-        _table_type: Option<Vec<&str>>,
-        _column_name: Option<&str>,
+        depth: ObjectDepth,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: Option<&str>,
+        table_type: Option<Vec<&str>>,
+        column_name: Option<&str>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(unsupported("get_objects"))
+        metadata::objects(
+            &self.session,
+            metadata::Filter {
+                depth,
+                catalog,
+                db_schema,
+                table_name,
+                table_type,
+                column_name,
+            },
+        )
     }
 
     fn get_table_schema(
@@ -311,7 +378,7 @@ impl adbc_core::Connection for DuckFleetConnection {
     }
 
     fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(unsupported("get_table_types"))
+        metadata::table_types()
     }
 
     fn get_statistic_names(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {

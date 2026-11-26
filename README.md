@@ -254,6 +254,10 @@ The dbt adapter itself is not in this repo: it is a first-class `AdapterType::Du
 in a fork of dbt-core v2 (`athvin/dbt`), whose compiled `dbt` binary this repo downloads
 by pinned release. A model's `meta.platform` (cpu/memory/disk) is what asks for a pod.
 
+## ADBC driver
+
+`duckfleet-adbc` lets Arrow-native tools connect through ADBC: pyarrow, pandas, Polars, DuckDB, and R. You get typed Arrow results, bound parameters, transactions, cancellation, catalog metadata, and explicit compute selection over the HTTP/Arrow API. Release archives install a driver manifest so driver managers load it by the name `duckfleet`. See the [ADBC guide](docs/adbc.md) and [decision 0001](docs/decisions/0001-connectivity.md).
+
 ## Rust SDK
 
 The [`duckfleet`](server/sdk/README.md) crate is the supported Rust client. It provides explicit sessions with transactions, cancellation, and compute selection, typed bound parameters, Arrow `RecordBatch` results, durable jobs with verified resumable downloads, and a stable `ErrorKind` that never replays SQL. The CLI and the integration harness use the same crate. Its minimum supported Rust version is 1.89. `make test-sdk` runs its real-Compose suite, and a `duckfleet-sdk-v<version>` tag publishes it to crates.io after the gates pass.

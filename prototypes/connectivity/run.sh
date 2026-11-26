@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reproduces the #172 connectivity matrix against the running Compose stack:
-#   W1/W2  prototype ADBC driver via adbc-driver-manager 1.13.0, pyarrow 26.0.1, pandas 3.1.1
+#   W1/W2  the ADBC driver (server/adbc; a prototype when the matrix was recorded) via adbc-driver-manager 1.13.0, pyarrow 26.0.1, pandas 3.1.1
 #   W3     psql 17.6 (the postgres:17.6-bookworm image) against the pgwire front
 #   W4     psycopg 3.3.9 against the pgwire front
 # Writes prototypes/connectivity/matrix.json. Requires: uv, docker, cargo, jq.
@@ -10,8 +10,8 @@ token=${DUCKFLEET_TOKEN:-duckfleet-local-development-token}
 out="$root/prototypes/connectivity/matrix.json"
 network=$(docker network ls --format '{{.Name}}' | grep -m1 'duckfleet-local_default')
 
-(cd "$root/prototypes/adbc-duckfleet" && cargo build --release --quiet)
-driver=$(ls "$root"/prototypes/adbc-duckfleet/target/release/libadbc_duckfleet.{dylib,so} 2>/dev/null | head -1 || true)
+(cd "$root/server" && cargo build --locked --release --quiet -p duckfleet-adbc)
+driver=$(ls "$root"/server/target/release/libadbc_duckfleet.{dylib,so} 2>/dev/null | head -1 || true)
 
 docker rm -f duckfleet-pgwire-forward >/dev/null 2>&1 || true
 docker run -d --rm --name duckfleet-pgwire-forward --network "$network" -p 127.0.0.1:15432:5432 \
