@@ -4,6 +4,7 @@ mod artifacts;
 mod audit;
 mod authz;
 mod autoscaling;
+mod catalog;
 mod cli;
 mod cli_config;
 #[allow(dead_code)]

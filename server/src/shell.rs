@@ -145,36 +145,20 @@ pub async fn run(options: ShellOptions) -> i32 {
                     println!("timing {}", if timing { "on" } else { "off" });
                 }
                 "\\dt" => {
-                    let sql = "SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('information_schema', 'duckfleet_system') ORDER BY table_schema, table_name";
-                    if execute(
-                        &connection,
-                        sql,
-                        Vec::new(),
-                        options.queue_timeout,
-                        &format,
-                        timing,
-                    )
-                    .await
-                        == Outcome::Fatal
-                    {
+                    let rows = crate::catalog::tables(&connection, options.queue_timeout).await;
+                    if finish_catalog(rows, &format) == Outcome::Fatal {
                         fatal = true;
                         break;
                     }
                 }
                 _ if command.starts_with("\\d ") => {
-                    let relation = command[3..].trim();
-                    let (sql, parameters) = describe_query(relation);
-                    if execute(
+                    let rows = crate::catalog::describe(
                         &connection,
-                        &sql,
-                        parameters,
+                        command[3..].trim(),
                         options.queue_timeout,
-                        &format,
-                        timing,
                     )
-                    .await
-                        == Outcome::Fatal
-                    {
+                    .await;
+                    if finish_catalog(rows, &format) == Outcome::Fatal {
                         fatal = true;
                         break;
                     }
@@ -250,6 +234,29 @@ enum Outcome {
     Fatal,
 }
 
+fn finish_catalog(
+    result: Result<QueryResult, crate::client::RemoteError>,
+    format: &str,
+) -> Outcome {
+    match result {
+        Ok(rows) => {
+            crate::cli::emit(&rows, format);
+            Outcome::Success
+        }
+        Err(error) => {
+            let fatal = error.failure_kind.as_deref() == Some("unknown_session")
+                || error.failure_kind.as_deref() == Some("transport_failure")
+                || error.acceptance.as_deref() == Some("unknown");
+            crate::cli::print_remote_error(&error);
+            if fatal {
+                Outcome::Fatal
+            } else {
+                Outcome::Failed
+            }
+        }
+    }
+}
+
 async fn execute(
     connection: &RemoteConnection,
     sql: &str,
@@ -296,12 +303,20 @@ async fn execute(
             eprintln!("canceling request_id: {request_id}");
             match connection.cancel().await {
                 Ok(_) => {
-                    println!("cancellation requested for {request_id}");
-                    if timing {
-                        println!("client_total_ms: {}", started.elapsed().as_millis());
-                        println!("server_elapsed_ms: unknown");
+                    println!("cancellation requested for {request_id}; waiting for terminal status");
+                    match wait_for_terminal(connection, &request_id).await {
+                        Ok(()) => {
+                            if timing {
+                                println!("client_total_ms: {}", started.elapsed().as_millis());
+                                println!("server_elapsed_ms: unknown");
+                            }
+                            Outcome::Canceled
+                        }
+                        Err(error) => {
+                            crate::cli::print_remote_error(&error);
+                            Outcome::Fatal
+                        }
                     }
-                    Outcome::Canceled
                 }
                 Err(error) => {
                     crate::cli::print_remote_error(&error);
@@ -309,6 +324,49 @@ async fn execute(
                 }
             }
         }
+    }
+}
+
+async fn wait_for_terminal(
+    connection: &RemoteConnection,
+    request_id: &str,
+) -> Result<(), crate::client::RemoteError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let bytes = connection
+            .client()
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/requests/{request_id}"),
+                None,
+                std::time::Duration::from_secs(2),
+            )
+            .await?;
+        let value: Value =
+            serde_json::from_slice(&bytes).map_err(|_| crate::client::RemoteError {
+                status: None,
+                failure_kind: Some("invalid_response".into()),
+                retry_safe: false,
+                message: "cancellation status returned invalid JSON".into(),
+                request_id: Some(request_id.into()),
+                acceptance: Some("unknown".into()),
+                status_url: Some(format!("/v1/requests/{request_id}").into()),
+            })?;
+        if value["state"] == "terminal" {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(crate::client::RemoteError {
+                status: None,
+                failure_kind: Some("cancellation_timeout".into()),
+                retry_safe: false,
+                message: "cancellation did not reach a terminal state within 10 seconds; the shell session was ended rather than admitting another statement".into(),
+                request_id: Some(request_id.into()),
+                acceptance: Some("unknown".into()),
+                status_url: Some(format!("/v1/requests/{request_id}").into()),
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -342,20 +400,6 @@ fn update_transaction(statement: &str, open: &mut bool) {
         "BEGIN" | "START" => *open = true,
         "COMMIT" | "ROLLBACK" => *open = false,
         _ => {}
-    }
-}
-
-fn describe_query(relation: &str) -> (String, Vec<Value>) {
-    if let Some((schema, table)) = relation.rsplit_once('.') {
-        (
-            "SELECT column_name, ordinal_position, data_type, is_nullable FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position".into(),
-            vec![Value::String(schema.into()), Value::String(table.into())],
-        )
-    } else {
-        (
-            "SELECT column_name, ordinal_position, data_type, is_nullable FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ? ORDER BY ordinal_position".into(),
-            vec![Value::String(relation.into())],
-        )
     }
 }
 

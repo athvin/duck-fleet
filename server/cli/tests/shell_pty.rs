@@ -65,7 +65,7 @@ fn persistent_multiline_shell_and_active_cancellation() {
     shell.exp_string("server_elapsed_ms:").unwrap();
     shell.exp_string("duckfleet> ").unwrap();
     shell.send_line("\\dt").unwrap();
-    shell.exp_string("table_schema").unwrap();
+    shell.exp_string("schema_name").unwrap();
     shell.exp_string("duckfleet> ").unwrap();
     shell.send_line("\\d shell_pty").unwrap();
     shell.exp_string("column_name").unwrap();

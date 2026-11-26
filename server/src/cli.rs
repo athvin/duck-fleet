@@ -103,6 +103,9 @@ pub async fn run(args: Vec<String>) -> i32 {
 
     let result = match parsed.command.as_str() {
         "sql" => run_sql(&url, &token, &parsed).await,
+        "schemas" | "tables" | "views" | "describe" | "preview" => {
+            run_catalog(&url, &token, &parsed).await
+        }
         "system" => run_system(&url, &token, &parsed).await,
         "job" => run_job(&url, &token, &parsed).await,
         "history" => {
@@ -167,7 +170,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|schemas|tables|views|describe|preview|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -471,6 +474,44 @@ async fn verify_local_chunk(
     })
     .await
     .map_err(|_| job_local_error(Some(id), "chunk verification task failed"))?
+}
+
+async fn run_catalog(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
+    let request = match parsed.command.as_str() {
+        "schemas" => crate::catalog::Request::Schemas,
+        "tables" => crate::catalog::Request::Relations {
+            kind: crate::catalog::RelationKind::Table,
+            schema: parsed.value("schema").map(str::to_owned),
+        },
+        "views" => crate::catalog::Request::Relations {
+            kind: crate::catalog::RelationKind::View,
+            schema: parsed.value("schema").map(str::to_owned),
+        },
+        "describe" => crate::catalog::Request::Describe(parsed.positionals[0].clone()),
+        "preview" => crate::catalog::Request::Preview(
+            parsed.positionals[0].clone(),
+            crate::catalog::validate_limit(parsed.value("limit")).map_err(|message| {
+                RemoteError {
+                    status: None,
+                    failure_kind: Some("invalid_request".into()),
+                    retry_safe: true,
+                    message,
+                    request_id: None,
+                    acceptance: Some("not_accepted".into()),
+                    status_url: None,
+                }
+            })?,
+        ),
+        _ => unreachable!("validated catalog command"),
+    };
+    crate::catalog::run(
+        url,
+        token,
+        request,
+        parsed.value("format").unwrap_or("table"),
+        crate::query::DEFAULT_QUEUE_TIMEOUT,
+    )
+    .await
 }
 
 async fn run_system(url: &str, token: &str, parsed: &Parsed) -> Result<(), RemoteError> {
@@ -831,7 +872,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 21] = [
+    const VALUE_FLAGS: [&'static str; 22] = [
         "url",
         "token",
         "cpu",
@@ -840,6 +881,7 @@ impl Parsed {
         "mode",
         "pool",
         "format",
+        "schema",
         "limit",
         "queue-timeout",
         "file",
@@ -909,7 +951,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <init|config|version|dev|status|stop|reset|shell|sql|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <init|config|version|dev|status|stop|reset|shell|sql|schemas|tables|views|describe|preview|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -954,6 +996,34 @@ impl Parsed {
         }
         if parsed.flags.iter().any(|flag| flag == "force") && parsed.command != "init" {
             return Err("--force applies only to init".into());
+        }
+        match parsed.command.as_str() {
+            "schemas" if parsed.positionals.is_empty() => {}
+            "tables" | "views" if parsed.positionals.is_empty() => {}
+            "describe" | "preview" if parsed.positionals.len() == 1 => {
+                crate::catalog::validate_relation(&parsed.positionals[0])?;
+            }
+            "schemas" | "tables" | "views" | "describe" | "preview" => {
+                return Err("catalog command has invalid positional arguments".into());
+            }
+            _ => {}
+        }
+        if parsed.value("schema").is_some()
+            && !matches!(parsed.command.as_str(), "tables" | "views")
+        {
+            return Err("--schema applies only to tables and views".into());
+        }
+        if matches!(
+            parsed.command.as_str(),
+            "schemas" | "tables" | "views" | "describe" | "preview"
+        ) && parsed
+            .value("format")
+            .is_some_and(|format| !["table", "csv", "json", "vertical"].contains(&format))
+        {
+            return Err("catalog --format must be table, csv, json, or vertical".into());
+        }
+        if parsed.command == "preview" {
+            crate::catalog::validate_limit(parsed.value("limit"))?;
         }
         if !matches!(parsed.command.as_str(), "sql" | "shell")
             && !parsed.is_job_submit()
@@ -1023,7 +1093,8 @@ impl Parsed {
                 }
             }
         }
-        if let Some(value) = parsed.value("limit")
+        if parsed.command != "preview"
+            && let Some(value) = parsed.value("limit")
             && value
                 .parse::<u32>()
                 .ok()
@@ -1301,6 +1372,11 @@ mod tests {
         assert!(parse(&["reset", "--yes"]).is_ok());
         assert!(parse(&["shell", "--no-history", "--format", "vertical"]).is_ok());
         assert!(parse(&["sql", "--file", "load.sql", "--continue-on-error"]).is_ok());
+        assert!(parse(&["schemas"]).is_ok());
+        assert!(parse(&["tables", "--schema", "analytics"]).is_ok());
+        assert!(parse(&["views", "--format", "json"]).is_ok());
+        assert!(parse(&["describe", "analytics.events"]).is_ok());
+        assert!(parse(&["preview", "analytics.events", "--limit", "1000"]).is_ok());
         for args in [
             vec!["init", "unexpected"],
             vec!["config"],
@@ -1315,6 +1391,11 @@ mod tests {
             vec!["shell", "--format", "yaml"],
             vec!["sql", "SELECT 1", "--no-history"],
             vec!["workers", "--continue-on-error"],
+            vec!["describe"],
+            vec!["schemas", "--schema", "analytics"],
+            vec!["preview", "analytics.events", "--limit", "0"],
+            vec!["preview", "analytics.events", "--limit", "1001"],
+            vec!["tables", "--format", "yaml"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }

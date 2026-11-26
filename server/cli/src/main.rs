@@ -1,3 +1,5 @@
+#[path = "../../src/catalog.rs"]
+mod catalog;
 #[path = "../../src/cli.rs"]
 mod cli;
 #[path = "../../src/cli_config.rs"]

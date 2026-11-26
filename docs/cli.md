@@ -14,11 +14,11 @@ duckfleet version
 To install a release archive directly, download the asset for your platform from the [DuckFleet releases page](https://github.com/athvin/duck-fleet/releases), then verify it against `SHA256SUMS` before extracting it:
 
 ```sh
-curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.3.0/duckfleet-0.3.0-aarch64-apple-darwin.tar.gz
-curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.3.0/SHA256SUMS
+curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.4.0/duckfleet-0.4.0-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.4.0/SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
-tar -xzf duckfleet-0.3.0-aarch64-apple-darwin.tar.gz
-install -m 0755 duckfleet-0.3.0-aarch64-apple-darwin/duckfleet /usr/local/bin/duckfleet
+tar -xzf duckfleet-0.4.0-aarch64-apple-darwin.tar.gz
+install -m 0755 duckfleet-0.4.0-aarch64-apple-darwin/duckfleet /usr/local/bin/duckfleet
 duckfleet version
 ```
 
@@ -67,6 +67,32 @@ The lifecycle commands orchestrate the same `compose.yaml` used by `make up`; th
 - `duckfleet reset` lists the selected Compose resources and named volumes before deletion. Interactive use requires typing the generated project name; automation requires `reset --yes`. It uses Compose's project namespace and never removes another project's resources. Connection settings are retained for the next `dev`, while durable volumes and the demo marker are removed.
 
 Startup failures name the relevant service and print a credential-free `docker compose ... logs` command. Existing `make up`, `make test`, and `make down` workflows remain available.
+
+## Lake catalog discovery and previews
+
+Use the ordinary authorized execution session to inspect lake objects:
+
+```sh
+duckfleet schemas
+duckfleet tables [--schema analytics]
+duckfleet views [--schema analytics]
+duckfleet describe analytics.events
+duckfleet preview analytics.events --limit 20 --format table
+```
+
+`schemas` includes empty schemas. `tables` and `views` keep object kinds distinct; filtering by an existing empty schema returns zero rows, while a missing schema is a classified error. `describe` reports relation schema/name plus column ordinal, name, type, and nullability where DuckDB exposes them. Unqualified relation names resolve only when exactly one visible relation matches; ambiguous and missing relations have distinct errors.
+
+Relation arguments are parsed as identifiers, never executable SQL fragments. Unquoted components follow DuckDB's lowercase folding. Double quotes preserve mixed case, spaces, and dots, and a doubled quote represents a literal quote:
+
+```sh
+duckfleet describe 'catalog_fixture."dot.name"'
+duckfleet describe '"Odd.Schema"."space table"'
+duckfleet describe 'catalog_fixture."quote""name"'
+```
+
+Discovery values use bound parameters. Preview resolves the exact relation first and quotes each identifier component before executing `SELECT *`. The default limit is 20 and the valid range is 1–1000; malformed, zero, negative, and excessive limits fail before opening a session. Output includes the applied limit and preserves typed values through Arrow. Reader and writer principals receive only behavior allowed by their existing catalog/storage credentials; these commands do not expose a writer DSN or privileged platform metadata.
+
+The shell's `\dt` and `\d <relation>` meta-commands call the same implementation and formatting as `tables` and `describe`.
 
 ## Interactive SQL shell
 
