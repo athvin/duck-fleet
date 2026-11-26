@@ -32,6 +32,19 @@ simple-protocol drivers connect directly.
 
 The current engine is DuckDB 2.0.1. See the [release, cutover, and rollback guide](docs/duckdb-2.0.1-release.md) and [engine qualification procedure](docs/engine-upgrades.md).
 
+## Native CLI quickstart
+
+Install the native `duckfleet` executable without Cargo or Docker, start the real local stack, and save project-local connection defaults:
+
+```sh
+brew install athvin/duckfleet/duckfleet
+make up
+DUCKFLEET_TOKEN=duckfleet-local-development-token duckfleet init
+duckfleet sql 'select 42'
+```
+
+`duckfleet.json` is non-secret and committable; `.duckfleet/` holds protected local state and is gitignored. See the [native CLI installation, configuration, and release guide](docs/cli.md) for direct downloads, checksums, supported architectures, and configuration precedence. Existing `DUCKFLEET_URL` and `DUCKFLEET_TOKEN` environment-based invocations remain supported.
+
 ## Supported installation
 
 For a credentialed Linux installation without dbt or Kubernetes, follow the
@@ -224,6 +237,7 @@ docker compose run --rm dbt dbt run --select fct_orders --full-refresh \
 
 ```text
 server/                 Rust gateway, workers, query history, and the cli + harness roles
+server/cli/             Native duckfleet executable, reusing the first-party CLI and client
 server/src/client.rs    HTTP/Arrow client the cli role and harness speak to the gateway with
 server/src/harness.rs   The dbt + HTTP + Postgres + S3 integration gate (the harness role)
 compose.yaml            PostgreSQL, RustFS, gateway, the persistent worker, dbt and CLI runners
@@ -239,13 +253,14 @@ by pinned release. A model's `meta.platform` (cpu/memory/disk) is what asks for 
 ## Use it without dbt
 
 dbt is an option, not a dependency. Everything the platform does is reachable from
-the HTTP API, and the same `duckfleet-server` binary speaks it as its `cli` role —
-no separate package, and no dbt in the image at all:
+the HTTP API. The native `duckfleet` executable packages the existing CLI role without
+DuckDB, dbt, Cargo, or Docker as runtime requirements. Initialize a project or use the
+existing environment variables:
 
 ```sh
 export DUCKFLEET_URL=http://localhost:18080
 export DUCKFLEET_TOKEN=duckfleet-local-development-token
-alias duckfleet='docker compose run --rm api'   # the cli role; dbt is not installed here
+duckfleet init
 
 duckfleet sql 'create or replace table analytics.events (id integer, region varchar)' \
               "insert into analytics.events values (1, 'eu')"

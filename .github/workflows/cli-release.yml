@@ -1,0 +1,119 @@
+name: Native CLI release
+on:
+  push:
+    tags: ["duckfleet-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing duckfleet-v* tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: startsWith(github.ref_name, 'duckfleet-v') || startsWith(inputs.tag, 'duckfleet-v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ startsWith(github.ref_name, 'duckfleet-v') && github.ref_name || inputs.tag }}
+      - name: Install pinned Rust toolchain
+        run: bash scripts/ci/install-rust.sh
+      - name: Install release target
+        run: source "$HOME/.cargo/env" && rustup target add "${{ matrix.target }}"
+      - name: Build native CLI
+        env:
+          TARGET: ${{ matrix.target }}
+          DUCKFLEET_RELEASE: ${{ startsWith(github.ref_name, 'duckfleet-v') && github.ref_name || inputs.tag }}
+        working-directory: server
+        run: source "$HOME/.cargo/env" && cargo build --locked --release -p duckfleet-cli --target "$TARGET"
+      - name: Package and exercise the extracted binary
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ startsWith(github.ref_name, 'duckfleet-v') && github.ref_name || inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG#duckfleet-v}"
+          name="duckfleet-${version}-${TARGET}"
+          mkdir -p "dist/${name}" smoke
+          cp "server/target/${TARGET}/release/duckfleet" "dist/${name}/duckfleet"
+          cp LICENSE docs/cli.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          tar -C smoke -xzf "dist/${name}.tar.gz"
+          binary="$PWD/smoke/${name}/duckfleet"
+          "$binary" version
+          case "$("$binary" version)" in
+            *"duckfleet ${version} "*) ;;
+            *) echo "release tag ${TAG} does not match the binary version" >&2; exit 1 ;;
+          esac
+          mkdir smoke/project
+          cd smoke/project
+          DUCKFLEET_TOKEN=release-smoke-secret "$binary" init
+          "$binary" config show > resolved.json
+          test -f duckfleet.json
+          test "$(grep -c '^\.duckfleet/$' .gitignore)" -eq 1
+          ! grep -q 'release-smoke-secret' duckfleet.json
+          ! grep -q 'release-smoke-secret' resolved.json
+          grep -q '<redacted>' resolved.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ startsWith(github.ref_name, 'duckfleet-v') && github.ref_name || inputs.tag }}
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          path: dist
+      - name: Create checksums and Homebrew formula
+        env:
+          TAG: ${{ startsWith(github.ref_name, 'duckfleet-v') && github.ref_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#duckfleet-v}"
+          find dist -name '*.tar.gz' -exec cp {} dist/ \;
+          cd dist
+          sha256sum duckfleet-*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cd ..
+          macos_arm=$(awk '/aarch64-apple-darwin.tar.gz$/ {print $1}' dist/SHA256SUMS)
+          linux_x86=$(awk '/x86_64-unknown-linux-gnu.tar.gz$/ {print $1}' dist/SHA256SUMS)
+          linux_arm=$(awk '/aarch64-unknown-linux-gnu.tar.gz$/ {print $1}' dist/SHA256SUMS)
+          sed -e "s/@VERSION@/${version}/g" \
+              -e "s/@MACOS_ARM_SHA256@/${macos_arm}/g" \
+              -e "s/@LINUX_X86_SHA256@/${linux_x86}/g" \
+              -e "s/@LINUX_ARM_SHA256@/${linux_arm}/g" \
+              packaging/homebrew/duckfleet.rb > dist/duckfleet.rb
+          ruby -c dist/duckfleet.rb
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ startsWith(github.ref_name, 'duckfleet-v') && github.ref_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --generate-notes --verify-tag
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS dist/duckfleet.rb --clobber

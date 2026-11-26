@@ -5,6 +5,7 @@ mod audit;
 mod authz;
 mod autoscaling;
 mod cli;
+mod cli_config;
 #[allow(dead_code)]
 mod client;
 mod compute;
