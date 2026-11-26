@@ -15,7 +15,7 @@ unset DUCKFLEET_URL DUCKFLEET_TOKEN
 "$binary" version
 "$binary" config show > config.json
 "$binary" sql 'select 42 as answer' > sql.out
-"$binary" history --limit 5 > history.json
+"$binary" history --limit 5 --format json > history.json
 "$binary" workers > workers.json
 "$binary" pools > pools.json
 

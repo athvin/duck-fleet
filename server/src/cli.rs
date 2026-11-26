@@ -109,11 +109,48 @@ pub async fn run(args: Vec<String>) -> i32 {
         "system" => run_system(&url, &token, &parsed).await,
         "job" => run_job(&url, &token, &parsed).await,
         "history" => {
-            let mut path = format!("/v1/queries?limit={}", parsed.limit(20));
-            if let Some(worker) = parsed.value("worker-id") {
-                path.push_str(&format!("&worker_id={worker}"));
-            }
-            get(&url, &token, &path).await
+            crate::history_cli::history(
+                &url,
+                &token,
+                crate::history_cli::HistoryOptions {
+                    filters: [
+                        "status",
+                        "failure-kind",
+                        "worker-id",
+                        "model-id",
+                        "invocation-id",
+                        "model-run-id",
+                    ]
+                    .into_iter()
+                    .filter_map(|name| {
+                        parsed
+                            .value(name)
+                            .map(|value| (name.replace('-', "_"), value.to_owned()))
+                    })
+                    .collect(),
+                    limit: parsed.limit(20),
+                    before: parsed
+                        .value("before")
+                        .map(|value| value.parse::<i64>().expect("validated history cursor")),
+                    format: parsed.value("format").unwrap_or("table").to_owned(),
+                    watch: parsed.flags.iter().any(|flag| flag == "watch"),
+                    interval: crate::history_cli::validate_interval(parsed.value("interval"))
+                        .expect("validated watch interval"),
+                },
+            )
+            .await
+        }
+        "profile" => {
+            crate::history_cli::profile(
+                &url,
+                &token,
+                crate::history_cli::ProfileOptions {
+                    id: parsed.positionals[0].clone(),
+                    raw: parsed.flags.iter().any(|flag| flag == "raw"),
+                    metrics: parsed.flags.iter().any(|flag| flag == "metrics"),
+                },
+            )
+            .await
         }
         "query" => match parsed.positionals.first() {
             Some(id) => get(&url, &token, &format!("/v1/queries/{id}")).await,
@@ -170,7 +207,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|schemas|tables|views|describe|preview|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -872,7 +909,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 22] = [
+    const VALUE_FLAGS: [&'static str; 28] = [
         "url",
         "token",
         "cpu",
@@ -895,6 +932,12 @@ impl Parsed {
         "result-max-rows",
         "output",
         "sql",
+        "failure-kind",
+        "model-id",
+        "invocation-id",
+        "model-run-id",
+        "interval",
+        "status",
     ];
     const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
@@ -917,6 +960,9 @@ impl Parsed {
                     "yes",
                     "no-history",
                     "continue-on-error",
+                    "watch",
+                    "raw",
+                    "metrics",
                 ]
                 .contains(&name)
                 {
@@ -951,7 +997,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <init|config|version|dev|status|stop|reset|shell|sql|schemas|tables|views|describe|preview|system|job|history|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <init|config|version|dev|status|stop|reset|shell|sql|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -1025,6 +1071,54 @@ impl Parsed {
         if parsed.command == "preview" {
             crate::catalog::validate_limit(parsed.value("limit"))?;
         }
+        if parsed.command == "history" && !parsed.positionals.is_empty() {
+            return Err("history takes no positional arguments".into());
+        }
+        if parsed.command == "history"
+            && parsed
+                .value("format")
+                .is_some_and(|format| !["table", "json"].contains(&format))
+        {
+            return Err("history --format must be table or json".into());
+        }
+        if parsed.command == "profile"
+            && (parsed.positionals.len() != 1
+                || uuid::Uuid::parse_str(&parsed.positionals[0]).is_err())
+        {
+            return Err("profile needs one valid query UUID".into());
+        }
+        if parsed.flags.iter().any(|flag| flag == "watch") && parsed.command != "history" {
+            return Err("--watch applies only to history".into());
+        }
+        if parsed.value("interval").is_some() && parsed.command != "history" {
+            return Err("--interval applies only to history".into());
+        }
+        if parsed.command == "history" {
+            crate::history_cli::validate_interval(parsed.value("interval"))?;
+        }
+        for flag in ["raw", "metrics"] {
+            if parsed.flags.iter().any(|value| value == flag) && parsed.command != "profile" {
+                return Err(format!("--{flag} applies only to profile"));
+            }
+        }
+        if parsed.command == "profile"
+            && parsed.flags.iter().any(|flag| flag == "raw")
+            && parsed.flags.iter().any(|flag| flag == "metrics")
+        {
+            return Err("profile --raw and --metrics are mutually exclusive".into());
+        }
+        for flag in [
+            "status",
+            "failure-kind",
+            "worker-id",
+            "model-id",
+            "invocation-id",
+            "model-run-id",
+        ] {
+            if parsed.value(flag).is_some() && parsed.command != "history" {
+                return Err(format!("--{flag} applies only to history"));
+            }
+        }
         if !matches!(parsed.command.as_str(), "sql" | "shell")
             && !parsed.is_job_submit()
             && parsed
@@ -1081,6 +1175,12 @@ impl Parsed {
         }
         for cursor in ["after", "before"] {
             if let Some(value) = parsed.value(cursor) {
+                if cursor == "before" && parsed.command == "history" {
+                    if value.parse::<i64>().ok().is_none_or(|before| before <= 0) {
+                        return Err("--before needs a positive history cursor".into());
+                    }
+                    continue;
+                }
                 let allowed = if cursor == "before" {
                     parsed.command == "audit"
                 } else {
@@ -1377,6 +1477,24 @@ mod tests {
         assert!(parse(&["views", "--format", "json"]).is_ok());
         assert!(parse(&["describe", "analytics.events"]).is_ok());
         assert!(parse(&["preview", "analytics.events", "--limit", "1000"]).is_ok());
+        assert!(
+            parse(&[
+                "history",
+                "--status",
+                "failed",
+                "--format",
+                "json",
+                "--watch",
+                "--interval",
+                "1",
+                "--before",
+                "10"
+            ])
+            .is_ok()
+        );
+        let query_id = uuid::Uuid::new_v4().to_string();
+        assert!(parse(&["profile", &query_id, "--raw"]).is_ok());
+        assert!(parse(&["profile", &query_id, "--metrics"]).is_ok());
         for args in [
             vec!["init", "unexpected"],
             vec!["config"],
@@ -1396,6 +1514,14 @@ mod tests {
             vec!["preview", "analytics.events", "--limit", "0"],
             vec!["preview", "analytics.events", "--limit", "1001"],
             vec!["tables", "--format", "yaml"],
+            vec!["history", "unexpected"],
+            vec!["history", "--format", "yaml"],
+            vec!["history", "--before", "0"],
+            vec!["profile", "not-a-uuid"],
+            vec!["profile", &query_id, "--raw", "--metrics"],
+            vec!["workers", "--watch"],
+            vec!["history", "--raw"],
+            vec!["workers", "--status", "failed"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }

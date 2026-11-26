@@ -14,11 +14,11 @@ duckfleet version
 To install a release archive directly, download the asset for your platform from the [DuckFleet releases page](https://github.com/athvin/duck-fleet/releases), then verify it against `SHA256SUMS` before extracting it:
 
 ```sh
-curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.4.0/duckfleet-0.4.0-aarch64-apple-darwin.tar.gz
-curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.4.0/SHA256SUMS
+curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.5.0/duckfleet-0.5.0-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/athvin/duck-fleet/releases/download/duckfleet-v0.5.0/SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
-tar -xzf duckfleet-0.4.0-aarch64-apple-darwin.tar.gz
-install -m 0755 duckfleet-0.4.0-aarch64-apple-darwin/duckfleet /usr/local/bin/duckfleet
+tar -xzf duckfleet-0.5.0-aarch64-apple-darwin.tar.gz
+install -m 0755 duckfleet-0.5.0-aarch64-apple-darwin/duckfleet /usr/local/bin/duckfleet
 duckfleet version
 ```
 
@@ -67,6 +67,35 @@ The lifecycle commands orchestrate the same `compose.yaml` used by `make up`; th
 - `duckfleet reset` lists the selected Compose resources and named volumes before deletion. Interactive use requires typing the generated project name; automation requires `reset --yes`. It uses Compose's project namespace and never removes another project's resources. Connection settings are retained for the next `dev`, while durable volumes and the demo marker are removed.
 
 Startup failures name the relevant service and print a credential-free `docker compose ... logs` command. Existing `make up`, `make test`, and `make down` workflows remain available.
+
+## Query history and DuckDB profiles
+
+`duckfleet history` defaults to a compact table that does not print SQL text. Use `--format json` for the API's query records and cursor:
+
+```sh
+duckfleet history --status failed --worker-id small
+duckfleet history --failure-kind transaction_conflict
+duckfleet history --model-id model.retail_demo.fct_orders
+duckfleet history --invocation-id <dbt-invocation>
+duckfleet history --model-run-id <run-id>
+duckfleet history --limit 50 --before <history-id> --format json
+```
+
+All filters map to the existing authorized history API. Cursor pages use `--before` with the returned `next_before` history ID and remain stable under concurrent inserts. `duckfleet history --watch --interval 2` polls at a bounded 1–60 second interval, retains only the current page in memory, and stops cleanly on Ctrl-C. JSON watch mode emits each polled page.
+
+Inspect one query with:
+
+```sh
+duckfleet profile <query-id>
+duckfleet profile <query-id> --metrics
+duckfleet profile <query-id> --raw
+```
+
+Default profile output includes queue, preparation/provisioning, engine execution, delivery, total observed, and client-observed totals separately. Missing timestamps and delivery/client measurements remain `unknown`; they are never converted to zero. The operator view lists the most expensive reported operators and a bounded tree with individual timings, rows, and estimated cardinality. Overlapping operator/CPU timings are not summed as wall-clock latency.
+
+`--metrics` omits the operator tree. `--raw` prints only the retained profile JSON returned by the authorized API, not the surrounding SQL-bearing history record. The two flags are mutually exclusive. Missing, sampled-out, expired, disabled, malformed, or unauthorized profiles produce classified errors rather than a false empty plan.
+
+Memory, temporary-directory, spill, and I/O metrics are labeled as DuckDB engine scope. They are not complete container RSS or provider cost measurements. Metadata-only principals can render authorized summary fields, but SQL text, raw errors, profile expressions, and raw profiles are never synthesized or exposed through these commands.
 
 ## Lake catalog discovery and previews
 

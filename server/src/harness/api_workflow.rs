@@ -153,7 +153,10 @@ async fn cli_workflow(ctx: &Ctx) -> anyhow::Result<()> {
     )?;
     for (command, expected) in [
         (vec!["workers"], "isolated_compute"),
-        (vec!["history", "--limit", "1"], "queries"),
+        (
+            vec!["history", "--limit", "1", "--format", "json"],
+            "queries",
+        ),
         (vec!["budget"], "prepaid_micro_usd"),
     ] {
         let out = cli(ctx, &command, 0)?;
