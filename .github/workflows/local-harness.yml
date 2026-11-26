@@ -43,6 +43,8 @@ jobs:
         run: make test-import
       - name: CSV, JSON, Arrow, and Parquet exports
         run: make test-export
+      - name: DuckLake snapshots, time travel, and bounded diffs
+        run: make test-snapshots
       - name: Rust SDK against real Compose (current and minimum Rust)
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"

@@ -103,6 +103,17 @@ pub async fn run(args: Vec<String>) -> i32 {
 
     let result = match parsed.command.as_str() {
         "sql" => run_sql(&url, &token, &parsed).await,
+        "snapshots" | "snapshot" => {
+            crate::snapshot_cli::run(
+                &url,
+                &token,
+                parsed
+                    .snapshot_command()
+                    .expect("validated snapshot command"),
+                parsed.value("format").unwrap_or("table"),
+            )
+            .await
+        }
         "export" => {
             let output = parsed.value("output").expect("validated output").to_owned();
             let source = match parsed.value("job") {
@@ -257,7 +268,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|import|export|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|import|export|snapshots|snapshot|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -648,6 +659,13 @@ pub(crate) fn emit(result: &QueryResult, format: &str) {
 }
 
 fn emit_json(result: &QueryResult) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rows_json(result)).unwrap_or_default()
+    );
+}
+
+pub(crate) fn rows_json(result: &QueryResult) -> Value {
     let rows: Vec<Value> = result
         .rows
         .iter()
@@ -663,10 +681,7 @@ fn emit_json(result: &QueryResult) {
             Value::Object(object)
         })
         .collect();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&Value::Array(rows)).unwrap_or_default()
-    );
+    Value::Array(rows)
 }
 
 /// Renders a stringified cell as a JSON value, using the Arrow column type to
@@ -772,7 +787,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 31] = [
+    const VALUE_FLAGS: [&'static str; 34] = [
         "url",
         "token",
         "cpu",
@@ -804,6 +819,9 @@ impl Parsed {
         "table",
         "delimiter",
         "job",
+        "at",
+        "from",
+        "to",
     ];
     const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
@@ -866,7 +884,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <init|config|version|dev|status|stop|reset|shell|sql|import|export|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <init|config|version|dev|status|stop|reset|shell|sql|import|export|snapshots|snapshot|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -973,6 +991,22 @@ impl Parsed {
             && !matches!(parsed.command.as_str(), "import" | "export")
         {
             return Err("--delimiter applies only to import and export".into());
+        }
+        if matches!(parsed.command.as_str(), "snapshots" | "snapshot") {
+            parsed.snapshot_command()?;
+            if parsed
+                .value("format")
+                .is_some_and(|format| !["table", "json", "csv", "vertical"].contains(&format))
+            {
+                return Err("snapshot --format must be table, json, csv, or vertical".into());
+            }
+        }
+        for flag in ["at", "from", "to"] {
+            if parsed.value(flag).is_some() && parsed.command != "snapshot" {
+                return Err(format!(
+                    "--{flag} applies only to snapshot preview and diff"
+                ));
+            }
         }
         if parsed.command == "export" {
             let output = parsed
@@ -1123,6 +1157,10 @@ impl Parsed {
         }
         for cursor in ["after", "before"] {
             if let Some(value) = parsed.value(cursor) {
+                if cursor == "before" && parsed.command == "snapshots" {
+                    crate::snapshot_cli::parse_id("--before", value)?;
+                    continue;
+                }
                 if cursor == "before" && parsed.command == "history" {
                     if value.parse::<i64>().ok().is_none_or(|before| before <= 0) {
                         return Err("--before needs a positive history cursor".into());
@@ -1196,6 +1234,63 @@ impl Parsed {
         }
         parsed.compute()?;
         Ok(parsed)
+    }
+
+    fn snapshot_command(&self) -> Result<crate::snapshot_cli::Command, String> {
+        use crate::snapshot_cli::{
+            Command, DEFAULT_EXAMPLES, DEFAULT_PAGE, MAX_EXAMPLES, MAX_PAGE, bounded, parse_id,
+        };
+        let id = |flag: &str| {
+            self.value(flag)
+                .ok_or_else(|| format!("snapshot needs --{flag} <snapshot-id>"))
+                .and_then(|value| parse_id(&format!("--{flag}"), value))
+        };
+        let only = |allowed: &[&str]| {
+            for flag in ["at", "from", "to", "before", "limit"] {
+                if self.value(flag).is_some() && !allowed.contains(&flag) {
+                    return Err(format!("--{flag} does not apply to this snapshot command"));
+                }
+            }
+            Ok(())
+        };
+        let positionals: Vec<&str> = self.positionals.iter().map(String::as_str).collect();
+        match (self.command.as_str(), positionals.as_slice()) {
+            ("snapshots", []) => {
+                only(&["before", "limit"])?;
+                Ok(Command::List {
+                    limit: bounded("--limit", self.value("limit"), DEFAULT_PAGE, MAX_PAGE)?,
+                    before: self.value("before").map(|v| parse_id("--before", v)).transpose()?,
+                })
+            }
+            ("snapshot", ["preview", relation]) => {
+                only(&["at", "limit"])?;
+                crate::catalog::validate_relation(relation)?;
+                Ok(Command::Preview {
+                    relation: (*relation).to_owned(),
+                    at: id("at")?,
+                    limit: crate::catalog::validate_limit(self.value("limit"))?,
+                })
+            }
+            ("snapshot", ["diff", relation]) => {
+                only(&["from", "to", "limit"])?;
+                crate::catalog::validate_relation(relation)?;
+                let (from, to) = (id("from")?, id("to")?);
+                if from > to {
+                    return Err(format!("--from {from} is after --to {to}"));
+                }
+                Ok(Command::Diff {
+                    relation: (*relation).to_owned(),
+                    from,
+                    to,
+                    examples: bounded("--limit", self.value("limit"), DEFAULT_EXAMPLES, MAX_EXAMPLES)?,
+                })
+            }
+            ("snapshot", [snapshot]) if !matches!(*snapshot, "preview" | "diff") => {
+                only(&[])?;
+                Ok(Command::Show { id: parse_id("snapshot", snapshot)? })
+            }
+            _ => Err("usage: snapshots [--limit N] [--before ID] | snapshot <id> | snapshot preview <schema.table> --at <id> [--limit N] | snapshot diff <schema.table> --from <id> --to <id> [--limit N]".into()),
+        }
     }
 
     fn is_job_submit(&self) -> bool {
@@ -1489,6 +1584,41 @@ mod tests {
             vec!["workers", "--status", "failed"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_arguments_are_bounded_and_validated_before_any_read() {
+        assert!(parse(&["snapshots"]).is_ok());
+        assert!(parse(&["snapshots", "--limit", "500", "--before", "10"]).is_ok());
+        assert!(parse(&["snapshot", "42", "--format", "json"]).is_ok());
+        assert!(parse(&["snapshot", "preview", "raw.t", "--at", "4", "--limit", "5"]).is_ok());
+        assert!(parse(&["snapshot", "diff", "raw.t", "--from", "1", "--to", "1"]).is_ok());
+        for args in [
+            vec!["snapshots", "extra"],
+            vec!["snapshots", "--limit", "501"],
+            vec!["snapshots", "--before", "abc"],
+            vec!["snapshots", "--at", "1"],
+            vec!["snapshot"],
+            vec!["snapshot", "abc"],
+            vec!["snapshot", "1", "--limit", "5"],
+            vec!["snapshot", "preview", "raw.t"],
+            vec!["snapshot", "preview", "raw.t", "--at", "-1"],
+            vec!["snapshot", "preview", "raw.t", "--at", "1", "--from", "1"],
+            vec!["snapshot", "diff", "raw.t", "--from", "5", "--to", "2"],
+            vec!["snapshot", "diff", "raw.t", "--from", "1"],
+            vec![
+                "snapshot", "diff", "raw.t", "--from", "1", "--to", "2", "--limit", "101",
+            ],
+            vec![
+                "snapshot", "diff", "raw.t", "--from", "1", "--to", "2", "--format", "xml",
+            ],
+            vec!["sql", "SELECT 1", "--at", "1"],
+        ] {
+            assert!(
+                parse(&args).is_err(),
+                "accepted invalid snapshot arguments {args:?}"
+            );
         }
     }
 

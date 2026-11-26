@@ -316,6 +316,8 @@ duckfleet export --job <request-id> --output result.csv --resume
 
 See the [CLI export guide](docs/cli.md#export-queries-and-durable-jobs).
 
+DuckLake snapshots are readable from the CLI: `duckfleet snapshots` lists them, `duckfleet snapshot preview <table> --at <id>` time-travels, and `duckfleet snapshot diff <table> --from <a> --to <b>` reports bounded added/deleted/updated rows. Every one of these is a read that never expires snapshots or changes current data. See the [snapshot guide](docs/cli.md#ducklake-snapshots-and-time-travel).
+
 History defaults to a SQL-free table with existing filters, cursor pagination, and bounded watch. Profiles expose readable operator and engine-metric evidence without confusing it for container memory or cost:
 
 ```sh

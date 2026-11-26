@@ -183,6 +183,38 @@ Format behavior:
 
 CSV refuses nested (list/struct/map) and dictionary columns before downloading. Cast them to `VARCHAR` in SQL, or choose another format.
 
+## DuckLake snapshots and time travel
+
+Every DuckLake commit creates a snapshot. The snapshot commands read them through an ordinary authorized session, so a reader principal can use them as far as its catalog credentials allow. They never expire snapshots, delete files, or change current data, and they create no snapshots of their own.
+
+```sh
+duckfleet snapshots --limit 20                      # newest first; prints "next page: --before <id>"
+duckfleet snapshots --limit 20 --before 1052 --format json
+duckfleet snapshot 1053                             # time, schema version, changes, author, message
+duckfleet snapshot preview raw.events --at 1052 --limit 50
+duckfleet snapshot diff raw.events --from 1051 --to 1054 --limit 5
+```
+
+`snapshots` pages by snapshot ID in descending order. Each page has at most `--limit` entries (1–500, default 50), and JSON output carries `next_before` for the next page. `snapshot preview` runs `SELECT * FROM <table> AT (VERSION => <id>) LIMIT <n>` (1–500 rows, default 20) and prints the snapshot and row limit it applied. Reading an old snapshot never changes the table's current contents.
+
+`snapshot diff` reports the net change between the table's state at `--from` and its state at `--to`. It reads DuckLake's `ducklake_table_changes` for the snapshots after `--from` up to and including `--to`, then groups the changes by DuckLake row ID:
+
+- **added**: the row did not exist at `--from` and exists at `--to`
+- **deleted**: the row existed at `--from` and is gone at `--to`
+- **updated**: DuckLake attributed an update to the same row ID, and the row's value at `--to` differs from its value at `--from`
+
+A row inserted and deleted inside the range is not reported. Update attribution comes from DuckLake's own pre- and post-images, so the command never pairs a delete and an insert into an invented update. `--limit` (1–100, default 10) bounds the examples shown per change kind; the counts always cover every change. Images use the table's current schema, so a column added inside the range reads as null in older images. `--from` equal to `--to` is an empty diff.
+
+Refusals happen before any table scan. A missing or expired snapshot is `snapshot_not_found` (expiry removes a snapshot from the listing). `--from` after `--to`, malformed IDs, a relation in another catalog (`cross_catalog`), and views (`not_a_table`) are all refused. Each statement has a 60-second deadline, and Ctrl-C cancels it through the session.
+
+**Retention.** Lake maintenance (`POST /v1/lake/maintenance`, which needs maintenance authority) expires snapshots older than its retention window. After expiry, `snapshot preview` and `snapshot diff` refuse those IDs, and the snapshot commands cannot bring them back. To time-travel to the state just after a query in history, find its finish time and choose the newest snapshot at or before it:
+
+```sh
+finished=$(duckfleet history --limit 1 --format json | jq -r '.queries[0].finished_at')
+duckfleet sql "SELECT max(snapshot_id) AS id FROM ducklake_snapshots(current_catalog()) WHERE snapshot_time <= '$finished'::TIMESTAMPTZ"
+duckfleet snapshot preview raw.events --at <id>
+```
+
 ## SQL files and standard input
 
 `duckfleet sql --file <path>` and piped `duckfleet sql` execute all statements on one session. A final semicolon is optional for file/stdin input; input is UTF-8 and bounded to one MiB. Use `--file -` to name stdin explicitly.

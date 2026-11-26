@@ -18,6 +18,8 @@ mod import_cli;
 mod protocol;
 #[path = "../../src/shell.rs"]
 mod shell;
+#[path = "../../src/snapshot_cli.rs"]
+mod snapshot_cli;
 
 mod credentials {
     pub(crate) use crate::protocol::valid_principal;
