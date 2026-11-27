@@ -1,0 +1,6 @@
+name: conflict_fixture
+version: '0.1.0'
+config-version: 2
+profile: duckfleet
+model-paths: [models]
+query-comment: null
