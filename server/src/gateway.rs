@@ -532,6 +532,9 @@ fn draining_refusal() -> ApiError {
          no statement was executed",
     )
 }
+/// How long a control operation waits for one of the bounded control slots.
+const CONTROL_WAIT: Duration = Duration::from_secs(5);
+
 impl Gateway {
     pub(crate) fn registry(&self) -> Arc<PoolRegistry> {
         self.pools.read().unwrap_or_else(|e| e.into_inner()).clone()
@@ -542,11 +545,15 @@ impl Gateway {
         &self,
         operation: impl FnOnce(&mut postgres::Client) -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
-        let permit = self
-            .controls
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ApiError::new(failure::CAPACITY, "control capacity reached"))?;
+        // Wait a moment for a permit rather than refusing outright: a dbt run's
+        // threads open and close sessions in bursts, and an instant 429 there
+        // fails a model that would have run a few milliseconds later. Still
+        // bounded, so a stuck control database cannot pile up waiters.
+        let permit = tokio::time::timeout(CONTROL_WAIT, self.controls.clone().acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| ApiError::new(failure::CAPACITY, "control capacity reached"))?;
         let dsn = self.authn.dsn.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -3396,6 +3403,31 @@ mod tests {
             "queued_queries": 0,
             "open_sessions": 0,
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_operations_wait_briefly_for_a_slot_then_refuse() {
+        let app = test_gateway(vec!["http://worker:8080".into()]);
+        let held = app.controls.clone().acquire_many_owned(8).await.unwrap();
+        // A burst waits rather than failing at once...
+        let waiting = {
+            let app = app.clone();
+            tokio::spawn(async move { app.control_db(|_| Ok(())).await })
+        };
+        tokio::time::sleep(CONTROL_WAIT / 2).await;
+        assert!(
+            !waiting.is_finished(),
+            "control op refused instead of waiting"
+        );
+        drop(held);
+        // ...and proceeds once a slot frees (it then fails here only because the
+        // fixture has no control database, which is not a capacity refusal).
+        let result = waiting.await.unwrap();
+        assert_ne!(result.err().map(|error| error.0), Some(failure::CAPACITY));
+        // A slot that never frees is still a bounded, clear refusal.
+        let _held = app.controls.clone().acquire_many_owned(8).await.unwrap();
+        let refused = app.control_db(|_| Ok(())).await.unwrap_err();
+        assert_eq!(refused.0, failure::CAPACITY);
     }
 
     fn test_gateway(endpoints: Vec<String>) -> Gateway {
