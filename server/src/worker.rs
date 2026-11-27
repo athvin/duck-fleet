@@ -612,8 +612,15 @@ impl Worker {
                     Authority::Reader => ("S3_READER_ACCESS_KEY", "S3_READER_SECRET_KEY"),
                     Authority::Writer => ("S3_ACCESS_KEY", "S3_SECRET_KEY"),
                 };
+                // TLS to a local store is opt-in (#213): the Compose harness fronts its
+                // object store with TLS so this takes real S3's CA-bundle path.
+                let use_ssl = match std::env::var("S3_USE_SSL").as_deref() {
+                    Err(_) | Ok("" | "false") => "false",
+                    Ok("true") => "true",
+                    Ok(other) => anyhow::bail!("S3_USE_SSL must be true or false, not {other:?}"),
+                };
                 startup.run("creating the object store secret", &format!(
-                    "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');",
+                    "CREATE SECRET local_s3 (TYPE S3, KEY_ID {}, SECRET {}, ENDPOINT {}, URL_STYLE 'path', USE_SSL {use_ssl}, REGION 'us-east-1');",
                     literal(&required(key)?), literal(&required(secret)?), literal(&required("S3_ENDPOINT")?)
                 ))?;
                 if authority == Authority::Writer
