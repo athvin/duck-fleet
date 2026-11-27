@@ -102,83 +102,74 @@ impl Drop for MockS3 {
     }
 }
 
+/// SQL may reach the lake prefix and nothing else (#196): a secret scoped to any
+/// other bucket, pointed at an endpoint we observe, must be refused by the engine
+/// before a single request leaves the worker. That is strictly stronger than the
+/// property this probe once checked (credentials signed only within their scope),
+/// so a refusal plus an empty request log is the pass, and any request reaching
+/// the fixture, signed or not, is a failure.
 async fn s3_secret_scope_check(ctx: &Ctx) -> anyhow::Result<Value> {
     let server = MockS3::start().await?;
     let mut connection = ctx.open_named("aws-secret-scope", None).await?;
-    sql(
-        &connection,
-        &format!(
-            "CREATE SECRET live_scope_probe (TYPE S3, KEY_ID 'TESTLOCALONLY', SECRET 'test-local-secret', ENDPOINT '{}', URL_STYLE 'path', USE_SSL false, REGION 'us-east-2', SCOPE 's3://duckfleet-scope-fixture/lake/')",
-            server.address
+    let mut refusals = 0;
+    for (name, key, bucket) in [
+        (
+            "live_scope_probe",
+            "TESTLOCALONLY",
+            "duckfleet-scope-fixture",
         ),
-    )
-    .await?;
-    let _ = connection
-        .execute(
-            "SELECT * FROM read_csv('s3://duckfleet-scope-fixture/lake/fixture.csv')",
-            Vec::new(),
+        ("live_scope_neighbor", "", "duckfleet-scope-fixture-other"),
+    ] {
+        sql(
+            &connection,
+            &format!(
+                "CREATE SECRET {name} (TYPE S3, KEY_ID '{key}', SECRET 'test-local-secret', ENDPOINT '{}', URL_STYLE 'path', USE_SSL false, REGION 'us-east-2', SCOPE 's3://{bucket}/lake/')",
+                server.address
+            ),
         )
-        .await;
-    let in_scope = server.take();
-    let signed_in_scope = in_scope
-        .iter()
-        .filter(|request| {
-            request.path.starts_with("/duckfleet-scope-fixture/lake/")
-                && request
-                    .authorization
-                    .as_deref()
-                    .is_some_and(|value| value.contains("Credential=TESTLOCALONLY/"))
-        })
-        .count();
-    require(
-        signed_in_scope > 0,
-        "the in-scope S3 fixture received no signed request",
-    )?;
-
-    // Give the neighbor the same endpoint without credentials so its request is
-    // observed rather than sent to the real bucket or omitted entirely.
-    sql(
-        &connection,
-        &format!(
-            "CREATE SECRET live_scope_neighbor (TYPE S3, KEY_ID '', SECRET '', ENDPOINT '{}', URL_STYLE 'path', USE_SSL false, REGION 'us-east-2', SCOPE 's3://duckfleet-scope-fixture-other/lake/')",
-            server.address
-        ),
-    )
-    .await?;
-    let _ = connection
-        .execute(
-            "SELECT * FROM read_csv('s3://duckfleet-scope-fixture-other/lake/fixture.csv')",
-            Vec::new(),
-        )
-        .await;
-    let neighbor = server.take();
+        .await?;
+        let outcome = connection
+            .execute(
+                &format!("SELECT * FROM read_csv('s3://{bucket}/lake/fixture.csv')"),
+                Vec::new(),
+            )
+            .await;
+        let refused = outcome.as_ref().err().is_some_and(|error| {
+            format!("{error:?}").contains("file system operations are disabled by configuration")
+        });
+        require(
+            refused,
+            format!(
+                "a read of s3://{bucket}/lake/ outside the lake was not refused by the engine file lockdown"
+            ),
+        )?;
+        refusals += 1;
+    }
+    let requests = server.take();
     connection.close().await?;
+    // Each recorded request names its path and whether it carried credentials.
     require(
-        !neighbor.is_empty(),
-        "the prefix-neighbor probe made no S3 request",
-    )?;
-    require(
-        neighbor
-            .iter()
-            .all(|request| request.authorization.is_none()),
-        "a prefix-neighbor bucket received scoped credentials",
-    )?;
-    require(
-        neighbor
-            .iter()
-            .all(|request| !request.path.starts_with("/duckfleet-scope-fixture/")),
-        "a prefix-neighbor probe reused the in-scope bucket path",
+        requests.is_empty(),
+        format!(
+            "S3 requests left the worker for buckets outside the lake (path, signed): {:?}",
+            requests
+                .iter()
+                .map(|request| (&request.path, request.authorization.is_some()))
+                .collect::<Vec<_>>()
+        ),
     )?;
     let evidence = json!({
-        "signed_in_scope_requests": signed_in_scope,
-        "unsigned_neighbor_requests": neighbor.len(),
-        "neighbor_credentials_sent": false,
+        "out_of_lake_reads_refused": refusals,
+        "requests_leaving_worker": requests.len(),
+        "credentials_sent_outside_lake": false,
     });
     super::write_artifact(
         "aws-secret-scope.json",
         &serde_json::to_string_pretty(&evidence)?,
     );
-    println!("PASS: live worker scoped credentials were not sent to a prefix-neighbor bucket");
+    println!(
+        "PASS: the engine lockdown refused out-of-lake S3 reads before any request left the worker"
+    );
     Ok(evidence)
 }
 
