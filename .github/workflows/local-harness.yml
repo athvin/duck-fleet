@@ -11,7 +11,7 @@ concurrency:
 jobs:
   harness:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust toolchain
@@ -45,6 +45,8 @@ jobs:
         run: make test-export
       - name: DuckLake snapshots, time travel, and bounded diffs
         run: make test-snapshots
+      - name: Evidence-based compute advice
+        run: make test-advise
       - name: Rust SDK against real Compose (current and minimum Rust)
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"

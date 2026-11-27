@@ -1,4 +1,4 @@
-.PHONY: up test check test-cli test-dev test-shell test-catalog test-history test-import test-export test-sdk test-snapshots down
+.PHONY: up test check test-cli test-dev test-shell test-catalog test-history test-import test-export test-sdk test-snapshots test-advise down
 up:
 	docker compose build
 	docker compose up -d --wait server
@@ -26,6 +26,9 @@ test-export:
 
 test-snapshots:
 	bash scripts/test-snapshots.sh
+
+test-advise:
+	bash scripts/test-advise.sh
 
 test-sdk:
 	cd server && cargo +$${DUCKFLEET_SDK_TOOLCHAIN:-1.99.0} test -p duckfleet --locked --test compose -- --ignored --test-threads=1
