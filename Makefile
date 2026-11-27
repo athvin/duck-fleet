@@ -1,7 +1,11 @@
-.PHONY: up test check test-cli test-dev test-shell test-catalog test-history test-import test-export test-sdk test-snapshots test-advise test-advise-dbt test-local-io test-pgwire-clients test-adbc down
+.PHONY: up ui test check test-cli test-dev test-shell test-catalog test-history test-import test-export test-sdk test-snapshots test-advise test-advise-dbt test-local-io test-pgwire-clients test-adbc down
 up:
 	docker compose build
 	docker compose up -d --wait server
+# Builds the admin console bundle and the CLI that embeds it (duckfleet ui).
+ui:
+	cd web/admin && npm ci && npm run build
+	cd server && cargo build --locked -p duckfleet-cli
 test:
 	bash scripts/test-local.sh
 check:
