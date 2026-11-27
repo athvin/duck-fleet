@@ -40,7 +40,9 @@ output=$(printf 'select 1;\n' | docker run -i --rm --network "$network" -e PGOPT
 [[ "$output" == *"0A000"* && "$output" == *"compute_unavailable"* ]]
 output=$(printf 'select 1;\n' | docker run -i --rm --network "$network" -e PGOPTIONS='-c duckfleet.gpu=1' \
   postgres:17.6-bookworm psql "$dsn" -X -At -v VERBOSITY=verbose 2>&1 || true)
-[[ "$output" == *"42704"* ]]
+# psql prints no SQLSTATE for an error at connect time (VERBOSITY applies once
+# connected), so the message is what is checked here; the unit tests pin 42704.
+[[ "$output" == *'unrecognized configuration parameter "duckfleet.gpu"'* ]]
 output=$(psql_run $'set duckfleet.cpu = 1;\nselect 1;\nset duckfleet.cpu = 2;\n\\echo state :LAST_ERROR_SQLSTATE')
 [[ "$output" == *"0A000"* && "$output" != *"state 55P02"* ]]
 
