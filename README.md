@@ -1,34 +1,67 @@
 # DuckFleet
 
-A managed DuckLake platform, starting with a local Docker feasibility harness.
-The intended domain is `duckfleet.com`, pending purchase.
+A Postgres-compatible endpoint for DuckLake, with burstable Kubernetes compute
+for transformation work. The intended domain is `duckfleet.com`, pending purchase.
 
 ## What DuckFleet is
 
-An open-source, self-hosted data warehouse for a single organization, built on
-DuckDB and DuckLake. A Rust gateway routes SQL to a fleet of DuckDB workers
-sharing one DuckLake — PostgreSQL holds the catalog, S3 holds the Parquet — so
-many processes read and write the same tables concurrently. DuckLake, not
-DuckFleet, removes DuckDB's single-writer limit: writers commit through the
-catalog, conflicts surface at commit, and the losing transaction is discarded
-whole and reported retry-safe. What DuckFleet adds is the warehouse around
-that: routing, admission control, per-model compute sizing, query history,
-profiling, failure classification, and metering.
+**A Postgres-compatible endpoint backed by DuckLake instead of Postgres.** You
+connect to DuckFleet the way you would connect to any Postgres server. Behind
+the endpoint, a Rust gateway routes each query to DuckDB compute reading and
+writing one shared DuckLake: PostgreSQL holds only the catalog, and the data
+lives as Parquet in S3. DuckFleet is open source and self-hosted, for a single
+organization.
 
-The scaling model is horizontal across queries, not within one. Each query runs
-on a single DuckDB process bounded by the node it is on; the fleet scales by
-running more processes against the same lake. A workload whose individual
-queries need more than the largest node you will buy has outgrown DuckFleet and
-belongs on a distributed engine such as Trino or Snowflake. Most do not.
+**Two kinds of compute behind one endpoint.**
 
-Compute comes in two tiers: prestarted persistent workers for everyday queries,
-and an isolated per-session pod with exactly the requested CPU and memory for
-jobs that need more. The namespace boundary is per team or environment, each
-running its own DuckLake; the trust model is teams within one organization, not
-hostile tenants. Clients speak HTTP with Arrow IPC results natively — a built-in
-CLI and a dbt adapter exist — and an opt-in
-[Postgres wire-protocol front](#the-postgres-wire-front) lets `psql` and
-simple-protocol drivers connect directly.
+- **Persistent workers**, the default, are always running and tuned for quick,
+  light queries: point lookups, a handful of rows, dashboards. A query with no
+  compute request runs here.
+- **Isolated pods** are for transformation work. A query or dbt model that
+  submits extra metadata asking for CPU, memory, or disk gets its own
+  Kubernetes pod of exactly that size. The gateway starts the pod, runs the
+  work there, watches it to completion, and removes it, so heavy jobs never
+  compete with the interactive tier. That makes compute burstable: it scales
+  with whatever the Kubernetes cluster it runs on can schedule.
+
+**The bet.** Starting and stopping a pod has a real cost in time, and we accept
+it. In exchange, transformation workloads run on compute you already pay for
+in Kubernetes instead of a Snowflake or Redshift bill. The scaling model is
+horizontal across queries, not within one: each query runs on a single DuckDB
+process bounded by the pod it is on, and the fleet scales by running more
+processes against the same lake. On EKS that bound is some very large CPU and
+memory instances, which most workloads will not outgrow. DuckFleet targets
+terabytes, not petabytes; a workload whose individual queries need more than
+the largest node you will buy belongs on a distributed engine such as Trino or
+Snowflake. Most do not.
+
+DuckLake, not DuckFleet, removes DuckDB's single-writer limit: writers commit
+through the catalog, conflicts surface at commit, and the losing transaction
+is discarded whole and reported retry-safe. What DuckFleet adds is the
+warehouse around that.
+
+**What you get by using it.** Developer-facing features DuckDB does not ship
+with, available simply by sending queries through DuckFleet: the
+`duckfleet_system.query_history` table and its siblings, profiling, failure
+classification, admission control, and metering with budgets. You observe
+runtime queries without paying for a separate tool.
+
+**dbt-native.** A first-class DuckFleet adapter, in the `athvin/dbt` fork of
+dbt-core v2, builds SQL models against DuckFleet, and each model names its own
+compute in `meta.platform`.
+
+**Interfaces today.** The [Postgres wire front](#the-postgres-wire-front) is
+the headline client experience, and it is still opt-in and partial: simple
+protocol only, scalar result types, and every connection runs on the default
+persistent pool. Requesting an isolated pod from a Postgres connection is
+tracked in #204. The full-featured protocol underneath is HTTP with Arrow IPC
+results, which the dbt adapter, the [ADBC driver](#adbc-driver), the
+[Rust SDK](#rust-sdk), and the built-in CLI use, and through which isolated
+compute is available now.
+
+The namespace boundary is per team or environment, each running its own
+DuckLake; the trust model is teams within one organization, not hostile
+tenants.
 
 The current engine is DuckDB 2.0.1. See the [release, cutover, and rollback guide](docs/duckdb-2.0.1-release.md) and [engine qualification procedure](docs/engine-upgrades.md).
 

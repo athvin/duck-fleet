@@ -16,10 +16,13 @@
 > 2. **Namespace per team/environment, not per customer or database.** Each
 >    namespace runs one DuckLake holding many logical databases. Provisioned
 >    workers are shared per size within a namespace, not dedicated per customer.
-> 3. **HTTP + Arrow now, Postgres wire protocol later.** The native data plane
->    stays the authenticated HTTP/Arrow-IPC protocol with the Python client and
->    dbt adapter; a pgwire front for BI tools and Postgres drivers is planned as
->    a later compatibility layer, not a rewrite of the transport.
+> 3. **Postgres-compatible endpoint first, HTTP + Arrow underneath** (revised
+>    November 26, 2026). The headline client experience is a Postgres wire
+>    endpoint backed by DuckLake. The full-featured data plane stays the
+>    authenticated HTTP/Arrow-IPC protocol used by the dbt adapter, ADBC
+>    driver, and Rust SDK; pgwire is a front over the same gateway, not a
+>    rewrite of the transport. Selecting isolated compute from a Postgres
+>    connection is tracked in #204.
 
 **Executive thesis:** Build a Rust-first, dbt-native managed DuckDB/DuckLake platform that routes individual dbt models to persistent, pooled, or burst compute, while providing the operational layer customers expect from a warehouse: query history, performance profiling, cost attribution, budgets, secure sharing, backups, and automated insights. Sell predictable baseline capacity with metered, budget-controlled elasticity. The competitive wedge is per-model compute policy plus transparent cost accounting, not simply “hosted DuckDB.”
 
