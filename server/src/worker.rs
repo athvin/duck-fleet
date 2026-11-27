@@ -2167,7 +2167,54 @@ fn engine_file_access(lake: &str, staging: Option<&str>, ca_bundle: Option<&str>
     )
 }
 
+/// A bare `COMMIT`/`ROLLBACK`/`ABORT`/`END`, the statements PostgreSQL answers with a
+/// warning rather than an error when no transaction is open.
+fn ends_transaction(sql: &str) -> bool {
+    let words: Vec<String> = sql
+        .trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    matches!(
+        words
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["commit" | "rollback" | "abort" | "end"]
+            | [
+                "commit" | "rollback" | "abort" | "end",
+                "transaction" | "work"
+            ]
+    )
+}
+
 fn execute(conn: &Connection, sql: &str, parameters: Vec<SqlValue>) -> Result<(Vec<u8>, i64)> {
+    match execute_statement(conn, sql, parameters) {
+        // Ending a transaction that is not open is a no-op, as in PostgreSQL. Clients
+        // (dbt among them) roll back after any failure, including one that happened
+        // before their first statement ran; an error here would replace the real
+        // failure with "cannot rollback - no transaction is active". Answered by
+        // running the same statement over an empty transaction, so the result has
+        // exactly the shape a successful one does.
+        Err(error)
+            if ends_transaction(sql)
+                && format!("{error:#}").contains("no transaction is active") =>
+        {
+            conn.execute_batch("BEGIN TRANSACTION")
+                .map_err(|_| anyhow::anyhow!("could not open a transaction to end"))?;
+            execute_statement(conn, sql, vec![])
+        }
+        result => result,
+    }
+}
+
+fn execute_statement(
+    conn: &Connection,
+    sql: &str,
+    parameters: Vec<SqlValue>,
+) -> Result<(Vec<u8>, i64)> {
     let mut statement = conn.prepare(sql)?;
     let batches = statement.query_arrow(params_from_iter(parameters.iter()))?;
     let mut bytes = Vec::new();
@@ -2562,6 +2609,18 @@ DETAIL: Key (typname, typnamespace)=(ducklake_metadata, 2200) already exists."#;
     fn oversized_results_fail_instead_of_silent_truncation() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         assert!(execute(&conn, "SELECT * FROM range(100001)", vec![]).is_err());
+        // Ending a transaction that is not open is a no-op, as in PostgreSQL...
+        for sql in ["rollback", "COMMIT;", "abort transaction", " END WORK ; "] {
+            assert!(ends_transaction(sql), "{sql}");
+            execute(&conn, sql, vec![])?;
+        }
+        // ...but only for exactly those statements, and a real one still works.
+        assert!(!ends_transaction("rollback to savepoint a"));
+        assert!(!ends_transaction("select 'rollback'"));
+        execute(&conn, "BEGIN", vec![])?;
+        execute(&conn, "CREATE TABLE rolled_back(i INT)", vec![])?;
+        execute(&conn, "ROLLBACK", vec![])?;
+        assert!(execute(&conn, "SELECT * FROM rolled_back", vec![]).is_err());
         Ok(())
     }
 }
