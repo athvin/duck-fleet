@@ -548,10 +548,12 @@ pub fn verify_aws(args: Vec<String>) -> Result<()> {
     {
         bail!("AWS evidence has invalid S3 files");
     }
+    // The harness probe (#208): both out-of-lake reads refused by the engine
+    // lockdown, and no request, signed or not, left the worker.
     let scope = &evidence["secret_scope"];
-    if scope["signed_in_scope_requests"].as_u64().unwrap_or(0) == 0
-        || scope["unsigned_neighbor_requests"].as_u64().unwrap_or(0) == 0
-        || scope["neighbor_credentials_sent"] != false
+    if scope["out_of_lake_reads_refused"].as_u64() != Some(2)
+        || scope["requests_leaving_worker"].as_u64() != Some(0)
+        || scope["credentials_sent_outside_lake"] != false
     {
         bail!("secret-scope evidence is incomplete");
     }
