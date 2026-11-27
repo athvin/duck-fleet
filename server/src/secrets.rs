@@ -54,6 +54,12 @@ impl Redactor {
         Self { secrets }
     }
 
+    /// This redactor plus values only learned at runtime, such as refreshed
+    /// object-store credentials.
+    pub(crate) fn with(&self, values: impl IntoIterator<Item = String>) -> Self {
+        Self::new(self.secrets.iter().cloned().chain(values))
+    }
+
     pub(crate) fn scrub(&self, text: &str) -> String {
         self.secrets
             .iter()

@@ -37,6 +37,7 @@ mod metering;
 mod ownership;
 mod pgwire;
 mod platform;
+mod pod_credentials;
 mod pools;
 mod pricing;
 mod profiling;
