@@ -9,7 +9,7 @@ assert_cluster
 # server's real egress address, workers pinned to the DuckFleet pool — merged into
 # values.json before anything reads it. Written here rather than baked into chart
 # defaults because the API server address is a fact about the cluster (#39).
-bash scripts/ops.sh aws-deploy-values "$KUBE_CONTEXT"
+bash scripts/ops.sh aws-deploy-values "$KUBE_CONTEXT" "$NAMESPACE"
 if [[ "${DUCKFLEET_UPGRADE_LEGACY_DATABASE:-false}" == true ]]; then
   bash scripts/aws/upgrade-database-roles.sh
 fi
@@ -20,7 +20,7 @@ bash scripts/ops.sh aws-check-dns-egress "$DUCKFLEET_CLUSTER" "$AWS_REGION"
 # And that the gateway may reach the API server, when isolated compute is enabled. A
 # rule written against the Service address matches nothing once kube-proxy has
 # rewritten the destination; see #32.
-bash scripts/ops.sh aws-check-api-egress "$KUBE_CONTEXT"
+bash scripts/ops.sh aws-check-api-egress
 # Require the existing EKS Auto Mode storage class, never change shared cluster objects.
 [[ $("${KUBE[@]}" get storageclass gp3 -o jsonpath='{.provisioner}') == ebs.csi.eks.amazonaws.com ]] || {
   echo 'Expected Auto Mode gp3 storage class is unavailable' >&2; exit 1;
