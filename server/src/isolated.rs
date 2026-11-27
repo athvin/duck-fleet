@@ -72,6 +72,70 @@ pub(crate) struct Isolation {
     /// default covers that grace. A refusal no emptiness could cure — the request
     /// alone exceeds the limit — is never waited on.
     quota_wait: Duration,
+    /// The largest size one node can allocate to a session pod, when the deploy
+    /// knows it (#214). A request above it is refused before a pod is created:
+    /// otherwise it sits Unschedulable for the whole provisioning grace on a
+    /// cluster that adds nodes, waiting for an instance that does not exist.
+    ceiling: Ceiling,
+}
+
+/// Per-dimension maximums for one session pod; `None` is unbounded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Ceiling {
+    pub cpu: Option<u16>,
+    pub memory_bytes: Option<u64>,
+}
+
+impl Ceiling {
+    fn from_env() -> anyhow::Result<Self> {
+        let cpu = match std::env::var("DUCKFLEET_ISOLATED_MAX_CPU") {
+            Ok(text) if !text.trim().is_empty() => {
+                Some(text.trim().parse::<u16>().map_err(|_| {
+                    anyhow::anyhow!("DUCKFLEET_ISOLATED_MAX_CPU {text:?} must be a whole number")
+                })?)
+            }
+            _ => None,
+        }
+        .filter(|cpu| *cpu > 0);
+        let memory_bytes = match std::env::var("DUCKFLEET_ISOLATED_MAX_MEMORY") {
+            Ok(text) if !text.trim().is_empty() => {
+                Some(crate::compute::parse_quantity(text.trim()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DUCKFLEET_ISOLATED_MAX_MEMORY {text:?} must be a binary quantity such as 240Gi"
+                    )
+                })?)
+            }
+            _ => None,
+        };
+        Ok(Self { cpu, memory_bytes })
+    }
+
+    /// Refuses a size no node can allocate, naming both the request and the
+    /// ceiling, before anything is created.
+    pub(crate) fn admit(&self, wanted: Resources) -> Result<(), ApiError> {
+        let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
+        let cpu_over = self.cpu.is_some_and(|max| wanted.cpu > max);
+        let memory_over = self
+            .memory_bytes
+            .is_some_and(|max| wanted.memory_bytes > max);
+        if !cpu_over && !memory_over {
+            return Ok(());
+        }
+        let largest = match (self.cpu, self.memory_bytes) {
+            (Some(cpu), Some(memory)) => format!("{cpu} CPU / {:.0}Gi", gib(memory)),
+            (Some(cpu), None) => format!("{cpu} CPU"),
+            (None, Some(memory)) => format!("{:.0}Gi of memory", gib(memory)),
+            (None, None) => unreachable!("an unbounded ceiling admits everything"),
+        };
+        Err(ApiError::new(
+            failure::NOT_PLACEABLE,
+            format!(
+                "this session asks for {} CPU / {:.0}Gi, more than the largest node this cluster                  provisions can allocate ({largest}). Ask for a smaller size; no pod was created,                  no statement ran, and the request was not downgraded to a shared worker",
+                wanted.cpu,
+                gib(wanted.memory_bytes)
+            ),
+        ))
+    }
 }
 
 /// A running session pod.
@@ -155,6 +219,7 @@ impl Isolation {
             ready: env_seconds("DUCKFLEET_ISOLATED_READY_SECONDS", 120)?,
             provisioning: env_seconds("DUCKFLEET_ISOLATED_PROVISIONING_SECONDS", 0)?,
             quota_wait: env_seconds("DUCKFLEET_ISOLATED_QUOTA_WAIT_SECONDS", 90)?,
+            ceiling: Ceiling::from_env()?,
         }))
     }
 
@@ -183,6 +248,7 @@ impl Isolation {
         lifecycle_id: uuid::Uuid,
         authority: Authority,
     ) -> Result<Pod, ApiError> {
+        self.ceiling.admit(wanted)?;
         let name = format!("{PREFIX}{lifecycle_id}");
         let spec = specify_with_authority(&self.template, &self.owner, &name, wanted, authority)
             .map_err(|error| {
@@ -210,6 +276,7 @@ impl Isolation {
         expected_uid: Option<&str>,
         runtime_seconds: u64,
     ) -> Result<JobPod, ApiError> {
+        self.ceiling.admit(wanted)?;
         if self.template["spec"]["activeDeadlineSeconds"]
             .as_u64()
             .is_none_or(|lifetime| runtime_seconds.saturating_add(30) > lifetime)
@@ -823,6 +890,7 @@ mod tests {
             ready: Duration::from_secs(1),
             provisioning: Duration::ZERO,
             quota_wait: Duration::ZERO,
+            ceiling: Ceiling::default(),
         };
         let wanted = Resources {
             cpu: 1,
@@ -886,6 +954,7 @@ mod tests {
             ready: Duration::from_secs(1),
             provisioning: Duration::ZERO,
             quota_wait: Duration::ZERO,
+            ceiling: Ceiling::default(),
         };
         assert_eq!(
             isolation.endpoint("duckfleet-session-route").await.unwrap(),
@@ -934,6 +1003,7 @@ mod tests {
             ready: Duration::from_secs(1),
             provisioning: Duration::ZERO,
             quota_wait: Duration::ZERO,
+            ceiling: Ceiling::default(),
         };
         let result = isolation
             .sweep_filtered(
@@ -1238,6 +1308,38 @@ mod tests {
         unsafe { std::env::remove_var(&name) };
         assert!(error.contains(&name), "{error}");
         assert!(error.contains("soon"), "{error}");
+    }
+
+    #[test]
+    fn a_size_above_the_node_ceiling_is_refused_before_a_pod_exists() {
+        let gib = 1u64 << 30;
+        let ceiling = Ceiling {
+            cpu: Some(30),
+            memory_bytes: Some(240 * gib),
+        };
+        let at = |cpu, memory| Resources {
+            cpu,
+            memory_bytes: memory * gib,
+            disk_bytes: 10 * gib,
+        };
+        assert!(ceiling.admit(at(14, 56)).is_ok(), "14 CPU / 56Gi fits");
+        assert!(
+            ceiling.admit(at(30, 240)).is_ok(),
+            "the ceiling itself fits"
+        );
+        for (cpu, memory) in [(31, 8), (2, 241), (64, 512)] {
+            let error = ceiling.admit(at(cpu, memory)).unwrap_err();
+            assert_eq!(error.0.kind, "not_placeable");
+            assert!(
+                error.1.contains("30 CPU / 240Gi") && error.1.contains("smaller size"),
+                "{}",
+                error.1
+            );
+        }
+        assert!(
+            Ceiling::default().admit(at(1024, 4096)).is_ok(),
+            "no ceiling configured: the scheduler decides"
+        );
     }
 
     #[test]

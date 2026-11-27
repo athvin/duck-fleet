@@ -24,6 +24,7 @@ mod protocol;
 mod shell;
 #[path = "../../src/snapshot_cli.rs"]
 mod snapshot_cli;
+mod ui;
 
 mod credentials {
     pub(crate) use crate::protocol::valid_principal;

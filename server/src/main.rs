@@ -37,6 +37,7 @@ mod metering;
 mod ownership;
 mod pgwire;
 mod platform;
+mod pod_credentials;
 mod pools;
 mod pricing;
 mod profiling;
@@ -54,6 +55,8 @@ mod system_query;
 mod system_result;
 mod system_sql;
 mod telemetry;
+#[path = "ui_unavailable.rs"]
+mod ui;
 mod usage;
 mod worker;
 mod worker_ownership;

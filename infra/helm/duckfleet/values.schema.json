@@ -183,6 +183,8 @@
         "readySeconds": {"type": "integer", "minimum": 5, "maximum": 600},
         "provisioningSeconds": {"type": "integer", "minimum": 0, "maximum": 600},
         "quotaWaitSeconds": {"type": "integer", "minimum": 0, "maximum": 600},
+        "maxCpu": {"type": "integer", "minimum": 0, "maximum": 1024},
+        "maxMemory": {"type": "string", "pattern": "^([0-9]+(Ki|Mi|Gi|Ti))?$"},
         "apiServerPorts": {
           "type": "array",
           "items": {"type": "integer", "minimum": 1, "maximum": 65535}
@@ -286,6 +288,17 @@
         "annotations": {
           "type": "object",
           "additionalProperties": {"type": "string"}
+        },
+        "loadBalancer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "sourceCidrs": {
+              "type": "array",
+              "items": {"type": "string", "pattern": "^[0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}$"}
+            }
+          }
         }
       }
     },
