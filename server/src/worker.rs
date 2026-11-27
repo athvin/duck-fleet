@@ -722,6 +722,7 @@ impl Worker {
                     .then(|| std::env::var("DUCKFLEET_RESULT_DATA_PATH").ok())
                     .flatten()
                     .as_deref(),
+                system_ca_bundle(),
             ),
         )?;
         let root = startup.into_connection();
@@ -2112,9 +2113,31 @@ fn parameter(value: &Value) -> Result<SqlValue> {
     })
 }
 
+/// Where httpfs looks for the system CA bundle, in its own search order. It reads
+/// the bundle lazily, on the first TLS connection, which on AWS is after the
+/// lockdown below: without the bundle allowlisted, every real S3 request fails with
+/// "Cannot read a CA certificate bundle". Compose and kind use plain-HTTP RustFS,
+/// so only a TLS object store reaches this.
+const CA_BUNDLES: [&str; 5] = [
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+];
+
+/// The first CA bundle present on this host, if any.
+fn system_ca_bundle() -> Option<&'static str> {
+    CA_BUNDLES
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())
+}
+
 /// The allowlist the engine keeps after startup. Directory entries end in a
-/// slash so a prefix never matches a sibling such as `lake-other/`.
-fn engine_file_access(lake: &str, staging: Option<&str>) -> String {
+/// slash so a prefix never matches a sibling such as `lake-other/`. The CA bundle
+/// is the one exact file allowed: public certificates, root-owned, and read-only
+/// to the unprivileged worker, so allowing it exposes no secret and grants no write.
+fn engine_file_access(lake: &str, staging: Option<&str>, ca_bundle: Option<&str>) -> String {
     let directory = |path: &str| {
         if path.ends_with('/') {
             path.to_owned()
@@ -2131,8 +2154,11 @@ fn engine_file_access(lake: &str, staging: Option<&str>) -> String {
     if let Some(staging) = staging {
         allowed.push(directory(staging));
     }
+    let files = ca_bundle
+        .map(|path| format!("SET allowed_paths=[{}]; ", literal(path)))
+        .unwrap_or_default();
     format!(
-        "SET allowed_directories=[{}]; SET enable_external_access=false;",
+        "SET allowed_directories=[{}]; {files}SET enable_external_access=false;",
         allowed
             .iter()
             .map(|path| literal(path))
@@ -2170,13 +2196,29 @@ fn execute(conn: &Connection, sql: &str, parameters: Vec<SqlValue>) -> Result<(V
 mod tests {
     #[test]
     fn engine_file_access_allows_only_platform_prefixes() {
-        let sql = engine_file_access("s3://bucket/lake", Some("s3://bucket/results/"));
+        let sql = engine_file_access("s3://bucket/lake", Some("s3://bucket/results/"), None);
         assert!(sql.starts_with(
             "SET allowed_directories=['s3://bucket/lake/', '/tmp/duckfleet-spill/', "
         ));
         assert!(sql.contains("'s3://bucket/results/'"));
         assert!(sql.ends_with("SET enable_external_access=false;"));
-        assert!(!engine_file_access("s3://bucket/lake/", None).contains("results"));
+        assert!(!sql.contains("allowed_paths"));
+        assert!(!engine_file_access("s3://bucket/lake/", None, None).contains("results"));
+        // TLS object stores need the CA bundle: exactly that one file, set before
+        // external access is switched off for good.
+        let tls = engine_file_access(
+            "s3://bucket/lake",
+            None,
+            Some("/etc/ssl/certs/ca-certificates.crt"),
+        );
+        assert!(tls.ends_with(
+            "SET allowed_paths=['/etc/ssl/certs/ca-certificates.crt']; SET enable_external_access=false;"
+        ));
+        assert!(
+            super::CA_BUNDLES
+                .iter()
+                .all(|path| path.starts_with("/etc/"))
+        );
         assert!(
             crate::failure::explain(
                 "Permission Error: Cannot access file \"/dev/stdout\" - file system operations are disabled by configuration".into()
