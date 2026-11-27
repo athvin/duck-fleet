@@ -11,12 +11,6 @@ clean-targets: [target, dbt_packages]
 models:
   duckfleet_package_compat:
     +materialized: table
-    isolated:
-      # One model on an isolated pod, so package macros are proven on both tiers.
-      +meta:
-        platform:
-          cpu: 1
-          memory: 2Gi
 
 seeds:
   duckfleet_package_compat:

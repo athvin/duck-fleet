@@ -184,7 +184,7 @@ workload attribution — tags never size compute.
 
 To choose a size from evidence rather than by guessing, `duckfleet advise query <id>` or `duckfleet advise model <dbt-node-id>` reads retained history and profiles. It reports whether queueing, isolated startup, memory/spill, or CPU dominates, then suggests one explicit rerun. It is read-only and never changes compute; see the [advice guide](docs/cli.md#compute-advice-from-observed-evidence).
 
-The pinned `athvin/dbt` adapter release `duckfleet-v0.1.6` forwards only resource
+The pinned `athvin/dbt` adapter release `duckfleet-v0.1.7` forwards only resource
 selection (`cpu`, `memory`, `disk`); it silently drops `mode` and `pool` metadata.
 Use the HTTP API or CLI for explicit pool selection. Adding these fields to dbt
 models does not enable the feature: a coordinated follow-up in

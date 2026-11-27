@@ -6,13 +6,15 @@
 #   DUCKFLEET_URL=... DUCKFLEET_TOKEN=... compat/dbt-packages/run.sh
 #
 # Needs the DuckFleet dbt (`brew install athvin/duckfleet/dbt-duckfleet`).
+# CI runs it in the harness's dbt image: `make test-dbt-packages`.
 set -euo pipefail
 cd "$(dirname "$0")"
 : "${DUCKFLEET_TOKEN:?set DUCKFLEET_URL and DUCKFLEET_TOKEN for the gateway}"
 dbt=(dbt --profiles-dir .)
 
 "${dbt[@]}" deps
-"${dbt[@]}" build --full-refresh
+# DUCKFLEET_COMPAT_ISOLATED=false where the gateway has no isolated compute.
+"${dbt[@]}" build --full-refresh --vars "{isolated: ${DUCKFLEET_COMPAT_ISOLATED:-true}}"
 
 # codegen reads the catalog back through the adapter's introspection.
 yaml=$("${dbt[@]}" run-operation codegen.generate_model_yaml --args '{"model_names": ["orders_enriched"]}')
