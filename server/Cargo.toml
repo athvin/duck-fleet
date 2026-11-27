@@ -1,5 +1,5 @@
 [workspace]
-members = ["ops", "cli", "sdk"]
+members = ["ops", "cli", "sdk", "adbc"]
 
 [package]
 name = "duckfleet-server"

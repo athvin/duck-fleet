@@ -3,6 +3,27 @@
 version = 4
 
 [[package]]
+name = "adbc_core"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d1448c5d1597ce04cf1228e9e096dc4dc0dc0d568080283824125c60b22c325"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+]
+
+[[package]]
+name = "adbc_ffi"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e45d58b6adb27c160c8a67be956c1d260e90aad56e36e2a46f3bcffa914a8ab"
+dependencies = [
+ "adbc_core",
+ "arrow-array",
+ "arrow-schema",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -704,6 +725,21 @@ dependencies = [
  "ring",
  "rustls",
  "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "duckfleet-adbc"
+version = "0.1.0"
+dependencies = [
+ "adbc_core",
+ "adbc_ffi",
+ "arrow-array",
+ "arrow-json",
+ "arrow-schema",
+ "duckfleet",
  "serde_json",
  "tokio",
  "uuid",

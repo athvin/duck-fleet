@@ -1,0 +1,24 @@
+[package]
+name = "duckfleet-adbc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "ADBC driver for DuckFleet over its HTTP/Arrow API"
+license = "Apache-2.0"
+repository = "https://github.com/athvin/duck-fleet"
+publish = false
+
+[lib]
+name = "adbc_duckfleet"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adbc_core = "0.25.0"
+adbc_ffi = "0.25.0"
+arrow-array = "60.0.0"
+arrow-json = "60.0.0"
+arrow-schema = "60.0.0"
+duckfleet = { path = "../sdk" }
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
+uuid = { version = "1.29.2", features = ["v4"] }

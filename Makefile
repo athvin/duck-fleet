@@ -1,4 +1,4 @@
-.PHONY: up test check test-cli test-dev test-shell test-catalog test-history test-import test-export test-sdk test-snapshots test-advise test-advise-dbt test-local-io test-pgwire-clients down
+.PHONY: up test check test-cli test-dev test-shell test-catalog test-history test-import test-export test-sdk test-snapshots test-advise test-advise-dbt test-local-io test-pgwire-clients test-adbc down
 up:
 	docker compose build
 	docker compose up -d --wait server
@@ -38,6 +38,9 @@ test-local-io:
 
 test-pgwire-clients:
 	bash scripts/test-pgwire-clients.sh
+
+test-adbc:
+	bash scripts/test-adbc.sh
 
 test-sdk:
 	cd server && cargo +$${DUCKFLEET_SDK_TOOLCHAIN:-1.99.0} test -p duckfleet --locked --test compose -- --ignored --test-threads=1
