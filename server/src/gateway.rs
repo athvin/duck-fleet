@@ -2366,11 +2366,39 @@ impl crate::pgwire::Platform for PgPlatform {
     }
 
     /// The same authorization and route as `POST /v1/sessions/{id}/cancel`, as
-    /// the connection's own principal.
-    async fn cancel(&self, identity: &Identity, session: &crate::pgwire::Session) {
+    /// the connection's own principal, plus `POST /v1/requests/{id}/cancel` for
+    /// the statement in flight: a statement still waiting in the queue is not
+    /// yet the session's active query, so only its request latch stops it.
+    async fn cancel(
+        &self,
+        identity: &Identity,
+        session: &crate::pgwire::Session,
+        request: Option<Uuid>,
+    ) {
         let Ok(id) = Uuid::parse_str(&session.session_id) else {
             return;
         };
+        if let Some(request) = request {
+            // The worker persists the request row on submission; a cancel that
+            // races ahead of it sees not-found briefly, so retry for a moment.
+            for _ in 0..40 {
+                let actor = identity.clone();
+                match self
+                    .0
+                    .control_db(move |db| queue::request_cancel(db, request, &actor))
+                    .await
+                {
+                    Err(error) if error.0.kind == crate::failure::NOT_FOUND.kind => {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    Err(error) => {
+                        tracing::debug!(kind = error.0.kind, "pgwire request cancel refused");
+                        break;
+                    }
+                    Ok(_) => break,
+                }
+            }
+        }
         let Ok(endpoint) = self.0.route(id, identity, Action::QueryCancel).await else {
             return;
         };

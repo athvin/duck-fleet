@@ -87,10 +87,14 @@ pub(crate) trait Platform: Send + Sync + 'static {
     fn close_session(&self, session: Session) -> impl std::future::Future<Output = ()> + Send;
     /// Cancels the session's running statement, as the original connection's
     /// principal. Possession of the connection's secret key authorizes it.
+    /// `request` is the statement in flight when the CancelRequest arrived, so
+    /// a statement still queued (not yet the session's active query) is
+    /// cancelled too rather than the request being silently lost.
     fn cancel(
         &self,
         identity: &Identity,
         session: &Session,
+        request: Option<Uuid>,
     ) -> impl std::future::Future<Output = ()> + Send;
     fn draining(&self) -> bool;
 }
@@ -105,7 +109,7 @@ pub(crate) struct Session {
 /// socket can find the session it targets. Keys are random per connection and
 /// removed when the connection ends; an unknown or mismatched key is ignored.
 mod cancel_keys {
-    use super::{Identity, Session};
+    use super::{Identity, Session, Uuid};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
@@ -113,6 +117,7 @@ mod cancel_keys {
         secret: i32,
         identity: Identity,
         session: Option<Session>,
+        request: Option<Uuid>,
     }
 
     fn targets() -> &'static Mutex<HashMap<i32, Target>> {
@@ -154,6 +159,7 @@ mod cancel_keys {
                 secret,
                 identity,
                 session: None,
+                request: None,
             },
         );
         Registration { pid, secret }
@@ -169,14 +175,29 @@ mod cancel_keys {
         }
     }
 
-    pub(super) fn find(pid: i32, secret: i32) -> Option<(Identity, Session)> {
+    /// Records the statement now in flight on the connection (or none).
+    pub(super) fn set_request(pid: i32, request: Option<Uuid>) {
+        if let Some(target) = targets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&pid)
+        {
+            target.request = request;
+        }
+    }
+
+    pub(super) fn find(pid: i32, secret: i32) -> Option<(Identity, Session, Option<Uuid>)> {
         let map = targets().lock().unwrap_or_else(|e| e.into_inner());
         let target = map.get(&pid)?;
         // Constant-time comparison of the 32-bit secret.
         if (target.secret ^ secret) != 0 {
             return None;
         }
-        Some((target.identity.clone(), target.session.clone()?))
+        Some((
+            target.identity.clone(),
+            target.session.clone()?,
+            target.request,
+        ))
     }
 }
 
@@ -239,8 +260,8 @@ async fn connection<P: Platform>(platform: Arc<P>, socket: TcpStream) -> Result<
         // A CancelRequest gets no response, as in PostgreSQL. A matching key
         // cancels through the ordinary session cancel path; SQL is never replayed.
         Startup::Cancel { pid, secret } => {
-            if let Some((identity, session)) = cancel_keys::find(pid, secret) {
-                platform.cancel(&identity, &session).await;
+            if let Some((identity, session, request)) = cancel_keys::find(pid, secret) {
+                platform.cancel(&identity, &session, request).await;
             }
             Ok(())
         }
@@ -829,10 +850,17 @@ async fn run_statement<P: Platform>(
     // The caller must know the ID while this synchronous operation is waiting.
     // A notice describes submission, never successful durable acceptance.
     submitted_notice(stream, request_id).await?;
-    match platform
+    let pid = CANCEL_KEY.try_with(|pid| *pid).ok();
+    if let Some(pid) = pid {
+        cancel_keys::set_request(pid, Some(request_id));
+    }
+    let outcome = platform
         .query(identity, open, request_id, sql.to_owned())
-        .await
-    {
+        .await;
+    if let Some(pid) = pid {
+        cancel_keys::set_request(pid, None);
+    }
+    match outcome {
         QueryOutcome::Rows(arrow) => {
             *transaction = transaction.after_success(&transaction_effects(sql));
             tokio::time::timeout(WRITE_TIMEOUT, write_arrow(stream, sql, &arrow))
@@ -1624,7 +1652,7 @@ mod tests {
             self.closed.fetch_add(1, Ordering::SeqCst);
         }
 
-        async fn cancel(&self, _identity: &Identity, _session: &Session) {
+        async fn cancel(&self, _identity: &Identity, _session: &Session, _request: Option<Uuid>) {
             self.canceled.fetch_add(1, Ordering::SeqCst);
         }
 
