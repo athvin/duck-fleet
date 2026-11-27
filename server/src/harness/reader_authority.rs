@@ -166,24 +166,17 @@ pub async fn checks(ctx: &Ctx) -> Result<()> {
     .await?;
     sql(&reader, "SET allow_extension_repositories='forbidden'").await?;
     denied(&reader, "INSTALL fts").await?;
-    sql(
+    // Workers disable external access after startup (#185), so SQL cannot
+    // attach another catalog or database at all, even read-only with the
+    // reader's own credentials: there is no alternate path to write through.
+    denied(
         &reader,
         &format!("ATTACH 'ducklake:postgres:{catalog_dsn}' AS alternate_{table} (DATA_PATH '{data_path}', DUCKLAKE_VERSION '1.0', READ_ONLY)"),
     )
     .await?;
     denied(
         &reader,
-        &format!("CREATE TABLE alternate_{table}.escape(id INTEGER)"),
-    )
-    .await?;
-    sql(
-        &reader,
         &format!("ATTACH 'postgres:{catalog_dsn}' AS direct_{table}"),
-    )
-    .await?;
-    denied(
-        &reader,
-        &format!("CREATE TABLE direct_{table}.escape(id INTEGER)"),
     )
     .await?;
 

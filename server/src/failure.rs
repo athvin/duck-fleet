@@ -364,6 +364,22 @@ pub(crate) fn classify(error: &str, reason: Option<&str>) -> Failure {
     }
 }
 
+/// DuckDB's refusal once worker-local and arbitrary remote file access is
+/// disabled at startup.
+const LOCAL_IO_MARKER: &str = "file system operations are disabled by configuration";
+
+/// Adds the supported alternative to an engine refusal of local or remote I/O.
+/// The refusal happens before the statement reads or writes anything.
+pub(crate) fn explain(message: String) -> String {
+    if message.contains(LOCAL_IO_MARKER) {
+        format!(
+            "{message} (workers expose only the lake and private import staging to SQL; use `duckfleet export` to write results to a local file and `duckfleet import` to load one)"
+        )
+    } else {
+        message
+    }
+}
+
 /// Resolves a stored history `failure_kind` back to its classification, so an
 /// older record keeps the meaning it was written with.
 pub(crate) fn by_kind(kind: &str) -> Option<Failure> {
