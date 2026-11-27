@@ -203,6 +203,8 @@ await_no_isolated_pods() {
 await_no_isolated_pods
 harness duckfleet-isolated 'duckfleet-server --isolated' 600
 grep -q 'PASS: an isolated session ran on its own pod' artifacts/kind/duckfleet-isolated.log
+grep -q "PASS: a pgwire connection's options ran it on an isolated pod of that size" \
+  artifacts/kind/duckfleet-isolated.log
 # Both ceilings, named separately, because they refuse at different moments: the
 # namespace quota before a pod exists and the scheduler after one does. Asserting only
 # one would pass while the other path went untested.

@@ -583,6 +583,54 @@ async fn isolated_checks(ctx: &Ctx) -> anyhow::Result<()> {
     )?;
     println!("PASS: an isolated session ran on its own pod {pod}");
 
+    // The same request over pgwire (#204), as a plain Postgres client asks for it:
+    // in the connection's options. History records the request and the placement
+    // exactly as for HTTP.
+    let host = reqwest::Url::parse(&ctx.url)?
+        .host_str()
+        .context("gateway hostname")?
+        .to_owned();
+    let token = ctx.token.clone();
+    let marker = format!("pgwire-isolated-{}", uuid::Uuid::new_v4());
+    let statement = format!("/* {marker} */ select 21 * 2");
+    let answered =
+        tokio::task::spawn_blocking(move || {
+            let mut pg = postgres::Config::new()
+                .host(&host)
+                .port(5432)
+                .user("harness")
+                .dbname("lake")
+                .password(token)
+                .options("-c duckfleet.cpu=1 -c duckfleet.memory=768Mi")
+                .connect_timeout(Duration::from_secs(5))
+                .connect(postgres::NoTls)?;
+            let rows = pg.simple_query(&statement)?;
+            Ok::<_, postgres::Error>(rows.iter().any(
+                |m| matches!(m, postgres::SimpleQueryMessage::Row(r) if r.get(0) == Some("42")),
+            ))
+        })
+        .await??;
+    require(answered, "the pgwire isolated session did not answer")?;
+    let history = request_json(&ctx.client()?, Method::GET, "/v1/queries?limit=100", None).await?;
+    let record = history["queries"]
+        .as_array()
+        .and_then(|q| {
+            q.iter()
+                .find(|r| r["sql"].as_str().is_some_and(|s| s.contains(&marker)))
+        })
+        .cloned()
+        .context("no history row for the pgwire isolated statement")?;
+    require(
+        record["context"]["operation"] == "pgwire"
+            && record["placement"]["compute"] == "isolated"
+            && record["placement"]["memory_bytes"] == json!(768 * 1024 * 1024)
+            && record["worker_id"]
+                .as_str()
+                .is_some_and(|w| w.starts_with("duckfleet-session-") && w != pod),
+        format!("{record}"),
+    )?;
+    println!("PASS: a pgwire connection's options ran it on an isolated pod of that size");
+
     // A size the fleet cannot serve must be refused with the refusing component's own
     // reason, never downgraded to the persistent tier. The two ceilings fail at
     // different moments: the namespace quota refuses at admission before a pod exists,
