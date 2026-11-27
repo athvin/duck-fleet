@@ -155,11 +155,18 @@ expect_failure "$binary" export --job "$job" --output expired.csv
 [[ ! -e expired.csv ]]
 
 # Ctrl-C cancels the durable job, reports it, and publishes nothing.
-"$binary" export "select count(*) from range(100000000000) a" --output canceled.csv >cancel.out 2>cancel.err &
+"$binary" export "select sum(sin(range)) from range(100000000000)" --output canceled.csv >cancel.out 2>cancel.err &
 active_pid=$!
+# Interrupt only once the job is executing, so the CLI is waiting on it with
+# its Ctrl-C handler installed rather than still submitting.
 for _ in {1..100}; do
   grep -q 'request_id' cancel.err 2>/dev/null && break
   sleep 0.1
+done
+pending_job=$(request_id cancel.err)
+for _ in {1..120}; do
+  [[ "$("$binary" job status "$pending_job" 2>/dev/null | jq -r .state)" == executing ]] && break
+  sleep 0.5
 done
 sleep 1
 kill -INT "$active_pid"
