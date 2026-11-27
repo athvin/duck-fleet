@@ -18,11 +18,13 @@ arrow-ipc = "60.0.0"
 arrow-csv = "60.0.0"
 arrow-json = "60.0.0"
 arrow-schema = { version = "60.0.0", features = ["serde"] }
+axum = "0.8"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
 ring = "0.17"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rust-embed = { version = "8.14.0", features = ["mime-guess"] }
 rustyline = "19.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
@@ -31,5 +33,4 @@ tokio-util = { version = "0.7", features = ["io"] }
 uuid = { version = "1.29.2", features = ["v4", "serde"] }
 
 [dev-dependencies]
-axum = "0.8"
 rexpect = "0.7.1"
