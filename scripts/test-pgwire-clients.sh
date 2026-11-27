@@ -26,8 +26,10 @@ output=$(psql_run $'select [1, 2] as l;\n\\echo state :LAST_ERROR_SQLSTATE\nsele
 # psql Ctrl-C sends CancelRequest; the statement stops well before its deadline.
 started=$(date +%s)
 output=$(printf 'select sum(sin(range)) from range(100000000000);\n' | docker run -i --rm --network "$network" postgres:17.6-bookworm \
-  timeout -k 20 -s INT 3 psql "$dsn" -X -At -v VERBOSITY=verbose 2>&1 || true)
-[[ "$(( $(date +%s) - started ))" -lt 20 ]]
+  timeout -k 20 -s INT 8 psql "$dsn" -X -At -v VERBOSITY=verbose 2>&1 || true)
+# The interrupt lands at 8 s, after container start and session open; the
+# statement's own deadline is 60 s, so finishing well before that is the cancel.
+[[ "$(( $(date +%s) - started ))" -lt 40 ]]
 [[ "$output" == *"57014"* && "$output" == *"[canceled]"* ]]
 
 # Third-party client compatibility runs only in a pinned container; the
