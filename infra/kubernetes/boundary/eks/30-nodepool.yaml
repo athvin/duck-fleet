@@ -41,25 +41,32 @@ spec:
           value: "true"
           effect: NoSchedule
       requirements:
-        # `xlarge` is the point: it makes a true 2-CPU Guaranteed worker provisionable
-        # on demand rather than impossible. It does not run one continuously — see
-        # `limits` below, the consolidation policy, and the `suspended` chart value.
+        # `xlarge` makes a true 2-CPU Guaranteed worker provisionable on demand. The
+        # sizes above it are for isolated models (#214): instance sizes, not this
+        # pool, are meant to be the ceiling for a large transformation. The largest,
+        # 8xlarge, is 32 vCPU, and r6i/r7i give 256 GiB at that size for spill-heavy
+        # work. Karpenter picks the cheapest type that fits a pod, so a small worker
+        # still lands on a `large`. None of this runs continuously: see `limits`
+        # below, the consolidation policy, and the `suspended` chart value. The
+        # gateway refuses a size above what one such node can allocate
+        # (`isolatedCompute.maxCpu`/`maxMemory`) instead of leaving the pod Pending.
         - key: eks.amazonaws.com/instance-family
           operator: In
-          values: [m6i, m6a]
+          values: [m6i, m6a, r6i, r7i]
         - key: eks.amazonaws.com/instance-size
           operator: In
-          values: [large, xlarge]
+          values: [large, xlarge, 2xlarge, 4xlarge, 8xlarge]
         # On-demand only. A worker holds a DuckLake write transaction, and spot
         # reclamation mid-statement is a rollback the caller did not ask for.
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-  # The hard ceiling on what this pool will ever provision: four xlarge nodes. A
+  # The hard ceiling on what this pool will ever provision: the standing fleet plus
+  # one largest isolated model, with room for a node to be replaced under it. A
   # runaway session loop is already bounded by the namespace quota beside this; this
   # bounds the bill if anything gets past it.
   limits:
-    cpu: "16"
+    cpu: "64"
   disruption:
     # `WhenEmpty`, not `WhenEmptyOrUnderutilized`. Consolidating a busy node would
     # evict a worker mid-statement; the drain added in #16 handles that gracefully, but

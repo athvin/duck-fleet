@@ -285,6 +285,40 @@ printf 'create temporary table t (id int); insert into t values (42); select * f
 
 Execution stops at the first error by default and returns non-zero. `--continue-on-error` explicitly continues after classified SQL errors while retaining a failing exit status; it never continues after an unknown session, transport uncertainty, or other outcome where further execution could hide recovery requirements.
 
+## Admin console
+
+`duckfleet ui` serves a read-only web console for the gateway the CLI is configured for:
+
+```sh
+duckfleet ui              # listens on 127.0.0.1:7878
+duckfleet ui --port 0     # any free port
+duckfleet ui --url https://gateway.example --token "$TOKEN"
+```
+
+It prints a one-time launch link; open it in a browser. The first view, **Fleet**, refreshes every two seconds from `/v1/workers` and `/v1/pools`. It shows gateway sessions against their limit, open sessions against capacity for each persistent pool, and every worker's state, resources, sessions, and queue. Polling pauses while the tab is hidden.
+
+The console is a static Next.js bundle (`web/admin`) embedded in the CLI binary. The page calls the gateway's own `/v1/...` paths. The CLI forwards those requests to the gateway with its configured bearer token, so the browser never holds the credential and the gateway authorizes every request exactly as it would a CLI command. Only `GET` requests are forwarded: the console cannot cancel, change budgets, or run SQL.
+
+The local server is meant for one person on their own machine:
+
+- It binds only to 127.0.0.1 and refuses requests whose `Host` header names anything else, which defeats DNS rebinding.
+- API requests need the random per-launch key from the printed link. The launch link swaps the key for an `HttpOnly`, `SameSite=Strict` cookie and removes it from the address bar.
+- Cross-site and foreign-`Origin` requests are refused.
+
+These checks protect against other web pages in your browser, not against other processes running as your user, which can already read the CLI's local credential.
+
+To work on the console:
+
+```sh
+cd web/admin
+npm ci
+npm run build          # writes web/admin/out
+cd ../../server
+cargo run -p duckfleet-cli -- ui
+```
+
+Debug builds read `web/admin/out` from disk on every request, so after the first build `npm run build` and a browser reload are enough. Release builds embed the bundle. A binary built without `web/admin/out` still works; `duckfleet ui` then explains how to build the bundle. `make ui` does both builds.
+
 ## Source-based development
 
 The native crate reuses the command implementation in `server/src/cli.rs` and HTTP/Arrow transport in `server/src/client.rs`; it is not a second client implementation.
@@ -299,4 +333,4 @@ The Docker Compose `api` service and `DUCKFLEET_ROLE=cli duckfleet-server` role 
 
 ## Releases
 
-A tag named `duckfleet-v<version>` runs the native CLI release workflow. Each platform job builds and packages the binary, extracts the archive, and runs `version`, `init`, and redaction checks against that extracted executable. The release job verifies and publishes `SHA256SUMS` and generates a Homebrew formula containing the same checksums.
+A tag named `duckfleet-v<version>` runs the native CLI release workflow. Each platform job builds the admin console bundle, then builds and packages the binary, extracts the archive, and runs `version`, `init`, and redaction checks against that extracted executable. The release job verifies and publishes `SHA256SUMS` and generates a Homebrew formula containing the same checksums.

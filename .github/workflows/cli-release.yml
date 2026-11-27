@@ -34,6 +34,19 @@ jobs:
         run: bash scripts/ci/install-rust.sh
       - name: Install release target
         run: export PATH="$HOME/.cargo/bin:$PATH" && rustup target add "${{ matrix.target }}"
+      - name: Build the admin console bundle
+        # Node comes from the runner image. The bundle is embedded by
+        # server/cli/src/ui.rs; a release without it would ship a CLI whose
+        # `duckfleet ui` only explains how to build it.
+        working-directory: web/admin
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run build
+          test -f out/index.html
       - name: Build native CLI
         env:
           TARGET: ${{ matrix.target }}

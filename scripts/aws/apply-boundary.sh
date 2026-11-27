@@ -48,6 +48,21 @@ if ! "${KUBE[@]}" get nodeclass.eks.amazonaws.com "$DUCKFLEET_NODE_CLASS" > /dev
   exit 1
 fi
 
+# Optional: expose the gateway through an EKS Auto Mode ALB (#210). Both facts are
+# the operator's; the VPC ranges the ALB sends from are looked up, not assumed.
+if [[ -n "${DUCKFLEET_EXPOSURE_HOST:-}${DUCKFLEET_EXPOSURE_CERTIFICATE_ARN:-}" ]]; then
+  certificate_status=$(aws acm describe-certificate --region "$AWS_REGION" \
+    --certificate-arn "${DUCKFLEET_EXPOSURE_CERTIFICATE_ARN:?set DUCKFLEET_EXPOSURE_CERTIFICATE_ARN with DUCKFLEET_EXPOSURE_HOST}" \
+    --query Certificate.Status --output text)
+  [[ "$certificate_status" == ISSUED ]] || {
+    echo "Certificate is $certificate_status, not ISSUED; add its DNS validation record first" >&2; exit 1;
+  }
+  vpc=$(aws eks describe-cluster --region "$AWS_REGION" --name "$DUCKFLEET_CLUSTER" \
+    --query cluster.resourcesVpcConfig.vpcId --output text)
+  DUCKFLEET_EXPOSURE_SOURCE_CIDRS=$(aws ec2 describe-vpcs --region "$AWS_REGION" --vpc-ids "$vpc" \
+    --query 'Vpcs[0].CidrBlockAssociationSet[].CidrBlock' --output text | tr '\t' ',')
+  export DUCKFLEET_EXPOSURE_HOST DUCKFLEET_EXPOSURE_CERTIFICATE_ARN DUCKFLEET_EXPOSURE_SOURCE_CIDRS
+fi
 boundary=$(bash scripts/ops.sh aws-render-boundary "$NAMESPACE" "$DUCKFLEET_NODE_CLASS")
 cat <<EOF
 Applying the DuckFleet ownership boundary

@@ -160,10 +160,19 @@ pgwire:
 exposure:
   enabled: false
   host: ""
-  tlsSecretName: ""
   ingressClassName: ""
-  controllerNamespace: ""
   annotations: {}
+  # An in-cluster ingress controller (nginx and the like) terminates TLS with this
+  # Secret and reaches the gateway from controllerNamespace.
+  tlsSecretName: ""
+  controllerNamespace: ""
+  # Or a cloud load balancer terminates TLS itself and sends from VPC addresses:
+  # an EKS Auto Mode ALB whose IngressClassParams carry the ACM certificate. The
+  # operator's boundary (scripts/aws/apply-boundary.sh) creates that class and
+  # records these values; scripts/aws/deploy.sh passes them in.
+  loadBalancer:
+    enabled: false
+    sourceCidrs: []
 
 # Empty preserves the historical small pool and worker-small[-N] identities.
 # Set named pools to size CPU, memory, and spill disk independently. Configuration
@@ -242,6 +251,14 @@ isolatedCompute:
   # termination grace (#94). The default covers that grace; a request the quota could
   # never fit, even empty, is still refused at once. Zero restores relay-immediately.
   quotaWaitSeconds: 90
+  # The largest size one node of the cluster can allocate to a session pod. A request
+  # above either is refused at once with both sizes named, rather than created and left
+  # Pending until provisioningSeconds runs out. Zero / empty means no ceiling, which
+  # suits a fixed-node cluster, where the scheduler's own verdict is already
+  # immediate. The AWS deploy sets these to what the duckfleet NodePool's largest
+  # instance can allocate (#214).
+  maxCpu: 0
+  maxMemory: ""
   # Where the Kubernetes API server may be reached, and on which port. Both required
   # when enabled: defaulting them would mean opening egress to reach an address nobody
   # declared.

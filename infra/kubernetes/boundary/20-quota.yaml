@@ -21,6 +21,11 @@
 # cap that matters: six pods are the standing fleet, so 24 leaves about eighteen session
 # pods at once, which is a working development lane and nowhere near a cluster.
 #
+# The cpu and memory lines fit ONE isolated model at the gateway's ceiling (30 CPU /
+# 240Gi, `isolatedCompute.maxCpu`/`maxMemory`) beside the standing fleet (#214). A
+# quota smaller than that ceiling would refuse the very sizes the NodePool exists to
+# provide.
+#
 # Only cpu and memory are bounded. Quotas are conditional — naming a resource here
 # makes it mandatory on every container in the namespace — and while every container
 # in the chart declares cpu and memory, the gateway and PostgreSQL declare no
@@ -35,7 +40,7 @@ spec:
     # Terminal pods are excluded by Kubernetes, so completed harness Jobs do not
     # accumulate against this.
     count/pods: "24"
-    requests.cpu: "16"
-    requests.memory: 24Gi
-    limits.cpu: "24"
-    limits.memory: 32Gi
+    requests.cpu: "40"
+    requests.memory: 256Gi
+    limits.cpu: "48"
+    limits.memory: 272Gi

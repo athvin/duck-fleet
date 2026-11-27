@@ -562,6 +562,24 @@ cannot consume theirs. It permits `xlarge` as well as `large`, which is what mak
 overhead. `limits.cpu` is the spend ceiling and `WhenEmpty` consolidation is what makes
 `suspended: true` actually stop costing money.
 
+For isolated models it also permits `2xlarge` through `8xlarge`, in m6i/m6a and
+the memory-optimized r6i/r7i (#214), so the instance size, not the pool, is the
+ceiling: up to 32 vCPU, and 256 GiB on an r-family 8xlarge. Karpenter picks the
+cheapest type that fits each pod, so a small worker still lands on a `large`. The pool's
+`limits.cpu` is 64, the standing fleet plus one largest model. The quota beside it
+admits one model at the gateway's ceiling next to the fleet. That ceiling is
+`isolatedCompute.maxCpu`/`maxMemory`, 30 CPU / 240Gi on the AWS lane, which is what one
+8xlarge can allocate after kube-reserved and daemonsets. A request above it is refused
+at once with `not_placeable` naming both sizes, rather than left Pending for the
+provisioning grace. Widening the pool is an operator step like the rest of the
+boundary: re-run `scripts/aws/apply-boundary.sh` after this changes.
+
+A larger instance costs more to bring up than a `large`, and that cost lands on the
+first open of an isolated model. `artifacts/cold-start.json` records it for the sizes
+the harness opens. It has not yet been measured on the widened pool: the
+measurement for, for example, a 14 CPU / 56Gi model is owed once the boundary is
+re-applied (#214).
+
 It references an existing **NodeClass** by name — `DUCKFLEET_NODE_CLASS` in
 `scripts/aws/target.env`, defaulting to the `default` that EKS Auto Mode creates. A
 NodeClass carries the node IAM role and the subnet and security group selectors, which

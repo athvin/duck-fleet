@@ -1,4 +1,3 @@
-use anyhow::Context;
 use axum::{
     Router,
     extract::{Request, State},
@@ -166,6 +165,12 @@ async fn s3_refresh_handler(
     }
 }
 
+/// The worker's Pod Identity path (`pod_credentials`), against the real engine:
+/// credentials come from the agent using the token file, the engine is locked
+/// down exactly as a worker locks it, and a secret replaced with fresh
+/// credentials after the lockdown is the one S3 then sees. DuckDB's own
+/// credential_chain cannot do that last step once external access is off, which
+/// is what broke long-running persistent workers.
 async fn aws_credentials() -> anyhow::Result<()> {
     let credentials = CredentialState::default();
     let storage = S3State::default();
@@ -180,8 +185,8 @@ async fn aws_credentials() -> anyhow::Result<()> {
     let token_path =
         std::env::temp_dir().join(format!("duckfleet-test-token-{}", uuid::Uuid::new_v4()));
     std::fs::write(&token_path, "test-pod-identity-token")?;
-    // The DuckDB credential-chain extension reads process environment. These values are
-    // fixture-only and no other code mutates this process's environment while set.
+    // pod_credentials reads process environment. These values are fixture-only and
+    // no other code mutates this process's environment while set.
     unsafe {
         std::env::set_var(
             "AWS_CONTAINER_CREDENTIALS_FULL_URI",
@@ -190,66 +195,69 @@ async fn aws_credentials() -> anyhow::Result<()> {
         std::env::set_var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", &token_path);
         std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
     }
-    let result = (|| -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Handle::current();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use crate::pod_credentials::{Secret, fetch, secret_sql_at};
         let connection = extensions()?;
-        connection.execute_batch(&format!(
-            "CREATE SECRET aws_s3 (TYPE S3, PROVIDER credential_chain, REFRESH auto,
-             ENDPOINT '127.0.0.1:{storage_port}', URL_STYLE 'path', USE_SSL false,
-             REGION 'us-east-2', SCOPE 's3://test/lake/')"
+        let secrets = [Secret {
+            name: "aws_s3",
+            scope: "s3://test/lake/".into(),
+        }];
+        let endpoint = format!("127.0.0.1:{storage_port}");
+        let read = |connection: &duckdb::Connection| {
+            connection.query_row(
+                "SELECT * FROM read_csv('s3://test/lake/fixture.csv')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+        };
+        // In the worker's order: the first secret is installed at startup, before
+        // the lockdown. By the time S3 sees these credentials they are stale.
+        let old = fetch(&runtime)?;
+        anyhow::ensure!(old.key_id() == "TESTOLDLOCALONLY");
+        connection.execute_batch(&secret_sql_at(&secrets, "us-east-2", &old, Some(&endpoint)))?;
+        connection.execute_batch(&crate::worker::engine_file_access(
+            "s3://test/lake/",
+            None,
+            None,
         ))?;
-        let value = connection.query_row(
-            "SELECT * FROM read_csv('s3://test/lake/fixture.csv')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        anyhow::ensure!(value == 42);
-        let requests = credentials.requests.lock().unwrap();
         anyhow::ensure!(
-            !requests.is_empty()
-                && requests
-                    .iter()
-                    .all(|value| value.as_deref() == Some("test-pod-identity-token"))
+            read(&connection).is_err(),
+            "stale credentials were accepted"
         );
-        anyhow::ensure!(
-            credentials.keys.lock().unwrap()[..2] == ["TESTOLDLOCALONLY", "TESTNEWLOCALONLY"]
-        );
-        let requests = storage.requests.lock().unwrap();
-        let old = requests
-            .iter()
-            .position(|(_, value)| {
-                value
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("Credential=TESTOLDLOCALONLY/")
-            })
-            .context("old credential was not tried")?;
-        let new = requests
-            .iter()
-            .position(|(_, value)| {
-                value
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("Credential=TESTNEWLOCALONLY/")
-            })
-            .context("fresh credential was not tried")?;
-        anyhow::ensure!(
-            old < new,
-            "credential refresh did not precede the successful retry"
-        );
+        // Refreshed after the lockdown, as the worker's refresher does.
+        let new = fetch(&runtime)?;
+        anyhow::ensure!(new.key_id() == "TESTNEWLOCALONLY");
+        connection.execute_batch(&secret_sql_at(&secrets, "us-east-2", &new, Some(&endpoint)))?;
+        anyhow::ensure!(read(&connection)? == 42);
         let provider = connection.query_row(
             "SELECT provider FROM duckdb_secrets() WHERE name='aws_s3'",
             [],
             |row| row.get::<_, String>(0),
         )?;
-        anyhow::ensure!(provider == "credential_chain");
+        anyhow::ensure!(
+            provider == "config",
+            "the secret is {provider}, not explicit keys"
+        );
         Ok(())
-    })();
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    let requests = credentials.requests.lock().unwrap().clone();
     credential_task.abort();
     storage_task.abort();
     let _ = std::fs::remove_file(token_path);
     result?;
+    anyhow::ensure!(
+        requests.len() == 2
+            && requests
+                .iter()
+                .all(|value| value.as_deref() == Some("test-pod-identity-token")),
+        "the agent was not called with the token file: {requests:?}"
+    );
     println!(
-        "PASS: container credentials used the token file and a 403 fetched fresh credentials and retried S3"
+        "PASS: pod identity credentials used the token file, and a secret refreshed after the engine lockdown replaced stale ones"
     );
     Ok(())
 }

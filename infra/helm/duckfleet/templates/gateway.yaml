@@ -99,6 +99,12 @@ spec:
             - {name: DUCKFLEET_ISOLATED_READY_SECONDS, value: {{ .Values.isolatedCompute.readySeconds | quote }}}
             - {name: DUCKFLEET_ISOLATED_PROVISIONING_SECONDS, value: {{ .Values.isolatedCompute.provisioningSeconds | quote }}}
             - {name: DUCKFLEET_ISOLATED_QUOTA_WAIT_SECONDS, value: {{ .Values.isolatedCompute.quotaWaitSeconds | quote }}}
+            {{- if .Values.isolatedCompute.maxCpu }}
+            - {name: DUCKFLEET_ISOLATED_MAX_CPU, value: {{ .Values.isolatedCompute.maxCpu | quote }}}
+            {{- end }}
+            {{- if .Values.isolatedCompute.maxMemory }}
+            - {name: DUCKFLEET_ISOLATED_MAX_MEMORY, value: {{ .Values.isolatedCompute.maxMemory | quote }}}
+            {{- end }}
             # Session pods are owned by this pod, so losing the gateway has the
             # garbage collector remove them rather than leaving them billing.
             - name: DUCKFLEET_POD_NAME

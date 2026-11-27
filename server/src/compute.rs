@@ -174,7 +174,7 @@ fn quantity(bytes: u64) -> String {
 ///
 /// A suffix is required: a bare number would be ambiguous between bytes and
 /// mebibytes, and both Kubernetes and Docker express a container cap with a suffix.
-fn parse_quantity(text: &str) -> Option<u64> {
+pub(crate) fn parse_quantity(text: &str) -> Option<u64> {
     for (suffix, multiplier) in [("Gi", GIB), ("Mi", MIB), ("Ki", 1024)] {
         if let Some(number) = text.strip_suffix(suffix) {
             return number.trim().parse::<u64>().ok()?.checked_mul(multiplier);

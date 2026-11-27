@@ -104,6 +104,15 @@ pub async fn run(args: Vec<String>) -> i32 {
         .await;
     }
 
+    if parsed.command == "ui" {
+        return crate::ui::run(crate::ui::Options {
+            url,
+            token,
+            port: parsed.port().expect("validated port"),
+        })
+        .await;
+    }
+
     let result = match parsed.command.as_str() {
         "sql" => run_sql(&url, &token, &parsed).await,
         "advise" => {
@@ -282,7 +291,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "policy" => run_policy(&url, &token, &parsed).await,
         other => {
             eprintln!(
-                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|sql|import|export|snapshots|snapshot|advise|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
+                "unknown command: {other} (init|config|version|dev|status|stop|reset|shell|ui|sql|import|export|snapshots|snapshot|advise|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit)"
             );
             return 2;
         }
@@ -864,7 +873,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    const VALUE_FLAGS: [&'static str; 36] = [
+    const VALUE_FLAGS: [&'static str; 37] = [
         "url",
         "token",
         "cpu",
@@ -901,6 +910,7 @@ impl Parsed {
         "to",
         "thresholds",
         "project-dir",
+        "port",
     ];
     const COMPUTE_FLAGS: [&'static str; 5] = ["cpu", "memory", "disk", "mode", "pool"];
 
@@ -965,7 +975,7 @@ impl Parsed {
         }
         let parsed = Parsed {
             command: command.ok_or(
-                "usage: <init|config|version|dev|status|stop|reset|shell|sql|import|export|snapshots|snapshot|advise|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
+                "usage: <init|config|version|dev|status|stop|reset|shell|ui|sql|import|export|snapshots|snapshot|advise|schemas|tables|views|describe|preview|system|job|history|profile|query|request|cancel|usage|budget|workers|pools|principals|credentials|policy|audit> ...",
             )?,
             positionals,
             values,
@@ -1001,6 +1011,24 @@ impl Parsed {
                 .is_some_and(|format| !["table", "csv", "json", "vertical"].contains(&format))
         {
             return Err("shell --format must be table, csv, json, or vertical".into());
+        }
+        if parsed.command == "ui" {
+            if !parsed.positionals.is_empty() {
+                return Err("ui takes no positional arguments".into());
+            }
+            if let Some((name, _)) = parsed
+                .values
+                .iter()
+                .find(|(name, _)| !matches!(name.as_str(), "url" | "token" | "port"))
+            {
+                return Err(format!("--{name} does not apply to ui"));
+            }
+            if !parsed.flags.is_empty() || !parsed.params.is_empty() {
+                return Err("ui takes only --port, --url, and --token".into());
+            }
+            parsed.port()?;
+        } else if parsed.value("port").is_some() {
+            return Err("--port applies only to ui".into());
         }
         if parsed.flags.iter().any(|flag| flag == "no-history") && parsed.command != "shell" {
             return Err("--no-history applies only to shell".into());
@@ -1504,6 +1532,16 @@ impl Parsed {
         Ok(request)
     }
 
+    /// The local port `duckfleet ui` listens on. Zero asks the OS for a free one.
+    fn port(&self) -> Result<u16, String> {
+        match self.value("port") {
+            None => Ok(crate::ui::DEFAULT_PORT),
+            Some(value) => value
+                .parse::<u16>()
+                .map_err(|_| "--port must be an integer from 0 to 65535".into()),
+        }
+    }
+
     fn value(&self, name: &str) -> Option<&str> {
         self.values
             .iter()
@@ -1565,6 +1603,20 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Parsed, String> {
         Parsed::from_args(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn ui_accepts_only_its_own_options() {
+        let parsed = parse(&["ui"]).unwrap();
+        assert_eq!(parsed.port().unwrap(), crate::ui::DEFAULT_PORT);
+        let parsed = parse(&["ui", "--port", "0", "--url", "http://x"]).unwrap();
+        assert_eq!(parsed.port().unwrap(), 0);
+        assert!(parse(&["ui", "--port", "70000"]).is_err());
+        assert!(parse(&["ui", "--port", "nope"]).is_err());
+        assert!(parse(&["ui", "extra"]).is_err());
+        assert!(parse(&["ui", "--format", "json"]).is_err());
+        assert!(parse(&["ui", "--watch"]).is_err());
+        assert!(parse(&["workers", "--port", "1"]).is_err());
     }
 
     #[test]
