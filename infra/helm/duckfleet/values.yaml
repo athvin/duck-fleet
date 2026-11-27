@@ -160,10 +160,19 @@ pgwire:
 exposure:
   enabled: false
   host: ""
-  tlsSecretName: ""
   ingressClassName: ""
-  controllerNamespace: ""
   annotations: {}
+  # An in-cluster ingress controller (nginx and the like) terminates TLS with this
+  # Secret and reaches the gateway from controllerNamespace.
+  tlsSecretName: ""
+  controllerNamespace: ""
+  # Or a cloud load balancer terminates TLS itself and sends from VPC addresses:
+  # an EKS Auto Mode ALB whose IngressClassParams carry the ACM certificate. The
+  # operator's boundary (scripts/aws/apply-boundary.sh) creates that class and
+  # records these values; scripts/aws/deploy.sh passes them in.
+  loadBalancer:
+    enabled: false
+    sourceCidrs: []
 
 # Empty preserves the historical small pool and worker-small[-N] identities.
 # Set named pools to size CPU, memory, and spill disk independently. Configuration

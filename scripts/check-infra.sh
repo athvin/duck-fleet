@@ -103,6 +103,24 @@ for missing in tlsSecretName controllerNamespace host; do
   fi
 done
 echo 'PASS: exposure without its host, certificate secret, or controller namespace is rejected'
+balanced="$validation_dir/exposed-load-balancer.yaml"
+lb_args=(--set exposure.enabled=true --set exposure.host=duckfleet.example.com
+  --set exposure.ingressClassName=duckfleet-duckfleet-dev --set exposure.loadBalancer.enabled=true
+  --set 'exposure.loadBalancer.sourceCidrs={10.0.0.0/16}')
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" "${lb_args[@]}" > "$balanced"
+ops check-chart "$balanced" > /dev/null
+echo 'PASS: load balancer exposure listens on HTTPS only and admits only the named VPC ranges'
+for missing in sourceCidrs ingressClassName; do
+  args=(--set exposure.enabled=true --set exposure.host=duckfleet.example.com --set exposure.loadBalancer.enabled=true)
+  [ "$missing" != sourceCidrs ] && args+=(--set 'exposure.loadBalancer.sourceCidrs={10.0.0.0/16}')
+  [ "$missing" != ingressClassName ] && args+=(--set exposure.ingressClassName=duckfleet-duckfleet-dev)
+  if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+       "${args[@]}" > /dev/null 2>&1; then
+    echo "Load balancer exposure without $missing must fail the render" >&2
+    exit 1
+  fi
+done
+echo 'PASS: load balancer exposure without its source ranges or class is rejected'
 external="$validation_dir/external-postgres.yaml"
 helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
   --set postgres.bundled=false \
