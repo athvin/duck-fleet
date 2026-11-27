@@ -118,6 +118,11 @@ pub fn overlay(cidrs: &[String], ports: &[u64]) -> Value {
             "apiServerPorts": ports,
             "readySeconds": 420,
             "provisioningSeconds": 240,
+            // What the duckfleet NodePool's largest instance (8xlarge: 32 vCPU, up
+            // to 256 GiB on r6i/r7i) can allocate to one pod after kube-reserved and
+            // the node's daemonsets (#214).
+            "maxCpu": 30,
+            "maxMemory": "240Gi",
         },
         "nodeSelector": {
             "kubernetes.io/os": "linux",
