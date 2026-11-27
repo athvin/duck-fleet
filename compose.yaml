@@ -45,6 +45,24 @@ services:
       DUCKFLEET_READER_OBJECT_SECRET_KEY: ${DUCKFLEET_READER_OBJECT_SECRET_KEY:-local-lake-reader-object-password}
     depends_on: [object-store]
 
+  # TLS in front of the object store (#213), so the workers' DuckDB S3 traffic takes
+  # the same TLS path it takes against real S3: httpfs loads the CA bundle lazily,
+  # after the engine file lockdown, and only an allowlisted bundle can be read then
+  # (#206). The test CA it generates is added to the bundle the workers mount as their
+  # system one. Results and bucket setup keep talking to the object store directly.
+  object-store-tls:
+    build:
+      context: .
+      dockerfile: docker/object-store-tls.Dockerfile
+    volumes:
+      - object-store-tls:/tls
+      - object-store-trust:/trust
+    depends_on: [object-store]
+    healthcheck:
+      test: [CMD, sh, -c, "test -s /trust/ca-certificates.crt && nc -z 127.0.0.1 9443"]
+      interval: 2s
+      retries: 30
+
   platform-provision:
     image: postgres:17.6-bookworm
     entrypoint: [/bin/bash, /etc/duckfleet/provision-database.sh]
@@ -131,11 +149,22 @@ services:
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       CATALOG_DSN: host=postgres port=5432 dbname=lake user=duckfleet_catalog password=${DUCKFLEET_DB_CATALOG_PASSWORD:-local-lake-catalog-password}
       PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_worker password=${DUCKFLEET_DB_WORKER_PASSWORD:-local-platform-worker-password}
-      S3_ENDPOINT: object-store:9000
+      S3_ENDPOINT: object-store-tls:9443
+      S3_USE_SSL: "true"
       S3_ACCESS_KEY: ${DUCKFLEET_OBJECT_ACCESS_KEY:-DUCKFLEETLOCAL}
       S3_SECRET_KEY: ${DUCKFLEET_OBJECT_SECRET_KEY:-local-object-store-password}
       S3_DATA_PATH: s3://duckfleet/lake/
+    volumes:
+      # The system roots plus the local test CA, at the path httpfs reads first.
+      # `nocopy`: an empty volume must not be seeded from this image's own certs.
+      - type: volume
+        source: object-store-trust
+        target: /etc/ssl/certs
+        read_only: true
+        volume: {nocopy: true}
     depends_on:
+      object-store-tls:
+        condition: service_healthy
       platform-migrate:
         condition: service_completed_successfully
       bucket-init:
@@ -161,7 +190,17 @@ services:
     environment:
       <<: *worker-environment
       DUCKFLEET_WORKER_ID: small-b
+    volumes:
+      # The system roots plus the local test CA, at the path httpfs reads first.
+      # `nocopy`: an empty volume must not be seeded from this image's own certs.
+      - type: volume
+        source: object-store-trust
+        target: /etc/ssl/certs
+        read_only: true
+        volume: {nocopy: true}
     depends_on:
+      object-store-tls:
+        condition: service_healthy
       worker-small:
         condition: service_healthy
     healthcheck: *worker-health
@@ -194,11 +233,22 @@ services:
       DUCKFLEET_PLATFORM_WAIT_SECONDS: "120"
       CATALOG_READER_DSN: host=postgres port=5432 dbname=lake user=duckfleet_catalog_reader password=${DUCKFLEET_DB_CATALOG_READER_PASSWORD:-local-lake-reader-password}
       PLATFORM_DSN: host=postgres port=5432 dbname=platform user=duckfleet_worker password=local-platform-worker-password
-      S3_ENDPOINT: object-store:9000
+      S3_ENDPOINT: object-store-tls:9443
+      S3_USE_SSL: "true"
       S3_READER_ACCESS_KEY: DUCKFLEETREADER
       S3_READER_SECRET_KEY: ${DUCKFLEET_READER_OBJECT_SECRET_KEY:-local-lake-reader-object-password}
       S3_DATA_PATH: s3://duckfleet/lake/
+    volumes:
+      # The system roots plus the local test CA, at the path httpfs reads first.
+      # `nocopy`: an empty volume must not be seeded from this image's own certs.
+      - type: volume
+        source: object-store-trust
+        target: /etc/ssl/certs
+        read_only: true
+        volume: {nocopy: true}
     depends_on:
+      object-store-tls:
+        condition: service_healthy
       platform-migrate:
         condition: service_completed_successfully
       bucket-init:
@@ -263,7 +313,17 @@ services:
       DUCKFLEET_WORKER_CPU: "2"
       DUCKFLEET_WORKER_MEMORY: 3Gi
       DUCKFLEET_WORKER_DISK: 4Gi
+    volumes:
+      # The system roots plus the local test CA, at the path httpfs reads first.
+      # `nocopy`: an empty volume must not be seeded from this image's own certs.
+      - type: volume
+        source: object-store-trust
+        target: /etc/ssl/certs
+        read_only: true
+        volume: {nocopy: true}
     depends_on:
+      object-store-tls:
+        condition: service_healthy
       platform-migrate:
         condition: service_completed_successfully
       bucket-init:
@@ -396,3 +456,5 @@ services:
 volumes:
   postgres-data:
   object-data:
+  object-store-tls:
+  object-store-trust:
