@@ -1,0 +1,7 @@
+order_id,customer_id,status,amount,ordered_at
+1,1,shipped,10.50,2026-01-01
+2,1,shipped,20.00,2026-01-02
+3,2,returned,5.25,2026-01-02
+4,3,shipped,99.99,2026-01-05
+5,2,pending,15.00,2026-01-07
+6,4,shipped,42.00,2026-01-09

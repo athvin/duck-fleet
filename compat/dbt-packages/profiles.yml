@@ -1,0 +1,10 @@
+duckfleet:
+  target: k8s
+  outputs:
+    k8s:
+      type: duckfleet
+      endpoint: '{{ env_var("DUCKFLEET_URL", "http://localhost:18090") }}'
+      token: '{{ env_var("DUCKFLEET_TOKEN") }}'
+      database: lake
+      schema: package_compat
+      threads: 4

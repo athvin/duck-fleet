@@ -1,0 +1,25 @@
+name: duckfleet_package_compat
+version: '0.1.0'
+config-version: 2
+profile: duckfleet
+model-paths: [models]
+seed-paths: [seeds]
+test-paths: [tests]
+macro-paths: [macros]
+clean-targets: [target, dbt_packages]
+
+models:
+  duckfleet_package_compat:
+    +materialized: table
+    isolated:
+      # One model on an isolated pod, so package macros are proven on both tiers.
+      +meta:
+        platform:
+          cpu: 1
+          memory: 2Gi
+
+seeds:
+  duckfleet_package_compat:
+    orders:
+      +column_types:
+        amount: decimal(10,2)
