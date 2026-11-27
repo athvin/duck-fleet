@@ -23,7 +23,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::{ApiError, credentials::Identity, system_query};
+use crate::{ApiError, compute::ComputeRequest, credentials::Identity, system_query};
 
 /// Separate bound on wire sockets, including unauthenticated and idle clients.
 /// Backend sessions also acquire the gateway's shared HTTP/pgwire/platform permit.
@@ -67,9 +67,12 @@ pub(crate) trait Platform: Send + Sync + 'static {
         identity: &Identity,
         mode: ConnectionMode,
     ) -> impl std::future::Future<Output = std::result::Result<(), ApiError>> + Send;
+    /// `compute` is the connection's request (#204): from its startup options or
+    /// `SET duckfleet.*` before the first statement, else the default pool.
     fn open_session(
         &self,
         identity: &Identity,
+        compute: &ComputeRequest,
     ) -> impl std::future::Future<Output = std::result::Result<Session, ApiError>> + Send;
     fn query(
         &self,
@@ -376,6 +379,13 @@ async fn established<P: Platform>(
             return Ok(());
         }
     };
+    let mut compute = match startup_compute(startup) {
+        Ok(compute) => compute,
+        Err(refusal) => {
+            error_response(stream, refusal.code, &refusal.message).await?;
+            return Ok(());
+        }
+    };
     if platform.draining() {
         error_response(stream, "57P01", "the gateway is shutting down").await?;
         return Ok(());
@@ -456,6 +466,7 @@ async fn established<P: Platform>(
                 mode,
                 &mut session,
                 &mut prepared,
+                &mut compute,
             ),
         )
         .await;
@@ -532,6 +543,145 @@ impl<'a> Fields<'a> {
     }
 }
 
+/// A startup refused for its `duckfleet.*` compute request, with its own words.
+#[derive(Debug)]
+struct ComputeRefusal {
+    code: &'static str,
+    message: String,
+}
+
+/// The connection's compute request (#204), from `duckfleet.*` startup parameters
+/// and `-c duckfleet.*=…` / `--duckfleet.*=…` entries in `options`, the way libpq
+/// passes a setting at connect time. Other options keep being ignored.
+fn startup_compute(body: &[u8]) -> Result<ComputeRequest, ComputeRefusal> {
+    let mut fields = Fields(body);
+    let mut compute = ComputeRequest::default();
+    let mut settings: Vec<(String, String)> = Vec::new();
+    while let Ok(key) = fields.string() {
+        if key.is_empty() {
+            break;
+        }
+        let Ok(value) = fields.string() else { break };
+        if key.starts_with("duckfleet.") {
+            settings.push((key.to_owned(), value.to_owned()));
+        } else if key == "options" {
+            let mut words = value.split_whitespace();
+            while let Some(word) = words.next() {
+                let setting = if word == "-c" {
+                    words.next().unwrap_or_default()
+                } else if let Some(rest) = word.strip_prefix("-c") {
+                    rest
+                } else if let Some(rest) = word.strip_prefix("--") {
+                    rest
+                } else {
+                    continue;
+                };
+                if let Some((name, value)) = setting.split_once('=')
+                    && name.starts_with("duckfleet.")
+                {
+                    settings.push((name.to_owned(), value.to_owned()));
+                }
+            }
+        }
+    }
+    for (name, value) in settings {
+        apply_compute_setting(&mut compute, &name, Some(&value))?;
+    }
+    Ok(compute)
+}
+
+/// One `duckfleet.*` setting applied to the request; `None` resets it. Checked with
+/// the HTTP API's own validation, so a size is held to one rule however it arrives.
+fn apply_compute_setting(
+    compute: &mut ComputeRequest,
+    name: &str,
+    value: Option<&str>,
+) -> Result<(), ComputeRefusal> {
+    let value = value.map(|v| v.trim().trim_matches('\'').to_owned());
+    let mut next = compute.clone();
+    match name.to_ascii_lowercase().as_str() {
+        "duckfleet.mode" => {
+            next.mode = match value.as_deref() {
+                None => None,
+                Some(v) => Some(
+                    serde_json::from_value(serde_json::Value::String(v.to_ascii_lowercase()))
+                        .map_err(|_| ComputeRefusal {
+                            code: "22023",
+                            message: format!(
+                                "invalid value for duckfleet.mode: {v:?} (persistent or isolated)"
+                            ),
+                        })?,
+                ),
+            };
+        }
+        "duckfleet.pool" => next.pool = value,
+        "duckfleet.cpu" => {
+            next.cpu = match value.as_deref() {
+                None => None,
+                Some(v) => Some(v.parse::<u16>().map_err(|_| ComputeRefusal {
+                    code: "22023",
+                    message: format!("invalid value for duckfleet.cpu: {v:?} (a whole number)"),
+                })?),
+            };
+        }
+        "duckfleet.memory" => next.memory = value,
+        "duckfleet.disk" => next.disk = value,
+        other => {
+            return Err(ComputeRefusal {
+                code: "42704",
+                message: format!(
+                    "unrecognized configuration parameter \"{other}\" (duckfleet.mode, \
+                     duckfleet.pool, duckfleet.cpu, duckfleet.memory, duckfleet.disk)"
+                ),
+            });
+        }
+    }
+    next.validate().map_err(|error| ComputeRefusal {
+        code: "22023",
+        message: format!("invalid compute request: {}", error.1),
+    })?;
+    *compute = next;
+    Ok(())
+}
+
+/// `SET [SESSION] duckfleet.<name> {=|TO} <value>` or `RESET duckfleet.<name>`, as
+/// (name, value); `None` value is a reset. Anything else is not ours.
+fn compute_statement(sql: &str) -> Option<(String, Option<String>)> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let mut words = sql.splitn(2, char::is_whitespace);
+    let verb = words.next()?.to_ascii_uppercase();
+    let rest = words.next()?.trim();
+    match verb.as_str() {
+        "RESET" => {
+            let name = rest.trim();
+            name.to_ascii_lowercase()
+                .starts_with("duckfleet.")
+                .then(|| (name.to_owned(), None))
+        }
+        "SET" => {
+            let rest = rest
+                .strip_prefix("SESSION ")
+                .or_else(|| rest.strip_prefix("session "))
+                .unwrap_or(rest)
+                .trim();
+            let (name, value) = if let Some((name, value)) = rest.split_once('=') {
+                (name.trim(), value.trim())
+            } else {
+                let mut parts = rest.splitn(3, char::is_whitespace);
+                let name = parts.next()?;
+                if !parts.next()?.eq_ignore_ascii_case("to") {
+                    return None;
+                }
+                (name, parts.next()?.trim())
+            };
+            name.to_ascii_lowercase()
+                .starts_with("duckfleet.")
+                .then(|| (name.to_owned(), Some(value.to_owned())))
+        }
+        _ => None,
+    }
+}
+
 fn startup_mode(body: &[u8]) -> ProtocolResult<(String, ConnectionMode)> {
     let mut fields = Fields(body);
     let mut options = std::collections::BTreeMap::new();
@@ -552,7 +702,8 @@ fn startup_mode(body: &[u8]) -> ProtocolResult<(String, ConnectionMode)> {
         }
         if matches!(key, "pool" | "duckfleet_pool") {
             return Err(ProtocolError::unsupported(
-                "pgwire uses the configured default pool; explicit pool selection is unsupported",
+                "select a pool with duckfleet.pool (options='-c duckfleet.pool=NAME'), not this \
+                 parameter",
             ));
         }
     }
@@ -685,6 +836,7 @@ async fn connection_loop<P: Platform>(
     mode: ConnectionMode,
     session: &mut Option<Session>,
     prepared: &mut Option<String>,
+    compute: &mut ComputeRequest,
 ) -> Result<()> {
     let mut auth_checks = tokio::time::interval_at(
         tokio::time::Instant::now() + AUTH_CHECK_INTERVAL,
@@ -737,6 +889,7 @@ async fn connection_loop<P: Platform>(
                         identity,
                         mode,
                         session,
+                        compute,
                         sql,
                         &mut transaction,
                     )
@@ -802,6 +955,7 @@ async fn connection_loop<P: Platform>(
                             identity,
                             mode,
                             session,
+                            compute,
                             sql,
                             &mut transaction,
                         )
@@ -841,15 +995,52 @@ async fn connection_loop<P: Platform>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_statement<P: Platform>(
     platform: &P,
     stream: &mut BufStream<TcpStream>,
     identity: &Identity,
     mode: ConnectionMode,
     session: &mut Option<Session>,
+    compute: &mut ComputeRequest,
     sql: &str,
     transaction: &mut Transaction,
 ) -> Result<bool> {
+    // `SET duckfleet.*` configures the compute the session opens on, so it is ours
+    // and never reaches the engine. Accepted until the session exists (it opens on
+    // the first statement); after that its compute is fixed and the change is
+    // refused rather than silently ignored.
+    if mode == ConnectionMode::Warehouse
+        && let Some((name, value)) = compute_statement(sql)
+    {
+        if session.is_some() {
+            error_response(
+                stream,
+                "55P02",
+                &format!(
+                    "{name} cannot be changed once this connection's session has opened; set it \
+                     in the connection's options or before the first statement"
+                ),
+            )
+            .await?;
+            return Ok(false);
+        }
+        return match apply_compute_setting(compute, &name, value.as_deref()) {
+            Ok(()) => {
+                let tag: &[u8] = if value.is_some() {
+                    b"SET\0"
+                } else {
+                    b"RESET\0"
+                };
+                write_message(stream, b'C', tag).await?;
+                Ok(true)
+            }
+            Err(refusal) => {
+                error_response(stream, refusal.code, &refusal.message).await?;
+                Ok(false)
+            }
+        };
+    }
     if mode == ConnectionMode::System {
         // The system service owns admission and fresh authentication/policy/read
         // in one deadline. A separate auth-lane preflight would double that budget.
@@ -866,7 +1057,7 @@ async fn run_statement<P: Platform>(
         return refuse_access(stream, error).await;
     }
     if session.is_none() {
-        match platform.open_session(identity).await {
+        match platform.open_session(identity, compute).await {
             Ok(opened) => {
                 if let Ok(pid) = CANCEL_KEY.try_with(|pid| *pid) {
                     cancel_keys::publish(pid, &opened);
@@ -1007,6 +1198,10 @@ fn sqlstate(kind: &str) -> &'static str {
             "53300"
         }
         "transaction_conflict" => "40001",
+        // Isolated compute this deployment cannot provide (#204): no pod grant, or a
+        // size no node or quota can hold. Neither ran anything.
+        "compute_unavailable" => "0A000",
+        "not_placeable" => "53000",
         _ => "XX000",
     }
 }
@@ -1565,6 +1760,7 @@ mod tests {
         canceled: AtomicUsize,
         statements: Mutex<Vec<String>>,
         request_ids: Mutex<Vec<Uuid>>,
+        computes: Mutex<Vec<ComputeRequest>>,
         hold_open: bool,
         hold_query: bool,
         system_queries: AtomicUsize,
@@ -1636,7 +1832,9 @@ mod tests {
         async fn open_session(
             &self,
             identity: &Identity,
+            compute: &ComputeRequest,
         ) -> std::result::Result<Session, ApiError> {
+            self.computes.lock().unwrap().push(compute.clone());
             assert_eq!(identity.principal, "test-user");
             self.opened.fetch_add(1, Ordering::SeqCst);
             if self.hold_open {
@@ -1913,6 +2111,143 @@ mod tests {
         write_message(&mut client, b'X', &[]).await.unwrap();
         flush(&mut client).await.unwrap();
         finished(task).await;
+    }
+
+    #[test]
+    fn startup_options_carry_the_compute_request() {
+        let packet = |pairs: &[(&str, &str)]| {
+            let mut out = Vec::new();
+            for (k, v) in pairs {
+                out.extend_from_slice(k.as_bytes());
+                out.push(0);
+                out.extend_from_slice(v.as_bytes());
+                out.push(0);
+            }
+            out.push(0);
+            out
+        };
+        let compute = startup_compute(&packet(&[
+            ("user", "u"),
+            (
+                "options",
+                "-c duckfleet.cpu=2 -csearch_path=x --duckfleet.memory=4Gi",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(compute.cpu, Some(2));
+        assert_eq!(compute.memory.as_deref(), Some("4Gi"));
+        assert_eq!(compute.pool, None, "other options are ignored, as before");
+        // asyncpg's server_settings arrive as top-level startup parameters.
+        let compute = startup_compute(&packet(&[("duckfleet.mode", "isolated")])).unwrap();
+        assert_eq!(compute.mode, Some(crate::compute::Mode::Isolated));
+        assert_eq!(
+            startup_compute(&packet(&[])).unwrap(),
+            ComputeRequest::default(),
+            "no request keeps the default pool"
+        );
+        let unknown = startup_compute(&packet(&[("options", "-c duckfleet.gpu=1")])).unwrap_err();
+        assert_eq!(unknown.code, "42704");
+        let bad = startup_compute(&packet(&[("options", "-c duckfleet.cpu=lots")])).unwrap_err();
+        assert_eq!(bad.code, "22023");
+        let conflicting = startup_compute(&packet(&[(
+            "options",
+            "-c duckfleet.pool=etl -c duckfleet.mode=isolated",
+        )]))
+        .unwrap_err();
+        assert_eq!(conflicting.code, "22023", "{}", conflicting.message);
+    }
+
+    #[test]
+    fn set_and_reset_of_duckfleet_settings_are_recognized() {
+        assert_eq!(
+            compute_statement("SET duckfleet.cpu = 8;"),
+            Some(("duckfleet.cpu".into(), Some("8".into())))
+        );
+        assert_eq!(
+            compute_statement("set session duckfleet.memory to '32Gi'"),
+            Some(("duckfleet.memory".into(), Some("'32Gi'".into())))
+        );
+        assert_eq!(
+            compute_statement("RESET duckfleet.cpu"),
+            Some(("duckfleet.cpu".into(), None))
+        );
+        for other in [
+            "SET search_path = x",
+            "select 1",
+            "SET duckfleet",
+            "SETTLE duckfleet.cpu = 1",
+        ] {
+            assert_eq!(compute_statement(other), None, "{other}");
+        }
+        let mut compute = ComputeRequest::default();
+        apply_compute_setting(&mut compute, "duckfleet.memory", Some("'32Gi'")).unwrap();
+        assert_eq!(
+            compute.memory.as_deref(),
+            Some("32Gi"),
+            "quotes are a value's, not part of it"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_before_the_first_statement_sizes_the_session_and_after_is_refused() {
+        let platform = Arc::new(TestPlatform::default());
+        let (mut client, task) = test_connection(platform.clone()).await;
+        statement(&mut client, "SET duckfleet.cpu = 4").await;
+        successful_response(&mut client).await;
+        statement(&mut client, "SET duckfleet.memory TO '8Gi'").await;
+        successful_response(&mut client).await;
+        assert_eq!(
+            platform.opened.load(Ordering::SeqCst),
+            0,
+            "SET opens nothing"
+        );
+        statement(&mut client, "select 1").await;
+        successful_response(&mut client).await;
+        let opened = platform.computes.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].cpu, Some(4));
+        assert_eq!(opened[0].memory.as_deref(), Some("8Gi"));
+        assert!(
+            !platform
+                .statements
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.to_ascii_lowercase().contains("duckfleet")),
+            "the settings never reach the engine"
+        );
+        statement(&mut client, "SET duckfleet.cpu = 8").await;
+        refusal(&mut client, "55P02").await;
+        write_message(&mut client, b'X', &[]).await.unwrap();
+        flush(&mut client).await.unwrap();
+        finished(task).await;
+    }
+
+    #[tokio::test]
+    async fn a_bad_startup_compute_option_is_refused_with_its_sqlstate() {
+        let platform = Arc::new(TestPlatform::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let task = tokio::spawn(connection(platform.clone(), server));
+        let mut client = BufStream::new(client);
+        let startup = "user\0u\0database\0lake\0options\0-c duckfleet.cpu=-1\0\0";
+        client
+            .write_i32(i32::try_from(startup.len() + 8).unwrap())
+            .await
+            .unwrap();
+        client.write_i32(PROTOCOL_V3).await.unwrap();
+        client.write_all(startup.as_bytes()).await.unwrap();
+        flush(&mut client).await.unwrap();
+        refusal(&mut client, "22023").await;
+        finished(task).await;
+        assert_eq!(
+            platform.checks.load(Ordering::SeqCst),
+            0,
+            "refused before authenticating"
+        );
     }
 
     #[tokio::test]

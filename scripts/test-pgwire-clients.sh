@@ -32,6 +32,20 @@ output=$(printf 'select sum(sin(range)) from range(100000000000);\n' | docker ru
 [[ "$(( $(date +%s) - started ))" -lt 40 ]]
 [[ "$output" == *"57014"* && "$output" == *"[canceled]"* ]]
 
+# Compute from the connection's options (#204). Compose has no pod grant, so an
+# isolated request is refused with a SQLSTATE, never run on the persistent tier;
+# a bad setting is refused at startup.
+output=$(printf 'select 1;\n' | docker run -i --rm --network "$network" -e PGOPTIONS='-c duckfleet.cpu=1' \
+  postgres:17.6-bookworm psql "$dsn" -X -At -v VERBOSITY=verbose 2>&1 || true)
+[[ "$output" == *"0A000"* && "$output" == *"compute_unavailable"* ]]
+output=$(printf 'select 1;\n' | docker run -i --rm --network "$network" -e PGOPTIONS='-c duckfleet.gpu=1' \
+  postgres:17.6-bookworm psql "$dsn" -X -At -v VERBOSITY=verbose 2>&1 || true)
+# psql prints no SQLSTATE for an error at connect time (VERBOSITY applies once
+# connected), so the message is what is checked here; the unit tests pin 42704.
+[[ "$output" == *'unrecognized configuration parameter "duckfleet.gpu"'* ]]
+output=$(psql_run $'set duckfleet.cpu = 1;\nselect 1;\nset duckfleet.cpu = 2;\n\\echo state :LAST_ERROR_SQLSTATE')
+[[ "$output" == *"0A000"* && "$output" != *"state 55P02"* ]]
+
 # Third-party client compatibility runs only in a pinned container; the
 # repository's own tooling stays Rust-only (see compat/README.md).
 docker run --rm --network "$network" -e PGWIRE_DSN="$dsn" -v "$root/compat:/compat:ro" \

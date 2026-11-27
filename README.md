@@ -741,10 +741,23 @@ receives random BackendKeyData. A CancelRequest carrying that key, such as psql'
 Ctrl-C or psycopg's `cancel()`, cancels the running statement through the
 ordinary session cancel path (`57014`). A forged or stale key cancels nothing.
 
-Pgwire uses the configured default persistent pool when its backend session
-opens. This release has no per-connection pool selection mechanism; database
-names and startup options do not select a pool. A pool reload affects new backend
-sessions, while existing ones retain their worker and allocation.
+A pgwire connection chooses its compute the way the HTTP API does, with the same
+resource-based sizing and no size enum (#204). Two ways to set it:
+`duckfleet.cpu`, `duckfleet.memory`, `duckfleet.disk`, `duckfleet.mode` and
+`duckfleet.pool` can go in the connection's options (for example
+`psql "... options='-c duckfleet.cpu=8 -c duckfleet.memory=32Gi'"`, or `PGOPTIONS`),
+or be set with `SET duckfleet.cpu = 8` before the first statement. The backend
+session opens on the first statement, so compute is fixed from then on, and a later
+`SET duckfleet.*` is refused with `55P02`. A size alone means isolated compute, as over
+HTTP. Validation, authorization, refusals and history (`placement`,
+`context.operation = "pgwire"`) are the HTTP API's. Where isolated compute is
+unavailable, as in Compose with no pod grant, the request is refused with `0A000`
+(`compute_unavailable`), and a size no node or quota can hold with `53000`
+(`not_placeable`). It is never run on the persistent tier instead. An unknown
+`duckfleet.*` setting is `42704`, and an invalid value `22023`. A connection that
+sets nothing uses the configured default persistent pool, as before. A pool
+reload affects new backend sessions, while existing ones retain their worker and
+allocation.
 
 The honest limits, refused rather than fudged: no extended-protocol bind
 parameters (interpolate client-side, as `psql` and psycopg2 already do), no

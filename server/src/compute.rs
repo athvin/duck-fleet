@@ -185,7 +185,7 @@ pub(crate) fn parse_quantity(text: &str) -> Option<u64> {
 
 /// Original caller intent. Serialization deliberately omits absent fields;
 /// durable fingerprint versions implement their own historical projections.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ComputeRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]

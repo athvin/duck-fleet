@@ -2261,10 +2261,16 @@ impl crate::pgwire::Platform for PgPlatform {
         self.0.system.query(identity, request).await
     }
 
-    async fn open_session(&self, identity: &Identity) -> Result<crate::pgwire::Session, ApiError> {
+    async fn open_session(
+        &self,
+        identity: &Identity,
+        compute: &crate::compute::ComputeRequest,
+    ) -> Result<crate::pgwire::Session, ApiError> {
+        // The connection's own compute request (#204), through the same selection,
+        // authorization and history as `POST /v1/sessions`.
         let request = SessionRequest {
             context: json!({"operation": "pgwire"}),
-            ..SessionRequest::default()
+            compute: compute.clone(),
         };
         match self.0.open_session(request, identity).await? {
             SessionOutcome::Opened { endpoint, id, .. } => Ok(crate::pgwire::Session {
@@ -3609,7 +3615,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let http_id = *app.routes.lock().await.keys().next().unwrap();
         let pg = PgPlatform(app.clone());
-        let refused = pg.open_session(&identity).await.err().unwrap();
+        let refused = pg
+            .open_session(&identity, &crate::compute::ComputeRequest::default())
+            .await
+            .err()
+            .unwrap();
         assert_eq!(refused.0.kind, "capacity");
         let refused = platform_statement(&app, &identity, TrustedOperation::LakeSnapshots)
             .await
@@ -3617,7 +3627,10 @@ mod tests {
         assert_eq!(refused.0.kind, "capacity");
         assert_eq!(server.opens.load(Ordering::SeqCst), 1);
         app.close_internal(http_id).await;
-        let session = pg.open_session(&identity).await.unwrap();
+        let session = pg
+            .open_session(&identity, &crate::compute::ComputeRequest::default())
+            .await
+            .unwrap();
         let refused = open(
             State(app.clone()),
             Extension(identity.clone()),
