@@ -86,6 +86,19 @@ def _():
     b.close()
 
 
+@check("unsupported result types are a classified error and the connection stays usable")
+def _():
+    conn = connect(autocommit=True)
+    for sql in ("SELECT [1, 2] AS l", "SELECT {'a': 1} AS s", "SELECT '\\xAA'::BLOB AS b"):
+        try:
+            conn.execute(sql)
+            raise AssertionError(f"{sql} was not refused")
+        except psycopg.errors.FeatureNotSupported as error:
+            assert "cast it to VARCHAR" in str(error), error
+    assert conn.execute("SELECT [1, 2]::VARCHAR, 42").fetchone() == ("[1, 2]", 42)
+    conn.close()
+
+
 setup.execute("DROP SCHEMA pgwire_clients CASCADE")
 setup.close()
 sys.exit(1 if failures else 0)
