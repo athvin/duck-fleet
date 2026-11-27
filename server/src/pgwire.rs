@@ -118,6 +118,10 @@ mod cancel_keys {
         identity: Identity,
         session: Option<Session>,
         request: Option<Uuid>,
+        /// A statement is being handled: opening a session, queued, or running.
+        in_statement: bool,
+        /// A valid CancelRequest arrived during the current statement.
+        canceled: bool,
     }
 
     fn targets() -> &'static Mutex<HashMap<i32, Target>> {
@@ -160,6 +164,8 @@ mod cancel_keys {
                 identity,
                 session: None,
                 request: None,
+                in_statement: false,
+                canceled: false,
             },
         );
         Registration { pid, secret }
@@ -175,23 +181,60 @@ mod cancel_keys {
         }
     }
 
-    /// Records the statement now in flight on the connection (or none).
-    pub(super) fn set_request(pid: i32, request: Option<Uuid>) {
-        if let Some(target) = targets()
+    fn with<T>(pid: i32, f: impl FnOnce(&mut Target) -> T) -> Option<T> {
+        targets()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_mut(&pid)
-        {
-            target.request = request;
+            .map(f)
+    }
+
+    /// Marks a statement as being handled until the guard drops, so a cancel
+    /// that lands while its session is still opening is not lost.
+    pub(super) struct Statement(i32);
+
+    impl Drop for Statement {
+        fn drop(&mut self) {
+            with(self.0, |target| {
+                target.in_statement = false;
+                target.canceled = false;
+                target.request = None;
+            });
         }
     }
 
+    pub(super) fn begin_statement(pid: i32) -> Statement {
+        with(pid, |target| {
+            target.in_statement = true;
+            target.canceled = false;
+            target.request = None;
+        });
+        Statement(pid)
+    }
+
+    impl Statement {
+        /// Records the request about to be submitted. False when the statement
+        /// was already canceled, in which case it must not be submitted.
+        pub(super) fn submit(&self, request: Uuid) -> bool {
+            with(self.0, |target| {
+                target.request = Some(request);
+                !target.canceled
+            })
+            .unwrap_or(true)
+        }
+    }
+
+    /// Matches a CancelRequest key. A match during a statement marks it
+    /// canceled and returns the session and request to interrupt, if known.
     pub(super) fn find(pid: i32, secret: i32) -> Option<(Identity, Session, Option<Uuid>)> {
-        let map = targets().lock().unwrap_or_else(|e| e.into_inner());
-        let target = map.get(&pid)?;
+        let mut map = targets().lock().unwrap_or_else(|e| e.into_inner());
+        let target = map.get_mut(&pid)?;
         // Constant-time comparison of the 32-bit secret.
         if (target.secret ^ secret) != 0 {
             return None;
+        }
+        if target.in_statement {
+            target.canceled = true;
         }
         Some((
             target.identity.clone(),
@@ -812,6 +855,10 @@ async fn run_statement<P: Platform>(
         // in one deadline. A separate auth-lane preflight would double that budget.
         return run_system_statement(platform, stream, identity, sql).await;
     }
+    let statement = CANCEL_KEY
+        .try_with(|pid| *pid)
+        .ok()
+        .map(cancel_keys::begin_statement);
     // Validate at the statement boundary even if the next periodic check is not
     // due. In particular a successful handshake never authorizes a later lazy
     // session open after that same credential has been revoked.
@@ -850,16 +897,19 @@ async fn run_statement<P: Platform>(
     // The caller must know the ID while this synchronous operation is waiting.
     // A notice describes submission, never successful durable acceptance.
     submitted_notice(stream, request_id).await?;
-    let pid = CANCEL_KEY.try_with(|pid| *pid).ok();
-    if let Some(pid) = pid {
-        cancel_keys::set_request(pid, Some(request_id));
-    }
-    let outcome = platform
-        .query(identity, open, request_id, sql.to_owned())
-        .await;
-    if let Some(pid) = pid {
-        cancel_keys::set_request(pid, None);
-    }
+    // A CancelRequest that arrived while the session was opening (before there
+    // was anything to interrupt) still cancels this statement.
+    let outcome = if statement.as_ref().is_none_or(|s| s.submit(request_id)) {
+        platform
+            .query(identity, open, request_id, sql.to_owned())
+            .await
+    } else {
+        QueryOutcome::Refused {
+            kind: "canceled".into(),
+            message: "canceling statement due to user request".into(),
+        }
+    };
+    drop(statement);
     match outcome {
         QueryOutcome::Rows(arrow) => {
             *transaction = transaction.after_success(&transaction_effects(sql));
@@ -2072,6 +2122,41 @@ mod tests {
             cancel_keys::find(pid, secret).is_none(),
             "ended connections are forgotten"
         );
+    }
+
+    #[test]
+    fn a_cancel_during_session_open_stops_the_statement_before_submission() {
+        let registration = cancel_keys::register(Identity::bootstrap());
+        let (pid, secret) = (registration.pid, registration.secret);
+        // Between statements a cancel is a no-op, as in PostgreSQL.
+        assert!(cancel_keys::find(pid, secret).is_none());
+        let statement = cancel_keys::begin_statement(pid);
+        assert!(statement.submit(Uuid::new_v4()), "not canceled yet");
+        drop(statement);
+        let statement = cancel_keys::begin_statement(pid);
+        // The session is still opening: nothing to interrupt, but the key matches.
+        assert!(cancel_keys::find(pid, cancel_keys_wrong(secret)).is_none());
+        assert!(
+            statement.submit(Uuid::new_v4()),
+            "a forged key cancels nothing"
+        );
+        drop(statement);
+        let statement = cancel_keys::begin_statement(pid);
+        assert!(cancel_keys::find(pid, secret).is_none(), "no session yet");
+        assert!(
+            !statement.submit(Uuid::new_v4()),
+            "the real key canceled it"
+        );
+        drop(statement);
+        let statement = cancel_keys::begin_statement(pid);
+        assert!(
+            statement.submit(Uuid::new_v4()),
+            "the next statement is fresh"
+        );
+    }
+
+    fn cancel_keys_wrong(secret: i32) -> i32 {
+        secret.wrapping_add(1)
     }
 
     #[test]
