@@ -606,6 +606,8 @@ impl Worker {
             ),
         )?;
         startup.run("loading extensions", " SET temp_directory='/tmp/duckfleet-spill'; SET extension_directory='/opt/duckdb/extensions'; SET allow_extension_repositories='forbidden'; LOAD icu; LOAD httpfs; LOAD postgres; LOAD ducklake; LOAD aws;")?;
+        // Pod Identity secrets the worker must keep fresh itself; see pod_credentials.
+        let mut credential_refresh = None;
         match std::env::var("S3_AUTH_MODE").as_deref().unwrap_or("local") {
             "local" => {
                 let (key, secret) = match authority {
@@ -637,19 +639,29 @@ impl Worker {
                 // IMDS is disabled in the chart; no static keys are deployed.
                 required("AWS_CONTAINER_CREDENTIALS_FULL_URI")?;
                 required("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")?;
-                startup.run("creating the pod identity object store secret", &format!(
-                    "CREATE SECRET aws_s3 (TYPE S3, PROVIDER credential_chain, REFRESH auto, REGION {}, SCOPE {});",
-                    literal(&required("AWS_REGION")?), literal(&required("S3_DATA_PATH")?)
-                ))?;
+                // Explicit keys the worker fetches and replaces, never DuckDB's
+                // credential_chain: the engine lockdown below forbids the chain,
+                // so a chain secret would stop working at its first expiry.
+                let mut secrets = vec![crate::pod_credentials::Secret {
+                    name: "aws_s3",
+                    scope: required("S3_DATA_PATH")?,
+                }];
                 if authority == Authority::Writer
-                    && std::env::var("DUCKFLEET_RESULT_DATA_PATH").is_ok()
+                    && let Ok(scope) = std::env::var("DUCKFLEET_RESULT_DATA_PATH")
                 {
-                    startup.run("creating the pod identity import staging secret", &format!(
-                        "CREATE SECRET import_results (TYPE S3, PROVIDER credential_chain, REFRESH auto, REGION {}, SCOPE {});",
-                        literal(&required("AWS_REGION")?),
-                        literal(&required("DUCKFLEET_RESULT_DATA_PATH")?)
-                    ))?;
+                    secrets.push(crate::pod_credentials::Secret {
+                        name: "import_results",
+                        scope,
+                    });
                 }
+                let region = required("AWS_REGION")?;
+                let expiration =
+                    startup.inspect("creating the pod identity object store secrets", |conn| {
+                        crate::pod_credentials::install(
+                            conn, &runtime, &redactor, &secrets, &region,
+                        )
+                    })?;
+                credential_refresh = Some((secrets, region, expiration));
             }
             _ => anyhow::bail!("unsupported S3_AUTH_MODE"),
         }
@@ -726,6 +738,16 @@ impl Worker {
             ),
         )?;
         let root = startup.into_connection();
+        if let Some((secrets, region, expiration)) = credential_refresh {
+            crate::pod_credentials::keep_fresh(
+                root.try_clone()?,
+                runtime.clone(),
+                redactor.clone(),
+                secrets,
+                region,
+                expiration,
+            )?;
+        }
         placement["duckdb_threads"] = json!(root.query_row(
             "SELECT current_setting('threads')::BIGINT",
             [],
@@ -2137,7 +2159,11 @@ fn system_ca_bundle() -> Option<&'static str> {
 /// slash so a prefix never matches a sibling such as `lake-other/`. The CA bundle
 /// is the one exact file allowed: public certificates, root-owned, and read-only
 /// to the unprivileged worker, so allowing it exposes no secret and grants no write.
-fn engine_file_access(lake: &str, staging: Option<&str>, ca_bundle: Option<&str>) -> String {
+pub(crate) fn engine_file_access(
+    lake: &str,
+    staging: Option<&str>,
+    ca_bundle: Option<&str>,
+) -> String {
     let directory = |path: &str| {
         if path.ends_with('/') {
             path.to_owned()
