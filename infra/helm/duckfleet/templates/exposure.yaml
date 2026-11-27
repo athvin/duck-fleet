@@ -1,22 +1,38 @@
 {{/*
-Reaching the API from outside the cluster, rendered only when asked for. Three
-facts have to be named before anything renders, because each belongs to the
-operator and a default would invent it: the host, the TLS certificate Secret
-(this chart never mints certificates), and the namespace the ingress controller
-runs in — the isolation NetworkPolicy admits only this namespace's pods, so an
-unnamed controller would produce an Ingress that cannot reach the gateway.
+Reaching the API from outside the cluster, rendered only when asked for. The facts
+that have to be named before anything renders each belong to the operator, and a
+default would invent them: the host, how TLS is terminated, and where traffic to
+the gateway comes from. The isolation NetworkPolicy admits only this namespace's
+pods, so an unnamed source would produce an Ingress that cannot reach the gateway.
 
-TLS comes before credentials: a bearer token must never cross plain HTTP. The
-tls block is unconditional, and the redirect annotation below is the
-nginx-family spelling of "refuse plain HTTP" — an operator running a different
-controller owns configuring its equivalent, and may override the annotation set
-through exposure.annotations.
+Two shapes:
+  - an in-cluster ingress controller: TLS from a kubernetes.io/tls Secret, traffic
+    from the controller's namespace;
+  - a cloud load balancer (exposure.loadBalancer): TLS terminated by the load
+    balancer with a certificate its class names, traffic from VPC ranges.
+
+TLS comes before credentials: a bearer token must never cross plain HTTP. With a
+controller, the tls block is unconditional and the redirect annotation is the
+nginx-family spelling of "refuse plain HTTP". With a load balancer, the only
+listener is HTTPS:443, so there is no plain-HTTP port to refuse.
 */}}
 {{- if .Values.exposure.enabled -}}
 {{- $host := required "exposure.host is required when exposure is enabled" .Values.exposure.host -}}
-{{- $secret := required "exposure.tlsSecretName is required: the chart never mints certificates" .Values.exposure.tlsSecretName -}}
-{{- $controller := required "exposure.controllerNamespace is required: traffic is admitted from a namespace an operator names, never from everywhere" .Values.exposure.controllerNamespace -}}
-{{- $annotations := merge .Values.exposure.annotations (dict "nginx.ingress.kubernetes.io/ssl-redirect" "true") -}}
+{{- $lb := .Values.exposure.loadBalancer | default dict -}}
+{{- $annotations := dict -}}
+{{- if $lb.enabled }}
+{{- if not $lb.sourceCidrs }}{{ fail "exposure.loadBalancer.sourceCidrs is required: traffic is admitted from ranges an operator names, never from everywhere" }}{{ end }}
+{{- $_ := required "exposure.ingressClassName is required: the load balancer's class carries its certificate" .Values.exposure.ingressClassName -}}
+{{- $annotations = merge .Values.exposure.annotations (dict
+    "alb.ingress.kubernetes.io/listen-ports" "[{\"HTTPS\":443}]"
+    "alb.ingress.kubernetes.io/target-type" "ip"
+    "alb.ingress.kubernetes.io/healthcheck-path" "/healthz"
+    "alb.ingress.kubernetes.io/success-codes" "200") -}}
+{{- else }}
+{{- $_ := required "exposure.tlsSecretName is required: the chart never mints certificates" .Values.exposure.tlsSecretName -}}
+{{- $_ := required "exposure.controllerNamespace is required: traffic is admitted from a namespace an operator names, never from everywhere" .Values.exposure.controllerNamespace -}}
+{{- $annotations = merge .Values.exposure.annotations (dict "nginx.ingress.kubernetes.io/ssl-redirect" "true") -}}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -29,9 +45,11 @@ spec:
   {{- with .Values.exposure.ingressClassName }}
   ingressClassName: {{ . }}
   {{- end }}
+  {{- if not $lb.enabled }}
   tls:
     - hosts: [{{ $host | quote }}]
-      secretName: {{ $secret }}
+      secretName: {{ .Values.exposure.tlsSecretName }}
+  {{- end }}
   rules:
     - host: {{ $host | quote }}
       http:
@@ -40,8 +58,8 @@ spec:
             pathType: Prefix
             backend: {service: {name: server, port: {number: 8080}}}
 ---
-# The isolation policy admits only this namespace's pods, so the controller needs
-# its own narrow door: its namespace, the gateway pod, port 8080, nothing else.
+# The isolation policy admits only this namespace's pods, so the exposure needs its
+# own narrow door: the named source, the gateway pod, port 8080, nothing else.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -52,7 +70,13 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - from:
+        {{- if $lb.enabled }}
+        {{- range $lb.sourceCidrs }}
+        - ipBlock: {cidr: {{ . | quote }}}
+        {{- end }}
+        {{- else }}
         - namespaceSelector:
-            matchLabels: {kubernetes.io/metadata.name: {{ $controller }}}
+            matchLabels: {kubernetes.io/metadata.name: {{ .Values.exposure.controllerNamespace }}}
+        {{- end }}
       ports: [{port: 8080}]
 {{- end -}}

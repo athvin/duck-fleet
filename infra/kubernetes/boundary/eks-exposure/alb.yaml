@@ -1,0 +1,57 @@
+# Reaching the gateway from outside the cluster through an EKS Auto Mode ALB.
+# Rendered by apply-boundary.sh only when the operator names both a host and an
+# ACM certificate for it (DUCKFLEET_EXPOSURE_HOST, DUCKFLEET_EXPOSURE_CERTIFICATE_ARN).
+#
+# The class is cluster-scoped, so it is the operator's, like the node pool. Its
+# namespaceSelector means only this namespace's Ingresses can use it, and the
+# certificate it names is the only one the load balancer will present.
+#
+# TLS before credentials: with a certificate configured the ALB listens on
+# HTTPS:443 only, so a bearer token never crosses plain HTTP.
+apiVersion: eks.amazonaws.com/v1
+kind: IngressClassParams
+metadata:
+  name: duckfleet-${namespace}
+spec:
+  scheme: internet-facing
+  targetType: ip
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: ${namespace}
+  certificateARNs:
+    - ${certificate_arn}
+  sslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+  loadBalancerAttributes:
+    # A statement is one HTTP request; heavy isolated models outlive the 60s default.
+    - key: idle_timeout.timeout_seconds
+      value: "900"
+  tags:
+    - key: app.kubernetes.io/part-of
+      value: duckfleet
+    - key: duckfleet.io/namespace
+      value: ${namespace}
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: duckfleet-${namespace}
+spec:
+  controller: eks.amazonaws.com/alb
+  parameters:
+    apiGroup: eks.amazonaws.com
+    kind: IngressClassParams
+    name: duckfleet-${namespace}
+---
+# The facts the deploy needs and cannot look up itself: the deploy identity is
+# scoped to its namespace and has no EC2 access. `duckfleet-ops aws-deploy-values`
+# turns this into the chart's `exposure` values on every deploy.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duckfleet-exposure
+  namespace: ${namespace}
+data:
+  host: ${host}
+  ingressClassName: duckfleet-${namespace}
+  # The ALB reaches pods directly (target type ip) from addresses in the VPC.
+  sourceCidrs: '${source_cidrs}'

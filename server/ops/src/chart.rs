@@ -673,30 +673,55 @@ pub fn validate_chart(objects: &[Value]) -> Result<()> {
             "one Ingress and its policy are required"
         );
         let ingress = ingresses[0];
-        let tls = util::array(ingress["spec"].get("tls"));
-        let tls_hosts: BTreeSet<_> = tls
-            .iter()
-            .flat_map(|block| util::array(block.get("hosts")))
-            .filter_map(Value::as_str)
-            .collect();
-        ensure!(
-            tls.iter().all(|block| block.get("secretName").is_some()),
-            "TLS without a certificate secret"
-        );
+        let annotations = &ingress["metadata"]["annotations"];
         let rules = util::array(ingress["spec"].get("rules"));
         let rule_hosts: BTreeSet<_> = rules
             .iter()
             .filter_map(|rule| rule["host"].as_str())
             .collect();
         ensure!(
-            !rule_hosts.is_empty() && rule_hosts.is_subset(&tls_hosts),
-            "every exposed host must terminate TLS"
+            !rule_hosts.is_empty(),
+            "an exposed Ingress must name its host"
         );
-        ensure!(
-            ingress["metadata"]["annotations"]["nginx.ingress.kubernetes.io/ssl-redirect"]
-                == "true",
-            "plain HTTP must redirect to TLS"
-        );
+        // Two shapes: a cloud load balancer that terminates TLS itself and listens
+        // only on HTTPS:443, or an in-cluster controller that terminates with a
+        // Secret and redirects plain HTTP.
+        let load_balancer = annotations
+            .get("alb.ingress.kubernetes.io/listen-ports")
+            .is_some();
+        if load_balancer {
+            let ports: Value = serde_json::from_str(util::text(
+                annotations.get("alb.ingress.kubernetes.io/listen-ports"),
+            ))
+            .context("listen-ports is not JSON")?;
+            ensure!(
+                ports == json!([{"HTTPS": 443}]),
+                "a load balancer exposure must listen on HTTPS:443 only"
+            );
+            ensure!(
+                ingress["spec"]["ingressClassName"].is_string(),
+                "a load balancer exposure must name the class that carries its certificate"
+            );
+        } else {
+            let tls = util::array(ingress["spec"].get("tls"));
+            let tls_hosts: BTreeSet<_> = tls
+                .iter()
+                .flat_map(|block| util::array(block.get("hosts")))
+                .filter_map(Value::as_str)
+                .collect();
+            ensure!(
+                tls.iter().all(|block| block.get("secretName").is_some()),
+                "TLS without a certificate secret"
+            );
+            ensure!(
+                rule_hosts.is_subset(&tls_hosts),
+                "every exposed host must terminate TLS"
+            );
+            ensure!(
+                annotations["nginx.ingress.kubernetes.io/ssl-redirect"] == "true",
+                "plain HTTP must redirect to TLS"
+            );
+        }
         for rule in rules {
             for path in util::array(rule["http"].get("paths")) {
                 ensure!(
@@ -707,13 +732,26 @@ pub fn validate_chart(objects: &[Value]) -> Result<()> {
             }
         }
         let admitted = util::array(exposure_policy.unwrap()["spec"]["ingress"][0].get("from"));
-        ensure!(
-            !admitted.is_empty()
-                && admitted
+        ensure!(!admitted.is_empty(), "exposure admits nothing");
+        if load_balancer {
+            for source in admitted {
+                let cidr = source["ipBlock"]["cidr"]
+                    .as_str()
+                    .context("a load balancer exposure must admit only ipBlocks")?;
+                let network = Network::parse(cidr)?;
+                ensure!(
+                    network.is_private() && network.prefix_len() >= 8,
+                    "exposure source {cidr} is not a private VPC range"
+                );
+            }
+        } else {
+            ensure!(
+                admitted
                     .iter()
                     .all(|source| source.get("namespaceSelector").is_some()),
-            "exposure must admit only the named controller namespace"
-        );
+                "exposure must admit only the named controller namespace"
+            );
+        }
     }
 
     let isolation = &by_name

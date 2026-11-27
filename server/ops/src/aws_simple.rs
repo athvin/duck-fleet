@@ -169,6 +169,32 @@ pub fn deploy_values(args: Vec<String>) -> Result<()> {
     for (key, value) in util::object(&overlay) {
         values[key] = value.clone();
     }
+    // Exposure is per namespace, and values.json is not, so it is always
+    // rewritten from this namespace's ConfigMap (or removed when there is none).
+    let exposure = util::run_status([
+        "kubectl",
+        "--context",
+        &args[0],
+        "-n",
+        namespace,
+        "get",
+        "configmap",
+        "duckfleet-exposure",
+        "-o",
+        "json",
+    ])?;
+    if exposure.status.success() {
+        let config: Value = serde_json::from_slice(&exposure.stdout)?;
+        let exposure = exposure_values(&config)?;
+        println!(
+            "deploy values: exposed at https://{} through IngressClass {}",
+            util::text(exposure.get("host")),
+            util::text(exposure.get("ingressClassName"))
+        );
+        values["exposure"] = exposure;
+    } else if let Some(object) = values.as_object_mut() {
+        object.remove("exposure");
+    }
     util::write_json(&path, &values)?;
     println!(
         "deploy values: isolated compute on, API egress to {cidrs:?} ports {ports:?}, workers pinned to the duckfleet pool"
@@ -290,9 +316,109 @@ pub fn render_boundary(args: Vec<String>) -> Result<()> {
     if args.is_empty() || args.len() > 2 {
         bail!("usage: aws-render-boundary <namespace> [node-class]");
     }
-    let documents = boundary_documents(&args[0], args.get(1).map_or("", String::as_str))?;
+    let mut documents = boundary_documents(&args[0], args.get(1).map_or("", String::as_str))?;
+    let variable = |name: &str| std::env::var(name).unwrap_or_default();
+    let host = variable("DUCKFLEET_EXPOSURE_HOST");
+    let certificate = variable("DUCKFLEET_EXPOSURE_CERTIFICATE_ARN");
+    let sources = variable("DUCKFLEET_EXPOSURE_SOURCE_CIDRS");
+    if !(host.is_empty() && certificate.is_empty()) {
+        let sources: Vec<String> = sources
+            .split(',')
+            .map(str::trim)
+            .filter(|cidr| !cidr.is_empty())
+            .map(str::to_owned)
+            .collect();
+        documents.extend(exposure_documents(&args[0], &host, &certificate, &sources)?);
+    }
     print!("{}", util::yaml_string(&documents)?);
     Ok(())
+}
+
+/// The EKS Auto Mode ALB that exposes one namespace's gateway: an IngressClass
+/// and its IngressClassParams (cluster-scoped, so the operator's), plus the
+/// ConfigMap that hands the deploy its exposure values. Every fact is required:
+/// a default host, certificate, or source range would be invented.
+pub fn exposure_documents(
+    namespace: &str,
+    host: &str,
+    certificate_arn: &str,
+    source_cidrs: &[String],
+) -> Result<Vec<Value>> {
+    let host_pattern =
+        regex::Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")?;
+    if !host_pattern.is_match(host) {
+        bail!("DUCKFLEET_EXPOSURE_HOST must be a DNS name, got {host:?}");
+    }
+    if !regex::Regex::new(r"^arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/[0-9a-f-]+$")?
+        .is_match(certificate_arn)
+    {
+        bail!(
+            "DUCKFLEET_EXPOSURE_CERTIFICATE_ARN must be an ACM certificate ARN, got {certificate_arn:?}"
+        );
+    }
+    if source_cidrs.is_empty() {
+        bail!(
+            "DUCKFLEET_EXPOSURE_SOURCE_CIDRS must name the VPC ranges the load balancer sends from"
+        );
+    }
+    for cidr in source_cidrs {
+        let network = Network::parse(cidr)?;
+        if !network.is_private() || network.prefix_len() < 8 {
+            bail!(
+                "exposure source {cidr} is not private; the load balancer sends from VPC addresses"
+            );
+        }
+    }
+    let path = util::root().join("infra/kubernetes/boundary/eks-exposure/alb.yaml");
+    let text = std::fs::read_to_string(path)?
+        .replace("${namespace}", namespace)
+        .replace("${host}", host)
+        .replace("${certificate_arn}", certificate_arn)
+        .replace("${source_cidrs}", &serde_json::to_string(source_cidrs)?);
+    if regex::Regex::new(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")?.is_match(&text) {
+        bail!("unresolved exposure placeholder");
+    }
+    let documents: Vec<Value> = util::yaml_documents(&text)?
+        .into_iter()
+        .filter(|document| !document.is_null())
+        .collect();
+    for document in &documents {
+        let kind = util::text(document.get("kind"));
+        let name = util::text(document["metadata"].get("name"));
+        match kind {
+            "IngressClass" | "IngressClassParams" => {
+                if name != format!("duckfleet-{namespace}") {
+                    bail!("cluster-scoped {kind}/{name} is not named for {namespace}");
+                }
+            }
+            _ if document["metadata"]
+                .get("namespace")
+                .and_then(Value::as_str)
+                == Some(namespace) => {}
+            _ => bail!("{kind}/{name} does not name namespace {namespace}"),
+        }
+    }
+    Ok(documents)
+}
+
+/// The chart's `exposure` values from the operator's `duckfleet-exposure` ConfigMap.
+pub fn exposure_values(config: &Value) -> Result<Value> {
+    let data = &config["data"];
+    let host = util::text(data.get("host"));
+    let class = util::text(data.get("ingressClassName"));
+    let sources: Vec<String> = serde_json::from_str(util::text(data.get("sourceCidrs")))
+        .context("duckfleet-exposure sourceCidrs is not a JSON list")?;
+    if host.is_empty() || class.is_empty() || sources.is_empty() {
+        bail!(
+            "the duckfleet-exposure ConfigMap is incomplete; re-run scripts/aws/apply-boundary.sh"
+        );
+    }
+    Ok(json!({
+        "enabled": true,
+        "host": host,
+        "ingressClassName": class,
+        "loadBalancer": {"enabled": true, "sourceCidrs": sources},
+    }))
 }
 
 pub fn boundary_documents(namespace: &str, node_class: &str) -> Result<Vec<Value>> {
@@ -582,6 +708,40 @@ mod tests {
                 .unwrap()
                 .ends_with(&format!("worker@sha256:{}", "a".repeat(64)))
         );
+    }
+
+    #[test]
+    fn exposure_is_namespaced_and_round_trips_into_values() {
+        let documents = exposure_documents(
+            "duckfleet-demo",
+            "duckfleet-demo.example.com",
+            "arn:aws:acm:us-east-2:123456789012:certificate/fff0813e-733e-4b06-a9a7-638623fb17bd",
+            &["10.0.0.0/16".into()],
+        )
+        .unwrap();
+        let kinds: Vec<&str> = documents
+            .iter()
+            .map(|d| util::text(d.get("kind")))
+            .collect();
+        assert_eq!(kinds, ["IngressClassParams", "IngressClass", "ConfigMap"]);
+        assert_eq!(
+            documents[0]["spec"]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "duckfleet-demo"
+        );
+        let values = exposure_values(&documents[2]).unwrap();
+        assert_eq!(values["host"], "duckfleet-demo.example.com");
+        assert_eq!(values["ingressClassName"], "duckfleet-duckfleet-demo");
+        assert_eq!(values["loadBalancer"]["sourceCidrs"][0], "10.0.0.0/16");
+    }
+
+    #[test]
+    fn exposure_refuses_invented_or_public_facts() {
+        let arn = "arn:aws:acm:us-east-2:123456789012:certificate/abc";
+        let cidrs = ["10.0.0.0/16".to_string()];
+        assert!(exposure_documents("ns", "", arn, &cidrs).is_err());
+        assert!(exposure_documents("ns", "h.example.com", "not-an-arn", &cidrs).is_err());
+        assert!(exposure_documents("ns", "h.example.com", arn, &[]).is_err());
+        assert!(exposure_documents("ns", "h.example.com", arn, &["0.0.0.0/0".into()]).is_err());
     }
 
     #[test]
