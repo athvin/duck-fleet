@@ -41,6 +41,8 @@ jobs:
           tar -xzf /tmp/duckdb-cli.tar.gz -C /usr/local/bin duckdb
       - name: Worker file access is limited to the lake and staging
         run: make test-local-io
+      - name: psql and psycopg against the pgwire front
+        run: make test-pgwire-clients
       - name: Private CSV and Parquet imports
         run: make test-import
       - name: CSV, JSON, Arrow, and Parquet exports
