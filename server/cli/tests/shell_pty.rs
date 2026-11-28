@@ -64,6 +64,19 @@ fn persistent_multiline_shell_and_active_cancellation() {
     shell.exp_string("client_total_ms:").unwrap();
     shell.exp_string("server_elapsed_ms:").unwrap();
     shell.exp_string("duckfleet> ").unwrap();
+    // \dt lists lake tables, not temporary ones, so give it one of its own rather
+    // than relying on whatever earlier suites left in the lake: on a fresh stack
+    // it has nothing to print and the header never appears.
+    statement(
+        &mut shell,
+        "create schema if not exists shell_pty_fixture",
+        "duckfleet> ",
+    );
+    statement(
+        &mut shell,
+        "create or replace table shell_pty_fixture.listed (id integer)",
+        "duckfleet> ",
+    );
     shell.send_line("\\dt").unwrap();
     shell.exp_string("schema_name").unwrap();
     shell.exp_string("duckfleet> ").unwrap();
@@ -83,6 +96,11 @@ fn persistent_multiline_shell_and_active_cancellation() {
     shell.exp_string("after_cancel").unwrap();
     shell.exp_string("42").unwrap();
     shell.exp_string("duckfleet> ").unwrap();
+    statement(
+        &mut shell,
+        "drop schema if exists shell_pty_fixture cascade",
+        "duckfleet> ",
+    );
     shell.send_line("\\quit").unwrap();
     shell.exp_eof().unwrap();
 }
