@@ -130,7 +130,9 @@ impl Ceiling {
         Err(ApiError::new(
             failure::NOT_PLACEABLE,
             format!(
-                "this session asks for {} CPU / {:.0}Gi, more than the largest node this cluster                  provisions can allocate ({largest}). Ask for a smaller size; no pod was created,                  no statement ran, and the request was not downgraded to a shared worker",
+                "this session asks for {} CPU / {:.0}Gi, more than the largest node this cluster \
+                 provisions can allocate ({largest}). Ask for a smaller size; no pod was created, \
+                 no statement ran, and the request was not downgraded to a shared worker",
                 wanted.cpu,
                 gib(wanted.memory_bytes)
             ),
@@ -1331,7 +1333,9 @@ mod tests {
             let error = ceiling.admit(at(cpu, memory)).unwrap_err();
             assert_eq!(error.0.kind, "not_placeable");
             assert!(
-                error.1.contains("30 CPU / 240Gi") && error.1.contains("smaller size"),
+                error.1.contains("30 CPU / 240Gi")
+                    && error.1.contains("smaller size")
+                    && !error.1.contains("  "),
                 "{}",
                 error.1
             );
