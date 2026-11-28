@@ -193,16 +193,19 @@ them, test model/hook session affinity, and publish a new pinned release. Existi
 dbt configurations keep their resource-based isolation behavior.
 
 `cpu` is an integer; `memory` and `disk` are binary quantities such as `2Gi` or
-`512Mi`. Memory is the container cap, and DuckDB-managed memory is held to half of
-it, leaving room for extensions, networking, and Arrow results. `disk` is the
+`512Mi`. Memory is the container cap. On an isolated pod DuckDB's `memory_limit` is
+set automatically to half of it and `threads` to the requested CPU, leaving room for
+extensions, networking, and Arrow results. A persistent worker is shared, so it
+defaults lower (40% of its memory) and each pool can set its own `engine` limits; see
+[decision 0002](docs/decisions/0002-engine-limits.md). `disk` is the
 pod's ephemeral-storage limit, enforced by the kubelet. The CPU quota the worker
 asserts comes from its limit, always the exact size requested. The local harness
 runs one persistent worker out of the box:
 
 | Tier | CPU / memory | DuckDB threads | DuckDB memory limit |
 | --- | --- | --- | --- |
-| persistent (`small`) | 1 / `1Gi` | 1 | 512 MiB |
-| isolated (per model) | as requested | = CPU | half of memory |
+| persistent (`small`) | 1 / `1Gi` | 1 | 409 MiB (40%, configurable per pool) |
+| isolated (per model) | as requested | = CPU | half of memory (deployment-wide override only) |
 
 Docker CPU quotas are hard limits on CPU time, not dedicated cores.
 

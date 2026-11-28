@@ -128,11 +128,6 @@ impl Resources {
         }
         Ok(())
     }
-    /// DuckDB is held to half the container cap, leaving room for extensions,
-    /// networking and Arrow results. This is the rule the README documents.
-    pub fn engine_memory(self) -> String {
-        format!("{}MiB", self.memory_bytes / 2 / MIB)
-    }
     /// How far the engine may spill to local disk, kept below the ephemeral-storage
     /// limit by a fixed margin so DuckDB errors before the kubelet evicts the pod.
     /// Asking for more disk is therefore how a caller makes room for a larger
@@ -154,6 +149,181 @@ impl Resources {
     }
     pub fn describe(self) -> Value {
         json!({"cpu": self.cpu, "memory_bytes": self.memory_bytes, "disk_bytes": self.disk_bytes})
+    }
+}
+
+/// Share of the container cap DuckDB is given on an isolated pod when nothing is
+/// configured. The pod serves one session, so the engine may take the whole of
+/// the half the process does not need for extensions, networking and Arrow results.
+pub(crate) const ISOLATED_ENGINE_MEMORY_PERCENT: u64 = 50;
+/// Share given on a persistent worker when its pool configures nothing. Lower than
+/// the isolated share because a persistent worker holds many sessions at once: every
+/// session's connection adds its own result buffers and Arrow batches outside the
+/// engine's pool, so the margin outside the engine has to be wider.
+pub(crate) const PERSISTENT_ENGINE_MEMORY_PERCENT: u64 = 40;
+/// Bounds on a configured share. Above the ceiling the process has too little room
+/// outside the engine and is OOM-killed instead of DuckDB reporting an error.
+const ENGINE_MEMORY_PERCENT_RANGE: std::ops::RangeInclusive<u64> = 10..=90;
+/// Smallest buffer pool the engine is started with, whatever the share works out to.
+const MINIMUM_ENGINE_MEMORY: u64 = MINIMUM_MEMORY / 2;
+
+/// Where the engine limits a worker started with came from. Recorded with its
+/// placement, so history says whether a query ran under the automatic sizing or
+/// under a hand-set one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EngineSource {
+    /// Derived from the container size alone.
+    Automatic,
+    /// Set by a persistent pool's `engine` block.
+    Configured,
+    /// Set by `isolatedCompute.engineOverride`, which applies to every isolated pod.
+    Override,
+}
+impl EngineSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Configured => "configured",
+            Self::Override => "override",
+        }
+    }
+}
+
+/// What the worker passes to DuckDB at startup. `memory_limit` and `threads` are
+/// database-wide in DuckDB, not per connection, so on a persistent worker these are
+/// one pool that every session on it shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EngineLimits {
+    pub memory_bytes: u64,
+    pub threads: u16,
+    pub source: EngineSource,
+}
+
+/// The engine settings a worker's environment asks for, still as text.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EngineSettings {
+    /// `DUCKFLEET_ENGINE_MEMORY`: an absolute binary quantity. Persistent only, since
+    /// an isolated pod's size changes with every request.
+    pub memory: Option<String>,
+    /// `DUCKFLEET_ENGINE_MEMORY_PERCENT`: a share of the container cap.
+    pub memory_percent: Option<String>,
+    /// `DUCKFLEET_ENGINE_THREADS`. On a persistent worker it must not exceed the
+    /// CPU limit; on an isolated pod it is a ceiling, because one override has to fit
+    /// every requested size.
+    pub threads: Option<String>,
+}
+impl EngineSettings {
+    pub fn from_env() -> Self {
+        let read = |name| {
+            std::env::var(name)
+                .ok()
+                .filter(|v: &String| !v.trim().is_empty())
+        };
+        Self {
+            memory: read("DUCKFLEET_ENGINE_MEMORY"),
+            memory_percent: read("DUCKFLEET_ENGINE_MEMORY_PERCENT"),
+            threads: read("DUCKFLEET_ENGINE_THREADS"),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.memory.is_none() && self.memory_percent.is_none() && self.threads.is_none()
+    }
+
+    /// Resolves the engine limits for a worker of this size and mode.
+    ///
+    /// Isolated pods size the engine from what the caller asked for unless the
+    /// deployment sets an override. Persistent workers default lower and take their
+    /// pool's settings. Either way a setting larger than the container is refused at
+    /// startup rather than left for the kernel to settle with an OOM kill.
+    pub fn resolve(&self, resources: Resources, mode: Mode) -> Result<EngineLimits, String> {
+        let source = match (self.is_empty(), mode) {
+            (true, _) => EngineSource::Automatic,
+            (false, Mode::Persistent) => EngineSource::Configured,
+            (false, Mode::Isolated) => EngineSource::Override,
+        };
+        let ceiling = resources.memory_bytes * ENGINE_MEMORY_PERCENT_RANGE.end() / 100;
+        let memory_bytes = match (&self.memory, &self.memory_percent) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "set DUCKFLEET_ENGINE_MEMORY or DUCKFLEET_ENGINE_MEMORY_PERCENT, not both"
+                        .into(),
+                );
+            }
+            (Some(_), None) if mode == Mode::Isolated => {
+                return Err("an isolated pod's engine memory can only be overridden as a percentage (DUCKFLEET_ENGINE_MEMORY_PERCENT); its size changes per request".into());
+            }
+            (Some(memory), None) => {
+                let bytes = parse_quantity(memory.trim()).ok_or_else(|| {
+                    format!(
+                        "DUCKFLEET_ENGINE_MEMORY {memory:?} must be a binary quantity such as 512Mi"
+                    )
+                })?;
+                if bytes < MINIMUM_ENGINE_MEMORY || bytes > ceiling {
+                    return Err(format!(
+                        "DUCKFLEET_ENGINE_MEMORY {memory} must be between {}Mi and {}% of the {} container",
+                        MINIMUM_ENGINE_MEMORY / MIB,
+                        ENGINE_MEMORY_PERCENT_RANGE.end(),
+                        resources.memory()
+                    ));
+                }
+                bytes
+            }
+            (None, percent) => {
+                let percent = match percent {
+                    None if mode == Mode::Isolated => ISOLATED_ENGINE_MEMORY_PERCENT,
+                    None => PERSISTENT_ENGINE_MEMORY_PERCENT,
+                    Some(text) => text
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|p| ENGINE_MEMORY_PERCENT_RANGE.contains(p))
+                        .ok_or_else(|| {
+                            format!(
+                                "DUCKFLEET_ENGINE_MEMORY_PERCENT {text:?} must be a whole number from {} to {}",
+                                ENGINE_MEMORY_PERCENT_RANGE.start(),
+                                ENGINE_MEMORY_PERCENT_RANGE.end()
+                            )
+                        })?,
+                };
+                (resources.memory_bytes * percent / 100).max(MINIMUM_ENGINE_MEMORY)
+            }
+        };
+        let threads = match &self.threads {
+            None => resources.cpu,
+            Some(text) => {
+                let threads = text
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|t| *t >= 1)
+                    .ok_or_else(|| {
+                        format!(
+                            "DUCKFLEET_ENGINE_THREADS {text:?} must be a whole number of at least 1"
+                        )
+                    })?;
+                match mode {
+                    Mode::Isolated => threads.min(resources.cpu),
+                    Mode::Persistent if threads > resources.cpu => {
+                        return Err(format!(
+                            "DUCKFLEET_ENGINE_THREADS {threads} exceeds the worker's {} CPU",
+                            resources.cpu
+                        ));
+                    }
+                    Mode::Persistent => threads,
+                }
+            }
+        };
+        Ok(EngineLimits {
+            memory_bytes,
+            threads,
+            source,
+        })
+    }
+}
+impl EngineLimits {
+    /// The `memory_limit` value DuckDB is given, rounded down to whole MiB.
+    pub fn memory(self) -> String {
+        format!("{}MiB", self.memory_bytes / MIB)
     }
 }
 
@@ -637,17 +807,113 @@ mod tests {
         );
     }
 
+    fn settings(
+        memory: Option<&str>,
+        percent: Option<&str>,
+        threads: Option<&str>,
+    ) -> EngineSettings {
+        EngineSettings {
+            memory: memory.map(str::to_owned),
+            memory_percent: percent.map(str::to_owned),
+            threads: threads.map(str::to_owned),
+        }
+    }
+
+    /// With nothing configured an isolated pod gets half its cap and a thread per CPU:
+    /// the engine is sized from what the caller asked for.
     #[test]
-    fn the_engine_gets_half_the_container_cap() {
-        assert_eq!(Resources::default().engine_memory(), "512MiB");
+    fn an_isolated_engine_is_sized_from_the_request() {
+        let limits = EngineSettings::default()
+            .resolve(
+                Resources::parse("4", "8Gi", "10Gi").unwrap(),
+                Mode::Isolated,
+            )
+            .unwrap();
+        assert_eq!(limits.memory(), "4096MiB");
+        assert_eq!(limits.threads, 4);
+        assert_eq!(limits.source, EngineSource::Automatic);
         assert_eq!(
-            Resources {
-                cpu: 2,
-                memory_bytes: 2 * GIB,
-                disk_bytes: 10 * GIB,
-            }
-            .engine_memory(),
-            "1024MiB"
+            EngineSettings::default()
+                .resolve(Resources::default(), Mode::Isolated)
+                .unwrap()
+                .memory(),
+            "512MiB"
+        );
+    }
+
+    /// A shared worker defaults lower than an isolated pod of the same size.
+    #[test]
+    fn a_persistent_engine_defaults_below_the_isolated_share() {
+        let resources = Resources::parse("2", "4Gi", "4Gi").unwrap();
+        let limits = EngineSettings::default()
+            .resolve(resources, Mode::Persistent)
+            .unwrap();
+        assert_eq!(limits.memory_bytes, 4 * GIB * 40 / 100);
+        assert_eq!(limits.threads, 2);
+        assert_eq!(limits.source, EngineSource::Automatic);
+        // The smallest container still gets a workable buffer pool.
+        let smallest = Resources::parse("1", "256Mi", "1Gi").unwrap();
+        assert_eq!(
+            EngineSettings::default()
+                .resolve(smallest, Mode::Persistent)
+                .unwrap()
+                .memory(),
+            "128MiB"
+        );
+    }
+
+    #[test]
+    fn a_pool_may_set_its_engine_but_not_beyond_its_container() {
+        let resources = Resources::parse("4", "8Gi", "4Gi").unwrap();
+        let limits = settings(Some("2Gi"), None, Some("2"))
+            .resolve(resources, Mode::Persistent)
+            .unwrap();
+        assert_eq!((limits.memory(), limits.threads), ("2048MiB".into(), 2));
+        assert_eq!(limits.source, EngineSource::Configured);
+        let limits = settings(None, Some("25"), None)
+            .resolve(resources, Mode::Persistent)
+            .unwrap();
+        assert_eq!(limits.memory_bytes, 8 * GIB * 25 / 100);
+        for refused in [
+            settings(Some("8Gi"), None, None),
+            settings(Some("64Mi"), None, None),
+            settings(Some("2GB"), None, None),
+            settings(Some("2Gi"), Some("25"), None),
+            settings(None, Some("95"), None),
+            settings(None, Some("5"), None),
+            settings(None, None, Some("5")),
+            settings(None, None, Some("0")),
+        ] {
+            assert!(
+                refused.resolve(resources, Mode::Persistent).is_err(),
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// The isolated override is deliberate and visible: it is a share rather than a
+    /// size, its thread count is a ceiling so one value fits every request, and the
+    /// worker records it as an override.
+    #[test]
+    fn an_isolated_override_scales_with_the_request() {
+        let small = Resources::parse("1", "2Gi", "2Gi").unwrap();
+        let large = Resources::parse("8", "32Gi", "20Gi").unwrap();
+        let override_ = settings(None, Some("70"), Some("4"));
+        let limits = override_.resolve(small, Mode::Isolated).unwrap();
+        assert_eq!(
+            (limits.memory_bytes, limits.threads),
+            (2 * GIB * 70 / 100, 1)
+        );
+        assert_eq!(limits.source, EngineSource::Override);
+        let limits = override_.resolve(large, Mode::Isolated).unwrap();
+        assert_eq!(
+            (limits.memory_bytes, limits.threads),
+            (32 * GIB * 70 / 100, 4)
+        );
+        assert!(
+            settings(Some("1Gi"), None, None)
+                .resolve(large, Mode::Isolated)
+                .is_err()
         );
     }
 

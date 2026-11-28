@@ -57,6 +57,24 @@ helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$valu
   --set 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32' > "$isolated"
 ops check-chart "$isolated" > /dev/null
 echo 'PASS: isolated compute renders its pod template and API egress, and no RBAC'
+engine="$validation_dir/engine.yaml"
+helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+  --set isolatedCompute.enabled=true \
+  --set 'isolatedCompute.apiServerCidrs[0]=10.96.0.1/32' \
+  --set-json 'isolatedCompute.engineOverride={"memoryPercent":70,"maxThreads":4}' \
+  --set-json 'persistentPools={"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","engine":{"memory":"512Mi","threads":1}}}' > "$engine"
+ops check-chart "$engine" > /dev/null
+grep -q 'DUCKFLEET_ENGINE_MEMORY, value: "512Mi"' "$engine"
+grep -q 'DUCKFLEET_ENGINE_MEMORY_PERCENT\\",\\"value\\":\\"70' "$engine"
+for oversized in '{"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","engine":{"threads":2}}}' \
+                 '{"small":{"cpu":1,"memory":"1Gi","disk":"2Gi","engine":{"memory":"1Gi"}}}'; do
+  if helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
+       --set-json "persistentPools=$oversized" > /dev/null 2>&1; then
+    echo "An engine limit beyond its pool must fail to render: $oversized" >&2
+    exit 1
+  fi
+done
+echo 'PASS: pool engine limits and the isolated override render, and oversized limits are refused'
 results="$validation_dir/results.yaml"
 helm template duckfleet infra/helm/duckfleet --namespace duckfleet-dev -f "$values" \
   --set results.enabled=true > "$results"
