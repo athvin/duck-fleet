@@ -184,6 +184,14 @@ persistentPools: {}
 # persistentPools:
 #   small: {cpu: 1, memory: 1Gi, disk: 2Gi, workers: 1}
 #   interactive: {cpu: 2, memory: 3Gi, disk: 4Gi, workers: 2, maxSessionsPerWorker: 32}
+# Each pool may also set the DuckDB engine inside its container with `engine`:
+#   interactive: {cpu: 4, memory: 8Gi, disk: 8Gi, engine: {memory: 3Gi, threads: 4}}
+# `memory` (a quantity) or `memoryPercent` (10-90, of the container's memory), and
+# `threads` (at most cpu). Unset, a persistent worker gives DuckDB 40% of its memory
+# and a thread per CPU. These are database-wide in DuckDB, so every session on a
+# worker shares them; they are not a per-session share. To keep one tenant from
+# crowding others out, use admission limits instead. See
+# docs/decisions/0002-engine-limits.md.
 # Each pool may also specify a complete jobLimits envelope (snake_case fields).
 # authority defaults to writer. A reader pool uses only CATALOG_READER_DSN and the
 # duckfleet-reader Pod Identity; provision both before declaring it. Example:
@@ -259,6 +267,18 @@ isolatedCompute:
   # instance can allocate (#214).
   maxCpu: 0
   maxMemory: ""
+  # MANUAL OVERRIDE — leave empty unless you have a specific reason. By default each
+  # isolated pod sizes DuckDB from the request: memory_limit is half the requested
+  # memory and threads equals the requested CPU, so a caller who asks for more gets
+  # more. Setting anything here replaces that for EVERY isolated session in the
+  # deployment, and the worker records `engine_limits: override` in each placement so
+  # history shows it was in force.
+  #   memoryPercent: 10-90, the share of each pod's memory DuckDB may use. Raise it
+  #     for memory-bound statistics over narrow results; lower it when results are
+  #     large Arrow streams that live outside DuckDB's pool.
+  #   maxThreads: a ceiling. A pod gets min(maxThreads, requested cpu).
+  # Absolute memory is not offered: isolated sizes change per request.
+  engineOverride: {}
   # Where the Kubernetes API server may be reached, and on which port. Both required
   # when enabled: defaulting them would mean opening egress to reach an address nobody
   # declared.

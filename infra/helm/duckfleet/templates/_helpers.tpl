@@ -92,6 +92,14 @@ seccompProfile:
 {{- if lt (include "duckfleet.quantityBytes" $pool.disk | int64) 1073741824 -}}
 {{- fail (printf "pool %s disk must be at least 1Gi" $name) -}}
 {{- end -}}
+{{- with $pool.engine -}}
+{{- if and (hasKey . "threads") (gt (int .threads) (int $pool.cpu)) -}}
+{{- fail (printf "pool %s engine.threads must not exceed its cpu" $name) -}}
+{{- end -}}
+{{- if and (hasKey . "memory") (gt (include "duckfleet.quantityBytes" .memory | int64) (div (mul (include "duckfleet.quantityBytes" $pool.memory | int64) 90) 100)) -}}
+{{- fail (printf "pool %s engine.memory must be at most 90%% of its memory" $name) -}}
+{{- end -}}
+{{- end -}}
 {{- $_ := set $pools $name $pool -}}
 {{- end -}}
 {{- else -}}
@@ -234,6 +242,22 @@ credentials, are sent to the gateway for the same runtime overlap validation. */
 # match the ephemeral-storage request/limit above. The gateway overwrites it, with
 # cpu and memory, in the isolated pod template before creating a sized session.
 - {name: DUCKFLEET_WORKER_DISK, value: {{ .disk | quote }}}
+# DuckDB's memory_limit and threads. Empty means automatic: an isolated pod sizes the
+# engine from the request (half the memory, a thread per CPU); a persistent worker
+# defaults to 40% of its memory, since every session on it shares one engine. A
+# persistent pool sets these with `engine`; isolated pods only through
+# isolatedCompute.engineOverride. See docs/decisions/0002-engine-limits.md.
+{{- with .engine }}
+{{- if hasKey . "memory" }}
+- {name: DUCKFLEET_ENGINE_MEMORY, value: {{ .memory | quote }}}
+{{- end }}
+{{- if hasKey . "memoryPercent" }}
+- {name: DUCKFLEET_ENGINE_MEMORY_PERCENT, value: {{ .memoryPercent | quote }}}
+{{- end }}
+{{- if hasKey . "threads" }}
+- {name: DUCKFLEET_ENGINE_THREADS, value: {{ .threads | quote }}}
+{{- end }}
+{{- end }}
 - {name: S3_AUTH_MODE, value: pod_identity}
 {{- if eq $authority "writer" }}
 {{ include "duckfleet.resultEnv" $ }}
@@ -311,7 +335,7 @@ spec:
         requests: {cpu: "1", memory: 1Gi, ephemeral-storage: 2Gi}
         limits: {cpu: "1", memory: 1Gi, ephemeral-storage: 3Gi}
       env:
-        {{- include "duckfleet.workerEnv" (dict "root" . "id" "replaced-per-session" "cpu" "1" "memory" "1Gi" "disk" "2Gi") | nindent 8 }}
+        {{- include "duckfleet.workerEnv" (dict "root" . "id" "replaced-per-session" "cpu" "1" "memory" "1Gi" "disk" "2Gi" "engine" (include "duckfleet.isolatedEngine" . | fromJson)) | nindent 8 }}
         # Declares that this process is a pod created for one session. The worker
         # admits exactly one isolated session and refuses shared ones, and reports
         # the mode to history from this rather than from the request, so a caller
@@ -392,4 +416,17 @@ startupProbe:
 {{- end }}
 - {name: DUCKFLEET_PLATFORM_DATABASE, value: platform}
 - {name: DUCKFLEET_LAKE_DATABASE, value: lake}
+{{- end -}}
+
+{{/*
+The isolated override, renamed to the worker's settings. maxThreads becomes the
+worker's thread setting, which an isolated worker treats as a ceiling so one value
+fits every requested size.
+*/}}
+{{- define "duckfleet.isolatedEngine" -}}
+{{- $override := .Values.isolatedCompute.engineOverride | default dict -}}
+{{- $engine := dict -}}
+{{- if hasKey $override "memoryPercent" -}}{{- $_ := set $engine "memoryPercent" $override.memoryPercent -}}{{- end -}}
+{{- if hasKey $override "maxThreads" -}}{{- $_ := set $engine "threads" $override.maxThreads -}}{{- end -}}
+{{- toJson $engine -}}
 {{- end -}}

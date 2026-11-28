@@ -580,6 +580,12 @@ impl Worker {
         placement["cgroup_cpu_quota"] = json!(observed.cpu_quota);
         placement["cgroup_cpu_period"] = json!(observed.cpu_period);
         placement["worker_boot_id"] = json!(status.boot_id());
+        // Resolved before the platform wait, so a misconfigured engine setting fails
+        // the pod at once instead of after the catalog becomes reachable.
+        let engine = crate::compute::EngineSettings::from_env()
+            .resolve(resources, mode)
+            .map_err(anyhow::Error::msg)?;
+        placement["engine_limits"] = json!(engine.source.name());
         let redactor = Redactor::from_env();
         let platform_dsn = required("PLATFORM_DSN")?;
         let platform_wait = crate::platform::schema_wait()?;
@@ -599,9 +605,12 @@ impl Worker {
             &format!(
                 // Spill is sized from the disk the pod was given, so asking for more
                 // disk is how a caller makes room for a larger out-of-core query.
+                // Memory and threads come from `EngineSettings::resolve`: sized from
+                // the request on an isolated pod, a lower configurable share on a
+                // persistent worker. See docs/decisions/0002-engine-limits.md.
                 "SET memory_limit='{}'; SET threads={}; SET max_temp_directory_size='{}';",
-                resources.engine_memory(),
-                resources.cpu,
+                engine.memory(),
+                engine.threads,
                 resources.spill_limit(),
             ),
         )?;
