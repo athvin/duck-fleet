@@ -29,6 +29,16 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install "${{ matrix.toolchain }}" --profile minimal --component clippy,rustfmt
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # Dependencies only: workspace crates rebuild every run, because a fresh checkout
+      # is newer than any restored output.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            server/target
+          key: sdk-${{ matrix.toolchain }}-${{ hashFiles('server/Cargo.lock') }}
+          restore-keys: sdk-${{ matrix.toolchain }}-
       - name: Format
         run: cargo +${{ matrix.toolchain }} fmt -p duckfleet -- --check
       - name: Clippy

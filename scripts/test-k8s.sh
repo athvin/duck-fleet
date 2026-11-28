@@ -50,6 +50,8 @@ cleanup() {
       -c "SELECT lifecycle_id,principal_id,pool,created_at,released_at FROM compute_reservations ORDER BY created_at DESC LIMIT 30" \
       > artifacts/kind/compute-lifecycles.txt 2>&1 || true
   fi
+  [[ -z "${images_pid:-}" ]] || kill "$images_pid" > /dev/null 2>&1 || true
+  [[ -z "${ops_pid:-}" ]] || kill "$ops_pid" > /dev/null 2>&1 || true
   rm -rf "$work"
   [[ "${DUCKFLEET_KEEP_CLUSTER:-false}" == true ]] || kind delete cluster --name "$CLUSTER" > /dev/null 2>&1 || true
   exit "$status"
@@ -57,6 +59,26 @@ cleanup() {
 trap cleanup EXIT
 
 kind delete cluster --name "$CLUSTER" > /dev/null 2>&1 || true
+# The images do not need the cluster and the cluster does not need the images, so
+# they are built while the node boots and Calico rolls out, and joined before load.
+# The build log goes to a file so the two do not interleave; it is printed after.
+images_log=artifacts/kind/image-build.log
+build_images() {
+  docker build --target runtime --tag duckfleet-worker:local -f docker/server.Dockerfile . \
+    && docker build --tag duckfleet-dbt:local -f docker/dbt.Dockerfile . \
+    && docker build --tag duckfleet-s3:local -f docker/s3.Dockerfile .
+}
+images_started=$SECONDS
+if [[ "${DUCKFLEET_PREBUILT_IMAGES:-}" == 1 ]]; then
+  images_pid=""
+else
+  build_images > "$images_log" 2>&1 &
+  images_pid=$!
+fi
+# Every step after the load goes through scripts/ops.sh, whose first call would
+# otherwise compile duckfleet-ops on the host with the cluster already waiting.
+cargo build --quiet --locked --manifest-path server/Cargo.toml --package duckfleet-ops > artifacts/kind/ops-build.log 2>&1 &
+ops_pid=$!
 # No --wait: with the default CNI disabled the nodes stay NotReady until one is
 # installed, so readiness is waited for after Calico below.
 kind create cluster --name "$CLUSTER" --config infra/kind/cluster.yaml
@@ -72,9 +94,18 @@ printf 'enforcing CNI (calico %s) ready in %ss\n' "$CALICO_VERSION" "$((SECONDS 
 
 # Built locally and loaded into the node; the Rust kind-localize transform rewrites the chart's ECR
 # digests to these tags with imagePullPolicy Never, so nothing is ever pulled.
-docker build --target runtime --tag duckfleet-worker:local -f docker/server.Dockerfile .
-docker build --tag duckfleet-dbt:local -f docker/dbt.Dockerfile .
-docker build --tag duckfleet-s3:local -f docker/s3.Dockerfile .
+if [[ -n "$images_pid" ]]; then
+  images_status=0
+  wait "$images_pid" || images_status=$?
+  cat "$images_log"
+  [[ "$images_status" -eq 0 ]] || { echo "image build failed" >&2; exit "$images_status"; }
+fi
+ops_status=0
+wait "$ops_pid" || ops_status=$?
+ops_pid=""
+[[ "$ops_status" -eq 0 ]] || { cat artifacts/kind/ops-build.log; exit "$ops_status"; }
+images_pid=""
+printf 'images ready %ss after cluster setup started\n' "$((SECONDS - images_started))"
 kind load docker-image --name "$CLUSTER" duckfleet-worker:local duckfleet-dbt:local duckfleet-s3:local
 
 # The same boundary an operator applies to the real cluster, rather than a convenient
@@ -168,6 +199,24 @@ harness() { # harness <job-name> <command> [timeout] [extra kind-harness-job arg
   "${KUBE[@]}" delete "job/$name" --cascade=foreground --wait=true --timeout=60s
 }
 
+# DUCKFLEET_K8S_PART splits the lane for CI: `scale` runs only the scale build below
+# on its own cluster, `main` runs everything else; the default `all` runs both here.
+# The scale build is the longest stage and nothing after it reads what it leaves.
+part=${DUCKFLEET_K8S_PART:-all}
+case "$part" in all | main | scale) ;; *) echo "unknown DUCKFLEET_K8S_PART: $part" >&2; exit 2 ;; esac
+scale_stage() {
+  # Exercise the packaged scale project with the same read-only/non-root pod
+  # security and writable artifact mounts used by the AWS harness.
+  harness duckfleet-scale 'duckfleet-server --scale'
+  grep -q 'PASS: scale build completed' artifacts/kind/duckfleet-scale.log
+}
+if [[ "$part" == scale ]]; then
+  scale_stage
+  "${KUBE[@]}" get pods -o wide > artifacts/kind/pods.txt
+  echo 'PASS: the packaged scale project built in-cluster on the released chart'
+  exit 0
+fi
+
 bash scripts/ops.sh kind-assert-role-posture --context "$CONTEXT" --namespace "$NS" > artifacts/kind/role-secret-posture.json
 harness duckfleet-rbac 'duckfleet-server --rbac' 900
 harness duckfleet-system 'duckfleet-server --system' 300
@@ -181,10 +230,7 @@ harness duckfleet-harness 'duckfleet-server'
 grep -q 'PASS: protocol checks and dbt lifecycle' artifacts/kind/duckfleet-harness.log
 grep -q 'PASS: resource/sizing routing refuses what it cannot serve' artifacts/kind/duckfleet-harness.log
 
-# Exercise the packaged scale project with the same read-only/non-root pod
-# security and writable artifact mounts used by the AWS harness.
-harness duckfleet-scale 'duckfleet-server --scale'
-grep -q 'PASS: scale build completed' artifacts/kind/duckfleet-scale.log
+[[ "$part" == main ]] || scale_stage
 
 # On-demand compute. The harness asserts what the API reports; these assert the
 # cluster facts it cannot see, which is the half that matters for a leak.

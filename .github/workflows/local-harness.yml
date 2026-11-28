@@ -1,73 +1,165 @@
 name: Docker dbt harness
+# One run used to be a single serial job (about 63 minutes on average, 49-76 over
+# recent runs) beside the kind lane. It is now a graph: the Compose images are built
+# once and loaded by five suite runners in parallel, the Rust checks run beside them,
+# and the kind lane runs as two clusters. docs/ci-benchmarks/README.md has the
+# measurements behind each split. aws-wait-checks reads only this file's run
+# conclusion on main, so job names here are free to change.
 on:
   pull_request:
   push:
     branches: [main]
+  # Lets a branch run the full harness without a pull request (and lets the timing
+  # comparison in docs/ci-benchmarks be repeated on demand).
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
   group: local-harness-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  harness:
+  # Documentation-only changes skip everything below. A skipped job still lets the
+  # run (and any required check on it) conclude successfully.
+  changes:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/ci/changed-code.sh "$BASE" >> "$GITHUB_OUTPUT"
+
+  # Builds every Compose image once. Each suite runner below loads this archive
+  # instead of recompiling the workspace against an empty build cache.
+  images:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build the Compose images
+        run: docker compose --profile test build
+      - name: Archive the images
+        run: bash scripts/ci/images.sh save "$RUNNER_TEMP/duckfleet-images.tar.zst"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: duckfleet-images
+          path: ${{ runner.temp }}/duckfleet-images.tar.zst
+          # Already zstd; a second compression pass only costs time.
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  # fmt, clippy and the workspace tests, then the native CLI's own `dev` lifecycle.
+  # `duckfleet dev` runs `docker compose build` itself, so it belongs on the runner
+  # whose build cache the check stage has just warmed, not on one that loaded images.
+  rust-checks:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust toolchain
-        run: bash scripts/ci/install-rust.sh
+        run: bash scripts/ci/install-rust.sh && echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Rust checks in Docker
         run: make check
-      - name: Real dbt integration and restart checks
-        run: make test
-      - name: Native CLI project and real Compose smoke
-        run: |
-          cd server
-          cargo build --locked -p duckfleet-cli
-          cd ..
-          make test-cli
       - name: Native CLI lifecycle and two-project isolation
-        run: make test-dev
-      - name: Interactive shell PTY and SQL input lifecycle
-        run: make test-shell
-      - name: Lake catalog discovery and reader authority
-        run: make test-catalog
-      - name: History, real profiles, sampling, and metadata privacy
-        run: make test-history
-      - name: Install pinned DuckDB CLI for independent import fixtures
-        run: |
-          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-cli-linux-amd64.tar.gz -o /tmp/duckdb-cli.tar.gz
-          printf '%s  %s\n' 'b676268be4d39e4e41a904442c9796c9914e645cc085c7505f048f2c992b5eca' '/tmp/duckdb-cli.tar.gz' | sha256sum -c -
-          tar -xzf /tmp/duckdb-cli.tar.gz -C /usr/local/bin duckdb
-      - name: Worker file access is limited to the lake and staging
-        run: make test-local-io
-      - name: psql and psycopg against the pgwire front
-        run: make test-pgwire-clients
-      - name: Private CSV and Parquet imports
-        run: make test-import
-      - name: CSV, JSON, Arrow, and Parquet exports
-        run: make test-export
-      - name: DuckLake snapshots, time travel, and bounded diffs
-        run: make test-snapshots
-      - name: Evidence-based compute advice
-        run: make test-advise
-      - name: dbt write-conflict advice on real artifacts
-        run: make test-advise-dbt
-      - name: dbt_utils, dbt_expectations, audit_helper, and codegen through dbt deps
-        run: make test-dbt-packages
-      - name: ADBC driver through adbc-driver-manager
-        run: make test-adbc
-      - name: Rust SDK against real Compose (current and minimum Rust)
-        run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          rustup toolchain install 1.89.0 --profile minimal
-          make test-sdk
-          DUCKFLEET_SDK_TOOLCHAIN=1.89.0 make test-sdk
+        run: bash scripts/ci/run-suites.sh rust-checks test-dev
       - name: Save test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: duckfleet-local-harness
+          name: duckfleet-local-harness-rust-checks
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The Compose suites, each on its own stack. Every script creates and drops its own
+  # fixtures, so they need nothing from one another; the shards are balanced from
+  # the per-step history in docs/ci-benchmarks/baseline-steps.csv.
+  compose:
+    needs: [changes, images]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Real dbt integration and restart checks, minus the scale build below.
+          - shard: core
+            targets: test
+            skip_scale: '1'
+          # The 110-model scale build, the longest single stage, on its own stack.
+          - shard: scale
+            targets: test-scale
+          # Native CLI smoke, PTY shell, catalog, history, worker file access, pgwire clients.
+          - shard: cli
+            targets: test-cli test-shell test-catalog test-history test-local-io test-pgwire-clients
+            up: true
+          # Imports, exports, DuckLake snapshots, compute advice.
+          - shard: data
+            targets: test-import test-export test-snapshots test-advise
+            up: true
+            duckdb: true
+          # dbt advice and packages, the ADBC driver, the Rust SDK on current and minimum Rust.
+          - shard: clients
+            targets: test-advise-dbt test-dbt-packages test-adbc test-sdk test-sdk-msrv
+            up: true
+            msrv: true
+    env:
+      DUCKFLEET_PREBUILT_IMAGES: '1'
+      DUCKFLEET_SKIP_SCALE: ${{ matrix.skip_scale || '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: bash scripts/ci/install-rust.sh && echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install minimum supported Rust
+        if: matrix.msrv
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: Install pinned DuckDB CLI for independent import fixtures
+        if: matrix.duckdb
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-cli-linux-amd64.tar.gz -o /tmp/duckdb-cli.tar.gz
+          printf '%s  %s\n' 'b676268be4d39e4e41a904442c9796c9914e645cc085c7505f048f2c992b5eca' '/tmp/duckdb-cli.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/duckdb-cli.tar.gz -C /usr/local/bin duckdb
+      # Host-side cargo output (the CLI, its PTY tests, duckfleet-ops, the SDK suite).
+      # Keyed by lockfile: workspace crates still rebuild from source every run, since
+      # a fresh checkout is newer than any restored output; only dependencies are reused.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            server/target
+          key: host-cargo-${{ matrix.shard }}-${{ hashFiles('server/Cargo.lock') }}
+          restore-keys: host-cargo-${{ matrix.shard }}-
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: duckfleet-images
+          path: ${{ runner.temp }}
+      - name: Load the Compose images
+        run: bash scripts/ci/images.sh load "$RUNNER_TEMP/duckfleet-images.tar.zst"
+      - name: Start the local stack
+        if: matrix.up
+        run: docker compose up -d --wait server
+      - name: Run ${{ matrix.targets }}
+        run: bash scripts/ci/run-suites.sh "${{ matrix.shard }}" ${{ matrix.targets }}
+      - name: Save Compose logs on failure
+        if: failure()
+        run: docker compose --profile "*" logs --no-color > artifacts/compose-${{ matrix.shard }}.log 2>&1 || true
+      - name: Save test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: duckfleet-local-harness-${{ matrix.shard }}
           path: artifacts/
           if-no-files-found: ignore
           retention-days: 7
@@ -76,23 +168,32 @@ jobs:
         run: docker compose down -v
 
   # Runs beside the Compose harness rather than after it: this proves scheduling,
-  # probes and real cgroup limits, which Compose cannot express at all.
+  # probes and real cgroup limits, which Compose cannot express at all. Two clusters:
+  # the in-cluster scale build runs on its own so it is not added to everything else.
   kubernetes:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [main, scale]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust toolchain
         run: bash scripts/ci/install-rust.sh
       - run: bash scripts/ci/install-infra-tools.sh
       - run: bash scripts/ci/install-kind.sh
-      - name: Kubernetes release and in-cluster dbt harness
+      - name: Kubernetes release and in-cluster dbt harness (${{ matrix.part }})
+        env:
+          DUCKFLEET_K8S_PART: ${{ matrix.part }}
         run: make test-k8s
       - name: Save cluster evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: duckfleet-kind-harness
+          name: duckfleet-kind-harness-${{ matrix.part }}
           path: artifacts/kind/
           if-no-files-found: ignore
           retention-days: 7

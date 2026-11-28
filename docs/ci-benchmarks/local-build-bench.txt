@@ -1,0 +1,39 @@
+pull 21.5 0
+B0_cold_check 21.8 1
+B0_compose_build 1.7 1
+B0.check 359.7 0
+B0.aws_check 4.5 0
+B0.img_worker 38.0 0
+B0.img_dbt 91.5 0
+B0.img_api 32.4 0
+B0.img_s3 43.6 0
+B0.size_worker 1250776617
+B0.size_dbt 1460618030
+B0.size_api 1243045113
+B0.size_s3 444529899
+B0.save_zstd 16.0 0
+B0.archive_bytes 
+B0.warm_check 75.8 0
+B0.warm_img_worker 3.4 0
+B0.warm_img_dbt 62.1 0
+B0.buildkit_bytes 9175361
+V1.check 280.6 0
+V1.aws_check 3.6 0
+V1.img_worker 23.6 0
+V1.img_dbt 64.8 0
+V1.img_api 21.7 0
+V1.img_s3 30.7 0
+V1.size_worker 734433745
+V1.size_dbt 944275068
+V1.size_api 726702244
+V1.size_s3 240335458
+V1.save_zstd 10.4 0
+V1.archive_bytes 
+V1.warm_check 54.8 0
+V1.warm_img_worker 2.0 0
+V1.warm_img_dbt 49.5 0
+V1.buildkit_bytes 17826113
+B0.archive_bytes_real 838789963
+V1.archive_bytes_real 548550552
+B0.load_zstd 21.8 0
+V1.load_zstd 14.3 0
