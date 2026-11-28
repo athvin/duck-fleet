@@ -16,5 +16,14 @@ jobs:
           terraform_version: 1.11.4
           terraform_wrapper: false
       - run: bash scripts/ci/install-infra-tools.sh
+      # duckfleet-ops' dependencies, which check-infra otherwise compiles cold each run.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            server/target
+          key: infra-ops-${{ hashFiles('server/Cargo.lock') }}
+          restore-keys: infra-ops-
       - run: make check-infra
 # Pull requests remain credential-free; AWS mutation runs only after main checks pass.

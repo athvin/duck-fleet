@@ -1,0 +1,23 @@
+run_id,job,minutes
+46098600019,kubernetes (main),26.6
+46098600019,kubernetes (scale),15.3
+46098600019,compose (core),13.3
+46098600019,compose (data),10.7
+46098600019,rust-checks,9.7
+46098600019,compose (clients),9.4
+46098600019,compose (scale),7.1
+46098600019,images,3.0
+46098600019,compose (cli),2.9
+46098600019,changes,0.1
+46098600019,wall-clock,27.0
+46100942491,kubernetes (main),26.7
+46100942491,compose (core),13.3
+46100942491,kubernetes (scale),11.1
+46100942491,compose (data),9.1
+46100942491,rust-checks,8.1
+46100942491,compose (clients),7.7
+46100942491,compose (scale),7.6
+46100942491,compose (cli),6.5
+46100942491,images,3.0
+46100942491,changes,0.1
+46100942491,wall-clock,27.0

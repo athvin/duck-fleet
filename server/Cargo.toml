@@ -53,3 +53,15 @@ tokio = { version = "1.54.1", features = ["full", "test-util"] }
 
 [patch.crates-io]
 duckdb = { path = "vendor/duckdb" }
+
+# Debug builds are what every image and CI job compiles, and full debuginfo made
+# them large: the worker binary alone was 567 MB. Line tables are kept for the
+# workspace's own crates, so panics and backtraces still name file and line;
+# dependencies carry none. Measured in docs/ci-benchmarks/README.md: cold compile
+# of the CI image set -25%, worker image 1.25 GB -> 0.73 GB, image archive -35%.
+# CARGO_PROFILE_DEV_DEBUG=true restores full debuginfo for the workspace crates.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

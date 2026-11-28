@@ -1,4 +1,4 @@
-.PHONY: up ui test check test-cli test-dev test-shell test-catalog test-history test-import test-export test-sdk test-snapshots test-advise test-advise-dbt test-dbt-packages test-local-io test-pgwire-clients test-adbc down
+.PHONY: up ui test check test-cli test-dev test-shell test-catalog test-history test-import test-export test-sdk test-sdk-msrv test-scale test-snapshots test-advise test-advise-dbt test-dbt-packages test-local-io test-pgwire-clients test-adbc down
 up:
 	docker compose build
 	docker compose up -d --wait server
@@ -11,6 +11,9 @@ test:
 check:
 	docker build --target check -f docker/server.Dockerfile .
 	docker build --target aws-credentials-check -f docker/server.Dockerfile .
+# The scale stage alone, on its own stack (CI runs it beside test-local.sh).
+test-scale:
+	bash scripts/test-scale.sh
 test-cli:
 	bash scripts/test-native-cli.sh
 test-dev:
@@ -51,6 +54,10 @@ test-adbc:
 
 test-sdk:
 	cd server && cargo +$${DUCKFLEET_SDK_TOOLCHAIN:-1.99.0} test -p duckfleet --locked --test compose -- --ignored --test-threads=1
+
+# The same suite on the SDK's minimum supported Rust.
+test-sdk-msrv:
+	$(MAKE) test-sdk DUCKFLEET_SDK_TOOLCHAIN=1.89.0
 
 .PHONY: check-infra
 check-infra:

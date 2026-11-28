@@ -6,7 +6,11 @@ mkdir -p artifacts
 trap 'result=$?; if [ "$result" -ne 0 ]; then docker compose --profile "*" logs --no-color > artifacts/compose-failure.log 2>&1; fi; exit "$result"' EXIT
 bash scripts/ops.sh compute-lifecycle check compose
 bash scripts/ops.sh test-database-roles
-docker compose --profile test build
+# CI builds the images once and loads them on every runner (local-harness.yml);
+# rebuilding there would recompile everything against an empty build cache.
+if [[ "${DUCKFLEET_PREBUILT_IMAGES:-}" != 1 ]]; then
+  docker compose --profile test build
+fi
 docker compose up -d --wait server
 
 # One persistent worker tier now (sizing derives an isolated pod, which needs
@@ -114,7 +118,12 @@ docker compose up -d --wait worker-small server
 # (DUCKFLEET_ROLE=harness), which drives the forked dbt binary. Default = main
 # lifecycle; then the stages that need both the gateway and a fresh fleet.
 docker compose run --rm dbt
-docker compose run --rm dbt duckfleet-server --scale
+# The 110-model scale build is the longest single stage (about 7 minutes) and needs
+# nothing earlier stages leave behind, so CI runs it on its own stack in parallel
+# (scripts/test-scale.sh) and sets this. A plain `make test` still runs it here.
+if [[ "${DUCKFLEET_SKIP_SCALE:-}" != 1 ]]; then
+  docker compose run --rm dbt duckfleet-server --scale
+fi
 docker compose run --rm dbt duckfleet-server --concurrency
 docker compose run --rm dbt duckfleet-server --metering
 
