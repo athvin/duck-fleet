@@ -1,4 +1,4 @@
-.PHONY: up ui test check test-cli test-dev test-shell test-catalog test-history test-import test-export test-sdk test-snapshots test-advise test-advise-dbt test-local-io test-pgwire-clients test-adbc down
+.PHONY: up ui test check test-cli test-dev test-shell test-catalog test-history test-import test-export test-sdk test-snapshots test-advise test-advise-dbt test-dbt-packages test-local-io test-pgwire-clients test-adbc down
 up:
 	docker compose build
 	docker compose up -d --wait server
@@ -36,6 +36,9 @@ test-advise:
 
 test-advise-dbt:
 	bash scripts/test-advise-dbt.sh
+
+test-dbt-packages:
+	bash scripts/test-dbt-packages.sh
 
 test-local-io:
 	bash scripts/test-local-io.sh

@@ -1,0 +1,8 @@
+version: 2
+sources:
+  # For codegen.generate_base_model, which reads a source's columns.
+  - name: package_compat
+    database: lake
+    schema: package_compat
+    tables:
+      - name: orders

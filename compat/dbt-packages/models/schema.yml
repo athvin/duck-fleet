@@ -1,0 +1,83 @@
+version: 2
+models:
+  - name: orders_enriched
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [order_id, customer_id]
+      - dbt_utils.equal_rowcount:
+          arguments:
+            compare_model: ref('orders')
+      - dbt_expectations.expect_table_row_count_to_be_between:
+          arguments:
+            min_value: 1
+            max_value: 100
+      - dbt_expectations.expect_table_columns_to_contain_set:
+          arguments:
+            column_list: [order_key, order_id, amount_hundreds]
+    columns:
+      - name: order_key
+        data_tests: [unique, not_null]
+      - name: amount
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+          - dbt_expectations.expect_column_values_to_be_between:
+              arguments:
+                min_value: 0
+                max_value: 1000
+          - dbt_expectations.expect_column_values_to_be_of_type:
+              arguments:
+                column_type: decimal(10,2)
+      - name: status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [shipped, returned, pending]
+          - dbt_expectations.expect_column_values_to_match_regex:
+              arguments:
+                regex: '^[a-z]+$'
+          - dbt_expectations.expect_column_distinct_count_to_equal:
+              arguments:
+                value: 3
+      - name: name
+        data_tests:
+          - dbt_utils.not_empty_string
+  - name: calendar
+    columns:
+      - name: date_day
+        data_tests:
+          - unique
+          - dbt_expectations.expect_column_values_to_be_increasing:
+              arguments:
+                sort_column: date_day
+    data_tests:
+      - dbt_expectations.expect_table_row_count_to_equal:
+          arguments:
+            value: 14
+  - name: orders_deduped
+    data_tests:
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "amount >= 0"
+      - dbt_expectations.expect_table_row_count_to_equal:
+          arguments:
+            value: 4
+  - name: status_pivot
+    data_tests:
+      - dbt_utils.fewer_rows_than:
+          arguments:
+            compare_model: ref('orders')
+  - name: orders_by_day
+    data_tests:
+      - dbt_utils.recency:
+          arguments:
+            datepart: day
+            field: day
+            interval: 100000
+      - dbt_expectations.expect_column_sum_to_be_between:
+          arguments:
+            column_name: orders
+            min_value: 6
+            max_value: 6
